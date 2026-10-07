@@ -18,6 +18,7 @@ Over the next 10–15 years, the Internet is transitioning from centralized hype
 4. **Energy-Aware Compute Placement:** Dynamically migrating compute to locations with optimal green energy and grid capacity.
 
 For a comprehensive breakdown of the long-term industry shift, read the **[Global Infrastructure Thesis (10–15 Year Horizon)](docs/THESIS.md)**.
+For the complete engineering and systems programming choices, read the **[Technology Stack Matrix](docs/TECH_STACK.md)** (Go + Rust + C/eBPF + Linux Networking).
 
 ---
 
