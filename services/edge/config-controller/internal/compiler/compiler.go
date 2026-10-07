@@ -317,9 +317,26 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			},
 		}
 
-		// Process customer routes and their upstream clusters
+		// Process customer routes and their upstream clusters.
+		// Sort routes by Priority descending (highest priority evaluated first in Envoy's first-match route table),
+		// tie-breaking by PathPrefix length descending (most specific prefix first),
+		// and ID ascending for strict determinism.
+		routes := append([]*model.Route(nil), topo.Routes...)
+		sort.SliceStable(routes, func(i, j int) bool {
+			if routes[i].Priority != routes[j].Priority {
+				return routes[i].Priority > routes[j].Priority
+			}
+			if len(routes[i].PathPrefix) != len(routes[j].PathPrefix) {
+				return len(routes[i].PathPrefix) > len(routes[j].PathPrefix)
+			}
+			if routes[i].PathPrefix != routes[j].PathPrefix {
+				return routes[i].PathPrefix > routes[j].PathPrefix
+			}
+			return routes[i].ID < routes[j].ID
+		})
+
 		customerRoutes := make([]Route, 0)
-		for _, r := range topo.Routes {
+		for _, r := range routes {
 			pool, exists := topo.Pools[r.PoolID]
 			if !exists || pool == nil || len(pool.Origins) == 0 {
 				continue

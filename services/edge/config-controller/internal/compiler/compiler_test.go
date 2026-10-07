@@ -614,3 +614,87 @@ func TestCompiler_EnforceHTTPS_Behavior(t *testing.T) {
 		}
 	}
 }
+
+func TestCompiler_RoutePriorityOrdering(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_prio",
+		Hostname:       "priority.example.com",
+		OriginAddress:  "root.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard error: %v", err)
+	}
+	if _, err := svc.VerifyDomain(res.DomainID); err != nil {
+		t.Fatalf("verify error: %v", err)
+	}
+
+	// Create two secondary pools
+	poolAPI := &model.OriginPool{
+		ID:        "pool_api",
+		ProjectID: "proj_priority",
+		Origins: []model.Origin{
+			{ID: "orig_api", PoolID: "pool_api", Address: "api.example.com", Port: 443, Protocol: model.ProtocolHTTPS, Healthy: true},
+		},
+	}
+	poolAuth := &model.OriginPool{
+		ID:        "pool_auth",
+		ProjectID: "proj_priority",
+		Origins: []model.Origin{
+			{ID: "orig_auth", PoolID: "pool_auth", Address: "auth.example.com", Port: 443, Protocol: model.ProtocolHTTPS, Healthy: true},
+		},
+	}
+	st.SaveOriginPool(poolAPI)
+	st.SaveOriginPool(poolAuth)
+
+	// Save routes with different priorities and path lengths:
+	// Route 1: "/" (Priority 0)
+	// Route 2: "/api" (Priority 10)
+	// Route 3: "/api/v1/auth" (Priority 10, longer prefix)
+	// Route 4: "/static" (Priority 5)
+	st.SaveRoute(&model.Route{ID: "r_root", DomainID: res.DomainID, PoolID: "pool_api", PathPrefix: "/", Priority: 0})
+	st.SaveRoute(&model.Route{ID: "r_api", DomainID: res.DomainID, PoolID: "pool_api", PathPrefix: "/api", Priority: 10})
+	st.SaveRoute(&model.Route{ID: "r_auth", DomainID: res.DomainID, PoolID: "pool_auth", PathPrefix: "/api/v1/auth", Priority: 10})
+	st.SaveRoute(&model.Route{ID: "r_static", DomainID: res.DomainID, PoolID: "pool_api", PathPrefix: "/static", Priority: 5})
+
+	topologies := st.GetActiveTopologies()
+	cfg, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("failed to compile: %v", err)
+	}
+
+	httpHCM := cfg.StaticResources.Listeners[0].FilterChains[0].Filters[0].TypedConfig
+	httpRouteCfg := httpHCM["route_config"].(map[string]interface{})
+	httpVhosts := httpRouteCfg["virtual_hosts"].([]compiler.VirtualHost)
+	vh := httpVhosts[0]
+
+	// Find the customer routes (skipping index 0 which is ACME challenge)
+	var prefixes []string
+	for _, r := range vh.Routes {
+		if r.Match.Prefix != "/.well-known/acme-challenge/" {
+			prefixes = append(prefixes, r.Match.Prefix)
+		}
+	}
+
+	// Expected order:
+	// 1. /api/v1/auth (Priority 10, length 12)
+	// 2. /api (Priority 10, length 4)
+	// 3. /static (Priority 5, length 7)
+	// 4. / (Priority 0, length 1)
+	expectedOrder := []string{"/api/v1/auth", "/api", "/static", "/"}
+	if len(prefixes) < 4 {
+		t.Fatalf("expected at least 4 customer routes, got %v", prefixes)
+	}
+	for i := 0; i < 4; i++ {
+		if prefixes[i] != expectedOrder[i] {
+			t.Errorf("route index %d mismatch: expected prefix %s, got %s (full order: %v)", i, expectedOrder[i], prefixes[i], prefixes)
+		}
+	}
+}

@@ -1537,6 +1537,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if r.Method == http.MethodPost {
+				if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+					writeError(w, http.StatusForbidden, "forbidden: platform operator role required for node registration")
+					return
+				}
 				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 				var node model.EdgeNode
 				if err := json.NewDecoder(r.Body).Decode(&node); err != nil {

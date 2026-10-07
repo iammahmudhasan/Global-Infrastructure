@@ -76,11 +76,7 @@ pub async fn handle_request(
 
     // 2. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();
-    let host = req_headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost")
-        .to_string();
+    let host = resolve_host(&req_headers, req.uri());
 
     let user_agent = req_headers
         .get("user-agent")
@@ -230,11 +226,13 @@ pub async fn handle_request(
     );
 
     // Forward all client application headers (Authorization, Cookie, Content-Type, Accept, etc.)
-    // Stripping hop-by-hop headers and untrusted client forwarding headers to prevent spoofing
+    // Stripping hop-by-hop headers, nominated Connection tokens, and untrusted client forwarding headers
+    let req_connection_tokens = parse_connection_tokens(req_headers.get("connection"));
     for (name, value) in req_headers.iter() {
         let name_str = name.as_str().to_lowercase();
         if HOP_BY_HOP_HEADERS.contains(&name_str.as_str())
             || STRIPPED_FORWARDING_HEADERS.contains(&name_str.as_str())
+            || req_connection_tokens.contains(&name_str)
         {
             continue;
         }
@@ -277,7 +275,16 @@ pub async fn handle_request(
                 .to_lowercase();
             let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
 
+            let resp_connection_tokens =
+                parse_connection_tokens(upstream_resp.headers().get("connection"));
+
             for (k, v) in upstream_resp.headers().iter() {
+                let k_lower = k.as_str().to_lowercase();
+                if is_hop_by_hop_response_header(&k_lower)
+                    || resp_connection_tokens.contains(&k_lower)
+                {
+                    continue;
+                }
                 if let (Ok(hn), Ok(hv)) = (
                     HeaderName::from_bytes(k.as_str().as_bytes()),
                     HeaderValue::from_bytes(v.as_bytes()),
@@ -366,6 +373,51 @@ pub async fn handle_request(
     }
 }
 
+/// Resolves target host according to RFC 9110 / HTTP/2 semantics:
+/// Prefers the Host header when present; falls back to URI authority (e.g. from HTTP/2 :authority);
+/// defaults to "localhost" if both are absent.
+pub fn resolve_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> String {
+    headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| uri.authority().map(|a| a.as_str().to_owned()))
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// Identifies standard RFC 9110 / RFC 7230 hop-by-hop response headers
+pub fn is_hop_by_hop_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Parses Connection header tokens (comma-separated header names) to strip per RFC 9110
+pub fn parse_connection_tokens(
+    conn_val: Option<&hyper::header::HeaderValue>,
+) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    if let Some(val) = conn_val {
+        if let Ok(s) = val.to_str() {
+            for token in s.split(',') {
+                let t = token.trim().to_lowercase();
+                if !t.is_empty() {
+                    tokens.insert(t);
+                }
+            }
+        }
+    }
+    tokens
+}
+
 pub fn normalize_accept_encoding(value: &str) -> String {
     let mut encs: Vec<String> = value
         .split(',')
@@ -403,5 +455,49 @@ mod tests {
             "br,deflate,gzip"
         );
         assert_eq!(normalize_accept_encoding(""), "");
+    }
+
+    #[test]
+    fn test_resolve_host_with_host_header() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("host", "customer-a.example.com".parse().unwrap());
+        let uri: hyper::Uri = "/api/v1".parse().unwrap();
+        assert_eq!(resolve_host(&headers, &uri), "customer-a.example.com");
+    }
+
+    #[test]
+    fn test_resolve_host_http2_authority() {
+        let headers = hyper::HeaderMap::new();
+        // In HTTP/2, :authority is parsed into URI authority while Host header is absent
+        let uri: hyper::Uri = "https://customer-b.example.com/api/v1".parse().unwrap();
+        assert_eq!(resolve_host(&headers, &uri), "customer-b.example.com");
+    }
+
+    #[test]
+    fn test_resolve_host_fallback_localhost() {
+        let headers = hyper::HeaderMap::new();
+        let uri: hyper::Uri = "/relative/path".parse().unwrap();
+        assert_eq!(resolve_host(&headers, &uri), "localhost");
+    }
+
+    #[test]
+    fn test_is_hop_by_hop_response_header() {
+        assert!(is_hop_by_hop_response_header("connection"));
+        assert!(is_hop_by_hop_response_header("keep-alive"));
+        assert!(is_hop_by_hop_response_header("transfer-encoding"));
+        assert!(is_hop_by_hop_response_header("upgrade"));
+        assert!(!is_hop_by_hop_response_header("content-type"));
+        assert!(!is_hop_by_hop_response_header("x-cache"));
+        assert!(!is_hop_by_hop_response_header("strict-transport-security"));
+    }
+
+    #[test]
+    fn test_parse_connection_tokens() {
+        let val: hyper::header::HeaderValue = "close, X-Custom-Header, Keep-Alive".parse().unwrap();
+        let tokens = parse_connection_tokens(Some(&val));
+        assert!(tokens.contains("close"));
+        assert!(tokens.contains("x-custom-header"));
+        assert!(tokens.contains("keep-alive"));
+        assert_eq!(tokens.len(), 3);
     }
 }

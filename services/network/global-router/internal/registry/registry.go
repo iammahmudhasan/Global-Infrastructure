@@ -26,6 +26,7 @@ var (
 	ErrInsufficientCapacity = errors.New("insufficient GPU capacity on backend")
 	ErrReservationExists    = errors.New("workload reservation already exists")
 	ErrReservationNotFound  = errors.New("workload reservation not found")
+	ErrInvalidBackend       = errors.New("invalid backend: missing required fields or negative capacity/cost/latency")
 )
 
 // Reservation tracks capacity ownership by a specific workload
@@ -169,15 +170,20 @@ func (r *Registry) Register(b *ComputeBackend) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if b == nil || b.ID == "" || b.Endpoint == "" || b.AvailableGPUs < 0 || b.HourlyCost < 0 || b.LatencyP95Ms < 0 {
+		return ErrInvalidBackend
+	}
+
 	if _, exists := r.backends[b.ID]; exists {
 		return ErrDuplicateBackend
 	}
 
-	if b.Breaker == nil {
-		b.Breaker = circuitbreaker.New(b.ID, 3, 10*time.Second)
+	cloned := *b
+	if cloned.Breaker == nil {
+		cloned.Breaker = circuitbreaker.New(cloned.ID, 3, 10*time.Second)
 	}
-	b.LastHealthCheck = time.Now()
-	r.backends[b.ID] = b
+	cloned.LastHealthCheck = time.Now().UTC()
+	r.backends[cloned.ID] = &cloned
 	return nil
 }
 
@@ -338,7 +344,37 @@ func (r *Registry) Reserve(workloadID, backendID string, count int) error {
 	return nil
 }
 
-// Release restores reserved GPU capacity using workload reservation ownership validation
+// CompleteWorkload records the execution outcome (success or failure) of a reserved workload,
+// feeding back directly into the circuit breaker lifecycle and releasing reserved GPU capacity.
+func (r *Registry) CompleteWorkload(workloadID string, success bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	res, exists := r.reservations[workloadID]
+	if !exists {
+		return ErrReservationNotFound
+	}
+
+	if b, ok := r.backends[res.BackendID]; ok {
+		b.AvailableGPUs += res.GPUs
+		if b.ActiveWorkloads > 0 {
+			b.ActiveWorkloads--
+		}
+		if b.Breaker != nil {
+			if success {
+				b.Breaker.RecordSuccess()
+			} else {
+				b.Breaker.RecordFailure()
+			}
+			b.CircuitState = b.Breaker.State()
+		}
+	}
+	delete(r.reservations, workloadID)
+	return nil
+}
+
+// Release restores reserved GPU capacity using workload reservation ownership validation.
+// If the backend has an in-flight trial probe without an explicit completion outcome, it releases the trial.
 func (r *Registry) Release(workloadID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -352,6 +388,10 @@ func (r *Registry) Release(workloadID string) error {
 		b.AvailableGPUs += res.GPUs
 		if b.ActiveWorkloads > 0 {
 			b.ActiveWorkloads--
+		}
+		if b.Breaker != nil {
+			b.Breaker.ReleaseTrial()
+			b.CircuitState = b.Breaker.State()
 		}
 	}
 	delete(r.reservations, workloadID)

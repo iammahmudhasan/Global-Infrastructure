@@ -1373,3 +1373,45 @@ func TestPoPAndRoutingAccessControl(t *testing.T) {
 		}
 	}
 }
+
+func TestNodeRegistration_OperatorOnly(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterTenantWithRole("key-operator", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
+	authInst.RegisterNode("key-node", "tenant-infra", "proj-infra", "edge-node-01")
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+
+	nodePayload, _ := json.Marshal(map[string]interface{}{
+		"id":         "node-rogue-01",
+		"hostname":   "rogue.dhaka.nexusedge.net",
+		"ip_address": "203.0.113.50",
+	})
+
+	// 1. EdgeNode role attempts node registration -> 403 Forbidden
+	req := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes", bytes.NewReader(nodePayload))
+	req.Header.Set("X-API-Key", "key-node")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "operator role required for node registration") {
+		t.Fatalf("expected 403 Forbidden for edge node registration attempt, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Tenant role attempts node registration -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes", bytes.NewReader(nodePayload))
+	req.Header.Set("X-API-Key", "key-tenant")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant registration attempt, got %d", w.Code)
+	}
+
+	// 3. Platform Operator attempts node registration -> 201 Created
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes", bytes.NewReader(nodePayload))
+	req.Header.Set("X-API-Key", "key-operator")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for operator node registration, got %d: %s", w.Code, w.Body.String())
+	}
+}

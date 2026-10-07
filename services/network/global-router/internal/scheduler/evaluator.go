@@ -176,7 +176,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 					AssignedBackend: b,
 					GPUsAllocated:   gpusReq,
 					CompositeScore:  item.score,
-					Reason:          "Deterministic fallback: placed on nearest healthy node with capacity",
+					Reason:          "Deterministic fallback: placed on lowest-score healthy node with capacity",
 					ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET", "CAPACITY_RESERVED"},
 					FallbackUsed:    true,
 					CalculatedAt:    time.Now().UTC(),

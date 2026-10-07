@@ -2,6 +2,7 @@ package registry_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
@@ -161,5 +162,163 @@ func TestRegistry_AdmitAndReserve(t *testing.T) {
 
 	if err := reg.AdmitAndReserve("workload-cb", "bd-dhaka-dgx01", 1); err != circuitbreaker.ErrCircuitOpen {
 		t.Errorf("expected ErrCircuitOpen, got: %v", err)
+	}
+}
+
+func TestRegistry_RegisterValidationAndCloning(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	// 1. Validation tests
+	if err := reg.Register(nil); err != registry.ErrInvalidBackend {
+		t.Errorf("expected ErrInvalidBackend for nil backend, got %v", err)
+	}
+
+	invalidCases := []*registry.ComputeBackend{
+		{ID: "", Endpoint: "https://test.internal", AvailableGPUs: 4, HourlyCost: 1.0, LatencyP95Ms: 10},
+		{ID: "test-id", Endpoint: "", AvailableGPUs: 4, HourlyCost: 1.0, LatencyP95Ms: 10},
+		{ID: "test-id", Endpoint: "https://test.internal", AvailableGPUs: -1, HourlyCost: 1.0, LatencyP95Ms: 10},
+		{ID: "test-id", Endpoint: "https://test.internal", AvailableGPUs: 4, HourlyCost: -0.5, LatencyP95Ms: 10},
+		{ID: "test-id", Endpoint: "https://test.internal", AvailableGPUs: 4, HourlyCost: 1.0, LatencyP95Ms: -5},
+	}
+
+	for i, tc := range invalidCases {
+		if err := reg.Register(tc); err != registry.ErrInvalidBackend {
+			t.Errorf("case %d: expected ErrInvalidBackend, got %v", i, err)
+		}
+	}
+
+	// 2. Successful registration and defensive cloning
+	callerBackend := &registry.ComputeBackend{
+		ID:            "custom-node-01",
+		Region:        "singapore",
+		Endpoint:      "https://sgp.internal",
+		GPUModel:      "A100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.50,
+		LatencyP95Ms:  25,
+		Healthy:       true,
+	}
+
+	if err := reg.Register(callerBackend); err != nil {
+		t.Fatalf("failed to register valid backend: %v", err)
+	}
+
+	// Mutate caller pointer
+	callerBackend.AvailableGPUs = 999
+	callerBackend.Healthy = false
+	callerBackend.HourlyCost = 0.01
+
+	stored, err := reg.Get("custom-node-01")
+	if err != nil {
+		t.Fatalf("failed to get registered backend: %v", err)
+	}
+
+	if stored.AvailableGPUs != 8 {
+		t.Errorf("caller mutation leaked into registry! Expected 8, got %d", stored.AvailableGPUs)
+	}
+	if !stored.Healthy {
+		t.Errorf("caller mutation of Healthy leaked into registry!")
+	}
+	if stored.HourlyCost != 2.50 {
+		t.Errorf("caller mutation of HourlyCost leaked into registry! Expected 2.50, got %f", stored.HourlyCost)
+	}
+
+	// 3. Duplicate registration
+	dup := &registry.ComputeBackend{
+		ID:       "custom-node-01",
+		Endpoint: "https://sgp2.internal",
+	}
+	if err := reg.Register(dup); err != registry.ErrDuplicateBackend {
+		t.Errorf("expected ErrDuplicateBackend, got %v", err)
+	}
+}
+
+func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	backendID := "bd-dhaka-dgx01"
+	b, err := reg.Get(backendID)
+	if err != nil {
+		t.Fatalf("failed to get backend: %v", err)
+	}
+	initialGPUs := b.AvailableGPUs
+
+	workloadID := "wl-execution-01"
+	if err := reg.AdmitAndReserve(workloadID, backendID, 2); err != nil {
+		t.Fatalf("failed to reserve workload: %v", err)
+	}
+
+	afterReserve, _ := reg.Get(backendID)
+	if afterReserve.AvailableGPUs != initialGPUs-2 {
+		t.Errorf("expected %d GPUs, got %d", initialGPUs-2, afterReserve.AvailableGPUs)
+	}
+
+	// 1. Complete with success
+	if err := reg.CompleteWorkload(workloadID, true); err != nil {
+		t.Fatalf("expected successful completion, got %v", err)
+	}
+
+	afterComplete, _ := reg.Get(backendID)
+	if afterComplete.AvailableGPUs != initialGPUs {
+		t.Errorf("expected GPUs restored to %d, got %d", initialGPUs, afterComplete.AvailableGPUs)
+	}
+
+	// 2. Double complete should return ErrReservationNotFound
+	if err := reg.CompleteWorkload(workloadID, true); err != registry.ErrReservationNotFound {
+		t.Errorf("expected ErrReservationNotFound, got %v", err)
+	}
+
+	// 3. Complete with failure feeds back into circuit breaker
+	testBackend := &registry.ComputeBackend{
+		ID:            "failing-node-01",
+		Region:        "dhaka",
+		Endpoint:      "https://fail.internal",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    3.0,
+		LatencyP95Ms:  50,
+		Healthy:       true,
+		Breaker:       circuitbreaker.New("failing-node-01", 2, 100*time.Millisecond),
+	}
+	if err := reg.Register(testBackend); err != nil {
+		t.Fatalf("failed to register failing-node-01: %v", err)
+	}
+
+	// Trip breaker via workload failure feedback
+	if err := reg.AdmitAndReserve("wl-fail-1", "failing-node-01", 1); err != nil {
+		t.Fatalf("admit 1 failed: %v", err)
+	}
+	_ = reg.CompleteWorkload("wl-fail-1", false)
+
+	if reg.CircuitState("failing-node-01") != circuitbreaker.StateClosed {
+		t.Errorf("expected StateClosed after 1 failure (max 2)")
+	}
+
+	if err := reg.AdmitAndReserve("wl-fail-2", "failing-node-01", 1); err != nil {
+		t.Fatalf("admit 2 failed: %v", err)
+	}
+	_ = reg.CompleteWorkload("wl-fail-2", false)
+
+	// Now should be OPEN
+	if reg.CircuitState("failing-node-01") != circuitbreaker.StateOpen {
+		t.Errorf("expected StateOpen after 2 failures, got %s", reg.CircuitState("failing-node-01"))
+	}
+
+	// Subsequent admit must be rejected by circuit breaker
+	if err := reg.AdmitAndReserve("wl-blocked", "failing-node-01", 1); err != circuitbreaker.ErrCircuitOpen {
+		t.Errorf("expected ErrCircuitOpen, got %v", err)
+	}
+
+	// 4. Safe release without explicit completion cleans up trial and capacity
+	workloadSafe := "wl-safe-01"
+	if err := reg.AdmitAndReserve(workloadSafe, backendID, 3); err != nil {
+		t.Fatalf("failed to reserve safe workload: %v", err)
+	}
+	if err := reg.Release(workloadSafe); err != nil {
+		t.Fatalf("expected successful release: %v", err)
+	}
+	restored, _ := reg.Get(backendID)
+	if restored.AvailableGPUs != initialGPUs {
+		t.Errorf("expected GPUs restored to %d, got %d", initialGPUs, restored.AvailableGPUs)
 	}
 }
