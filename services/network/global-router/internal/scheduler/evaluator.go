@@ -79,7 +79,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	// 2. Strict Constraint Filtering (Rules 23, 111, Finding 20)
 	for _, b := range candidates {
 		// Circuit Breaker & Health Check (Rule 14)
-		if b.Breaker != nil && b.Breaker.State() == circuitbreaker.StateOpen {
+		if b.CircuitState == circuitbreaker.StateOpen {
 			filterReasons = append(filterReasons, fmt.Sprintf("%s: circuit breaker OPEN", b.ID))
 			continue
 		}
@@ -124,41 +124,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		eligible = append(eligible, b)
 	}
 
-	// 3. Deterministic Fallback if Candidates Empty (Rule 30)
-	if len(eligible) == 0 {
-		// If strict sovereignty was requested, never violate the law (Rule 28)
-		if policy.StrictSovereignty {
-			return nil, fmt.Errorf("%w: strict sovereignty constraints violated. Filter details: %v",
-				ErrNoEligibleBackends, filterReasons)
-		}
-
-		// Otherwise, attempt fallback to best available healthy node with capacity
-		for _, b := range candidates {
-			if b.Healthy && (b.Breaker == nil || b.Breaker.State() != circuitbreaker.StateOpen) && b.AvailableGPUs >= gpusReq {
-				if err := e.reg.Reserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
-					decision := &DispatchDecision{
-						WorkloadID:      policy.WorkloadID,
-						TenantID:        policy.TenantID,
-						ProjectID:       policy.ProjectID,
-						Status:          "SCHEDULED",
-						AssignedBackend: b,
-						GPUsAllocated:   gpusReq,
-						CompositeScore:  999.0,
-						Reason:          "Deterministic fallback: placed on nearest healthy node with capacity",
-						ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET", "CAPACITY_RESERVED"},
-						FallbackUsed:    true,
-						CalculatedAt:    time.Now().UTC(),
-					}
-					e.recordIdempotencyLocked(idempotencyKey, decision)
-					return decision, nil
-				}
-			}
-		}
-
-		return nil, fmt.Errorf("%w: all nodes unhealthy or filtered. Details: %v", ErrNoEligibleBackends, filterReasons)
-	}
-
-	// 4. Multi-Objective Placement Optimization Function
+	// 3. Multi-Objective Optimization Weights
 	var wLat, wCost, wCarb float64
 	switch policy.Objective {
 	case ObjectiveLatency:
@@ -170,6 +136,59 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	default: // Balanced
 		wLat, wCost, wCarb = 1.5, 25.0, 0.5
 	}
+
+	// 4. Deterministic Fallback if Candidates Empty (Rule 30)
+	if len(eligible) == 0 {
+		// If strict sovereignty was requested, never violate the law (Rule 28)
+		if policy.StrictSovereignty {
+			return nil, fmt.Errorf("%w: strict sovereignty constraints violated. Filter details: %v",
+				ErrNoEligibleBackends, filterReasons)
+		}
+
+		// Collect healthy candidate fallback nodes with capacity and score them deterministically
+		type fallbackCandidate struct {
+			backend *registry.ComputeBackend
+			score   float64
+		}
+		var fallbackList []fallbackCandidate
+		for _, b := range candidates {
+			if b.Healthy && b.CircuitState != circuitbreaker.StateOpen && b.AvailableGPUs >= gpusReq {
+				score := (float64(b.LatencyP95Ms) * wLat) + (b.HourlyCost * wCost) + (b.CarbonIntensity * wCarb)
+				fallbackList = append(fallbackList, fallbackCandidate{backend: b, score: score})
+			}
+		}
+		sort.Slice(fallbackList, func(i, j int) bool {
+			if fallbackList[i].score != fallbackList[j].score {
+				return fallbackList[i].score < fallbackList[j].score
+			}
+			return fallbackList[i].backend.ID < fallbackList[j].backend.ID
+		})
+
+		for _, item := range fallbackList {
+			b := item.backend
+			if err := e.reg.Reserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
+				decision := &DispatchDecision{
+					WorkloadID:      policy.WorkloadID,
+					TenantID:        policy.TenantID,
+					ProjectID:       policy.ProjectID,
+					Status:          "SCHEDULED",
+					AssignedBackend: b,
+					GPUsAllocated:   gpusReq,
+					CompositeScore:  item.score,
+					Reason:          "Deterministic fallback: placed on nearest healthy node with capacity",
+					ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET", "CAPACITY_RESERVED"},
+					FallbackUsed:    true,
+					CalculatedAt:    time.Now().UTC(),
+				}
+				e.recordIdempotencyLocked(idempotencyKey, decision)
+				return decision, nil
+			}
+		}
+
+		return nil, fmt.Errorf("%w: all nodes unhealthy or filtered. Details: %v", ErrNoEligibleBackends, filterReasons)
+	}
+
+	// 5. Multi-Objective Placement Optimization Function
 
 	type scoredBackend struct {
 		backend *registry.ComputeBackend

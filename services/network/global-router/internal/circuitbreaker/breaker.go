@@ -27,6 +27,7 @@ type CircuitBreaker struct {
 	maxFailures   int
 	resetTimeout  time.Duration
 	lastStateTime time.Time
+	trialInFlight bool
 }
 
 func New(name string, maxFailures int, resetTimeout time.Duration) *CircuitBreaker {
@@ -36,6 +37,7 @@ func New(name string, maxFailures int, resetTimeout time.Duration) *CircuitBreak
 		maxFailures:   maxFailures,
 		resetTimeout:  resetTimeout,
 		lastStateTime: time.Now(),
+		trialInFlight: false,
 	}
 }
 
@@ -53,11 +55,15 @@ func (cb *CircuitBreaker) Allow() error {
 		if now.Sub(cb.lastStateTime) > cb.resetTimeout {
 			cb.state = StateHalfOpen
 			cb.lastStateTime = now
-			return nil // Allow single trial probe in half-open state
+			cb.trialInFlight = true
+			return nil // Allow single trial probe upon entering half-open state
 		}
 		return ErrCircuitOpen
 	case StateHalfOpen:
-		// In half-open state, reject extra concurrent requests during probe
+		if cb.trialInFlight {
+			return ErrCircuitOpen // Reject concurrent requests during in-flight trial probe
+		}
+		cb.trialInFlight = true
 		return nil
 	default:
 		return nil
@@ -70,6 +76,7 @@ func (cb *CircuitBreaker) RecordSuccess() {
 	defer cb.mu.Unlock()
 
 	cb.failureCount = 0
+	cb.trialInFlight = false
 	if cb.state == StateHalfOpen {
 		cb.state = StateClosed
 		cb.lastStateTime = time.Now()
@@ -82,6 +89,7 @@ func (cb *CircuitBreaker) RecordFailure() {
 	defer cb.mu.Unlock()
 
 	cb.failureCount++
+	cb.trialInFlight = false
 	cb.lastStateTime = time.Now()
 
 	if cb.state == StateHalfOpen || cb.failureCount >= cb.maxFailures {

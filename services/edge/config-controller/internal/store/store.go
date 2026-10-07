@@ -62,9 +62,18 @@ func (s *Store) SaveDomain(d *model.Domain) error {
 		return ErrAlreadyExists
 	}
 
-	s.domains[d.ID] = d
+	cloned := cloneDomain(d)
+	s.domains[d.ID] = cloned
 	s.hostIndex[d.Hostname] = d.ID
 	return nil
+}
+
+func cloneOrigin(o *model.Origin) *model.Origin {
+	if o == nil {
+		return nil
+	}
+	cp := *o
+	return &cp
 }
 
 func cloneDomain(d *model.Domain) *model.Domain {
@@ -229,7 +238,7 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 			return ErrMixedOriginProtocols
 		}
 	}
-	s.pools[p.ID] = p
+	s.pools[p.ID] = cloneOriginPool(p)
 	return nil
 }
 
@@ -237,7 +246,7 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pools[p.ID] = p
+	s.pools[p.ID] = cloneOriginPool(p)
 }
 
 func (s *Store) AddOrigin(o *model.Origin) error {
@@ -255,8 +264,9 @@ func (s *Store) AddOrigin(o *model.Origin) error {
 		}
 	}
 
-	s.origins[o.ID] = o
-	pool.Origins = append(pool.Origins, *o)
+	cloned := cloneOrigin(o)
+	s.origins[o.ID] = cloned
+	pool.Origins = append(pool.Origins, *cloned)
 	return nil
 }
 
@@ -278,9 +288,10 @@ func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
 func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.monitors[hm.PoolID] = hm
-	if pool, exists := s.pools[hm.PoolID]; exists {
-		pool.HealthMonitor = hm
+	cloned := cloneHealthMonitor(hm)
+	s.monitors[cloned.PoolID] = cloned
+	if pool, exists := s.pools[cloned.PoolID]; exists {
+		pool.HealthMonitor = cloneHealthMonitor(cloned)
 	}
 }
 
@@ -293,16 +304,17 @@ func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
 func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.healthStates[st.OriginID] = st
+	cloned := cloneOriginEndpointState(st)
+	s.healthStates[cloned.OriginID] = cloned
 
 	// Synchronize with origin entity healthy flag
-	if orig, exists := s.origins[st.OriginID]; exists {
-		orig.Healthy = st.Healthy
+	if orig, exists := s.origins[cloned.OriginID]; exists {
+		orig.Healthy = cloned.Healthy
 	}
-	if pool, exists := s.pools[st.PoolID]; exists {
+	if pool, exists := s.pools[cloned.PoolID]; exists {
 		for i := range pool.Origins {
-			if pool.Origins[i].ID == st.OriginID {
-				pool.Origins[i].Healthy = st.Healthy
+			if pool.Origins[i].ID == cloned.OriginID {
+				pool.Origins[i].Healthy = cloned.Healthy
 			}
 		}
 	}
@@ -363,7 +375,7 @@ func (s *Store) UpdateOriginHealthy(originID string, healthy bool) {
 func (s *Store) SaveRoute(r *model.Route) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.routes[r.DomainID] = append(s.routes[r.DomainID], r)
+	s.routes[r.DomainID] = append(s.routes[r.DomainID], cloneRoute(r))
 }
 
 func (s *Store) GetRoutes(domainID string) []*model.Route {
@@ -381,7 +393,7 @@ func (s *Store) GetRoutes(domainID string) []*model.Route {
 func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.security[sp.DomainID] = sp
+	s.security[sp.DomainID] = cloneSecurityPolicy(sp)
 }
 
 func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
@@ -447,9 +459,10 @@ func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) 
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
 	}
-	s.rateLimits[domainID] = rules
+	cloned := append([]model.RateLimitRule(nil), rules...)
+	s.rateLimits[domainID] = cloned
 	if s.security[domainID] != nil {
-		s.security[domainID].RateLimitRules = rules
+		s.security[domainID].RateLimitRules = append([]model.RateLimitRule(nil), rules...)
 	}
 	return nil
 }
@@ -492,7 +505,7 @@ func (s *Store) GetSecurityEvents(domainID string, limit int) []model.SecurityEv
 func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cache[cp.DomainID] = cp
+	s.cache[cp.DomainID] = cloneCachePolicy(cp)
 }
 
 func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
@@ -559,7 +572,7 @@ func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
 func (s *Store) SaveCertificate(cert *model.Certificate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.certificates[cert.DomainID] = cert
+	s.certificates[cert.DomainID] = cloneCertificate(cert)
 }
 
 func (s *Store) GetCertificate(domainID string) *model.Certificate {
@@ -571,7 +584,7 @@ func (s *Store) GetCertificate(domainID string) *model.Certificate {
 func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.challenges[ch.Token] = ch
+	s.challenges[ch.Token] = cloneACMEChallenge(ch)
 }
 
 func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
@@ -591,7 +604,7 @@ func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeSt
 func (s *Store) SaveTLSSettings(domainID string, settings *model.TLSSettings) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tlsSettings[domainID] = settings
+	s.tlsSettings[domainID] = cloneTLSSettings(settings)
 }
 
 func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {

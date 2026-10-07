@@ -237,3 +237,117 @@ func TestStore_TopologyRouteAndCacheDeepClone(t *testing.T) {
 		t.Errorf("internal rate limit rules slice was mutated! expected 1, got %d", len(freshRL))
 	}
 }
+
+func TestStore_SetterMutationResistance(t *testing.T) {
+	st := store.NewStore()
+
+	// 1. Caller mutates Domain pointer post-save
+	domain := &model.Domain{
+		ID:        "dom-postsave",
+		ProjectID: "prj-1",
+		Hostname:  "postsave.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	if err := st.SaveDomain(domain); err != nil {
+		t.Fatalf("failed to save domain: %v", err)
+	}
+	// Caller mutates original pointer after save
+	domain.Status = model.DomainStatusSuspended
+	domain.Hostname = "evil-mutated.example.com"
+
+	freshDom, err := st.GetDomain("dom-postsave")
+	if err != nil {
+		t.Fatalf("failed to get domain: %v", err)
+	}
+	if freshDom.Status != model.DomainStatusActive {
+		t.Errorf("store domain was mutated post-save! Expected ACTIVE, got %s", freshDom.Status)
+	}
+	if freshDom.Hostname != "postsave.example.com" {
+		t.Errorf("store domain hostname was mutated post-save! Expected postsave.example.com, got %s", freshDom.Hostname)
+	}
+
+	// 2. Caller mutates OriginPool and Origin post-save
+	pool := &model.OriginPool{
+		ID:          "pool-postsave",
+		ProjectID:   "prj-1",
+		Name:        "original-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+	}
+	st.SaveOriginPool(pool)
+	pool.Name = "mutated-pool-name"
+
+	freshPool, err := st.GetOriginPool("pool-postsave")
+	if err != nil {
+		t.Fatalf("failed to get pool: %v", err)
+	}
+	if freshPool.Name != "original-pool" {
+		t.Errorf("store pool name mutated post-save! Expected original-pool, got %s", freshPool.Name)
+	}
+
+	orig := &model.Origin{
+		ID:       "orig-postsave",
+		PoolID:   "pool-postsave",
+		Address:  "198.51.100.25",
+		Port:     443,
+		Protocol: model.ProtocolHTTPS,
+		Healthy:  true,
+	}
+	if err := st.AddOrigin(orig); err != nil {
+		t.Fatalf("failed to add origin: %v", err)
+	}
+	orig.Address = "198.51.100.99"
+	orig.Port = 8080
+
+	freshPoolWithOrig, _ := st.GetOriginPool("pool-postsave")
+	if freshPoolWithOrig.Origins[0].Address != "198.51.100.25" {
+		t.Errorf("store origin address mutated post-add! Expected 198.51.100.25, got %s", freshPoolWithOrig.Origins[0].Address)
+	}
+	if freshPoolWithOrig.Origins[0].Port != 443 {
+		t.Errorf("store origin port mutated post-add! Expected 443, got %d", freshPoolWithOrig.Origins[0].Port)
+	}
+
+	// 3. Caller mutates Route post-save
+	route := &model.Route{
+		ID:         "route-postsave",
+		DomainID:   "dom-postsave",
+		PoolID:     "pool-postsave",
+		PathPrefix: "/api",
+		Priority:   5,
+	}
+	st.SaveRoute(route)
+	route.PathPrefix = "/mutated-path"
+	route.Priority = 999
+
+	freshRoutes := st.GetRoutes("dom-postsave")
+	if freshRoutes[0].PathPrefix != "/api" || freshRoutes[0].Priority != 5 {
+		t.Errorf("store route mutated post-save! Expected /api and 5, got %s and %d",
+			freshRoutes[0].PathPrefix, freshRoutes[0].Priority)
+	}
+
+	// 4. Caller mutates SecurityPolicy post-save
+	secPolicy := &model.SecurityPolicy{
+		DomainID:         "dom-postsave",
+		WAFEnabled:       true,
+		RateLimitEnabled: true,
+	}
+	st.SaveSecurityPolicy(secPolicy)
+	secPolicy.WAFEnabled = false
+
+	freshSec := st.GetSecurityPolicy("dom-postsave")
+	if !freshSec.WAFEnabled {
+		t.Errorf("store security policy mutated post-save! Expected WAFEnabled true")
+	}
+
+	// 5. Caller mutates CachePolicy post-save
+	cachePol := &model.CachePolicy{
+		DomainID:          "dom-postsave",
+		DefaultTTLSeconds: 300,
+	}
+	st.SaveCachePolicy(cachePol)
+	cachePol.DefaultTTLSeconds = 0
+
+	freshCache := st.GetCachePolicy("dom-postsave")
+	if freshCache.DefaultTTLSeconds != 300 {
+		t.Errorf("store cache policy mutated post-save! Expected 300, got %d", freshCache.DefaultTTLSeconds)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -752,8 +753,19 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 	if req.Port == 0 {
 		req.Port = 443
 	}
+	if req.Port < 1 || req.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "origin port must be between 1 and 65535")
+		return
+	}
 	if req.Protocol == "" {
 		req.Protocol = "HTTPS"
+	}
+	req.Protocol = strings.ToUpper(strings.TrimSpace(req.Protocol))
+	switch req.Protocol {
+	case "HTTP", "HTTPS":
+	default:
+		writeError(w, http.StatusBadRequest, "origin protocol must be HTTP or HTTPS")
+		return
 	}
 	if req.Weight == 0 {
 		req.Weight = 100
@@ -771,6 +783,10 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 	}
 
 	if err := h.store.AddOrigin(origin); err != nil {
+		if errors.Is(err, store.ErrMixedOriginProtocols) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -164,3 +164,51 @@ func TestOnboardPortAndProtocolValidation(t *testing.T) {
 		t.Errorf("expected protocol FTP to be rejected")
 	}
 }
+
+func TestVerifyDomain_DoesNotBypassDNSVerification(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	t.Setenv("NEXUSEDGE_ENV", "production")
+
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+
+	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj-test",
+		Hostname:       "unverified-random-12345.example.com",
+		OriginAddress:  "198.51.100.20",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	_, err = svc.VerifyDomain(resp.DomainID)
+	if err == nil {
+		t.Fatal("expected DNS verification failure when dev mode is disabled")
+	}
+}
+
+func TestVerifyDomain_DefaultEnvironmentMustNotAutoActivate(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	t.Setenv("NEXUSEDGE_STRICT_DNS_VERIFY", "")
+
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+
+	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj-test",
+		Hostname:       "unverified-default-env-999.example.com",
+		OriginAddress:  "198.51.100.20",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	_, err = svc.VerifyDomain(resp.DomainID)
+	if err == nil {
+		t.Fatal("domain verification must fail closed when DNS proof is absent in default environment")
+	}
+}

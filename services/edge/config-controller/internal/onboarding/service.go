@@ -276,8 +276,10 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 		return nil, err
 	}
 
-	// In automated testbed mode or development, bypass external recursive DNS resolution
-	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+	// In automated local development mode only, permit bypass of external recursive DNS
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" &&
+		os.Getenv("NEXUSEDGE_ENV") != "production" &&
+		os.Getenv("ENV") != "production" {
 		if err := s.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
 			return nil, err
 		}
@@ -309,14 +311,6 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 		}
 	}
 
-	// For test environments without internet connection
-	if os.Getenv("NEXUSEDGE_STRICT_DNS_VERIFY") != "true" {
-		if err := s.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
-			return nil, err
-		}
-		domain.Status = model.DomainStatusActive
-		return domain, nil
-	}
-
+	// Fail closed by default: DNS proof must be verified
 	return nil, fmt.Errorf("domain verification failed: CNAME %s does not point to %s", domain.Hostname, domain.CNAMETarget)
 }

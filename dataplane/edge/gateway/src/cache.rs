@@ -12,8 +12,9 @@ pub struct CachedResponse {
     pub headers: HeaderMap,
     pub body: Bytes,
     pub expires_at: Instant,
-    /// Set of (lowercase_header_name, request_header_value) required by origin's Vary header
-    pub vary_headers: Vec<(String, String)>,
+    /// Set of (lowercase_header_name, Option<request_header_value>) required by origin's Vary header.
+    /// None distinguishes header absence from Some("") which represents an empty header value (RFC 9111 Section 4.1).
+    pub vary_headers: Vec<(String, Option<String>)>,
 }
 
 /// Bounded earliest-expiry eviction cache with RFC 9111 Vary header support.
@@ -49,11 +50,11 @@ impl EdgeCache {
                     // Verify that all Vary-nominated request headers match (RFC 9111 Section 4.1)
                     let mut matches = true;
                     for (vary_name, expected_val) in &entry.vary_headers {
-                        let actual_val = req_headers
+                        let actual_val: Option<String> = req_headers
                             .and_then(|h| h.get(vary_name))
                             .and_then(|v| v.to_str().ok())
-                            .unwrap_or("");
-                        if actual_val != expected_val {
+                            .map(|s| s.to_string());
+                        if actual_val != *expected_val {
                             matches = false;
                             break;
                         }
@@ -81,27 +82,36 @@ impl EdgeCache {
             return;
         }
 
-        // RFC 9111 Section 4.1: Reject Vary: * responses from being cached
-        if let Some(vary_val) = headers.get("vary").and_then(|v| v.to_str().ok()) {
-            if vary_val.split(',').any(|part| part.trim() == "*") {
-                return;
+        // RFC 9111 Section 4.1: Reject Vary: * responses across all Vary header lines
+        for vary_val in headers.get_all("vary").iter() {
+            if let Ok(v_str) = vary_val.to_str() {
+                if v_str.split(',').any(|part| part.trim() == "*") {
+                    return;
+                }
             }
         }
 
-        // Extract Vary nominated headers from origin response
+        // Extract Vary nominated headers across all response Vary lines
         let mut vary_headers = Vec::new();
-        if let Some(vary_val) = headers.get("vary").and_then(|v| v.to_str().ok()) {
-            for part in vary_val.split(',') {
-                let name = part.trim().to_lowercase();
-                if name.is_empty() {
-                    continue;
+        for vary_val in headers.get_all("vary").iter() {
+            if let Ok(v_str) = vary_val.to_str() {
+                for part in v_str.split(',') {
+                    let name = part.trim().to_lowercase();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if vary_headers
+                        .iter()
+                        .any(|(existing, _): &(String, _)| existing == &name)
+                    {
+                        continue;
+                    }
+                    let val: Option<String> = req_headers
+                        .and_then(|h| h.get(&name))
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    vary_headers.push((name, val));
                 }
-                let val = req_headers
-                    .and_then(|h| h.get(&name))
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                vary_headers.push((name, val));
             }
         }
 
@@ -328,5 +338,55 @@ mod tests {
 
         assert_eq!(cache.len(), 0, "Vary: * must never be cached");
         assert!(cache.get("http://example.com/dynamic", None).is_none());
+    }
+
+    #[test]
+    fn test_vary_missing_vs_empty_and_multiple_headers() {
+        let cache = EdgeCache::new(true, 3600, 10);
+        let mut resp_headers = HeaderMap::new();
+        // Multiple Vary header lines
+        resp_headers.append("vary", HeaderValue::from_static("X-Custom-Auth"));
+        resp_headers.append("vary", HeaderValue::from_static("Accept-Encoding"));
+
+        // Case 1: X-Custom-Auth is absent
+        let req_missing = HeaderMap::new();
+        cache.put(
+            "http://example.com/resource".to_string(),
+            StatusCode::OK,
+            resp_headers.clone(),
+            Bytes::from("body-absent"),
+            Some(Duration::from_secs(60)),
+            Some(&req_missing),
+        );
+
+        // Case 2: X-Custom-Auth is present but empty string
+        let mut req_empty = HeaderMap::new();
+        req_empty.insert("x-custom-auth", HeaderValue::from_static(""));
+        cache.put(
+            "http://example.com/resource".to_string(),
+            StatusCode::OK,
+            resp_headers.clone(),
+            Bytes::from("body-empty-val"),
+            Some(Duration::from_secs(60)),
+            Some(&req_empty),
+        );
+
+        // Verify they are stored as two separate variants
+        assert_eq!(
+            cache.len(),
+            2,
+            "Missing header and empty-string header must form distinct variants"
+        );
+
+        // Verify exact hits
+        let hit_missing = cache
+            .get("http://example.com/resource", Some(&req_missing))
+            .unwrap();
+        assert_eq!(hit_missing.body, Bytes::from("body-absent"));
+
+        let hit_empty = cache
+            .get("http://example.com/resource", Some(&req_empty))
+            .unwrap();
+        assert_eq!(hit_empty.body, Bytes::from("body-empty-val"));
     }
 }

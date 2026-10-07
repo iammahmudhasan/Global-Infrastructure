@@ -1,6 +1,7 @@
 package scheduler_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -291,5 +292,41 @@ func TestCandidateReservationFallback(t *testing.T) {
 
 	if decision.GPUsAllocated != 4 {
 		t.Errorf("expected 4 GPUs allocated, got %d", decision.GPUsAllocated)
+	}
+}
+
+func TestDeterministicFallbackOrdering(t *testing.T) {
+	// Verify that when no eligible candidate satisfies custom strict constraints (without sovereignty),
+	// fallback selection is 100% deterministic and reproducible across multiple evaluations.
+	var assignedIDs []string
+
+	for i := 0; i < 5; i++ {
+		reg := registry.NewRegistry()
+		eval := scheduler.NewEvaluator(reg)
+
+		policy := scheduler.DispatchPolicy{
+			WorkloadID:        fmt.Sprintf("workload-fallback-%d", i),
+			TenantID:          "tenant-test",
+			GPUsRequested:     1,
+			MaxCostRate:       0.01, // Intentionally impossible budget -> triggers fallback
+			StrictSovereignty: false,
+			Objective:         scheduler.ObjectiveCost,
+		}
+
+		decision, err := eval.Evaluate(policy)
+		if err != nil {
+			t.Fatalf("run %d: expected fallback placement, got error: %v", i, err)
+		}
+		if !decision.FallbackUsed {
+			t.Fatalf("run %d: expected FallbackUsed to be true", i)
+		}
+		assignedIDs = append(assignedIDs, decision.AssignedBackend.ID)
+	}
+
+	for i := 1; i < len(assignedIDs); i++ {
+		if assignedIDs[i] != assignedIDs[0] {
+			t.Fatalf("non-deterministic fallback: run 0 selected %s, run %d selected %s",
+				assignedIDs[0], i, assignedIDs[i])
+		}
 	}
 }

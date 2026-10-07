@@ -42,6 +42,11 @@ func TestCircuitBreakerFullLifecycle(t *testing.T) {
 		t.Fatalf("expected trial probe allowed in half-open, got: %v", err)
 	}
 
+	// Concurrent request while trial probe is in flight must be rejected
+	if err := cb.Allow(); err != circuitbreaker.ErrCircuitOpen {
+		t.Fatalf("expected concurrent trial request to be rejected with ErrCircuitOpen, got: %v", err)
+	}
+
 	// Step 6: Success restores to closed
 	cb.RecordSuccess()
 	if cb.State() != circuitbreaker.StateClosed {

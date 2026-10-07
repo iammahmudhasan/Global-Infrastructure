@@ -2,6 +2,7 @@ package registry
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -55,6 +56,7 @@ type ComputeBackend struct {
 	Mode            string                         `json:"mode"`   // "SIMULATION" or "PRODUCTION"
 	Source          string                         `json:"source"` // "SIMULATED" or "PROVIDER_API"
 	Breaker         *circuitbreaker.CircuitBreaker `json:"-"`
+	CircuitState    circuitbreaker.State           `json:"circuit_state"`
 }
 
 type Registry struct {
@@ -184,7 +186,23 @@ func cloneBackend(b *ComputeBackend) *ComputeBackend {
 		return nil
 	}
 	cp := *b
+	cp.Breaker = nil
+	if b.Breaker != nil {
+		cp.CircuitState = b.Breaker.State()
+	} else {
+		cp.CircuitState = circuitbreaker.StateClosed
+	}
 	return &cp
+}
+
+func (r *Registry) CircuitState(id string) circuitbreaker.State {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	b, ok := r.backends[id]
+	if !ok || b.Breaker == nil {
+		return circuitbreaker.StateClosed
+	}
+	return b.Breaker.State()
 }
 
 func (r *Registry) Get(id string) (*ComputeBackend, error) {
@@ -206,6 +224,9 @@ func (r *Registry) List() []*ComputeBackend {
 	for _, b := range r.backends {
 		list = append(list, cloneBackend(b))
 	}
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].ID < list[j].ID
+	})
 	return list
 }
 
@@ -222,6 +243,7 @@ func (r *Registry) UpdateHealth(id string, latencyMs int, healthy bool) {
 		} else {
 			b.Breaker.RecordFailure()
 		}
+		b.CircuitState = b.Breaker.State()
 	}
 }
 

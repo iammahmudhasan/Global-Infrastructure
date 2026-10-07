@@ -1075,3 +1075,79 @@ func TestControlPlane_GlobalBodySizeLimit(t *testing.T) {
 		t.Errorf("expected oversized request (> 1MB) to fail with 400 Bad Request, got %d", w.Code)
 	}
 }
+
+func TestAddOrigin_PortAndProtocolValidation(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Onboard a domain with an HTTPS origin
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "origin-val.example.com",
+		"origin_address":  "primary.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from onboard domain, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var onboardResp struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &onboardResp)
+	domainID := onboardResp.DomainID
+
+	// 2. Reject invalid port (> 65535)
+	badPortBody, _ := json.Marshal(map[string]interface{}{
+		"address":  "backup.example.com",
+		"port":     70000,
+		"protocol": "HTTPS",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/origins", bytes.NewReader(badPortBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "origin port must be between 1 and 65535") {
+		t.Fatalf("expected 400 with port error for port 70000, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Reject invalid protocol
+	badProtoBody, _ := json.Marshal(map[string]interface{}{
+		"address":  "backup.example.com",
+		"port":     443,
+		"protocol": "FTP",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/origins", bytes.NewReader(badProtoBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "origin protocol must be HTTP or HTTPS") {
+		t.Fatalf("expected 400 with protocol error for FTP, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Reject mixed protocol (HTTP added to an HTTPS pool)
+	mixedProtoBody, _ := json.Marshal(map[string]interface{}{
+		"address":  "backup.example.com",
+		"port":     80,
+		"protocol": "HTTP",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/origins", bytes.NewReader(mixedProtoBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "all origins in an origin pool must share the same protocol") {
+		t.Fatalf("expected 400 with mixed protocol error, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. Accept valid secondary origin (HTTPS, port 8443)
+	validBody, _ := json.Marshal(map[string]interface{}{
+		"address":  "backup.example.com",
+		"port":     8443,
+		"protocol": "HTTPS",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/origins", bytes.NewReader(validBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for valid origin, got %d: %s", w.Code, w.Body.String())
+	}
+}

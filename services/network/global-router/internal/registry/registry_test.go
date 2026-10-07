@@ -99,3 +99,30 @@ func TestRegistry_ReservationLifecycle(t *testing.T) {
 		t.Fatalf("expected ErrReservationNotFound on double release, got: %v", err)
 	}
 }
+
+func TestRegistry_CircuitBreakerIsolationAndDeterministicList(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	// 1. Verify Breaker is isolated (nil on clones) while CircuitState is populated
+	b, err := reg.Get("bd-dhaka-dgx01")
+	if err != nil {
+		t.Fatalf("failed to get backend: %v", err)
+	}
+	if b.Breaker != nil {
+		t.Errorf("expected Breaker pointer to be nil on cloned backend, got %v", b.Breaker)
+	}
+	if b.CircuitState == "" {
+		t.Errorf("expected CircuitState to be populated, got empty string")
+	}
+
+	// 2. Verify List() is sorted by ID deterministically
+	list := reg.List()
+	if len(list) < 2 {
+		t.Fatalf("expected at least 2 default backends, got %d", len(list))
+	}
+	for i := 1; i < len(list); i++ {
+		if list[i-1].ID >= list[i].ID {
+			t.Errorf("expected list to be sorted by ID ascending, but %s >= %s", list[i-1].ID, list[i].ID)
+		}
+	}
+}

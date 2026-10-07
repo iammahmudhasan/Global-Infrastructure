@@ -9,6 +9,8 @@ pub struct UpstreamNode {
     pub healthy: bool,
     pub latency_ms: u64,
     pub ewma_latency_ms: f64,
+    pub consecutive_passes: u32,
+    pub consecutive_failures: u32,
 }
 
 #[allow(dead_code)]
@@ -30,6 +32,8 @@ impl Router {
                 healthy: true,
                 latency_ms: 10,
                 ewma_latency_ms: 10.0,
+                consecutive_passes: 2,
+                consecutive_failures: 0,
             })
             .collect();
 
@@ -89,14 +93,32 @@ impl Router {
     pub fn mark_health(&self, url: &str, healthy: bool, latency_ms: u64) {
         let mut nodes = self.nodes.write().unwrap();
         if let Some(node) = nodes.iter_mut().find(|n| n.url == url) {
-            node.healthy = healthy;
-            node.latency_ms = latency_ms;
-            if healthy && latency_ms > 0 {
-                if node.ewma_latency_ms <= 0.0 {
-                    node.ewma_latency_ms = latency_ms as f64;
-                } else {
-                    node.ewma_latency_ms = Self::EWMA_ALPHA * (latency_ms as f64)
-                        + (1.0 - Self::EWMA_ALPHA) * node.ewma_latency_ms;
+            if healthy {
+                node.consecutive_passes += 1;
+                node.consecutive_failures = 0;
+                node.latency_ms = latency_ms;
+
+                // Threshold: 2 consecutive passes required to become healthy (prevents flapping)
+                if node.consecutive_passes >= 2 {
+                    node.healthy = true;
+                }
+
+                // EWMA latency smoothed update only on successful probes
+                if latency_ms > 0 {
+                    if node.ewma_latency_ms <= 0.0 {
+                        node.ewma_latency_ms = latency_ms as f64;
+                    } else {
+                        node.ewma_latency_ms = Self::EWMA_ALPHA * (latency_ms as f64)
+                            + (1.0 - Self::EWMA_ALPHA) * node.ewma_latency_ms;
+                    }
+                }
+            } else {
+                node.consecutive_failures += 1;
+                node.consecutive_passes = 0;
+
+                // Threshold: 3 consecutive failures required to become unhealthy (absorbs transient packet drops)
+                if node.consecutive_failures >= 3 {
+                    node.healthy = false;
                 }
             }
         }
@@ -113,7 +135,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_select_upstream_healthy_and_unhealthy() {
+    fn test_select_upstream_healthy_and_unhealthy_with_hysteresis() {
         let targets = vec![
             "https://origin-1.example.com".to_string(),
             "https://origin-2.example.com".to_string(),
@@ -124,12 +146,41 @@ mod tests {
         let u1 = router.select_upstream();
         assert!(u1.is_some());
 
-        // Mark origin-1 unhealthy
+        // Probe 1 & 2 failures on origin-1: should STILL be healthy due to 3-failure threshold
         router.mark_health("https://origin-1.example.com", false, 999);
+        router.mark_health("https://origin-1.example.com", false, 999);
+        {
+            let nodes = router.nodes.read().unwrap();
+            let n1 = nodes
+                .iter()
+                .find(|n| n.url == "https://origin-1.example.com")
+                .unwrap();
+            assert!(
+                n1.healthy,
+                "origin-1 should remain healthy after only 2 failures"
+            );
+        }
+
+        // Probe 3 failure on origin-1: now trips to unhealthy
+        router.mark_health("https://origin-1.example.com", false, 999);
+        {
+            let nodes = router.nodes.read().unwrap();
+            let n1 = nodes
+                .iter()
+                .find(|n| n.url == "https://origin-1.example.com")
+                .unwrap();
+            assert!(
+                !n1.healthy,
+                "origin-1 should become unhealthy after 3 consecutive failures"
+            );
+        }
+
         let u2 = router.select_upstream().unwrap();
         assert_eq!(u2, "https://origin-2.example.com");
 
-        // Mark origin-2 also unhealthy -> must return None (NO fallback to dead node)
+        // Fail origin-2 three times as well -> must return None
+        router.mark_health("https://origin-2.example.com", false, 999);
+        router.mark_health("https://origin-2.example.com", false, 999);
         router.mark_health("https://origin-2.example.com", false, 999);
         let u3 = router.select_upstream();
         assert!(
@@ -137,7 +188,22 @@ mod tests {
             "expected None when all upstreams are unhealthy"
         );
 
-        // Recover origin-1 -> resumes routing
+        // Recovery hysteresis: Probe 1 success -> should STILL be unhealthy (needs 2 passes)
+        router.mark_health("https://origin-1.example.com", true, 12);
+        {
+            let nodes = router.nodes.read().unwrap();
+            let n1 = nodes
+                .iter()
+                .find(|n| n.url == "https://origin-1.example.com")
+                .unwrap();
+            assert!(
+                !n1.healthy,
+                "origin-1 should remain unhealthy after only 1 passing probe"
+            );
+        }
+        assert!(router.select_upstream().is_none());
+
+        // Probe 2 success -> becomes healthy and resumes routing
         router.mark_health("https://origin-1.example.com", true, 12);
         let u4 = router.select_upstream();
         assert_eq!(u4, Some("https://origin-1.example.com".to_string()));
