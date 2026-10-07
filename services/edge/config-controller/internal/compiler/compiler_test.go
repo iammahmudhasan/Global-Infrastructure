@@ -329,5 +329,3 @@ func TestCompiler_ExactRateLimitAndClusterTLS(t *testing.T) {
 		}
 	}
 }
-
-

@@ -993,4 +993,3 @@ func TestCertificatesRoute_NeverLeaksPrivateKey(t *testing.T) {
 	}
 	assertNoPrivateKey(t, "POST /certificates/renew", w.Body.String())
 }
-

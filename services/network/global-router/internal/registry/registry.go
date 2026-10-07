@@ -275,4 +275,3 @@ func (r *Registry) Release(workloadID string) error {
 	delete(r.reservations, workloadID)
 	return nil
 }
-

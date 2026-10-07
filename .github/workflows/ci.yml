@@ -32,7 +32,12 @@ jobs:
       - name: Go Format Check
         run: |
           cd ${{ matrix.service }}
-          test -z "$(gofmt -l .)"
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following Go files need formatting:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
 
       - name: Run Go Vet
         run: |
