@@ -1,48 +1,45 @@
 package scheduler
 
-import "time"
+import (
+	"time"
 
-// DataResidency specifies sovereign legal jurisdiction constraints
-type DataResidency string
-
-const (
-	ResidencyAny        DataResidency = "ANY"
-	ResidencyBangladesh DataResidency = "BD" // Complies with National Data Management Act 2026
-	ResidencyEU         DataResidency = "EU" // Complies with GDPR & EU AI Act
-	ResidencyUS         DataResidency = "US"
-	ResidencySingapore  DataResidency = "SG"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 )
 
-// Policy defines customer constraints for intelligent workload dispatching
-type Policy struct {
-	Name            string        `json:"name"`
-	Residency       DataResidency `json:"residency"`
-	MaxLatencyMs    int           `json:"max_latency_ms"`
-	MaxCostPer1k    float64       `json:"max_cost_per_1k"` // Max price per 1000 tokens / compute units ($)
-	StrictSovereign bool          `json:"strict_sovereign"` // If true, never route outside legal jurisdiction
-	PreferredCloud  string        `json:"preferred_cloud"`  // Optional preference (e.g. "coreweave", "aws", "on-prem")
-	Timeout         time.Duration `json:"timeout"`
+type OptimizationObjective string
+
+const (
+	ObjectiveBalanced OptimizationObjective = "BALANCED"
+	ObjectiveLatency  OptimizationObjective = "LOW_LATENCY"
+	ObjectiveCost     OptimizationObjective = "MIN_COST"
+	ObjectiveCarbon   OptimizationObjective = "ZERO_CARBON"
+)
+
+// DispatchPolicy encapsulates client workload constraints and optimization targets (Rule 23)
+type DispatchPolicy struct {
+	WorkloadID          string                 `json:"workload_id"`
+	TenantID            string                 `json:"tenant_id"`
+	Name                string                 `json:"name"`
+	Residency           registry.DataResidency `json:"residency"`
+	StrictSovereignty   bool                   `json:"strict_sovereignty"` // Bangladesh NDMA 2026 / EU GDPR
+	RequiredGPU         string                 `json:"required_gpu"`       // "H100", "B200", "L40S", "A100"
+	MaxLatencyMs        int                    `json:"max_latency_ms"`     // Upper SLA bound
+	MaxCostRate         float64                `json:"max_cost_rate"`      // Maximum hourly budget ($/hr)
+	PreferredProvider   string                 `json:"preferred_provider"` // "on-prem-dhaka", "aws", "coreweave"
+	Objective           OptimizationObjective  `json:"objective"`
+	IdempotencyKey      string                 `json:"idempotency_key"`
 }
 
-// ComputeBackend represents a registered heterogeneous execution target
-type ComputeBackend struct {
-	ID            string        `json:"id"`
-	Provider      string        `json:"provider"` // "aws", "gcp", "coreweave", "on-prem-dhaka", "azure"
-	Region        string        `json:"region"`   // "ap-south-2", "us-east-1", "eu-central-1"
-	Jurisdiction  DataResidency `json:"jurisdiction"`
-	Endpoint      string        `json:"endpoint"`
-	CurrentCost1k float64       `json:"current_cost_1k"` // Real-time cost per 1k compute units ($)
-	LatencyP95Ms  int           `json:"latency_p95_ms"`
-	Healthy       bool          `json:"healthy"`
-	ErrorRate     float64       `json:"error_rate"`      // 0.0 to 1.0
-	ActiveLoads   int           `json:"active_loads"`
-}
-
-// DispatchDecision records why a specific backend was selected
+// DispatchDecision records the explainable result of an infrastructure placement (Rules 28, 111, 112)
 type DispatchDecision struct {
-	SelectedBackend *ComputeBackend `json:"selected_backend"`
-	Score           float64         `json:"score"`
-	Reason          string          `json:"reason"`
-	CalculatedAt    time.Time       `json:"calculated_at"`
-	Alternatives    []string        `json:"alternatives"`
+	WorkloadID       string                   `json:"workload_id"`
+	TenantID         string                   `json:"tenant_id"`
+	Status           string                   `json:"status"` // "SCHEDULED", "FAILED_NO_CAPACITY"
+	AssignedBackend  *registry.ComputeBackend `json:"assigned_backend"`
+	CompositeScore   float64                  `json:"composite_score"`
+	Reason           string                   `json:"reason"`
+	ReasonCodes      []string                 `json:"reason_codes"`
+	Alternatives     []string                 `json:"alternatives"`
+	FallbackUsed     bool                     `json:"fallback_used"`
+	CalculatedAt     time.Time                `json:"calculated_at"`
 }

@@ -1,7 +1,6 @@
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -62,8 +61,7 @@ impl RateLimiter {
             return true;
         }
 
-        // Fast path: try to check existing bucket with write lock
-        let mut buckets = self.buckets.write();
+        let mut buckets = self.buckets.write().unwrap();
         let bucket = buckets
             .entry(client_ip)
             .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
@@ -72,7 +70,7 @@ impl RateLimiter {
     }
 
     pub fn cleanup_stale(&self) {
-        let mut buckets = self.buckets.write();
+        let mut buckets = self.buckets.write().unwrap();
         let now = Instant::now();
         // Remove buckets not accessed in 10 minutes
         buckets.retain(|_, b| now.duration_since(b.last_update).as_secs() < 600);

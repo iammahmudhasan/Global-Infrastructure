@@ -1,6 +1,5 @@
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[allow(dead_code)]
@@ -39,7 +38,7 @@ impl Router {
 
     /// Selects next healthy upstream node using round-robin
     pub fn select_upstream(&self) -> Option<String> {
-        let nodes = self.nodes.read();
+        let nodes = self.nodes.read().unwrap();
         let healthy_nodes: Vec<&UpstreamNode> = nodes.iter().filter(|n| n.healthy).collect();
 
         if healthy_nodes.is_empty() {
@@ -53,7 +52,7 @@ impl Router {
 
     #[allow(dead_code)]
     pub fn mark_health(&self, url: &str, healthy: bool, latency_ms: u64) {
-        let mut nodes = self.nodes.write();
+        let mut nodes = self.nodes.write().unwrap();
         if let Some(node) = nodes.iter_mut().find(|n| n.url == url) {
             node.healthy = healthy;
             node.latency_ms = latency_ms;

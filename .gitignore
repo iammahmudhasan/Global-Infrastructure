@@ -1,5 +1,7 @@
-# Rust
+# Rust & Go Binaries
 target/
+bin/
+*.exe
 **/*.rs.bk
 Cargo.lock
 

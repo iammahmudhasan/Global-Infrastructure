@@ -1,9 +1,8 @@
 use bytes::Bytes;
 use hyper::header::HeaderMap;
 use hyper::StatusCode;
-use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -37,7 +36,7 @@ impl EdgeCache {
             return None;
         }
 
-        let store = self.store.read();
+        let store = self.store.read().unwrap();
         if let Some(entry) = store.get(key) {
             if Instant::now() < entry.expires_at {
                 return Some(entry.clone());
@@ -59,7 +58,7 @@ impl EdgeCache {
             expires_at: Instant::now() + ttl,
         };
 
-        let mut store = self.store.write();
+        let mut store = self.store.write().unwrap();
         if store.len() >= self.max_entries {
             // Evict expired entries
             let now = Instant::now();
@@ -71,7 +70,7 @@ impl EdgeCache {
 
     #[allow(dead_code)]
     pub fn purge(&self, key: &str) {
-        let mut store = self.store.write();
+        let mut store = self.store.write().unwrap();
         store.remove(key);
     }
 }

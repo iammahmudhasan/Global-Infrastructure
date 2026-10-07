@@ -1,140 +1,80 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/telemetry"
 )
 
-// Node represents an active global edge Point of Presence (PoP)
-type Node struct {
-	ID        string    `json:"id"`
-	Region    string    `json:"region"`
-	City      string    `json:"city"`
-	IP        string    `json:"ip"`
-	Status    string    `json:"status"`
-	LastSeen  time.Time `json:"last_seen"`
-	LatencyMs int       `json:"latency_ms"`
+type Server struct {
+	auth      *auth.Authenticator
+	registry  *registry.Registry
+	evaluator *scheduler.Evaluator
 }
 
-// GlobalConfig represents the declarative cluster rules synchronized to all Rust Data Planes
-type GlobalConfig struct {
-	Version    int      `json:"version"`
-	UpdatedAt  string   `json:"updated_at"`
-	BlockedIPs []string `json:"blocked_ips"`
-	WAFRules   []string `json:"waf_rules"`
-}
+func NewServer() *Server {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+	authenticator := auth.NewAuthenticator()
 
-type ControlPlaneState struct {
-	mu         sync.RWMutex
-	nodes      map[string]Node
-	config     GlobalConfig
-	controller *scheduler.WorkloadController
-}
-
-func NewControlPlaneState() *ControlPlaneState {
-	return &ControlPlaneState{
-		controller: scheduler.NewWorkloadController(),
-		nodes: map[string]Node{
-			"pop-sin-01": {
-				ID:        "pop-sin-01",
-				Region:    "ap-southeast-1",
-				City:      "Singapore",
-				IP:        "185.190.140.10",
-				Status:    "ONLINE",
-				LastSeen:  time.Now(),
-				LatencyMs: 8,
-			},
-			"pop-fra-01": {
-				ID:        "pop-fra-01",
-				Region:    "eu-central-1",
-				City:      "Frankfurt",
-				IP:        "185.190.141.20",
-				Status:    "ONLINE",
-				LastSeen:  time.Now(),
-				LatencyMs: 14,
-			},
-			"pop-dha-01": {
-				ID:        "pop-dha-01",
-				Region:    "ap-south-2",
-				City:      "Dhaka",
-				IP:        "185.190.142.30",
-				Status:    "ONLINE",
-				LastSeen:  time.Now(),
-				LatencyMs: 4,
-			},
-			"pop-iad-01": {
-				ID:        "pop-iad-01",
-				Region:    "us-east-1",
-				City:      "Virginia",
-				IP:        "185.190.143.40",
-				Status:    "ONLINE",
-				LastSeen:  time.Now(),
-				LatencyMs: 22,
-			},
-		},
-		config: GlobalConfig{
-			Version:   1,
-			UpdatedAt: time.Now().UTC().Format(time.RFC3339),
-			BlockedIPs: []string{
-				"198.51.100.42",
-				"203.0.113.195",
-			},
-			WAFRules: []string{
-				"SQLI_STRICT_MODE",
-				"XSS_BLOCK_INLINE_SCRIPTS",
-				"PATH_TRAVERSAL_PROTECT",
-			},
-		},
+	return &Server{
+		auth:      authenticator,
+		registry:  reg,
+		evaluator: eval,
 	}
 }
 
-func main() {
-	state := NewControlPlaneState()
-
+func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
-	// 1. Health check
+	// 1. Health Endpoints (Rules 41, 44)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"HEALTHY","service":"nexusedge-control-plane"}`))
+		w.Write([]byte(`{"status":"HEALTHY","plane":"control-plane","version":"1.0.0"}`))
 	})
 
-	// 2. Nodes discovery API
-	mux.HandleFunc("/api/v1/nodes", func(w http.ResponseWriter, r *http.Request) {
-		state.mu.RLock()
-		defer state.mu.RUnlock()
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		backends := s.registry.List()
+		healthyCount := 0
+		for _, b := range backends {
+			if b.Healthy {
+				healthyCount++
+			}
+		}
 
-		nodeList := make([]Node, 0, len(state.nodes))
-		for _, n := range state.nodes {
-			nodeList = append(nodeList, n)
+		if healthyCount == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"NOT_READY","error":"no healthy backends available"}`))
+			return
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"count": len(nodeList),
-			"nodes": nodeList,
-		})
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(fmt.Sprintf(`{"status":"READY","healthy_backends":%d}`, healthyCount)))
 	})
 
-	// 3. Declarative Global Config API (read by Rust Data Planes)
-	mux.HandleFunc("/api/v1/config", func(w http.ResponseWriter, r *http.Request) {
-		state.mu.RLock()
-		defer state.mu.RUnlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(state.config)
+	// 2. Metrics Endpoint (Prometheus scraper) (Rule 42)
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(telemetry.GlobalMetrics.ExportPrometheus()))
 	})
 
-	// 4. Multi-Cloud & AI Compute Backends Registry
+	// 3. Compute Backends Registry API
 	mux.HandleFunc("/api/v1/backends", func(w http.ResponseWriter, r *http.Request) {
-		backends := state.controller.ListBackends()
+		backends := s.registry.List()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"count":    len(backends),
@@ -142,46 +82,123 @@ func main() {
 		})
 	})
 
-	// 5. Phase 0 Core Engine: Real-Time Workload Dispatcher API
-	// Answers: "Where should every application & compute workload run right now?"
+	mux.HandleFunc("/api/v1/backends/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var b registry.ComputeBackend
+		if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		if err := s.registry.Register(&b); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Registration failed: %v"}`, err), http.StatusConflict)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "REGISTERED",
+			"backend": b.ID,
+		})
+	})
+
+	// 4. Phase 0 Core Engine: Multi-Cloud & AI Compute Workload Dispatcher (Rules 110, 111, 112)
 	mux.HandleFunc("/api/v1/workload/dispatch", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
 			return
 		}
 
-		var policy scheduler.Policy
+		var policy scheduler.DispatchPolicy
 		if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
-			http.Error(w, fmt.Sprintf("Invalid policy JSON payload: %v", err), http.StatusBadRequest)
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid policy JSON: %v"}`, err), http.StatusBadRequest)
 			return
 		}
 
-		decision, err := state.controller.EvaluateWorkload(policy)
+		// Inject authenticated tenant from context if not provided (Rules 54, 55)
+		tenantID, _ := r.Context().Value(auth.TenantContextKey).(string)
+		if tenantID != "" {
+			policy.TenantID = tenantID
+		}
+
+		start := time.Now()
+		decision, err := s.evaluator.Evaluate(policy)
+		duration := time.Since(start)
+
 		if err != nil {
+			telemetry.GlobalMetrics.RecordDispatch(string(policy.Residency), "none", duration, false)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error":   err.Error(),
-				"policy":  policy.Name,
-				"status":  "NO_SUITABLE_BACKEND",
+				"status":      "DISPATCH_REJECTED",
+				"workload_id": policy.WorkloadID,
+				"error":       err.Error(),
 			})
 			return
 		}
+
+		telemetry.GlobalMetrics.RecordDispatch(
+			string(decision.AssignedBackend.Jurisdiction),
+			decision.AssignedBackend.Provider,
+			duration,
+			true,
+		)
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(decision)
 	})
 
+	// Wrap in middleware chain: Correlation -> Auth (Rule 6: Dependency Direction)
+	handler := s.auth.Middleware(mux)
+	return telemetry.RequestCorrelationMiddleware(handler)
+}
+
+func main() {
+	server := NewServer()
+
 	port := 9090
 	serverAddr := fmt.Sprintf(":%d", port)
+
+	httpServer := &http.Server{
+		Addr:         serverAddr,
+		Handler:      server.routes(),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	log.Printf("=================================================================")
-	log.Printf(" NexusEdge Global AI & Compute Traffic Controller (Go)")
+	log.Printf(" NexusEdge Global AI & Compute Traffic Controller (Go Control Plane)")
 	log.Printf(" Listening on %s", serverAddr)
-	log.Printf(" Phase 0 Engine: Multi-Cloud Workload Placement Active")
-	log.Printf(" Sovereign Jurisdictions: Bangladesh (BDIX/SMW6), EU, US, SG")
+	log.Printf(" Multi-Cloud Heterogeneous Placement: AWS, CoreWeave, GCP, Dhaka, IS")
+	log.Printf(" Sovereign Enforcement: Bangladesh NDMA 2026, EU GDPR, US, SG")
+	log.Printf(" Real-Time Telemetry & Prometheus Scraping at /metrics")
 	log.Printf("=================================================================")
 
-	if err := http.ListenAndServe(serverAddr, mux); err != nil {
-		log.Fatalf("Control plane fatal error: %v", err)
+	// Graceful shutdown handling (Rule 41)
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Control plane fatal server failure: %v", err)
+		}
+	}()
+
+	<-shutdownChan
+	log.Println("Received termination signal. Initiating graceful shutdown...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		log.Printf("Forced shutdown encountered error: %v", err)
 	}
+
+	log.Println("NexusEdge Control Plane cleanly terminated.")
 }
