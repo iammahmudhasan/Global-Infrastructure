@@ -2,6 +2,10 @@
 
 This document provides definitive guidance for all AI assistants, engineers, and contributors operating on **NexusEdge**.
 
+> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) (123 Mandatory Platform Rules)  
+> **Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
+> **Priority Hierarchy:** `Correctness > Security > Reliability > Maintainability > Performance > Development Speed`
+
 ---
 
 ## ⚡ The First-Principles Development Protocol
@@ -13,7 +17,7 @@ This document provides definitive guidance for all AI assistants, engineers, and
    - We build the **Infrastructure-Neutral Global Fabric** answering the core question:
      *"Where should every application, AI inference request, and compute workload run right now?"*
 2. **Mandatory Real-World Verification:**
-   - Every single component, route, or scheduler algorithm written MUST be executed and verified immediately.
+   - Every single component, route, or scheduler algorithm written MUST be executed and verified immediately in the shell.
    - Run `cargo check`, `cargo test`, `go test ./...`, or execute Python placement models. Never commit unverified code.
 3. **Continuous Cryptographic Git Push:**
    - Commit with descriptive commit messages and push to `origin/main` after completing tasks.
@@ -68,9 +72,9 @@ buf breaking --against ".git#branch=main"
 
 | Plane | Stack & Primary Language | Invariant & Operational Responsibility |
 |---|---|---|
-| **Data Plane** | **Rust + C/eBPF** (`dataplane/`) | Latency matters. Line-rate packet processing, zero GC pauses, memory safety. |
-| **Control Plane**| **Go + gRPC** (`services/`) | Correctness matters. Raft consensus, K8s operators, NATS JetStream, Postgres 18. |
-| **Intelligence** | **Python 3.14** (`intelligence/`) | Optimization matters. PyTorch, vLLM, ClickHouse telemetry, placement math. |
+| **Data Plane** | **Rust + C/eBPF** (`dataplane/`) | Latency matters. Line-rate packet processing, zero GC pauses, memory safety. Never calls control plane for forwarding. |
+| **Control Plane**| **Go + gRPC** (`services/`) | Correctness matters. Raft consensus, K8s operators, NATS JetStream, Postgres 18. Domain owns its data. |
+| **Intelligence** | **Python 3.14** (`intelligence/`) | Optimization matters. PyTorch, vLLM, ClickHouse telemetry, placement math. Bounded by deterministic fallbacks. |
 | **Product / UI** | **TypeScript / Next.js** (`apps/`) | Developer experience. Tailwind, shadcn/ui, real-time 3D telemetry. |
 
 ---
@@ -92,6 +96,59 @@ rfcs/         → Formal architectural proposals (RFC 0001)
 adr/          → Permanent architectural decision records (ADR 0001, ADR 0002)
 security/     → Threat models, compliance, SBOM, cryptographic signing
 docs/         → Master architecture, network runbooks, operator guides
+```
+
+---
+
+## 🛡️ Rule 122: Absolute Non-Negotiables
+
+### NEVER:
+* Commit secrets into source code or test fixtures.
+* Invent test results or fabricate benchmark metrics.
+* Disable security (TLS, auth, isolation) to make tests pass.
+* Cross service private boundaries (`services/<A>/internal` -> `<B>`).
+* Put packet-path logic behind unnecessary control-plane calls.
+* Make AI the sole authority for critical infrastructure decisions without deterministic fallback.
+* Hide errors or return fake success responses.
+* Claim completion without actual shell validation.
+
+### ALWAYS:
+* Follow the 14-pillar directory structure.
+* Validate all external input.
+* Use least privilege.
+* Expose OpenTelemetry metrics, structured logs, and distributed traces.
+* Treat public and internal APIs as compatibility contracts.
+* Plan for failure modes (partitions, node crashes, hardware degradation).
+* Keep infrastructure state reconciled via declarative controllers.
+
+---
+
+## 📋 Rule 121: Final Completion Checklist
+
+```text
+[ ] Correct domain?
+[ ] Correct architectural boundary?
+[ ] Existing code inspected?
+[ ] Existing behavior preserved?
+[ ] API contracts preserved?
+[ ] Database ownership preserved?
+[ ] Security reviewed?
+[ ] Tenant isolation reviewed?
+[ ] Failure modes considered?
+[ ] Timeouts considered?
+[ ] Retries safe?
+[ ] Idempotency considered?
+[ ] Observability added?
+[ ] Tests added/updated?
+[ ] Performance measured when relevant?
+[ ] No secrets added?
+[ ] No unnecessary dependencies?
+[ ] No unrelated refactor?
+[ ] Documentation updated?
+[ ] Migration considered?
+[ ] Rollback considered?
+[ ] Actual validation performed?
+[ ] No fabricated test/benchmark claims?
 ```
 
 ---
