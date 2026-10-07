@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -27,14 +28,81 @@ type Monitor struct {
 	httpClient *http.Client
 }
 
+func safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("could not resolve origin host: %s", host)
+	}
+
+	for _, ip := range ips {
+		if isPrivateOrReservedIP(ip.IP) {
+			if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && ip.IP.IsLoopback() {
+				// Permitted for local testbed harnesses (httptest.NewServer) only under explicit dev mode
+				continue
+			}
+			return nil, fmt.Errorf("blocked private/reserved destination: %s (SSRF protection)", ip.IP)
+		}
+	}
+
+	dialer := &net.Dialer{
+		Timeout: 2 * time.Second,
+	}
+
+	// Dial the validated IP directly to prevent DNS rebinding between resolution and connection
+	target := net.JoinHostPort(ips[0].IP.String(), port)
+	return dialer.DialContext(ctx, network, target)
+}
+
+func isPrivateOrReservedIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
+		return true
+	}
+
+	if ipv4 := ip.To4(); ipv4 != nil {
+		if ipv4[0] == 10 {
+			return true
+		}
+		if ipv4[0] == 172 && (ipv4[1] >= 16 && ipv4[1] <= 31) {
+			return true
+		}
+		if ipv4[0] == 192 && ipv4[1] == 168 {
+			return true
+		}
+		if ipv4[0] == 100 && (ipv4[1] >= 64 && ipv4[1] <= 127) {
+			return true
+		}
+		if ipv4[0] == 169 && ipv4[1] == 254 {
+			return true
+		}
+		if ipv4[0] == 255 && ipv4[1] == 255 && ipv4[2] == 255 && ipv4[3] == 255 {
+			return true
+		}
+	} else {
+		if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
+			return true
+		}
+	}
+
+	return false
+}
+
 func NewMonitor() *Monitor {
 	return &Monitor{
 		httpClient: &http.Client{
 			Transport: &http.Transport{
 				DisableKeepAlives: true,
-				DialContext: (&net.Dialer{
-					Timeout: 2 * time.Second,
-				}).DialContext,
+				DialContext:       safeDialContext,
+			},
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // Fail closed against SSRF redirect attacks
 			},
 		},
 	}

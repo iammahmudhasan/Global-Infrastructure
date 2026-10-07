@@ -16,16 +16,21 @@ var (
 	ErrInvalidPolicy      = errors.New("invalid workload dispatch policy: missing required parameters")
 )
 
+type cachedDecision struct {
+	decision  *DispatchDecision
+	expiresAt time.Time
+}
+
 type Evaluator struct {
 	mu          sync.RWMutex
 	reg         *registry.Registry
-	idempotency map[string]*DispatchDecision
+	idempotency map[string]*cachedDecision
 }
 
 func NewEvaluator(reg *registry.Registry) *Evaluator {
 	return &Evaluator{
 		reg:         reg,
-		idempotency: make(map[string]*DispatchDecision),
+		idempotency: make(map[string]*cachedDecision),
 	}
 }
 
@@ -35,23 +40,34 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		return nil, ErrInvalidPolicy
 	}
 
-	// 1. Tenant-Scoped Idempotency Check (Rule 16, Finding 16)
+	// 1. Tenant & Project-Scoped Idempotency Check (Rules 16, 54, 55, Finding 21)
 	idempotencyKey := ""
 	if policy.IdempotencyKey != "" {
-		idempotencyKey = policy.TenantID + ":" + policy.IdempotencyKey
+		projectScope := policy.ProjectID
+		if projectScope == "" {
+			projectScope = "default"
+		}
+		idempotencyKey = fmt.Sprintf("%s:%s:%s", policy.TenantID, projectScope, policy.IdempotencyKey)
 		e.mu.RLock()
-		if existing, found := e.idempotency[idempotencyKey]; found {
-			e.mu.RUnlock()
-			return existing, nil
+		if cached, found := e.idempotency[idempotencyKey]; found {
+			if time.Now().Before(cached.expiresAt) {
+				e.mu.RUnlock()
+				return cached.decision, nil
+			}
 		}
 		e.mu.RUnlock()
+	}
+
+	gpusReq := policy.GPUsRequested
+	if gpusReq <= 0 {
+		gpusReq = 1
 	}
 
 	candidates := e.reg.List()
 	var eligible []*registry.ComputeBackend
 	var filterReasons []string
 
-	// 2. Strict Constraint Filtering (Rules 23, 111)
+	// 2. Strict Constraint Filtering (Rules 23, 111, Finding 20)
 	for _, b := range candidates {
 		// Circuit Breaker & Health Check (Rule 14)
 		if b.Breaker != nil && b.Breaker.State() == circuitbreaker.StateOpen {
@@ -60,6 +76,12 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		}
 		if !b.Healthy {
 			filterReasons = append(filterReasons, fmt.Sprintf("%s: health check failed", b.ID))
+			continue
+		}
+
+		// GPU Capacity Constraint (Finding 20)
+		if b.AvailableGPUs < gpusReq {
+			filterReasons = append(filterReasons, fmt.Sprintf("%s: insufficient GPUs (available %d, requested %d)", b.ID, b.AvailableGPUs, gpusReq))
 			continue
 		}
 
@@ -101,22 +123,26 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 				ErrNoEligibleBackends, filterReasons)
 		}
 
-		// Otherwise, attempt fallback to best available healthy node
+		// Otherwise, attempt fallback to best available healthy node with capacity
 		for _, b := range candidates {
-			if b.Healthy && (b.Breaker == nil || b.Breaker.State() != circuitbreaker.StateOpen) {
-				decision := &DispatchDecision{
-					WorkloadID:      policy.WorkloadID,
-					TenantID:        policy.TenantID,
-					Status:          "SCHEDULED",
-					AssignedBackend: b,
-					CompositeScore:  999.0,
-					Reason:          "Deterministic fallback: placed on nearest healthy node",
-					ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET"},
-					FallbackUsed:    true,
-					CalculatedAt:    time.Now().UTC(),
+			if b.Healthy && (b.Breaker == nil || b.Breaker.State() != circuitbreaker.StateOpen) && b.AvailableGPUs >= gpusReq {
+				if err := e.reg.ReserveGPU(b.ID, gpusReq); err == nil {
+					decision := &DispatchDecision{
+						WorkloadID:      policy.WorkloadID,
+						TenantID:        policy.TenantID,
+						ProjectID:       policy.ProjectID,
+						Status:          "SCHEDULED",
+						AssignedBackend: b,
+						GPUsAllocated:   gpusReq,
+						CompositeScore:  999.0,
+						Reason:          "Deterministic fallback: placed on nearest healthy node with capacity",
+						ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET", "CAPACITY_RESERVED"},
+						FallbackUsed:    true,
+						CalculatedAt:    time.Now().UTC(),
+					}
+					e.recordIdempotency(idempotencyKey, decision)
+					return decision, nil
 				}
-				e.recordIdempotency(policy.IdempotencyKey, decision)
-				return decision, nil
 			}
 		}
 
@@ -162,7 +188,12 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		}
 	}
 
-	// 5. Synthesize Explainable Decision Codes (Rule 112)
+	// 5. Reserve Capacity Atomically (Finding 20)
+	if err := e.reg.ReserveGPU(bestBackend.ID, gpusReq); err != nil {
+		return nil, fmt.Errorf("failed to reserve GPU capacity on %s: %w", bestBackend.ID, err)
+	}
+
+	// 6. Synthesize Explainable Decision Codes (Rule 112)
 	reasonCodes = append(reasonCodes, fmt.Sprintf("OPTIMAL_SCORE_%.2f", bestScore))
 	if bestBackend.Jurisdiction == registry.ResidencyBangladesh {
 		reasonCodes = append(reasonCodes, "SOVEREIGN_JURISDICTION_BD_MATCH")
@@ -181,8 +212,10 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	decision := &DispatchDecision{
 		WorkloadID:      policy.WorkloadID,
 		TenantID:        policy.TenantID,
+		ProjectID:       policy.ProjectID,
 		Status:          "SCHEDULED",
 		AssignedBackend: bestBackend,
+		GPUsAllocated:   gpusReq,
 		CompositeScore:  bestScore,
 		Reason:          reason,
 		ReasonCodes:     reasonCodes,
@@ -201,5 +234,8 @@ func (e *Evaluator) recordIdempotency(key string, decision *DispatchDecision) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.idempotency[key] = decision
+	e.idempotency[key] = &cachedDecision{
+		decision:  decision,
+		expiresAt: time.Now().Add(24 * time.Hour),
+	}
 }

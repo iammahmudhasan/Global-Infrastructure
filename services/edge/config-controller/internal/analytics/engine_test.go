@@ -29,6 +29,9 @@ func TestReservoirSampler_Percentiles(t *testing.T) {
 	if p.P90 < 89.0 || p.P90 > 92.0 {
 		t.Fatalf("expected p90 around 90.0, got %f", p.P90)
 	}
+	if p.P95 < 94.0 || p.P95 > 96.0 {
+		t.Fatalf("expected p95 around 95.0, got %f", p.P95)
+	}
 	if p.P99 < 98.0 || p.P99 > 100.0 {
 		t.Fatalf("expected p99 around 99.0, got %f", p.P99)
 	}

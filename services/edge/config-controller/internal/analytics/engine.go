@@ -82,11 +82,13 @@ func (s *ReservoirSampler) Percentiles() model.LatencyPercentiles {
 
 	p50Idx := int(math.Round(float64(n-1) * 0.50))
 	p90Idx := int(math.Round(float64(n-1) * 0.90))
+	p95Idx := int(math.Round(float64(n-1) * 0.95))
 	p99Idx := int(math.Round(float64(n-1) * 0.99))
 
 	return model.LatencyPercentiles{
 		P50: roundDecimals(sorted[p50Idx], 2),
 		P90: roundDecimals(sorted[p90Idx], 2),
+		P95: roundDecimals(sorted[p95Idx], 2),
 		P99: roundDecimals(sorted[p99Idx], 2),
 		Min: roundDecimals(sorted[0], 2),
 		Max: roundDecimals(sorted[n-1], 2),

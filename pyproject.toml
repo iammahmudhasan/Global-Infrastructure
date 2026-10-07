@@ -3,7 +3,7 @@ name = "nexusedge-intelligence"
 version = "0.1.0"
 description = "NexusEdge Intelligence Plane & Global Workload Placement Optimizer"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "polars>=1.9.0",
     "numpy>=1.26.0",

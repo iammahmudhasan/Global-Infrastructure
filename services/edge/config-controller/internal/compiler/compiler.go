@@ -56,10 +56,11 @@ type Filter struct {
 }
 
 type VirtualHost struct {
-	Name                 string               `json:"name"`
-	Domains              []string             `json:"domains"`
-	Routes               []Route              `json:"routes"`
-	ResponseHeadersToAdd []HeaderValueOption  `json:"response_headers_to_add,omitempty"`
+	Name                 string                 `json:"name"`
+	Domains              []string               `json:"domains"`
+	Routes               []Route                `json:"routes"`
+	ResponseHeadersToAdd []HeaderValueOption    `json:"response_headers_to_add,omitempty"`
+	TypedPerFilterConfig map[string]interface{} `json:"typed_per_filter_config,omitempty"`
 }
 
 type HeaderValueOption struct {
@@ -73,9 +74,10 @@ type HeaderValue struct {
 }
 
 type Route struct {
-	Match  RouteMatch  `json:"match"`
-	Route  *RouteAction `json:"route,omitempty"`
-	Redirect *RedirectAction `json:"redirect,omitempty"`
+	Match                RouteMatch             `json:"match"`
+	Route                *RouteAction           `json:"route,omitempty"`
+	Redirect             *RedirectAction        `json:"redirect,omitempty"`
+	TypedPerFilterConfig map[string]interface{} `json:"typed_per_filter_config,omitempty"`
 }
 
 type RouteMatch struct {
@@ -187,7 +189,49 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 		vh := VirtualHost{
 			Name:    fmt.Sprintf("vhost_%s", sanitizeName(hostname)),
 			Domains: []string{hostname, fmt.Sprintf("%s:*", hostname)},
-			Routes:  make([]Route, 0),
+			Routes: []Route{
+				{
+					Match: RouteMatch{Prefix: "/.well-known/acme-challenge/"},
+					Route: &RouteAction{
+						Cluster: "acme_challenge_service",
+						Timeout: "5s",
+					},
+				},
+			},
+		}
+
+		// Per-Domain VirtualHost Rate Limit Isolation (Finding 9, 14)
+		if topo.Security != nil && topo.Security.RateLimitEnabled && topo.Security.RateLimitRPM > 0 {
+			rpm := topo.Security.RateLimitRPM
+			tokensPerFill := rpm / 60
+			if tokensPerFill <= 0 {
+				tokensPerFill = 1
+			}
+			vh.TypedPerFilterConfig = map[string]interface{}{
+				"envoy.filters.http.local_ratelimit": map[string]interface{}{
+					"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+					"stat_prefix": fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
+					"token_bucket": map[string]interface{}{
+						"max_tokens":      rpm,
+						"tokens_per_fill": tokensPerFill,
+						"fill_interval":   "1s",
+					},
+					"filter_enabled": map[string]interface{}{
+						"runtime_key": "local_rate_limit_enabled",
+						"default_value": map[string]interface{}{
+							"numerator":   100,
+							"denominator": "HUNDRED",
+						},
+					},
+					"filter_enforced": map[string]interface{}{
+						"runtime_key": "local_rate_limit_enforced",
+						"default_value": map[string]interface{}{
+							"numerator":   100,
+							"denominator": "HUNDRED",
+						},
+					},
+				},
+			}
 		}
 
 		// Also build an HTTP redirect virtual host with ACME challenge bypass
@@ -250,15 +294,38 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 		httpsVirtualHosts = append(httpsVirtualHosts, vh)
 	}
 
-	// 1. Build Port 80 HTTP Ingress Listener (Redirects to HTTPS)
-	httpListener := c.buildHTTPListener(httpVirtualHosts)
-	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
+	// Determine if any active domain has a valid TLS certificate
+	hasCertificates := false
+	for _, topo := range topologies {
+		if topo.Certificate != nil && topo.Certificate.Status == model.CertStatusActive && topo.Certificate.CertPEM != "" {
+			hasCertificates = true
+			break
+		}
+	}
 
-	// 2. Build Port 443 HTTPS Ingress Listener
-	httpsListener := c.buildHTTPSListener(httpsVirtualHosts, topologies)
-	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
+	// 1. Build Port 80 HTTP Ingress Listener:
+	// If active TLS certificates exist, port 80 redirects to HTTPS (with ACME challenge bypass).
+	// If no TLS certificates exist yet, port 80 serves active customer HTTP routes directly with WAF & rate limits.
+	if hasCertificates {
+		httpListener := c.buildHTTPListener(httpVirtualHosts, topologies, false)
+		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 
-	// 3. Collect all unique upstream clusters
+		httpsListener := c.buildHTTPSListener(httpsVirtualHosts, topologies)
+		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
+		// Register SDS gRPC cluster so DownstreamTlsContext has no dangling cluster reference (P0 Finding 6B)
+		clustersMap["sds-grpc-cluster"] = c.buildSDSCluster()
+	} else {
+		// When only HTTP is available before TLS issuance, serve customer routes directly on port 80
+		httpListener := c.buildHTTPListener(httpsVirtualHosts, topologies, true)
+		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
+	}
+
+	// Register ACME challenge cluster whenever active virtual hosts exist (P0 Finding 6A)
+	if len(httpVirtualHosts) > 0 || len(httpsVirtualHosts) > 0 {
+		clustersMap["acme_challenge_service"] = c.buildACMECluster()
+	}
+
+	// 2. Collect all unique upstream clusters
 	for _, cluster := range clustersMap {
 		config.StaticResources.Clusters = append(config.StaticResources.Clusters, cluster)
 	}
@@ -304,65 +371,15 @@ func (c *Compiler) CompileForPoP(popID string, topologies []*store.DomainTopolog
 	return config, nil
 }
 
-func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost) Listener {
-	routeConfig := map[string]interface{}{
-		"name":          "edge_http_routes",
-		"virtual_hosts": virtualHosts,
-	}
-
-	hcmConfig := map[string]interface{}{
-		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
-		"stat_prefix":  "edge_http_ingress",
-		"route_config": routeConfig,
-		"access_log":   c.buildAccessLogConfig(),
-		"http_filters": []map[string]interface{}{
-			{
-				"name": "envoy.filters.http.router",
-				"typed_config": map[string]interface{}{
-					"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
-				},
-			},
-		},
-	}
-
-	return Listener{
-		Name: "edge_http_listener",
-		Address: Address{
-			SocketAddress: SocketAddress{
-				Address:   "0.0.0.0",
-				PortValue: c.httpPort,
-			},
-		},
-		FilterChains: []FilterChain{
-			{
-				Filters: []Filter{
-					{
-						Name:        "envoy.filters.network.http_connection_manager",
-						TypedConfig: hcmConfig,
-					},
-				},
-			},
-		},
-	}
-}
-
-func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology) Listener {
-	routeConfig := map[string]interface{}{
-		"name":          "edge_https_routes",
-		"virtual_hosts": virtualHosts,
-	}
-
+func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[string]interface{} {
 	httpFilters := make([]map[string]interface{}, 0)
 
 	// 1. Check if rate limiting is enabled across any active topologies
 	hasRateLimiting := false
-	maxRPM := 1000
 	for _, topo := range topologies {
 		if topo.Security != nil && topo.Security.RateLimitEnabled {
 			hasRateLimiting = true
-			if topo.Security.RateLimitRPM > 0 && topo.Security.RateLimitRPM < maxRPM {
-				maxRPM = topo.Security.RateLimitRPM
-			}
+			break
 		}
 	}
 
@@ -370,14 +387,14 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 		httpFilters = append(httpFilters, map[string]interface{}{
 			"name": "envoy.filters.http.local_ratelimit",
 			"typed_config": map[string]interface{}{
-				"@type":        "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
-				"stat_prefix":  "edge_http_local_rate_limiter",
+				"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+				"stat_prefix": "edge_http_local_rate_limiter",
 				"status": map[string]interface{}{
 					"code": "TooManyRequests",
 				},
 				"token_bucket": map[string]interface{}{
-					"max_tokens":      maxRPM,
-					"tokens_per_fill": maxRPM / 60,
+					"max_tokens":      100000,
+					"tokens_per_fill": 10000,
 					"fill_interval":   "1s",
 				},
 				"filter_enabled": map[string]interface{}{
@@ -481,6 +498,66 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 		},
 	})
 
+	return httpFilters
+}
+
+func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology, isServingDirect bool) Listener {
+	routeConfig := map[string]interface{}{
+		"name":          "edge_http_routes",
+		"virtual_hosts": virtualHosts,
+	}
+
+	var httpFilters []map[string]interface{}
+	if isServingDirect {
+		httpFilters = c.buildHTTPFilters(topologies)
+	} else {
+		httpFilters = []map[string]interface{}{
+			{
+				"name": "envoy.filters.http.router",
+				"typed_config": map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+				},
+			},
+		}
+	}
+
+	hcmConfig := map[string]interface{}{
+		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+		"stat_prefix":  "edge_http_ingress",
+		"route_config": routeConfig,
+		"access_log":   c.buildAccessLogConfig(),
+		"http_filters": httpFilters,
+	}
+
+	return Listener{
+		Name: "edge_http_listener",
+		Address: Address{
+			SocketAddress: SocketAddress{
+				Address:   "0.0.0.0",
+				PortValue: c.httpPort,
+			},
+		},
+		FilterChains: []FilterChain{
+			{
+				Filters: []Filter{
+					{
+						Name:        "envoy.filters.network.http_connection_manager",
+						TypedConfig: hcmConfig,
+					},
+				},
+			},
+		},
+	}
+}
+
+func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology) Listener {
+	routeConfig := map[string]interface{}{
+		"name":          "edge_https_routes",
+		"virtual_hosts": virtualHosts,
+	}
+
+	httpFilters := c.buildHTTPFilters(topologies)
+
 	hcmConfig := map[string]interface{}{
 		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 		"stat_prefix":  "edge_https_ingress",
@@ -490,11 +567,9 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 	}
 
 	filterChains := make([]FilterChain, 0)
-	hasCertificates := false
 
 	for _, topo := range topologies {
 		if topo.Certificate != nil && topo.Certificate.Status == model.CertStatusActive && topo.Certificate.CertPEM != "" {
-			hasCertificates = true
 			hostname := strings.ToLower(topo.Domain.Hostname)
 			tlsContext := c.buildDownstreamTLSContext(topo.Certificate)
 			filterChains = append(filterChains, FilterChain{
@@ -509,19 +584,6 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 				},
 				TransportSocket: tlsContext,
 			})
-		}
-	}
-
-	if !hasCertificates || len(filterChains) == 0 {
-		filterChains = []FilterChain{
-			{
-				Filters: []Filter{
-					{
-						Name:        "envoy.filters.network.http_connection_manager",
-						TypedConfig: hcmConfig,
-					},
-				},
-			},
 		}
 	}
 
@@ -687,6 +749,62 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 	}
 
 	return cluster
+}
+
+func (c *Compiler) buildACMECluster() Cluster {
+	return Cluster{
+		Name:           "acme_challenge_service",
+		ConnectTimeout: "2s",
+		Type:           "STATIC",
+		LbPolicy:       "ROUND_ROBIN",
+		LoadAssignment: LoadAssignment{
+			ClusterName: "acme_challenge_service",
+			Endpoints: []LocalityEndpoints{
+				{
+					LbEndpoints: []LbEndpoint{
+						{
+							Endpoint: Endpoint{
+								Address: Address{
+									SocketAddress: SocketAddress{
+										Address:   "127.0.0.1",
+										PortValue: 9091,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func (c *Compiler) buildSDSCluster() Cluster {
+	return Cluster{
+		Name:           "sds-grpc-cluster",
+		ConnectTimeout: "2s",
+		Type:           "STATIC",
+		LbPolicy:       "ROUND_ROBIN",
+		LoadAssignment: LoadAssignment{
+			ClusterName: "sds-grpc-cluster",
+			Endpoints: []LocalityEndpoints{
+				{
+					LbEndpoints: []LbEndpoint{
+						{
+							Endpoint: Endpoint{
+								Address: Address{
+									SocketAddress: SocketAddress{
+										Address:   "127.0.0.1",
+										PortValue: 18000,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 func sanitizeName(s string) string {

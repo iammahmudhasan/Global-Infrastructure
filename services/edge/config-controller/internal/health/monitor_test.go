@@ -14,6 +14,7 @@ import (
 )
 
 func TestMonitor_ProbeSuccessAndThreshold(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
 	// Mock healthy server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -81,6 +82,7 @@ func TestMonitor_ProbeSuccessAndThreshold(t *testing.T) {
 }
 
 func TestMonitor_ProbeFailureAndFailoverThreshold(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
 	// Mock failing server (returns 503)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -219,5 +221,50 @@ func TestSmartRouter_LowestLatencyAndFailover(t *testing.T) {
 	_, err = router.SelectOptimalOrigin(pool, states)
 	if err != health.ErrNoHealthyOrigins {
 		t.Errorf("expected ErrNoHealthyOrigins when all backends down, got: %v", err)
+	}
+}
+
+func TestMonitor_RuntimeSSRFBlocked(t *testing.T) {
+	// Ensure dev mode is explicitly off
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+
+	m := health.NewMonitor()
+	ctx := context.Background()
+
+	blockedTargets := []string{
+		"127.0.0.1",
+		"169.254.169.254", // Cloud metadata
+		"10.0.0.1",       // RFC 1918
+	}
+
+	for _, addr := range blockedTargets {
+		origin := &model.Origin{
+			ID:       "orig-ssrf-attack",
+			PoolID:   "pool-1",
+			Address:  addr,
+			Port:     80,
+			Protocol: model.ProtocolHTTP,
+			Healthy:  true,
+		}
+
+		monitorConfig := &model.HealthMonitor{
+			ID:                  "hm-1",
+			PoolID:              "pool-1",
+			Protocol:            model.HealthCheckProtocolHTTP,
+			Path:                "/healthz",
+			Port:                80,
+			TimeoutSeconds:      1,
+			HealthyThreshold:    2,
+			UnhealthyThreshold:  1,
+			ExpectedStatusCodes: []int{200},
+		}
+
+		st := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+		if st.Healthy {
+			t.Errorf("expected origin with address %s to be blocked and marked unhealthy", addr)
+		}
+		if st.ConsecutiveFailures == 0 {
+			t.Errorf("expected failure to be registered for blocked SSRF destination %s", addr)
+		}
 	}
 }

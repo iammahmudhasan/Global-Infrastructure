@@ -20,8 +20,9 @@ const (
 )
 
 var (
-	ErrBackendNotFound = errors.New("compute backend not found")
-	ErrDuplicateBackend = errors.New("backend with ID already exists")
+	ErrBackendNotFound      = errors.New("compute backend not found")
+	ErrDuplicateBackend    = errors.New("backend with ID already exists")
+	ErrInsufficientCapacity = errors.New("insufficient GPU capacity on backend")
 )
 
 // ComputeBackend represents a registered heterogeneous execution target (Bare-metal, Cloud, Edge)
@@ -203,3 +204,43 @@ func (r *Registry) UpdateHealth(id string, latencyMs int, healthy bool) {
 		}
 	}
 }
+
+// ReserveGPU decrements available GPU capacity and tracks active workloads atomically.
+func (r *Registry) ReserveGPU(id string, count int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b, ok := r.backends[id]
+	if !ok {
+		return ErrBackendNotFound
+	}
+	if count <= 0 {
+		count = 1
+	}
+	if b.AvailableGPUs < count {
+		return ErrInsufficientCapacity
+	}
+	b.AvailableGPUs -= count
+	b.ActiveWorkloads++
+	return nil
+}
+
+// ReleaseGPU restores reserved GPU capacity and decrements active workloads atomically.
+func (r *Registry) ReleaseGPU(id string, count int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b, ok := r.backends[id]
+	if !ok {
+		return ErrBackendNotFound
+	}
+	if count <= 0 {
+		count = 1
+	}
+	b.AvailableGPUs += count
+	if b.ActiveWorkloads > 0 {
+		b.ActiveWorkloads--
+	}
+	return nil
+}
+

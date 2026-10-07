@@ -66,6 +66,101 @@ func (s *Store) SaveDomain(d *model.Domain) error {
 	return nil
 }
 
+func cloneDomain(d *model.Domain) *model.Domain {
+	if d == nil {
+		return nil
+	}
+	cp := *d
+	return &cp
+}
+
+func cloneOriginPool(p *model.OriginPool) *model.OriginPool {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	cp.Origins = append([]model.Origin(nil), p.Origins...)
+	if p.HealthMonitor != nil {
+		hm := *p.HealthMonitor
+		if hm.ExpectedStatusCodes != nil {
+			hm.ExpectedStatusCodes = append([]int(nil), hm.ExpectedStatusCodes...)
+		}
+		cp.HealthMonitor = &hm
+	}
+	return &cp
+}
+
+func cloneHealthMonitor(hm *model.HealthMonitor) *model.HealthMonitor {
+	if hm == nil {
+		return nil
+	}
+	cp := *hm
+	if hm.ExpectedStatusCodes != nil {
+		cp.ExpectedStatusCodes = append([]int(nil), hm.ExpectedStatusCodes...)
+	}
+	return &cp
+}
+
+func cloneOriginEndpointState(st *model.OriginEndpointState) *model.OriginEndpointState {
+	if st == nil {
+		return nil
+	}
+	cp := *st
+	return &cp
+}
+
+func cloneRoute(r *model.Route) *model.Route {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	return &cp
+}
+
+func cloneSecurityPolicy(sp *model.SecurityPolicy) *model.SecurityPolicy {
+	if sp == nil {
+		return nil
+	}
+	cp := *sp
+	cp.WAFRules = append([]model.WAFRule(nil), sp.WAFRules...)
+	cp.RateLimitRules = append([]model.RateLimitRule(nil), sp.RateLimitRules...)
+	return &cp
+}
+
+func cloneCachePolicy(cp *model.CachePolicy) *model.CachePolicy {
+	if cp == nil {
+		return nil
+	}
+	cpc := *cp
+	cpc.CacheRules = append([]model.CacheRule(nil), cp.CacheRules...)
+	return &cpc
+}
+
+func cloneCertificate(cert *model.Certificate) *model.Certificate {
+	if cert == nil {
+		return nil
+	}
+	cp := *cert
+	cp.Domains = append([]string(nil), cert.Domains...)
+	return &cp
+}
+
+func cloneACMEChallenge(ch *model.ACMEChallenge) *model.ACMEChallenge {
+	if ch == nil {
+		return nil
+	}
+	cp := *ch
+	return &cp
+}
+
+func cloneTLSSettings(st *model.TLSSettings) *model.TLSSettings {
+	if st == nil {
+		return nil
+	}
+	cp := *st
+	return &cp
+}
+
 func (s *Store) GetDomain(id string) (*model.Domain, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -74,7 +169,7 @@ func (s *Store) GetDomain(id string) (*model.Domain, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
-	return d, nil
+	return cloneDomain(d), nil
 }
 
 func (s *Store) GetDomainByHost(hostname string) (*model.Domain, error) {
@@ -85,7 +180,7 @@ func (s *Store) GetDomainByHost(hostname string) (*model.Domain, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
-	return s.domains[id], nil
+	return cloneDomain(s.domains[id]), nil
 }
 
 func (s *Store) ListDomainsByProject(projectID string) []*model.Domain {
@@ -95,7 +190,7 @@ func (s *Store) ListDomainsByProject(projectID string) []*model.Domain {
 	var list []*model.Domain
 	for _, d := range s.domains {
 		if d.ProjectID == projectID {
-			list = append(list, d)
+			list = append(list, cloneDomain(d))
 		}
 	}
 	return list
@@ -141,9 +236,11 @@ func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
-	cp := *p
-	cp.HealthMonitor = s.monitors[poolID]
-	return &cp, nil
+	cp := cloneOriginPool(p)
+	if hm := s.monitors[poolID]; hm != nil {
+		cp.HealthMonitor = cloneHealthMonitor(hm)
+	}
+	return cp, nil
 }
 
 func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
@@ -158,7 +255,7 @@ func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
 func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.monitors[poolID]
+	return cloneHealthMonitor(s.monitors[poolID])
 }
 
 func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
@@ -182,7 +279,7 @@ func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
 func (s *Store) GetOriginHealthState(originID string) *model.OriginEndpointState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.healthStates[originID]
+	return cloneOriginEndpointState(s.healthStates[originID])
 }
 
 func (s *Store) ListPoolHealthStates(poolID string) []*model.OriginEndpointState {
@@ -197,7 +294,7 @@ func (s *Store) ListPoolHealthStates(poolID string) []*model.OriginEndpointState
 
 	for _, o := range pool.Origins {
 		if st, exists := s.healthStates[o.ID]; exists {
-			states = append(states, st)
+			states = append(states, cloneOriginEndpointState(st))
 		} else {
 			// Return default initial state
 			states = append(states, &model.OriginEndpointState{
@@ -240,7 +337,13 @@ func (s *Store) SaveRoute(r *model.Route) {
 func (s *Store) GetRoutes(domainID string) []*model.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]*model.Route(nil), s.routes[domainID]...)
+
+	routes := s.routes[domainID]
+	list := make([]*model.Route, len(routes))
+	for i, r := range routes {
+		list[i] = cloneRoute(r)
+	}
+	return list
 }
 
 func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
@@ -252,7 +355,7 @@ func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
 func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.security[domainID]
+	return cloneSecurityPolicy(s.security[domainID])
 }
 
 func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
@@ -363,7 +466,7 @@ func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cache[domainID]
+	return cloneCachePolicy(s.cache[domainID])
 }
 
 func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
@@ -425,7 +528,7 @@ func (s *Store) SaveCertificate(cert *model.Certificate) {
 func (s *Store) GetCertificate(domainID string) *model.Certificate {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.certificates[domainID]
+	return cloneCertificate(s.certificates[domainID])
 }
 
 func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
@@ -437,7 +540,7 @@ func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
 func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.challenges[token]
+	return cloneACMEChallenge(s.challenges[token])
 }
 
 func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeStatus) {
@@ -458,7 +561,7 @@ func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if st, exists := s.tlsSettings[domainID]; exists {
-		return st
+		return cloneTLSSettings(st)
 	}
 	return &model.TLSSettings{
 		EnforceHTTPS:  false,
@@ -487,36 +590,19 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 			continue // Only compile active, verified domains (Rule 17)
 		}
 
-		var secPolicy *model.SecurityPolicy
-		if sp := s.security[d.ID]; sp != nil {
-			cp := *sp
-			cp.WAFRules = append([]model.WAFRule(nil), s.wafRules[d.ID]...)
-			cp.RateLimitRules = append([]model.RateLimitRule(nil), s.rateLimits[d.ID]...)
-			secPolicy = &cp
-		}
-
-		var cachePolicy *model.CachePolicy
-		if cp := s.cache[d.ID]; cp != nil {
-			cpc := *cp
-			cpc.CacheRules = append([]model.CacheRule(nil), s.cacheRules[d.ID]...)
-			cachePolicy = &cpc
-		}
-
 		topo := &DomainTopology{
-			Domain:      d,
+			Domain:      cloneDomain(d),
 			Routes:      append([]*model.Route(nil), s.routes[d.ID]...),
 			Pools:       make(map[string]*model.OriginPool),
-			Security:    secPolicy,
-			Cache:       cachePolicy,
-			Certificate: s.certificates[d.ID],
-			TLSSettings: s.tlsSettings[d.ID],
+			Security:    cloneSecurityPolicy(s.security[d.ID]),
+			Cache:       cloneCachePolicy(s.cache[d.ID]),
+			Certificate: cloneCertificate(s.certificates[d.ID]),
+			TLSSettings: cloneTLSSettings(s.tlsSettings[d.ID]),
 		}
 
 		for _, r := range topo.Routes {
 			if pool, exists := s.pools[r.PoolID]; exists {
-				poolCopy := *pool
-				poolCopy.HealthMonitor = s.monitors[pool.ID]
-				topo.Pools[r.PoolID] = &poolCopy
+				topo.Pools[r.PoolID] = cloneOriginPool(pool)
 			}
 		}
 

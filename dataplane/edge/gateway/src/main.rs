@@ -85,8 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         rate_limiter: rate_limiter.clone(),
         waf,
         cache,
-        router,
-        http_client,
+        router: router.clone(),
+        http_client: http_client.clone(),
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
@@ -99,7 +99,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // 5. Bind TCP Listener and accept connections
+    // 5. Autonomous Upstream Health Probing Loop (Finding 14)
+    let health_router = router.clone();
+    let health_client = http_client.clone();
+    let health_path = config.upstream.health_check_path.clone();
+    let targets = config.upstream.targets.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            for target in &targets {
+                let check_url = format!("{}{}", target.trim_end_matches('/'), health_path);
+                let start = std::time::Instant::now();
+                let is_healthy = match health_client.get(&check_url).send().await {
+                    Ok(resp) => resp.status().is_success(),
+                    Err(_) => false,
+                };
+                let latency_ms = start.elapsed().as_millis() as u64;
+                health_router.mark_health(target, is_healthy, latency_ms);
+            }
+        }
+    });
+
+    // 6. Bind TCP Listener and accept connections
     let addr: SocketAddr = config.server.listen_addr.parse()?;
     let listener = TcpListener::bind(addr).await?;
     info!("Gateway successfully bound to {}", addr);

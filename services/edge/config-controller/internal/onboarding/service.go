@@ -82,6 +82,13 @@ func ValidateOriginAddress(addr string) error {
 		return errors.New("origin address cannot be empty")
 	}
 
+	// Reject host:port combination when OriginPort is a separate field (Finding 19)
+	if ip := net.ParseIP(addr); ip == nil {
+		if strings.Contains(addr, ":") {
+			return errors.New("origin_address must not include a port; use origin_port")
+		}
+	}
+
 	host := addr
 	if h, _, err := net.SplitHostPort(addr); err == nil {
 		host = h
@@ -147,12 +154,26 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 	if err := ValidateOriginAddress(req.OriginAddress); err != nil {
 		return nil, err
 	}
+
+	// Validate origin port (Finding 18)
 	if req.OriginPort == 0 {
 		req.OriginPort = 443
 	}
-	if req.OriginProtocol == "" {
-		req.OriginProtocol = "HTTPS"
+	if req.OriginPort < 1 || req.OriginPort > 65535 {
+		return nil, errors.New("origin_port must be between 1 and 65535")
 	}
+
+	// Validate origin protocol (Finding 18)
+	protocol := strings.ToUpper(strings.TrimSpace(req.OriginProtocol))
+	if protocol == "" {
+		protocol = "HTTPS"
+	}
+	switch protocol {
+	case "HTTP", "HTTPS":
+	default:
+		return nil, errors.New("origin_protocol must be HTTP or HTTPS")
+	}
+	req.OriginProtocol = protocol
 
 	hostname := strings.ToLower(strings.TrimSpace(req.Hostname))
 	domainID := generateID("dom")
@@ -256,7 +277,7 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 	}
 
 	// In automated testbed mode or development, bypass external recursive DNS resolution
-	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" || strings.HasSuffix(domain.Hostname, ".example.com") || strings.HasSuffix(domain.Hostname, ".test") {
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
 		if err := s.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
 			return nil, err
 		}

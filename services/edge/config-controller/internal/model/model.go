@@ -304,6 +304,7 @@ type TelemetryEvent struct {
 type LatencyPercentiles struct {
 	P50 float64 `json:"p50"`
 	P90 float64 `json:"p90"`
+	P95 float64 `json:"p95"`
 	P99 float64 `json:"p99"`
 	Min float64 `json:"min"`
 	Max float64 `json:"max"`

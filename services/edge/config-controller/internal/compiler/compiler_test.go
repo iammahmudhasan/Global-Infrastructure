@@ -16,14 +16,14 @@ func TestCompiler(t *testing.T) {
 	svc := onboarding.NewDomainService(st)
 	comp := compiler.NewCompiler(9901, 80, 443)
 
-	// 1. Initial compile: 0 domains -> default listeners, 0 clusters
+	// 1. Initial compile: 0 domains -> only HTTP listener before TLS provisioning, 0 clusters
 	topologies := st.GetActiveTopologies()
 	cfg, err := comp.Compile(topologies)
 	if err != nil {
 		t.Fatalf("unexpected compilation error: %v", err)
 	}
-	if len(cfg.StaticResources.Listeners) != 2 {
-		t.Errorf("expected 2 listeners (HTTP & HTTPS), got %d", len(cfg.StaticResources.Listeners))
+	if len(cfg.StaticResources.Listeners) != 1 {
+		t.Errorf("expected 1 listener (HTTP only before TLS certificates), got %d", len(cfg.StaticResources.Listeners))
 	}
 	if len(cfg.StaticResources.Clusters) != 0 {
 		t.Errorf("expected 0 clusters for unverified store, got %d", len(cfg.StaticResources.Clusters))
@@ -47,6 +47,7 @@ func TestCompiler(t *testing.T) {
 	}
 
 	// 3. Verify domain: now ACTIVE -> must generate virtual hosts & clusters
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
 	_, err = svc.VerifyDomain(res.DomainID)
 	if err != nil {
 		t.Fatalf("verify error: %v", err)
@@ -57,12 +58,28 @@ func TestCompiler(t *testing.T) {
 		t.Fatalf("compile error: %v", err)
 	}
 
-	if len(cfg.StaticResources.Clusters) != 1 {
-		t.Fatalf("expected 1 upstream cluster, got %d", len(cfg.StaticResources.Clusters))
+	// Only 1 listener (HTTP :80) before active TLS certificates are provisioned
+	if len(cfg.StaticResources.Listeners) != 1 {
+		t.Fatalf("expected 1 listener (HTTP only before TLS certificates), got %d", len(cfg.StaticResources.Listeners))
 	}
 
-	cluster := cfg.StaticResources.Clusters[0]
-	if cluster.TransportSocket == nil {
+	var originCluster *compiler.Cluster
+	var acmeCluster *compiler.Cluster
+	for i := range cfg.StaticResources.Clusters {
+		c := &cfg.StaticResources.Clusters[i]
+		if strings.HasPrefix(c.Name, "cluster_") {
+			originCluster = c
+		} else if c.Name == "acme_challenge_service" {
+			acmeCluster = c
+		}
+	}
+	if originCluster == nil {
+		t.Fatalf("expected customer origin cluster to be generated")
+	}
+	if acmeCluster == nil {
+		t.Fatalf("expected acme_challenge_service cluster to be defined without dangling reference")
+	}
+	if originCluster.TransportSocket == nil {
 		t.Errorf("expected HTTPS origin to have UpstreamTlsContext transport socket")
 	}
 
@@ -78,11 +95,8 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(jsonStr, "origin.customer.com") {
 		t.Errorf("expected JSON config to contain origin address origin.customer.com")
 	}
-	if !strings.Contains(jsonStr, "envoy.filters.http.local_ratelimit") {
-		t.Errorf("expected JSON config to contain local_ratelimit HTTP filter")
-	}
-	if !strings.Contains(jsonStr, "envoy.filters.http.cache") {
-		t.Errorf("expected JSON config to contain cache HTTP filter")
+	if !strings.Contains(jsonStr, "vh_rate_limit_api_customer_com") {
+		t.Errorf("expected JSON config to contain per-vhost rate limiter vh_rate_limit_api_customer_com")
 	}
 	if !strings.Contains(jsonStr, "envoy.access_loggers.file") || !strings.Contains(jsonStr, "bytes_sent") {
 		t.Errorf("expected JSON config to contain structured access log configuration")
@@ -133,7 +147,16 @@ func TestCompiler(t *testing.T) {
 		if len(cfgWithHC.StaticResources.Clusters) == 0 {
 			t.Fatalf("expected at least 1 cluster")
 		}
-		clusterHC := cfgWithHC.StaticResources.Clusters[0]
+		var clusterHC *compiler.Cluster
+		for i := range cfgWithHC.StaticResources.Clusters {
+			if strings.HasPrefix(cfgWithHC.StaticResources.Clusters[i].Name, "cluster_") {
+				clusterHC = &cfgWithHC.StaticResources.Clusters[i]
+				break
+			}
+		}
+		if clusterHC == nil {
+			t.Fatalf("expected origin cluster to exist")
+		}
 		if len(clusterHC.HealthChecks) == 0 {
 			t.Fatalf("expected cluster to have health_checks configured")
 		}
@@ -159,6 +182,20 @@ func TestCompiler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to compile with certificate: %v", err)
 	}
+	if len(cfgWithTLS.StaticResources.Listeners) != 2 {
+		t.Fatalf("expected 2 listeners (HTTP & HTTPS) after TLS provisioned, got %d", len(cfgWithTLS.StaticResources.Listeners))
+	}
+	hasSDSCluster := false
+	for _, c := range cfgWithTLS.StaticResources.Clusters {
+		if c.Name == "sds-grpc-cluster" {
+			hasSDSCluster = true
+			break
+		}
+	}
+	if !hasSDSCluster {
+		t.Fatalf("expected sds-grpc-cluster to be defined in clusters")
+	}
+
 	tlsJSON, _ := cfgWithTLS.ToJSON()
 	tlsStr := string(tlsJSON)
 	if !strings.Contains(tlsStr, "DownstreamTlsContext") {

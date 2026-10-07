@@ -75,12 +75,12 @@ The NexusEdge Global Edge Network + Security Gateway operates across three decou
      }'
    ```
 2. Inspect assigned edge routing target:
-   - Output contains: `"cname_target": "app.customer.com.edge.nexusedge.io"`
+   - Output contains: `"cname_target": "app.customer.com.edge.nexusedge.net"`
    - Output contains: `"verification_token": "nexusedge-verify-..."`
 3. Verify DNS delegation:
    ```bash
    dig +short CNAME app.customer.com
-   # Expected: app.customer.com.edge.nexusedge.io.
+   # Expected: app.customer.com.edge.nexusedge.net.
    ```
 4. Confirm domain activation:
    ```bash

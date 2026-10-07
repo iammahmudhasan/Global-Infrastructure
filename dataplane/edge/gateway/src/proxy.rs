@@ -156,9 +156,13 @@ pub async fn handle_request(
         WafResult::Allowed => {}
     }
 
-    // 5. Tenant-Isolated Edge Cache Check (Finding 5, RFC 9111)
+    // 5. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111)
     let scheme = "http";
-    let cache_key = format!("{}://{}{}", scheme, host, uri_string);
+    let accept_encoding = req_headers
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let cache_key = format!("{}://{}{}#ae={}", scheme, host, uri_string, accept_encoding);
 
     if method == Method::GET && !req_cc.contains("no-cache") && !req_cc.contains("no-store") {
         if let Some(cached) = state.cache.get(&cache_key) {
@@ -182,13 +186,22 @@ pub async fn handle_request(
         }
     }
 
-    // 6. Upstream Selection
+    // 6. Upstream Selection (Finding 13: 503 Service Unavailable when no healthy nodes exist)
     let upstream_base = match state.router.select_upstream() {
         Some(target) => target,
         None => {
+            warn!(uri = %uri_string, "No healthy upstream nodes available in pool");
+            let body = serde_json::json!({
+                "error": "Service Unavailable: No healthy upstream origin nodes available in pool",
+                "status": 503,
+                "node": state.config.server.node_id,
+                "region": state.config.server.region,
+            });
             let resp = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Full::new(Bytes::from("No upstream nodes configured")))
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
                 .unwrap();
             return Ok(resp);
         }

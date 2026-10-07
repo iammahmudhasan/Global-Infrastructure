@@ -69,7 +69,7 @@ NexusEdge enforces strict separation of concerns across three distinct operation
 graph TD
     subgraph IntelligencePlane["1. INTELLIGENCE PLANE (Optimization Matters)"]
         direction TB
-        PyModels["Python 3.14 + PyTorch / vLLM / NVIDIA Dynamo"]
+        PyModels["Python 3.12+ + PyTorch / vLLM / NVIDIA Dynamo"]
         CapacityEngine["Real-Time Capacity Forecaster (VRAM, Power, Subsea Fibers)"]
         WorkloadOptimizer["Multi-Objective Placement Optimizer (Latency, Cost, Carbon)"]
         PyModels --> WorkloadOptimizer
@@ -78,10 +78,10 @@ graph TD
 
     subgraph ControlPlane["2. CONTROL PLANE (Correctness Matters)"]
         direction TB
-        EdgeController["Go Edge Config Controller (:8080)"]
+        EdgeController["Go Edge Config Controller (:9091)"]
         Compiler["Envoy v3 Dynamic LDS / CDS / SDS Compiler"]
         AnycastManager["BGP Route Health Injection (RHI) Manager"]
-        CertManager["ACME HTTP-01 & ECDSA P-256 Engine"]
+        CertManager["TLS Development Lifecycle: HTTP-01-style Challenge + Local ECDSA Certificate"]
         AnalyticsStore["Vitter Algorithm R Reservoir Aggregator"]
         EdgeController --> Compiler
         EdgeController --> AnycastManager
@@ -139,7 +139,7 @@ NexusEdge's first commercial product (**Edge Security Gateway**) is developed ac
 
 ```
 [Milestone 1] ───► [Milestone 2] ───► [Milestone 3] ───► [Milestone 4]
-Domain Onboard      OWASP WAF          RFC 9111 CDN       EWMA Failover
+Domain Onboard     CRS-Aligned WAF     RFC 9111 CDN       EWMA Failover
       │                   │                  │                  │
       ▼                   ▼                  ▼                  ▼
 [Milestone 5] ───► [Milestone 6] ───► [Milestone 7] ───► [Milestone 8]
@@ -150,12 +150,12 @@ TLS Dev Lifecycle   Analytics Engine   Simulated PoP Mesh Stress & Hardening
 
 | Engine | Milestone | Technical Scope & Invariants | Execution Proof |
 |---|---|---|---|
-| **Domain Onboarding** | Milestone 1 | RFC 1123 hostname validation, CNAME target generation (`*.edge.nexusedge.io`), cryptographic verification tokens, dynamic Envoy v3 LDS/CDS compilation. | `TestValidateHostname`<br/>`TestOnboardAndVerifyDomain` |
-| **WAF & Security** | Milestone 2 | OWASP Core Rule Set (CRS 942 SQLi, 941 XSS, 930 LFI/RFI, 932 RCE, 913 Scanners), IP CIDR / Path / Header matchers, Token Bucket Rate Limiter with burst capacity. | `TestWAF_OWASP_Attacks`<br/>`TestRateLimiter` |
+| **Domain Onboarding** | Milestone 1 | RFC 1123 hostname validation, CNAME target generation (`*.edge.nexusedge.net`), cryptographic verification tokens, dynamic Envoy v3 LDS/CDS compilation. | `TestValidateHostname`<br/>`TestOnboardAndVerifyDomain` |
+| **WAF & Security** | Milestone 2 | OWASP-inspired / CRS-aligned detection engine prototype (CRS 942 SQLi, 941 XSS, 930 LFI/RFI, 932 RCE, 913 Scanners), IP CIDR / Path / Header matchers, Token Bucket Rate Limiter with burst capacity. | `TestWAF_OWASP_Attacks`<br/>`TestRateLimiter` |
 | **RFC 9111 CDN Cache** | Milestone 3 | Deterministic query sorting, header normalization, Cache-Control policy parsing (`no-store`, `private`, `max-age`), sub-second local cache invalidation and purge. | `TestCacheKeyNormalization`<br/>`TestCacheEngineLookupStorePurge` |
 | **EWMA Smart Routing** | Milestone 4 | Active origin health probing, Exponentially Weighted Moving Average ($\alpha = 0.2$) RTT latency smoothing, autonomous sub-ms failover upon consecutive failures. | `TestSmartRouter_LowestLatencyAndFailover`<br/>`TestMonitor_ProbeSuccessAndThreshold` |
 | **TLS Lifecycle (Dev Mode)** | Milestone 5 | HTTP-01 challenge orchestration, in-memory ECDSA P-256 key pair and local development x509 leaf issuance, Envoy DownstreamTlsContext SDS zero-reload secret rotation. | `TestCertificateManager_Workflow`<br/>`TestChaos_ZeroReloadCertificateRotation` |
-| **Traffic Analytics** | Milestone 6 | Vitter's Algorithm R reservoir sampling for exact p50/p95/p99 latency percentiles with zero heap allocations, time-series aggregation, bandwidth metering for billing. | `TestReservoirSampler_Percentiles`<br/>`TestEngine_TimeSeriesAndBilling` |
+| **Traffic Analytics** | Milestone 6 | Vitter's Algorithm R reservoir sampling for exact p50/p90/p95/p99 latency percentiles with zero heap allocations, time-series aggregation, bandwidth metering for billing. | `TestReservoirSampler_Percentiles`<br/>`TestEngine_TimeSeriesAndBilling` |
 | **Simulated Multi-PoP Mesh** | Milestone 7 | In-memory BGP Route Health Injection (RHI) / Withdrawal state model, Inter-PoP Latency Matrix, Local Metro Geo-Steering across simulated Dhaka, Singapore, Frankfurt, and Virginia PoPs. | `TestPoPManager_BGPRouteLifecycle`<br/>`TestPoPManager_LatencyMatrixAndSteering` |
 | **Stress & Hardening** | Milestone 8 | In-process high-concurrency pipeline saturation (>100k ops/sec), chaos injection testing (origin death, BGP drain, telemetry flood), and master operational runbooks. | `TestHighConcurrency_Pipeline`<br/>`TestChaos_PoPNetworkDrainAndAnycastFailover` |
 
@@ -253,7 +253,7 @@ Every subsystem in the repository is strictly tracked against our 6-stage lifecy
 ### System Prerequisites
 - Go 1.23+ (`go version`)
 - Rust 1.82+ (`rustc --version`)
-- Python 3.14+ (`python --version`)
+- Python 3.12+ (`python --version`)
 
 ### 1. Build and Run the Edge Config Controller
 ```bash
@@ -268,7 +268,7 @@ curl -s -X POST http://127.0.0.1:9091/v1/projects/prj-enterprise-01/domains \
   -H "Content-Type: application/json" \
   -H "X-API-Key: dev-fixture-key-01" \
   -d '{
-    "hostname": "api.dev.internal",
+    "hostname": "api.dev.example.com",
     "origin_address": "198.51.100.10",
     "origin_port": 443,
     "origin_protocol": "HTTPS"

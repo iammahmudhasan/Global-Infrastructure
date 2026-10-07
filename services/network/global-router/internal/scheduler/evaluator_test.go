@@ -131,6 +131,7 @@ func TestIdempotency(t *testing.T) {
 	policy := scheduler.DispatchPolicy{
 		WorkloadID:     "workload-idem-1",
 		TenantID:       "tenant-ai-labs",
+		ProjectID:      "proj-alpha",
 		Name:           "Idempotent Dispatch",
 		Residency:      registry.ResidencyUS,
 		Objective:      scheduler.ObjectiveCost,
@@ -149,5 +150,97 @@ func TestIdempotency(t *testing.T) {
 
 	if decision1 != decision2 {
 		t.Errorf("expected identical cached pointer for idempotent key")
+	}
+}
+
+func TestProjectScopedIdempotencyIsolation(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	policyA := scheduler.DispatchPolicy{
+		WorkloadID:     "workload-p1",
+		TenantID:       "tenant-ai-labs",
+		ProjectID:      "proj-finance",
+		Name:           "Finance Dispatch",
+		Residency:      registry.ResidencyUS,
+		Objective:      scheduler.ObjectiveCost,
+		IdempotencyKey: "shared-key-100",
+	}
+
+	policyB := scheduler.DispatchPolicy{
+		WorkloadID:     "workload-p2",
+		TenantID:       "tenant-ai-labs",
+		ProjectID:      "proj-marketing",
+		Name:           "Marketing Dispatch",
+		Residency:      registry.ResidencyUS,
+		Objective:      scheduler.ObjectiveCost,
+		IdempotencyKey: "shared-key-100",
+	}
+
+	decA, err := eval.Evaluate(policyA)
+	if err != nil {
+		t.Fatalf("policyA evaluation failed: %v", err)
+	}
+
+	decB, err := eval.Evaluate(policyB)
+	if err != nil {
+		t.Fatalf("policyB evaluation failed: %v", err)
+	}
+
+	if decA.WorkloadID == decB.WorkloadID {
+		t.Errorf("expected different workloads across projects despite identical idempotency key")
+	}
+	if decA.ProjectID != "proj-finance" || decB.ProjectID != "proj-marketing" {
+		t.Errorf("expected project IDs to be preserved")
+	}
+}
+
+func TestCapacityDepletionAndReservation(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	// bd-dhaka-dgx01 has 8 H100 GPUs default
+	b, err := reg.Get("bd-dhaka-dgx01")
+	if err != nil {
+		t.Fatalf("failed to get bd-dhaka-dgx01: %v", err)
+	}
+	initialGPUs := b.AvailableGPUs
+
+	// Request 6 GPUs with strict Bangladesh residency
+	policy1 := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-cap-1",
+		TenantID:          "tenant-fintech",
+		Residency:         registry.ResidencyBangladesh,
+		StrictSovereignty: true,
+		GPUsRequested:     6,
+		Objective:         scheduler.ObjectiveLatency,
+	}
+
+	dec1, err := eval.Evaluate(policy1)
+	if err != nil {
+		t.Fatalf("expected successful placement for 6 GPUs, got: %v", err)
+	}
+	if dec1.AssignedBackend.ID != "bd-dhaka-dgx01" {
+		t.Fatalf("expected bd-dhaka-dgx01, got: %s", dec1.AssignedBackend.ID)
+	}
+
+	bAfter, _ := reg.Get("bd-dhaka-dgx01")
+	if bAfter.AvailableGPUs != initialGPUs-6 {
+		t.Errorf("expected %d available GPUs, got: %d", initialGPUs-6, bAfter.AvailableGPUs)
+	}
+
+	// Request 4 more GPUs with strict Bangladesh residency (only 2 left)
+	policy2 := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-cap-2",
+		TenantID:          "tenant-fintech",
+		Residency:         registry.ResidencyBangladesh,
+		StrictSovereignty: true,
+		GPUsRequested:     4,
+		Objective:         scheduler.ObjectiveLatency,
+	}
+
+	_, err2 := eval.Evaluate(policy2)
+	if err2 == nil {
+		t.Fatalf("expected failure due to capacity exhaustion, got nil error")
 	}
 }

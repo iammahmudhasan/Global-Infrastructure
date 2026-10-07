@@ -105,13 +105,25 @@ func TestAPIWorkflow(t *testing.T) {
 	}
 
 	_ = json.Unmarshal(w.Body.Bytes(), &envoyCfg)
-	if len(envoyCfg.StaticResources.Clusters) != 1 {
-		t.Fatalf("expected 1 cluster in Envoy config, got %d", len(envoyCfg.StaticResources.Clusters))
+	var customerCluster *compiler.Cluster
+	var foundACME bool
+	for i := range envoyCfg.StaticResources.Clusters {
+		cl := &envoyCfg.StaticResources.Clusters[i]
+		if cl.Name == "acme_challenge_service" {
+			foundACME = true
+		} else {
+			customerCluster = cl
+		}
 	}
-
-	endpoints := envoyCfg.StaticResources.Clusters[0].LoadAssignment.Endpoints[0].LbEndpoints
+	if !foundACME {
+		t.Fatalf("expected acme_challenge_service cluster to be present in Envoy config")
+	}
+	if customerCluster == nil {
+		t.Fatalf("expected customer origin cluster in Envoy config")
+	}
+	endpoints := customerCluster.LoadAssignment.Endpoints[0].LbEndpoints
 	if len(endpoints) != 2 {
-		t.Fatalf("expected 2 endpoints in cluster, got %d", len(endpoints))
+		t.Fatalf("expected 2 endpoints in customer cluster, got %d", len(endpoints))
 	}
 
 	// 7. Add Custom WAF Rule
