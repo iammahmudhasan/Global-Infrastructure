@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package nexusedge.v1;
+
+option go_package = "github.com/iammahmudhasan/nexusedge-control-plane/proto/nexusedge/v1;nexusedgev1";
+
+// WorkloadType defines the fundamental execution classification
+enum WorkloadType {
+  WORKLOAD_TYPE_UNSPECIFIED = 0;
+  WORKLOAD_TYPE_STATIC_CONTENT = 1;      // Edge Cached / CDN asset
+  WORKLOAD_TYPE_API_GATEWAY = 2;         // Ingress API proxied via Envoy + Rust
+  WORKLOAD_TYPE_CONTAINER_POD = 3;       // Kubernetes + Cilium container
+  WORKLOAD_TYPE_MICROVM_FIRECRACKER = 4; // Isolated microVM for untrusted code
+  WORKLOAD_TYPE_GPU_INFERENCE = 5;       // vLLM / SGLang / Dynamo distributed inference
+  WORKLOAD_TYPE_AGENTIC_LOOP = 6;        // Persistent multi-turn reasoning agent with KV-cache
+  WORKLOAD_TYPE_DATABASE_VOLUME = 7;     // Persistent state mounted via Ceph RBD/S3
+}
+
+// DataJurisdiction defines sovereign regulatory legal residency
+enum DataJurisdiction {
+  DATA_JURISDICTION_UNSPECIFIED = 0;
+  DATA_JURISDICTION_ANY = 1;
+  DATA_JURISDICTION_BANGLADESH = 2; // National Data Management Act 2026 / CII Compliant
+  DATA_JURISDICTION_EU = 3;         // GDPR & EU AI Act
+  DATA_JURISDICTION_US = 4;
+  DATA_JURISDICTION_SINGAPORE = 5;
+}
+
+// WorkloadSpec describes customer constraints and requirements
+message WorkloadSpec {
+  string workload_id = 1;
+  string tenant_id = 2;
+  string name = 3;
+  WorkloadType type = 4;
+  DataJurisdiction jurisdiction = 5;
+  bool strict_sovereignty = 6;
+  
+  // Quality of Service & Economic Constraints
+  uint32 max_latency_p95_ms = 7;
+  double max_cost_budget_usd = 8;
+  
+  // Resource Requirements
+  uint32 cpu_millicores = 9;
+  uint64 memory_bytes = 10;
+  uint32 gpu_count = 11;
+  string required_gpu_model = 12; // "H100", "B200", "L40S", "A100"
+}
+
+// WorkloadStatus reflects the runtime location and health
+message WorkloadStatus {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PENDING = 1;
+    PHASE_OPTIMIZING = 2;
+    PHASE_SCHEDULED = 3;
+    PHASE_RUNNING = 4;
+    PHASE_FAILED = 5;
+  }
+  
+  Phase phase = 1;
+  string assigned_region = 2;
+  string assigned_node = 3;
+  string assigned_provider = 4; // "baremetal-dhaka", "aws", "gcp", "coreweave"
+  uint32 measured_latency_ms = 5;
+  double current_cost_rate_usd = 6;
+  string routing_reason = 7;
+}
+
+message ScheduleWorkloadRequest {
+  WorkloadSpec spec = 1;
+}
+
+message ScheduleWorkloadResponse {
+  string workload_id = 1;
+  WorkloadStatus status = 2;
+  string ingress_endpoint = 3;
+}
+
+// WorkloadService manages universal workloads across the global fabric
+service WorkloadService {
+  rpc ScheduleWorkload(ScheduleWorkloadRequest) returns (ScheduleWorkloadResponse);
+}
