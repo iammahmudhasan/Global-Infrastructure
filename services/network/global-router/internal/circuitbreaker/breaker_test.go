@@ -56,3 +56,34 @@ func TestCircuitBreakerFullLifecycle(t *testing.T) {
 		t.Errorf("expected failure count reset to 0, got: %d", cb.Failures())
 	}
 }
+
+func TestCircuitBreaker_ReleaseTrial(t *testing.T) {
+	cb := circuitbreaker.New("cw-gpu-trial-node", 1, 15*time.Millisecond)
+
+	// Fail and trip to OPEN
+	cb.RecordFailure()
+	if cb.State() != circuitbreaker.StateOpen {
+		t.Fatalf("expected StateOpen, got: %s", cb.State())
+	}
+
+	// Sleep past reset timeout to allow transition to HALF_OPEN
+	time.Sleep(20 * time.Millisecond)
+
+	// First probe allowed in HALF_OPEN (trialInFlight becomes true)
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("expected trial allowed, got: %v", err)
+	}
+
+	// Immediate next probe rejected because trial is in flight
+	if err := cb.Allow(); err != circuitbreaker.ErrCircuitOpen {
+		t.Fatalf("expected ErrCircuitOpen while trial in flight, got: %v", err)
+	}
+
+	// Release trial without record success/failure (e.g. reservation race failed)
+	cb.ReleaseTrial()
+
+	// Another probe must now be allowed without having to wait for another timeout
+	if err := cb.Allow(); err != nil {
+		t.Fatalf("expected new trial allowed after ReleaseTrial, got: %v", err)
+	}
+}

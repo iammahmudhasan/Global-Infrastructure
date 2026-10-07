@@ -1,6 +1,8 @@
 package compiler_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -387,5 +389,228 @@ func TestCompiler_TLSSettingsAndHSTSIntegration(t *testing.T) {
 	// Verify HSTS response header injection
 	if !strings.Contains(cfgStr, "Strict-Transport-Security") || !strings.Contains(cfgStr, "max-age=63072000; includeSubDomains") {
 		t.Errorf("expected VirtualHost to include Strict-Transport-Security response header")
+	}
+}
+
+func TestCompiler_DeterministicOutput(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	// Create 5 different domains with origins and certificates
+	hostnames := []string{"zeta.example.com", "alpha.example.com", "beta.example.com", "gamma.example.com", "delta.example.com"}
+	for _, h := range hostnames {
+		res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+			ProjectID:      "prj_determ",
+			Hostname:       h,
+			OriginAddress:  "origin." + h,
+			OriginPort:     443,
+			OriginProtocol: "HTTPS",
+		})
+		if err != nil {
+			t.Fatalf("onboard error for %s: %v", h, err)
+		}
+		if _, err := svc.VerifyDomain(res.DomainID); err != nil {
+			t.Fatalf("verify error for %s: %v", h, err)
+		}
+		st.SaveCertificate(&model.Certificate{
+			ID:        "cert-" + res.DomainID,
+			DomainID:  res.DomainID,
+			Status:    model.CertStatusActive,
+			CertPEM:   "-----BEGIN CERTIFICATE-----\nMOCK\n-----END CERTIFICATE-----",
+			ExpiresAt: time.Now().Add(90 * 24 * time.Hour),
+		})
+	}
+
+	topologies := st.GetActiveTopologies()
+	if len(topologies) != len(hostnames) {
+		t.Fatalf("expected %d topologies, got %d", len(hostnames), len(topologies))
+	}
+
+	// Compile once to establish golden checksum and JSON
+	firstCfg, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("initial compile failed: %v", err)
+	}
+	firstJSON, err := firstCfg.ToJSON()
+	if err != nil {
+		t.Fatalf("failed to marshal first json: %v", err)
+	}
+	firstHash := sha256.Sum256(firstJSON)
+	firstChecksum := hex.EncodeToString(firstHash[:])
+
+	// Compile 30 times and verify that every run produces the exact identical JSON and SHA-256 checksum
+	for i := 0; i < 30; i++ {
+		cfg, err := comp.Compile(topologies)
+		if err != nil {
+			t.Fatalf("compile run %d failed: %v", i, err)
+		}
+		jsonBytes, err := cfg.ToJSON()
+		if err != nil {
+			t.Fatalf("marshal run %d failed: %v", i, err)
+		}
+		hash := sha256.Sum256(jsonBytes)
+		checksum := hex.EncodeToString(hash[:])
+
+		if checksum != firstChecksum {
+			t.Fatalf("non-deterministic compile detected on iteration %d: expected checksum %s, got %s", i, firstChecksum, checksum)
+		}
+		if string(jsonBytes) != string(firstJSON) {
+			t.Fatalf("non-deterministic JSON content detected on iteration %d", i)
+		}
+	}
+}
+
+func TestCompiler_EnforceHTTPS_Behavior(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	// Domain 1: cert active + EnforceHTTPS = true
+	res1, _ := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_https_1",
+		Hostname:       "redirect.example.com",
+		OriginAddress:  "origin1.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	svc.VerifyDomain(res1.DomainID)
+	st.SaveCertificate(&model.Certificate{
+		ID:        "cert-1",
+		DomainID:  res1.DomainID,
+		Status:    model.CertStatusActive,
+		CertPEM:   "-----BEGIN CERTIFICATE-----\nCERT1\n-----END CERTIFICATE-----",
+		ExpiresAt: time.Now().Add(90 * 24 * time.Hour),
+	})
+	st.SaveTLSSettings(res1.DomainID, &model.TLSSettings{
+		EnforceHTTPS:  true,
+		MinTLSVersion: "TLSv1.2",
+	})
+
+	// Domain 2: cert active + EnforceHTTPS = false
+	res2, _ := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_https_2",
+		Hostname:       "direct.example.com",
+		OriginAddress:  "origin2.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	svc.VerifyDomain(res2.DomainID)
+	st.SaveCertificate(&model.Certificate{
+		ID:        "cert-2",
+		DomainID:  res2.DomainID,
+		Status:    model.CertStatusActive,
+		CertPEM:   "-----BEGIN CERTIFICATE-----\nCERT2\n-----END CERTIFICATE-----",
+		ExpiresAt: time.Now().Add(90 * 24 * time.Hour),
+	})
+	st.SaveTLSSettings(res2.DomainID, &model.TLSSettings{
+		EnforceHTTPS:  false,
+		MinTLSVersion: "TLSv1.2",
+	})
+
+	// Domain 3: no cert (HTTP direct)
+	res3, _ := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_https_3",
+		Hostname:       "nocert.example.com",
+		OriginAddress:  "origin3.example.com",
+		OriginPort:     80,
+		OriginProtocol: "HTTP",
+	})
+	svc.VerifyDomain(res3.DomainID)
+
+	topologies := st.GetActiveTopologies()
+	cfg, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("failed to compile: %v", err)
+	}
+
+	// Listeners: Port 80 HTTP listener and Port 443 HTTPS listener must both exist
+	if len(cfg.StaticResources.Listeners) != 2 {
+		t.Fatalf("expected 2 listeners (HTTP + HTTPS), got %d", len(cfg.StaticResources.Listeners))
+	}
+
+	var httpListener *compiler.Listener
+	var httpsListener *compiler.Listener
+	for i := range cfg.StaticResources.Listeners {
+		l := &cfg.StaticResources.Listeners[i]
+		if l.Address.SocketAddress.PortValue == 80 {
+			httpListener = l
+		} else if l.Address.SocketAddress.PortValue == 443 {
+			httpsListener = l
+		}
+	}
+	if httpListener == nil || httpsListener == nil {
+		t.Fatalf("expected both HTTP (:80) and HTTPS (:443) listeners")
+	}
+
+	// Inspect HTTP listener virtual hosts
+	httpHCM := httpListener.FilterChains[0].Filters[0].TypedConfig
+	httpRouteCfg := httpHCM["route_config"].(map[string]interface{})
+	httpVhosts := httpRouteCfg["virtual_hosts"].([]compiler.VirtualHost)
+
+	vhostMap := make(map[string]compiler.VirtualHost)
+	for _, vh := range httpVhosts {
+		vhostMap[vh.Domains[0]] = vh
+	}
+
+	// Domain 1 (redirect.example.com):
+	// Must have ACME challenge route first, then "/" HTTPS redirect
+	vh1, ok := vhostMap["redirect.example.com"]
+	if !ok {
+		t.Fatalf("missing vhost for redirect.example.com")
+	}
+	if len(vh1.Routes) < 2 {
+		t.Fatalf("expected at least 2 routes for redirect.example.com, got %d", len(vh1.Routes))
+	}
+	if vh1.Routes[0].Match.Prefix != "/.well-known/acme-challenge/" {
+		t.Errorf("expected route 0 to be ACME challenge bypass, got %s", vh1.Routes[0].Match.Prefix)
+	}
+	if vh1.Routes[1].Redirect == nil || !vh1.Routes[1].Redirect.HttpsRedirect {
+		t.Errorf("expected route 1 to have HttpsRedirect: true for redirect.example.com")
+	}
+
+	// Domain 2 (direct.example.com, EnforceHTTPS=false):
+	// Must have ACME challenge route first, then direct customer routes (NO HttpsRedirect!)
+	vh2, ok := vhostMap["direct.example.com"]
+	if !ok {
+		t.Fatalf("missing vhost for direct.example.com")
+	}
+	if len(vh2.Routes) < 2 {
+		t.Fatalf("expected at least 2 routes for direct.example.com, got %d", len(vh2.Routes))
+	}
+	if vh2.Routes[0].Match.Prefix != "/.well-known/acme-challenge/" {
+		t.Errorf("expected route 0 to be ACME challenge bypass, got %s", vh2.Routes[0].Match.Prefix)
+	}
+	for _, r := range vh2.Routes {
+		if r.Redirect != nil && r.Redirect.HttpsRedirect {
+			t.Errorf("direct.example.com with EnforceHTTPS=false must NOT have HttpsRedirect")
+		}
+	}
+	// Verify customer route to cluster exists on HTTP port 80
+	hasClusterRoute := false
+	for _, r := range vh2.Routes {
+		if r.Route != nil && strings.HasPrefix(r.Route.Cluster, "cluster_") {
+			hasClusterRoute = true
+			break
+		}
+	}
+	if !hasClusterRoute {
+		t.Errorf("direct.example.com on HTTP port 80 must have customer cluster route")
+	}
+
+	// Domain 3 (nocert.example.com):
+	// Must have ACME challenge route first, then direct customer routes
+	vh3, ok := vhostMap["nocert.example.com"]
+	if !ok {
+		t.Fatalf("missing vhost for nocert.example.com")
+	}
+	for _, r := range vh3.Routes {
+		if r.Redirect != nil && r.Redirect.HttpsRedirect {
+			t.Errorf("nocert.example.com without certificate must NOT have HttpsRedirect")
+		}
 	}
 }

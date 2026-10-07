@@ -3,6 +3,7 @@ package registry_test
 import (
 	"testing"
 
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 )
 
@@ -124,5 +125,41 @@ func TestRegistry_CircuitBreakerIsolationAndDeterministicList(t *testing.T) {
 		if list[i-1].ID >= list[i].ID {
 			t.Errorf("expected list to be sorted by ID ascending, but %s >= %s", list[i-1].ID, list[i].ID)
 		}
+	}
+}
+
+func TestRegistry_AdmitAndReserve(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	// 1. Normal successful admission and reservation
+	err := reg.AdmitAndReserve("workload-1", "bd-dhaka-dgx01", 2)
+	if err != nil {
+		t.Fatalf("expected successful AdmitAndReserve, got: %v", err)
+	}
+
+	// Double reservation for same workload must fail
+	if err := reg.AdmitAndReserve("workload-1", "bd-dhaka-dgx01", 1); err != registry.ErrReservationExists {
+		t.Errorf("expected ErrReservationExists, got: %v", err)
+	}
+
+	// 2. Insufficient capacity must fail and release trial
+	// bd-dhaka-dgx01 has 8 GPUs total, 2 reserved -> 6 available
+	if err := reg.AdmitAndReserve("workload-big", "bd-dhaka-dgx01", 100); err != registry.ErrInsufficientCapacity {
+		t.Errorf("expected ErrInsufficientCapacity, got: %v", err)
+	}
+
+	// Release workload-1
+	_ = reg.Release("workload-1")
+
+	// 3. Circuit breaker OPEN must reject AdmitAndReserve
+	for i := 0; i < 3; i++ {
+		reg.UpdateHealth("bd-dhaka-dgx01", 999, false)
+	}
+	if reg.CircuitState("bd-dhaka-dgx01") != circuitbreaker.StateOpen {
+		t.Fatalf("expected StateOpen")
+	}
+
+	if err := reg.AdmitAndReserve("workload-cb", "bd-dhaka-dgx01", 1); err != circuitbreaker.ErrCircuitOpen {
+		t.Errorf("expected ErrCircuitOpen, got: %v", err)
 	}
 }

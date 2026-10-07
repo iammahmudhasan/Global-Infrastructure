@@ -108,3 +108,10 @@ func (cb *CircuitBreaker) Failures() int {
 	defer cb.mu.RUnlock()
 	return cb.failureCount
 }
+
+// ReleaseTrial resets an in-flight trial probe flag when downstream reservation fails
+func (cb *CircuitBreaker) ReleaseTrial() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.trialInFlight = false
+}

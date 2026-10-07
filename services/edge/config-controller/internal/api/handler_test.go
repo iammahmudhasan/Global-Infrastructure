@@ -1329,3 +1329,47 @@ func TestEdgeNodeHeartbeat_IdentityBinding(t *testing.T) {
 		t.Fatalf("expected 200 for operator heartbeat, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestPoPAndRoutingAccessControl(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterTenantWithRole("key-tenant-user", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+	authInst.RegisterTenantWithRole("key-operator-user", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
+	authInst.RegisterNode("key-node-user", "tenant-infra", "proj-infra", "edge-node-01")
+
+	endpoints := []string{
+		"/v1/edge/pops",
+		"/v1/edge/pops/dhaka",
+		"/v1/edge/routing/matrix",
+	}
+
+	for _, ep := range endpoints {
+		// 1. Regular tenant -> 403 Forbidden
+		req := httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("X-API-Key", "key-tenant-user")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("expected 403 Forbidden for tenant on %s, got %d: %s", ep, w.Code, w.Body.String())
+		}
+
+		// 2. Platform operator -> 200 OK
+		req = httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("X-API-Key", "key-operator-user")
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for operator on %s, got %d: %s", ep, w.Code, w.Body.String())
+		}
+
+		// 3. Edge node -> 200 OK
+		req = httptest.NewRequest(http.MethodGet, ep, nil)
+		req.Header.Set("X-API-Key", "key-node-user")
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 OK for edge node on %s, got %d: %s", ep, w.Code, w.Body.String())
+		}
+	}
+}

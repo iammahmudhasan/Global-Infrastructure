@@ -166,11 +166,8 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 
 		for _, item := range fallbackList {
 			b := item.backend
-			// Enforce circuit breaker admission guard (Trial probe in HALF_OPEN state)
-			if err := e.reg.AllowBackend(b.ID); err != nil {
-				continue
-			}
-			if err := e.reg.Reserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
+			// Atomically check circuit breaker admission and reserve capacity
+			if err := e.reg.AdmitAndReserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
 				decision := &DispatchDecision{
 					WorkloadID:      policy.WorkloadID,
 					TenantID:        policy.TenantID,
@@ -238,10 +235,8 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	var bestScore float64
 
 	for _, item := range scored {
-		if err := e.reg.AllowBackend(item.backend.ID); err != nil {
-			continue
-		}
-		if err := e.reg.Reserve(policy.WorkloadID, item.backend.ID, gpusReq); err == nil {
+		// Atomically check circuit breaker admission and reserve capacity
+		if err := e.reg.AdmitAndReserve(policy.WorkloadID, item.backend.ID, gpusReq); err == nil {
 			bestBackend = item.backend
 			bestScore = item.score
 			break

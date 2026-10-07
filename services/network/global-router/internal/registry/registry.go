@@ -263,6 +263,50 @@ func (r *Registry) UpdateHealth(id string, latencyMs int, healthy bool) {
 	}
 }
 
+// AdmitAndReserve atomically checks circuit breaker admission and reserves compute capacity.
+// If the breaker is in HALF_OPEN state and admits a trial, but capacity reservation fails,
+// the trial in flight is immediately released to prevent deadlock (P2/P1 Finding).
+func (r *Registry) AdmitAndReserve(workloadID, backendID string, count int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.reservations[workloadID]; exists {
+		return ErrReservationExists
+	}
+
+	b, ok := r.backends[backendID]
+	if !ok {
+		return ErrBackendNotFound
+	}
+
+	if b.Breaker != nil {
+		if err := b.Breaker.Allow(); err != nil {
+			return err
+		}
+	}
+
+	if count <= 0 {
+		count = 1
+	}
+
+	if b.AvailableGPUs < count {
+		if b.Breaker != nil {
+			b.Breaker.ReleaseTrial()
+		}
+		return ErrInsufficientCapacity
+	}
+
+	b.AvailableGPUs -= count
+	b.ActiveWorkloads++
+	r.reservations[workloadID] = &Reservation{
+		WorkloadID: workloadID,
+		BackendID:  backendID,
+		GPUs:       count,
+		ReservedAt: time.Now().UTC(),
+	}
+	return nil
+}
+
 // Reserve tracks capacity ownership by a specific workload, preventing double reservations
 func (r *Registry) Reserve(workloadID, backendID string, count int) error {
 	r.mu.Lock()

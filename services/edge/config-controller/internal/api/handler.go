@@ -1479,6 +1479,10 @@ func (h *APIHandler) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
 	pops := h.popManager.ListPoPs()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total_pops": len(pops),
@@ -1499,6 +1503,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
+			if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+				writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+				return
+			}
 			pop, err := h.popManager.GetPoP(popID)
 			if err != nil {
 				writeError(w, http.StatusNotFound, err.Error())
@@ -1663,6 +1671,10 @@ func (h *APIHandler) handleRoutingRoute(w http.ResponseWriter, r *http.Request) 
 	case "matrix":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
 			return
 		}
 		matrix := h.popManager.GetLatencyMatrix()

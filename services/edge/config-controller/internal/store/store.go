@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
@@ -614,7 +616,7 @@ func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {
 		return cloneTLSSettings(st)
 	}
 	return &model.TLSSettings{
-		EnforceHTTPS:  false,
+		EnforceHTTPS:  true,
 		MinTLSVersion: "TLSv1.2",
 	}
 }
@@ -663,5 +665,24 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 
 		topologies = append(topologies, topo)
 	}
+
+	sort.Slice(topologies, func(i, j int) bool {
+		if topologies[i].Domain == nil {
+			return false
+		}
+		if topologies[j].Domain == nil {
+			return true
+		}
+
+		left := strings.ToLower(topologies[i].Domain.Hostname)
+		right := strings.ToLower(topologies[j].Domain.Hostname)
+
+		if left != right {
+			return left < right
+		}
+
+		return topologies[i].Domain.ID < topologies[j].Domain.ID
+	})
+
 	return topologies
 }

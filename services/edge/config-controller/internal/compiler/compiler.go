@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -199,7 +200,27 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 	httpsVirtualHosts := make([]VirtualHost, 0)
 	httpVirtualHosts := make([]VirtualHost, 0)
 
-	for _, topo := range topologies {
+	// Sort topologies deterministically to prevent output jitter and false rollout churn (P1 Determinism)
+	orderedTopologies := append([]*store.DomainTopology(nil), topologies...)
+	sort.Slice(orderedTopologies, func(i, j int) bool {
+		if orderedTopologies[i].Domain == nil {
+			return false
+		}
+		if orderedTopologies[j].Domain == nil {
+			return true
+		}
+
+		left := strings.ToLower(orderedTopologies[i].Domain.Hostname)
+		right := strings.ToLower(orderedTopologies[j].Domain.Hostname)
+
+		if left != right {
+			return left < right
+		}
+
+		return orderedTopologies[i].Domain.ID < orderedTopologies[j].Domain.ID
+	})
+
+	for _, topo := range orderedTopologies {
 		if topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
 			continue // Invariant: Only compile active domains (Rule 17)
 		}
@@ -264,10 +285,27 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			}
 		}
 
-		// Also build an HTTP redirect virtual host with ACME challenge bypass
+		// Per-Domain TLS and EnforceHTTPS Policy Evaluation (P1 Audit)
+		hasActiveCert := topo.Certificate != nil &&
+			topo.Certificate.Status == model.CertStatusActive &&
+			topo.Certificate.CertPEM != ""
+
+		enforceHTTPS := hasActiveCert
+		if topo.TLSSettings != nil {
+			enforceHTTPS = topo.TLSSettings.EnforceHTTPS && hasActiveCert
+		}
+
+		// Build HTTP virtual host:
+		// Always bypass ACME HTTP-01 challenge before evaluating customer routing or redirects.
+		httpVhName := fmt.Sprintf("http_redirect_%s", sanitizeName(hostname))
+		if !enforceHTTPS {
+			httpVhName = fmt.Sprintf("http_direct_%s", sanitizeName(hostname))
+		}
+
 		httpVh := VirtualHost{
-			Name:    fmt.Sprintf("http_redirect_%s", sanitizeName(hostname)),
-			Domains: []string{hostname, fmt.Sprintf("%s:*", hostname)},
+			Name:                 httpVhName,
+			Domains:              []string{hostname, fmt.Sprintf("%s:*", hostname)},
+			TypedPerFilterConfig: vh.TypedPerFilterConfig,
 			Routes: []Route{
 				{
 					Match: RouteMatch{Prefix: "/.well-known/acme-challenge/"},
@@ -276,17 +314,11 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 						Timeout: "5s",
 					},
 				},
-				{
-					Match: RouteMatch{Prefix: "/"},
-					Redirect: &RedirectAction{
-						HttpsRedirect: true,
-					},
-				},
 			},
 		}
-		httpVirtualHosts = append(httpVirtualHosts, httpVh)
 
-		// Process routes and their upstream clusters
+		// Process customer routes and their upstream clusters
+		customerRoutes := make([]Route, 0)
 		for _, r := range topo.Routes {
 			pool, exists := topo.Pools[r.PoolID]
 			if !exists || pool == nil || len(pool.Origins) == 0 {
@@ -300,7 +332,7 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 				timeoutStr = fmt.Sprintf("%.2fs", float64(r.TimeoutMs)/1000.0)
 			}
 
-			vh.Routes = append(vh.Routes, Route{
+			routeObj := Route{
 				Match: RouteMatch{
 					Prefix: r.PathPrefix,
 				},
@@ -312,7 +344,9 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 						NumRetries: 2,
 					},
 				},
-			})
+			}
+			customerRoutes = append(customerRoutes, routeObj)
+			vh.Routes = append(vh.Routes, routeObj)
 
 			// Add cluster to map if not already built
 			if _, alreadyExists := clustersMap[clusterName]; !alreadyExists {
@@ -321,32 +355,57 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			}
 		}
 
+		if enforceHTTPS {
+			httpVh.Routes = append(httpVh.Routes, Route{
+				Match: RouteMatch{Prefix: "/"},
+				Redirect: &RedirectAction{
+					HttpsRedirect: true,
+				},
+			})
+		} else {
+			httpVh.Routes = append(httpVh.Routes, customerRoutes...)
+		}
+
+		httpVirtualHosts = append(httpVirtualHosts, httpVh)
 		httpsVirtualHosts = append(httpsVirtualHosts, vh)
 	}
 
-	// Determine if any active domain has a valid TLS certificate
+	// Determine if any active domain has a valid TLS certificate and if any domain serves direct HTTP
 	hasCertificates := false
-	for _, topo := range topologies {
-		if topo.Certificate != nil && topo.Certificate.Status == model.CertStatusActive && topo.Certificate.CertPEM != "" {
+	anyServingDirectHTTP := false
+	for _, topo := range orderedTopologies {
+		if topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
+			continue
+		}
+		hasActiveCert := topo.Certificate != nil &&
+			topo.Certificate.Status == model.CertStatusActive &&
+			topo.Certificate.CertPEM != ""
+		if hasActiveCert {
 			hasCertificates = true
-			break
+		}
+		enforceHTTPS := hasActiveCert
+		if topo.TLSSettings != nil {
+			enforceHTTPS = topo.TLSSettings.EnforceHTTPS && hasActiveCert
+		}
+		if !enforceHTTPS {
+			anyServingDirectHTTP = true
 		}
 	}
 
-	// 1. Build Port 80 HTTP Ingress Listener:
-	// If active TLS certificates exist, port 80 redirects to HTTPS (with ACME challenge bypass).
-	// If no TLS certificates exist yet, port 80 serves active customer HTTP routes directly with WAF & rate limits.
+	// 1. Build Ingress Listeners:
+	// If active TLS certificates exist, port 443 HTTPS listener is constructed.
+	// Port 80 HTTP listener serves redirects or direct routes depending on EnforceHTTPS policies.
 	if hasCertificates {
-		httpListener := c.buildHTTPListener(httpVirtualHosts, topologies, false)
+		httpListener := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, anyServingDirectHTTP)
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 
-		httpsListener := c.buildHTTPSListener(httpsVirtualHosts, topologies)
+		httpsListener := c.buildHTTPSListener(httpsVirtualHosts, orderedTopologies)
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
 		// Register SDS gRPC cluster so DownstreamTlsContext has no dangling cluster reference (P0 Finding 6B)
 		clustersMap["sds-grpc-cluster"] = c.buildSDSCluster()
 	} else {
 		// When only HTTP is available before TLS issuance, serve customer routes directly on port 80
-		httpListener := c.buildHTTPListener(httpsVirtualHosts, topologies, true)
+		httpListener := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, true)
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 	}
 
@@ -355,9 +414,15 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 		clustersMap["acme_challenge_service"] = c.buildACMECluster()
 	}
 
-	// 2. Collect all unique upstream clusters
-	for _, cluster := range clustersMap {
-		config.StaticResources.Clusters = append(config.StaticResources.Clusters, cluster)
+	// 2. Collect all unique upstream clusters with deterministic alphabetical ordering (P1 Determinism)
+	clusterNames := make([]string, 0, len(clustersMap))
+	for name := range clustersMap {
+		clusterNames = append(clusterNames, name)
+	}
+	sort.Strings(clusterNames)
+
+	for _, name := range clusterNames {
+		config.StaticResources.Clusters = append(config.StaticResources.Clusters, clustersMap[name])
 	}
 
 	return config, nil
