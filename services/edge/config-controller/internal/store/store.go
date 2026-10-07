@@ -24,6 +24,7 @@ type Store struct {
 	rateLimits   map[string][]model.RateLimitRule   // domain ID -> Rate limit rules
 	events       map[string][]model.SecurityEvent   // domain ID -> Security events
 	cache        map[string]*model.CachePolicy      // domain ID -> policy
+	cacheRules   map[string][]model.CacheRule       // domain ID -> Cache rules
 	certificates map[string]*model.Certificate      // domain ID -> certificate
 }
 
@@ -39,6 +40,7 @@ func NewStore() *Store {
 		rateLimits:   make(map[string][]model.RateLimitRule),
 		events:       make(map[string][]model.SecurityEvent),
 		cache:        make(map[string]*model.CachePolicy),
+		cacheRules:   make(map[string][]model.CacheRule),
 		certificates: make(map[string]*model.Certificate),
 	}
 }
@@ -269,6 +271,56 @@ func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
 	return s.cache[domainID]
 }
 
+func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.domains[domainID]; !exists {
+		return ErrNotFound
+	}
+	s.cacheRules[domainID] = append(s.cacheRules[domainID], rule)
+	if s.cache[domainID] != nil {
+		s.cache[domainID].CacheRules = s.cacheRules[domainID]
+	}
+	return nil
+}
+
+func (s *Store) GetCacheRules(domainID string) []model.CacheRule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cacheRules[domainID]
+}
+
+func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rules, exists := s.cacheRules[domainID]
+	if !exists {
+		return ErrNotFound
+	}
+
+	filtered := make([]model.CacheRule, 0, len(rules))
+	found := false
+	for _, r := range rules {
+		if r.ID == ruleID {
+			found = true
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+
+	if !found {
+		return ErrNotFound
+	}
+
+	s.cacheRules[domainID] = filtered
+	if s.cache[domainID] != nil {
+		s.cache[domainID].CacheRules = filtered
+	}
+	return nil
+}
+
 type DomainTopology struct {
 	Domain   *model.Domain
 	Routes   []*model.Route
@@ -295,12 +347,17 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 			secPolicy.RateLimitRules = s.rateLimits[d.ID]
 		}
 
+		cachePolicy := s.cache[d.ID]
+		if cachePolicy != nil {
+			cachePolicy.CacheRules = s.cacheRules[d.ID]
+		}
+
 		topo := &DomainTopology{
 			Domain:   d,
 			Routes:   s.routes[d.ID],
 			Pools:    make(map[string]*model.OriginPool),
 			Security: secPolicy,
-			Cache:    s.cache[d.ID],
+			Cache:    cachePolicy,
 		}
 
 		for _, r := range topo.Routes {

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
@@ -18,20 +19,22 @@ import (
 )
 
 type APIHandler struct {
-	store     *store.Store
-	service   *onboarding.DomainService
-	compiler  *compiler.Compiler
-	wafEngine *security.WAFEngine
-	mux       *http.ServeMux
+	store       *store.Store
+	service     *onboarding.DomainService
+	compiler    *compiler.Compiler
+	wafEngine   *security.WAFEngine
+	cacheEngine *cache.CacheEngine
+	mux         *http.ServeMux
 }
 
 func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
 	h := &APIHandler{
-		store:     s,
-		service:   svc,
-		compiler:  c,
-		wafEngine: security.NewWAFEngine(),
-		mux:       http.NewServeMux(),
+		store:       s,
+		service:     svc,
+		compiler:    c,
+		wafEngine:   security.NewWAFEngine(),
+		cacheEngine: cache.NewCacheEngine(100000),
+		mux:         http.NewServeMux(),
 	}
 	h.registerRoutes()
 	return h
@@ -58,6 +61,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/envoy-config", h.handleEnvoyConfig)
 	h.mux.HandleFunc("/v1/edge/topologies", h.handleTopologies)
 	h.mux.HandleFunc("/v1/edge/evaluate", h.handleEvaluate)
+	h.mux.HandleFunc("/v1/edge/cache-lookup", h.handleCacheLookup)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +130,7 @@ func (h *APIHandler) handleListDomains(w http.ResponseWriter, r *http.Request, p
 	})
 }
 
-// /v1/domains/{domain_id}[/verify, /origins, /waf/rules, /rate-limits, /security/events]
+// /v1/domains/{domain_id}[/verify, /origins, /waf/rules, /rate-limits, /security/events, /cache/...]
 func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/domains/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -205,6 +209,40 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		writeError(w, http.StatusNotFound, "unknown security endpoint")
+	case "cache":
+		// /v1/domains/{domain_id}/cache/[policy, rules, purge]
+		if len(parts) >= 3 {
+			switch parts[2] {
+			case "policy":
+				if r.Method == http.MethodGet {
+					h.handleGetCachePolicy(w, r, domainID)
+					return
+				}
+				if r.Method == http.MethodPatch || r.Method == http.MethodPut {
+					h.handleUpdateCachePolicy(w, r, domainID)
+					return
+				}
+			case "rules":
+				if len(parts) == 4 && r.Method == http.MethodDelete {
+					h.handleDeleteCacheRule(w, r, domainID, parts[3])
+					return
+				}
+				if r.Method == http.MethodPost {
+					h.handleAddCacheRule(w, r, domainID)
+					return
+				}
+				if r.Method == http.MethodGet {
+					h.handleListCacheRules(w, r, domainID)
+					return
+				}
+			case "purge":
+				if r.Method == http.MethodPost {
+					h.handlePurgeCache(w, r, domainID)
+					return
+				}
+			}
+		}
+		writeError(w, http.StatusNotFound, "unknown cache endpoint")
 	default:
 		writeError(w, http.StatusNotFound, "unknown domain action")
 	}
@@ -407,6 +445,248 @@ func (h *APIHandler) handleGetSecurityEvents(w http.ResponseWriter, r *http.Requ
 		"domain_id": domainID,
 		"events":    events,
 		"count":     len(events),
+	})
+}
+
+// GET /v1/domains/{domain_id}/cache/policy
+func (h *APIHandler) handleGetCachePolicy(w http.ResponseWriter, r *http.Request, domainID string) {
+	cp := h.store.GetCachePolicy(domainID)
+	if cp == nil {
+		writeError(w, http.StatusNotFound, "cache policy not found")
+		return
+	}
+	cp.CacheRules = h.store.GetCacheRules(domainID)
+	writeJSON(w, http.StatusOK, cp)
+}
+
+// PATCH /v1/domains/{domain_id}/cache/policy
+func (h *APIHandler) handleUpdateCachePolicy(w http.ResponseWriter, r *http.Request, domainID string) {
+	cp := h.store.GetCachePolicy(domainID)
+	if cp == nil {
+		writeError(w, http.StatusNotFound, "cache policy not found")
+		return
+	}
+
+	var update struct {
+		CacheEnabled         *bool                      `json:"cache_enabled"`
+		DefaultTTLSeconds    *int                       `json:"default_ttl_seconds"`
+		RespectOriginHeaders *bool                      `json:"respect_origin_headers"`
+		QueryHandling        *model.QueryStringHandling `json:"query_handling"`
+		StripCookies         *bool                      `json:"strip_cookies"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if update.CacheEnabled != nil {
+		cp.CacheEnabled = *update.CacheEnabled
+	}
+	if update.DefaultTTLSeconds != nil {
+		cp.DefaultTTLSeconds = *update.DefaultTTLSeconds
+	}
+	if update.RespectOriginHeaders != nil {
+		cp.RespectOriginHeaders = *update.RespectOriginHeaders
+	}
+	if update.QueryHandling != nil {
+		cp.QueryHandling = *update.QueryHandling
+	}
+	if update.StripCookies != nil {
+		cp.StripCookies = *update.StripCookies
+	}
+
+	h.store.SaveCachePolicy(cp)
+	cp.CacheRules = h.store.GetCacheRules(domainID)
+	writeJSON(w, http.StatusOK, cp)
+}
+
+// POST /v1/domains/{domain_id}/cache/rules
+func (h *APIHandler) handleAddCacheRule(w http.ResponseWriter, r *http.Request, domainID string) {
+	var rule model.CacheRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cache rule payload")
+		return
+	}
+
+	if rule.Name == "" || rule.PathPattern == "" {
+		writeError(w, http.StatusBadRequest, "name and path_pattern are required")
+		return
+	}
+	if rule.TTLSeconds <= 0 {
+		rule.TTLSeconds = 3600
+	}
+	rule.ID = "cache-rule-" + generateHex(4)
+	rule.DomainID = domainID
+	rule.Enabled = true
+
+	if err := h.store.AddCacheRule(domainID, rule); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, rule)
+}
+
+// GET /v1/domains/{domain_id}/cache/rules
+func (h *APIHandler) handleListCacheRules(w http.ResponseWriter, r *http.Request, domainID string) {
+	rules := h.store.GetCacheRules(domainID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"domain_id": domainID,
+		"rules":     rules,
+		"count":     len(rules),
+	})
+}
+
+// DELETE /v1/domains/{domain_id}/cache/rules/{rule_id}
+func (h *APIHandler) handleDeleteCacheRule(w http.ResponseWriter, r *http.Request, domainID, ruleID string) {
+	if err := h.store.DeleteCacheRule(domainID, ruleID); err != nil {
+		writeError(w, http.StatusNotFound, "cache rule not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "cache rule deleted successfully",
+		"rule_id": ruleID,
+	})
+}
+
+// POST /v1/domains/{domain_id}/cache/purge
+func (h *APIHandler) handlePurgeCache(w http.ResponseWriter, r *http.Request, domainID string) {
+	var body struct {
+		Target string `json:"target"` // URL, prefix, or "*" for everything
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+
+	target := body.Target
+	if target == "" {
+		domain, _ := h.store.GetDomain(domainID)
+		if domain != nil {
+			target = domain.Hostname
+		} else {
+			target = domainID
+		}
+	}
+
+	purged := h.cacheEngine.Purge(target)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":        "purged",
+		"domain_id":     domainID,
+		"target":        target,
+		"purged_count":  purged,
+		"invalidation":  "immediate",
+	})
+}
+
+type CacheLookupRequest struct {
+	DomainID        string            `json:"domain_id"`
+	Method          string            `json:"method"`
+	Path            string            `json:"path"`
+	Query           string            `json:"query"`
+	Headers         map[string]string `json:"headers"`
+	OriginResponse  *OriginResponse   `json:"origin_response,omitempty"`
+}
+
+type OriginResponse struct {
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers"`
+	Body       string            `json:"body"`
+}
+
+// POST /v1/edge/cache-lookup
+func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req CacheLookupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	domain, err := h.store.GetDomain(req.DomainID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+
+	policy := h.store.GetCachePolicy(req.DomainID)
+	if policy == nil {
+		writeError(w, http.StatusNotFound, "cache policy not found")
+		return
+	}
+	rules := h.store.GetCacheRules(req.DomainID)
+	matchingRule := cache.FindMatchingRule(req.Path, rules)
+
+	// Construct HTTP request for cacheability verification
+	httpReq, _ := http.NewRequest(req.Method, req.Path, nil)
+	for k, v := range req.Headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	isCacheableReq, reqReason := cache.IsRequestCacheable(httpReq, policy)
+	if !isCacheableReq {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"cache_status": cache.CacheStatusBypass,
+			"reason":       reqReason,
+			"cacheable":    false,
+		})
+		return
+	}
+
+	cacheKey := cache.GenerateCacheKey("https", domain.Hostname, req.Path, req.Query, httpReq.Header, policy, matchingRule)
+
+	// Check if already in cache
+	cached, status := h.cacheEngine.Lookup(cacheKey)
+	if status == cache.CacheStatusHit {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"cache_status": cache.CacheStatusHit,
+			"cache_key":    cacheKey,
+			"status_code":  cached.StatusCode,
+			"headers":      cached.Headers,
+			"body":         string(cached.Body),
+			"age_seconds":  cached.Age(),
+			"etag":         cached.ETag,
+		})
+		return
+	}
+
+	// Cache MISS: If origin response was provided, evaluate cacheability and store
+	if req.OriginResponse != nil {
+		originRespHeaders := make(http.Header)
+		for k, v := range req.OriginResponse.Headers {
+			originRespHeaders.Set(k, v)
+		}
+
+		isCacheableResp, ttl, respReason := cache.IsResponseCacheable(req.OriginResponse.StatusCode, originRespHeaders, policy)
+		if isCacheableResp {
+			if matchingRule != nil && matchingRule.TTLSeconds > 0 {
+				ttl = matchingRule.TTLSeconds
+			}
+			newEntry := h.cacheEngine.Store(cacheKey, req.OriginResponse.StatusCode, req.OriginResponse.Headers, []byte(req.OriginResponse.Body), ttl)
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"cache_status": cache.CacheStatusMiss,
+				"cache_stored": true,
+				"cache_key":    cacheKey,
+				"ttl_seconds":  ttl,
+				"etag":         newEntry.ETag,
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"cache_status": cache.CacheStatusMiss,
+			"cache_stored": false,
+			"cache_key":    cacheKey,
+			"reason":       respReason,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"cache_status": cache.CacheStatusMiss,
+		"cache_key":    cacheKey,
 	})
 }
 

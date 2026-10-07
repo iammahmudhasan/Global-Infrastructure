@@ -196,4 +196,85 @@ func TestAPIWorkflow(t *testing.T) {
 	if eventsResp.Count == 0 {
 		t.Errorf("expected at least 1 security event logged from blocked attack, got 0")
 	}
+
+	// 12. Add Cache Rule for static assets
+	cacheRuleBody, _ := json.Marshal(map[string]interface{}{
+		"name":         "cache-static-images",
+		"path_pattern": "/images/*",
+		"ttl_seconds":  86400,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/cache/rules", bytes.NewReader(cacheRuleBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from add cache rule, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 13. Edge Cache Lookup Miss -> Store Origin Response
+	lookupMissBody, _ := json.Marshal(map[string]interface{}{
+		"domain_id": onboardResp.DomainID,
+		"method":    "GET",
+		"path":      "/images/logo.png",
+		"origin_response": map[string]interface{}{
+			"status_code": 200,
+			"headers": map[string]string{
+				"Content-Type":  "image/png",
+				"Cache-Control": "public, max-age=86400",
+			},
+			"body": "fake-png-binary-data",
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/cache-lookup", bytes.NewReader(lookupMissBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var missResult struct {
+		CacheStatus string `json:"cache_status"`
+		CacheStored bool   `json:"cache_stored"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &missResult)
+	if missResult.CacheStatus != "MISS" || !missResult.CacheStored {
+		t.Fatalf("expected initial lookup to be MISS and stored=true, got %+v", missResult)
+	}
+
+	// 14. Edge Cache Lookup -> Cache HIT
+	lookupHitBody, _ := json.Marshal(map[string]interface{}{
+		"domain_id": onboardResp.DomainID,
+		"method":    "GET",
+		"path":      "/images/logo.png",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/cache-lookup", bytes.NewReader(lookupHitBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var hitResult struct {
+		CacheStatus string `json:"cache_status"`
+		Body        string `json:"body"`
+		AgeSeconds  int    `json:"age_seconds"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &hitResult)
+	if hitResult.CacheStatus != "HIT" || hitResult.Body != "fake-png-binary-data" {
+		t.Fatalf("expected cache HIT with body, got %+v", hitResult)
+	}
+
+	// 15. Purge Cache
+	purgeBody, _ := json.Marshal(map[string]interface{}{
+		"target": "/images/logo.png",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/cache/purge", bytes.NewReader(purgeBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from purge, got %d", w.Code)
+	}
+
+	// 16. Lookup after purge -> Cache MISS
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/cache-lookup", bytes.NewReader(lookupHitBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var postPurgeResult struct {
+		CacheStatus string `json:"cache_status"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &postPurgeResult)
+	if postPurgeResult.CacheStatus != "MISS" {
+		t.Fatalf("expected post-purge lookup to be MISS, got %s", postPurgeResult.CacheStatus)
+	}
 }

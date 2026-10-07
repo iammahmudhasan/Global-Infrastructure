@@ -80,6 +80,9 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(jsonStr, "envoy.filters.http.local_ratelimit") {
 		t.Errorf("expected JSON config to contain local_ratelimit HTTP filter")
 	}
+	if !strings.Contains(jsonStr, "envoy.filters.http.cache") {
+		t.Errorf("expected JSON config to contain cache HTTP filter")
+	}
 
 	// 4. Add a custom WAF block rule and verify Envoy RBAC filter is generated
 	_ = st.AddWAFRule(res.DomainID, model.WAFRule{

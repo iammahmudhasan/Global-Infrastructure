@@ -377,7 +377,31 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 		})
 	}
 
-	// 3. Router filter (final terminal filter)
+	// 3. Check if CDN Caching is enabled across active topologies
+	hasCache := false
+	for _, topo := range topologies {
+		if topo.Cache != nil && topo.Cache.CacheEnabled {
+			hasCache = true
+			break
+		}
+	}
+
+	if hasCache {
+		httpFilters = append(httpFilters, map[string]interface{}{
+			"name": "envoy.filters.http.cache",
+			"typed_config": map[string]interface{}{
+				"@type": "type.googleapis.com/envoy.extensions.filters.http.cache.v3.CacheConfig",
+				"typed_config": map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.cache.simple_http_cache.v3.SimpleHttpCacheConfig",
+				},
+				"allowed_vary_headers": []map[string]interface{}{
+					{"exact": "accept-encoding"},
+				},
+			},
+		})
+	}
+
+	// 4. Router filter (final terminal filter)
 	httpFilters = append(httpFilters, map[string]interface{}{
 		"name": "envoy.filters.http.router",
 		"typed_config": map[string]interface{}{

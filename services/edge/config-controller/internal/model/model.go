@@ -140,12 +140,39 @@ type SecurityPolicy struct {
 	RateLimitRules   []RateLimitRule `json:"rate_limit_rules"`
 }
 
+type QueryStringHandling string
+
+const (
+	QueryStringIncludeAll      QueryStringHandling = "INCLUDE_ALL"
+	QueryStringIgnoreAll       QueryStringHandling = "IGNORE_ALL"
+	QueryStringIgnoreSelected  QueryStringHandling = "IGNORE_SELECTED"
+	QueryStringIncludeSelected QueryStringHandling = "INCLUDE_SELECTED"
+)
+
+type CacheRule struct {
+	ID                     string              `json:"id"`
+	DomainID               string              `json:"domain_id"`
+	Name                   string              `json:"name"`
+	PathPattern            string              `json:"path_pattern"` // e.g. "/static/*", "*.jpg"
+	TTLSeconds             int                 `json:"ttl_seconds"`
+	BypassCache            bool                `json:"bypass_cache"`
+	QueryHandling          QueryStringHandling `json:"query_handling"`
+	IgnoredParams          []string            `json:"ignored_params,omitempty"`
+	IncludedParams         []string            `json:"included_params,omitempty"`
+	CustomHeadersToInclude []string            `json:"custom_headers_to_include,omitempty"`
+	ServeStale             bool                `json:"serve_stale"`
+	Enabled                bool                `json:"enabled"`
+}
+
 type CachePolicy struct {
-	ID                    string `json:"id"`
-	DomainID              string `json:"domain_id"`
-	CacheEnabled          bool   `json:"cache_enabled"`
-	DefaultTTLSeconds     int    `json:"default_ttl_seconds"`
-	RespectOriginHeaders  bool   `json:"respect_origin_headers"`
+	ID                   string              `json:"id"`
+	DomainID             string              `json:"domain_id"`
+	CacheEnabled         bool                `json:"cache_enabled"`
+	DefaultTTLSeconds    int                 `json:"default_ttl_seconds"`
+	RespectOriginHeaders bool                `json:"respect_origin_headers"`
+	QueryHandling        QueryStringHandling `json:"query_handling"`
+	StripCookies         bool                `json:"strip_cookies"`
+	CacheRules           []CacheRule         `json:"cache_rules"`
 }
 
 type Certificate struct {
