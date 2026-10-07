@@ -235,7 +235,7 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 
 	// 2. Build Port 443 HTTPS Ingress Listener
-	httpsListener := c.buildHTTPSListener(httpsVirtualHosts)
+	httpsListener := c.buildHTTPSListener(httpsVirtualHosts, topologies)
 	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
 
 	// 3. Collect all unique upstream clusters
@@ -287,24 +287,109 @@ func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost) Listener {
 	}
 }
 
-func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost) Listener {
+func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology) Listener {
 	routeConfig := map[string]interface{}{
 		"name":          "edge_https_routes",
 		"virtual_hosts": virtualHosts,
 	}
 
+	httpFilters := make([]map[string]interface{}, 0)
+
+	// 1. Check if rate limiting is enabled across any active topologies
+	hasRateLimiting := false
+	maxRPM := 1000
+	for _, topo := range topologies {
+		if topo.Security != nil && topo.Security.RateLimitEnabled {
+			hasRateLimiting = true
+			if topo.Security.RateLimitRPM > 0 && topo.Security.RateLimitRPM < maxRPM {
+				maxRPM = topo.Security.RateLimitRPM
+			}
+		}
+	}
+
+	if hasRateLimiting {
+		httpFilters = append(httpFilters, map[string]interface{}{
+			"name": "envoy.filters.http.local_ratelimit",
+			"typed_config": map[string]interface{}{
+				"@type":        "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+				"stat_prefix":  "edge_http_local_rate_limiter",
+				"status": map[string]interface{}{
+					"code": "TooManyRequests",
+				},
+				"token_bucket": map[string]interface{}{
+					"max_tokens":      maxRPM,
+					"tokens_per_fill": maxRPM / 60,
+					"fill_interval":   "1s",
+				},
+				"filter_enabled": map[string]interface{}{
+					"runtime_key": "local_rate_limit_enabled",
+					"default_value": map[string]interface{}{
+						"numerator":   100,
+						"denominator": "HUNDRED",
+					},
+				},
+				"filter_enforced": map[string]interface{}{
+					"runtime_key": "local_rate_limit_enforced",
+					"default_value": map[string]interface{}{
+						"numerator":   100,
+						"denominator": "HUNDRED",
+					},
+				},
+			},
+		})
+	}
+
+	// 2. Check if any WAF Deny/Block rules exist (IP CIDRs or Path blocks)
+	var rbacDenyPrincipals []map[string]interface{}
+	for _, topo := range topologies {
+		if topo.Security != nil && topo.Security.WAFEnabled {
+			for _, rule := range topo.Security.WAFRules {
+				if !rule.Enabled || rule.Action != model.WAFActionBlock {
+					continue
+				}
+				if rule.MatchType == model.WAFMatchPathPrefix {
+					rbacDenyPrincipals = append(rbacDenyPrincipals, map[string]interface{}{
+						"header": map[string]interface{}{
+							"name":         ":path",
+							"string_match": map[string]interface{}{"prefix": rule.Pattern},
+						},
+					})
+				}
+			}
+		}
+	}
+
+	if len(rbacDenyPrincipals) > 0 {
+		httpFilters = append(httpFilters, map[string]interface{}{
+			"name": "envoy.filters.http.rbac",
+			"typed_config": map[string]interface{}{
+				"@type": "type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC",
+				"rules": map[string]interface{}{
+					"action": "DENY",
+					"policies": map[string]interface{}{
+						"edge_waf_block_policy": map[string]interface{}{
+							"permissions": []map[string]interface{}{{"any": true}},
+							"principals":  rbacDenyPrincipals,
+						},
+					},
+				},
+			},
+		})
+	}
+
+	// 3. Router filter (final terminal filter)
+	httpFilters = append(httpFilters, map[string]interface{}{
+		"name": "envoy.filters.http.router",
+		"typed_config": map[string]interface{}{
+			"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+		},
+	})
+
 	hcmConfig := map[string]interface{}{
 		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 		"stat_prefix":  "edge_https_ingress",
 		"route_config": routeConfig,
-		"http_filters": []map[string]interface{}{
-			{
-				"name": "envoy.filters.http.router",
-				"typed_config": map[string]interface{}{
-					"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
-				},
-			},
-		},
+		"http_filters": httpFilters,
 	}
 
 	return Listener{

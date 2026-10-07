@@ -20,6 +20,9 @@ type Store struct {
 	origins      map[string]*model.Origin
 	routes       map[string][]*model.Route          // domain ID -> routes
 	security     map[string]*model.SecurityPolicy   // domain ID -> policy
+	wafRules     map[string][]model.WAFRule         // domain ID -> WAF rules
+	rateLimits   map[string][]model.RateLimitRule   // domain ID -> Rate limit rules
+	events       map[string][]model.SecurityEvent   // domain ID -> Security events
 	cache        map[string]*model.CachePolicy      // domain ID -> policy
 	certificates map[string]*model.Certificate      // domain ID -> certificate
 }
@@ -32,6 +35,9 @@ func NewStore() *Store {
 		origins:      make(map[string]*model.Origin),
 		routes:       make(map[string][]*model.Route),
 		security:     make(map[string]*model.SecurityPolicy),
+		wafRules:     make(map[string][]model.WAFRule),
+		rateLimits:   make(map[string][]model.RateLimitRule),
+		events:       make(map[string][]model.SecurityEvent),
 		cache:        make(map[string]*model.CachePolicy),
 		certificates: make(map[string]*model.Certificate),
 	}
@@ -152,6 +158,105 @@ func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
 	return s.security[domainID]
 }
 
+func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.domains[domainID]; !exists {
+		return ErrNotFound
+	}
+	s.wafRules[domainID] = append(s.wafRules[domainID], rule)
+	if s.security[domainID] != nil {
+		s.security[domainID].WAFRules = s.wafRules[domainID]
+	}
+	return nil
+}
+
+func (s *Store) GetWAFRules(domainID string) []model.WAFRule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.wafRules[domainID]
+}
+
+func (s *Store) DeleteWAFRule(domainID string, ruleID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rules, exists := s.wafRules[domainID]
+	if !exists {
+		return ErrNotFound
+	}
+
+	filtered := make([]model.WAFRule, 0, len(rules))
+	found := false
+	for _, r := range rules {
+		if r.ID == ruleID {
+			found = true
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+
+	if !found {
+		return ErrNotFound
+	}
+
+	s.wafRules[domainID] = filtered
+	if s.security[domainID] != nil {
+		s.security[domainID].WAFRules = filtered
+	}
+	return nil
+}
+
+func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.domains[domainID]; !exists {
+		return ErrNotFound
+	}
+	s.rateLimits[domainID] = rules
+	if s.security[domainID] != nil {
+		s.security[domainID].RateLimitRules = rules
+	}
+	return nil
+}
+
+func (s *Store) GetRateLimitRules(domainID string) []model.RateLimitRule {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.rateLimits[domainID]
+}
+
+func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Append and keep recent 1000 events per domain in memory
+	events := append(s.events[ev.DomainID], ev)
+	if len(events) > 1000 {
+		events = events[len(events)-1000:]
+	}
+	s.events[ev.DomainID] = events
+}
+
+func (s *Store) GetSecurityEvents(domainID string, limit int) []model.SecurityEvent {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	events := s.events[domainID]
+	if limit <= 0 || limit > len(events) {
+		limit = len(events)
+	}
+
+	// Return most recent first
+	result := make([]model.SecurityEvent, limit)
+	for i := 0; i < limit; i++ {
+		result[i] = events[len(events)-1-i]
+	}
+	return result
+}
+
 func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -183,11 +288,18 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 			continue // Only compile active, verified domains (Rule 17)
 		}
 
+		secPolicy := s.security[d.ID]
+		if secPolicy != nil {
+			// Ensure rules are attached
+			secPolicy.WAFRules = s.wafRules[d.ID]
+			secPolicy.RateLimitRules = s.rateLimits[d.ID]
+		}
+
 		topo := &DomainTopology{
 			Domain:   d,
 			Routes:   s.routes[d.ID],
 			Pools:    make(map[string]*model.OriginPool),
-			Security: s.security[d.ID],
+			Security: secPolicy,
 			Cache:    s.cache[d.ID],
 		}
 

@@ -73,13 +73,71 @@ type Route struct {
 	TimeoutMs  int    `json:"timeout_ms"`
 }
 
+type WAFAction string
+
+const (
+	WAFActionAllow     WAFAction = "ALLOW"
+	WAFActionBlock     WAFAction = "BLOCK"
+	WAFActionLog       WAFAction = "LOG"
+	WAFActionChallenge WAFAction = "CHALLENGE"
+)
+
+type WAFMatchType string
+
+const (
+	WAFMatchIPCIDR    WAFMatchType = "IP_CIDR"
+	WAFMatchPathPrefix WAFMatchType = "PATH_PREFIX"
+	WAFMatchHeader     WAFMatchType = "HEADER"
+	WAFMatchQueryParam WAFMatchType = "QUERY_PARAM"
+	WAFMatchOWASPCRS   WAFMatchType = "OWASP_CRS"
+)
+
+type WAFRule struct {
+	ID          string       `json:"id"`
+	DomainID    string       `json:"domain_id"`
+	Name        string       `json:"name"`
+	Description string       `json:"description"`
+	MatchType   WAFMatchType `json:"match_type"`
+	Pattern     string       `json:"pattern"`
+	Action      WAFAction    `json:"action"`
+	Priority    int          `json:"priority"`
+	Enabled     bool         `json:"enabled"`
+}
+
+type RateLimitRule struct {
+	ID                string `json:"id"`
+	DomainID          string `json:"domain_id"`
+	PathPrefix        string `json:"path_prefix"`
+	RequestsPerMinute int    `json:"requests_per_minute"`
+	BurstSize         int    `json:"burst_size"`
+	KeyType           string `json:"key_type"` // "CLIENT_IP", "HEADER"
+	HeaderName        string `json:"header_name,omitempty"`
+	Enabled           bool   `json:"enabled"`
+}
+
+type SecurityEvent struct {
+	ID            string    `json:"id"`
+	DomainID      string    `json:"domain_id"`
+	Timestamp     time.Time `json:"timestamp"`
+	ClientIP      string    `json:"client_ip"`
+	Method        string    `json:"method"`
+	Path          string    `json:"path"`
+	UserAgent     string    `json:"user_agent"`
+	RuleTriggered string    `json:"rule_triggered"`
+	Action        WAFAction `json:"action"`
+	Details       string    `json:"details"`
+}
+
 type SecurityPolicy struct {
-	ID               string `json:"id"`
-	DomainID         string `json:"domain_id"`
-	WAFEnabled       bool   `json:"waf_enabled"`
-	WAFMode          string `json:"waf_mode"` // "BLOCK", "LOG"
-	RateLimitEnabled bool   `json:"rate_limit_enabled"`
-	RateLimitRPM     int    `json:"rate_limit_rpm"`
+	ID               string          `json:"id"`
+	DomainID         string          `json:"domain_id"`
+	WAFEnabled       bool            `json:"waf_enabled"`
+	WAFMode          string          `json:"waf_mode"` // "BLOCK", "LOG"
+	OWASPProtection  bool            `json:"owasp_protection"`
+	WAFRules         []WAFRule       `json:"waf_rules"`
+	RateLimitEnabled bool            `json:"rate_limit_enabled"`
+	RateLimitRPM     int             `json:"rate_limit_rpm"`
+	RateLimitRules   []RateLimitRule `json:"rate_limit_rules"`
 }
 
 type CachePolicy struct {

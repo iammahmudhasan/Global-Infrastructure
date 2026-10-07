@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
@@ -75,5 +76,27 @@ func TestCompiler(t *testing.T) {
 	}
 	if !strings.Contains(jsonStr, "origin.customer.internal") {
 		t.Errorf("expected JSON config to contain origin address origin.customer.internal")
+	}
+	if !strings.Contains(jsonStr, "envoy.filters.http.local_ratelimit") {
+		t.Errorf("expected JSON config to contain local_ratelimit HTTP filter")
+	}
+
+	// 4. Add a custom WAF block rule and verify Envoy RBAC filter is generated
+	_ = st.AddWAFRule(res.DomainID, model.WAFRule{
+		ID:        "rule-admin-block",
+		DomainID:  res.DomainID,
+		Name:      "block-admin",
+		MatchType: model.WAFMatchPathPrefix,
+		Pattern:   "/admin",
+		Action:    model.WAFActionBlock,
+		Enabled:   true,
+	})
+	cfgWithWAF, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("failed to compile topology with WAF rule: %v", err)
+	}
+	wafJsonBytes, _ := cfgWithWAF.ToJSON()
+	if !strings.Contains(string(wafJsonBytes), "envoy.filters.http.rbac") {
+		t.Errorf("expected JSON config to contain envoy.filters.http.rbac filter when WAF block rule is active")
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
@@ -106,5 +107,93 @@ func TestAPIWorkflow(t *testing.T) {
 	endpoints := envoyCfg.StaticResources.Clusters[0].LoadAssignment.Endpoints[0].LbEndpoints
 	if len(endpoints) != 2 {
 		t.Fatalf("expected 2 endpoints in cluster, got %d", len(endpoints))
+	}
+
+	// 7. Add Custom WAF Rule
+	wafRuleBody, _ := json.Marshal(map[string]interface{}{
+		"name":       "block-admin-path",
+		"match_type": "PATH_PREFIX",
+		"pattern":    "/admin",
+		"action":     "BLOCK",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/waf/rules", bytes.NewReader(wafRuleBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from add WAF rule, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 8. Configure Rate Limit Rule
+	rateLimitBody, _ := json.Marshal(map[string]interface{}{
+		"rules": []map[string]interface{}{
+			{
+				"path_prefix":          "/api/",
+				"requests_per_minute": 500,
+				"burst_size":          50,
+			},
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/rate-limits", bytes.NewReader(rateLimitBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from set rate limits, got %d", w.Code)
+	}
+
+	// 9. Evaluate simulated clean request
+	cleanEvalBody, _ := json.Marshal(map[string]interface{}{
+		"domain_id":  onboardResp.DomainID,
+		"client_ip":  "192.0.2.1",
+		"method":     "GET",
+		"path":       "/api/items",
+		"user_agent": "Mozilla/5.0",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(cleanEvalBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var cleanResult struct {
+		Blocked bool `json:"blocked"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &cleanResult)
+	if cleanResult.Blocked {
+		t.Errorf("clean request should not be blocked")
+	}
+
+	// 10. Evaluate simulated SQL Injection Attack -> MUST BE BLOCKED
+	attackEvalBody, _ := json.Marshal(map[string]interface{}{
+		"domain_id":  onboardResp.DomainID,
+		"client_ip":  "203.0.113.19",
+		"method":     "POST",
+		"path":       "/login",
+		"query":      "user=' OR 1=1--",
+		"user_agent": "sqlmap/1.5",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(attackEvalBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var attackResult struct {
+		Blocked       bool   `json:"blocked"`
+		StatusCode    int    `json:"status_code"`
+		RuleTriggered string `json:"rule_triggered"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &attackResult)
+	if !attackResult.Blocked || attackResult.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected SQL injection attack to be blocked (403), got %+v", attackResult)
+	}
+
+	// 11. Verify Security Event is recorded in domain security audit stream
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+onboardResp.DomainID+"/security/events", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from get security events, got %d", w.Code)
+	}
+	var eventsResp struct {
+		Count  int                   `json:"count"`
+		Events []model.SecurityEvent `json:"events"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &eventsResp)
+	if eventsResp.Count == 0 {
+		t.Errorf("expected at least 1 security event logged from blocked attack, got 0")
 	}
 }
