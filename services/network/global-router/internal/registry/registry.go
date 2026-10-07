@@ -41,6 +41,8 @@ type ComputeBackend struct {
 	Healthy         bool                           `json:"healthy"`
 	ActiveWorkloads int                            `json:"active_workloads"`
 	LastHealthCheck time.Time                      `json:"last_health_check"`
+	Mode            string                         `json:"mode"`   // "SIMULATION" or "PRODUCTION"
+	Source          string                         `json:"source"` // "SIMULATED" or "PROVIDER_API"
 	Breaker         *circuitbreaker.CircuitBreaker `json:"-"`
 }
 
@@ -142,6 +144,8 @@ func (r *Registry) bootstrapDefaults() {
 	}
 
 	for _, b := range defaults {
+		b.Mode = "SIMULATION"
+		b.Source = "SIMULATED"
 		r.backends[b.ID] = b
 	}
 }

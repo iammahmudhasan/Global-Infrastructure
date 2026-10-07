@@ -22,18 +22,18 @@ The NexusEdge Global Edge Network + Security Gateway operates across three decou
                                       v
 +-----------------------------------------------------------------------------+
 |                                 DATA PLANE                                  |
-|         Global Anycast (185.190.140.0/24, 2a0e:b107::/48)                   |
+|         Simulated Topology (RFC 5737 198.51.100.0/24, 2001:db8::/48)        |
 |  +--------------------+  +--------------------+  +-----------------------+  |
 |  |     pop-dhaka      |  |   pop-singapore    |  |     pop-frankfurt     |  |
-|  | Dhaka (BDIX)       |  | Singapore (SG1)    |  | Frankfurt (DE-CIX)    |  |
-|  | IPv4: 185.190.140.1|  | IPv4: 185.190.140.2|  | IPv4: 185.190.140.3   |  |
+|  | Dhaka (Simulated)  |  | SG (Simulated)     |  | Frankfurt (Simulated) |  |
+|  | IPv4: 198.51.100.1 |  | IPv4: 198.51.100.2 |  | IPv4: 198.51.100.3    |  |
 |  | Latency: <5ms Local|  | Latency: <32ms SEA |  | Latency: <115ms EU    |  |
 |  +--------------------+  +--------------------+  +-----------------------+  |
 |                                     |                                       |
 |                          +--------------------+                             |
 |                          |    pop-virginia    |                             |
-|                          | Virginia (Ashburn) |                             |
-|                          | IPv4: 185.190.140.4|                             |
+|                          | Ashburn (Simulated)|                             |
+|                          | IPv4: 198.51.100.4 |                             |
 |                          | Latency: <175ms US |                             |
 |                          +--------------------+                             |
 +-----------------------------------------------------------------------------+

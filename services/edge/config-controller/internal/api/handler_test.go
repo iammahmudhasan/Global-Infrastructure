@@ -628,7 +628,7 @@ func TestAPIWorkflow(t *testing.T) {
 	// 32. Register and Heartbeat an Edge Node in Dhaka PoP
 	nodePayload, _ := json.Marshal(map[string]interface{}{
 		"hostname":              "node-dhk-01.nexusedge.net",
-		"ip_address":            "103.150.180.12",
+		"ip_address":            "198.51.100.12",
 		"active_config_version": "v1.0.0",
 	})
 	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes", bytes.NewReader(nodePayload))

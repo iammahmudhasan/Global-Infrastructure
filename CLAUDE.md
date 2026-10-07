@@ -2,8 +2,8 @@
 
 This document provides definitive guidance for all AI assistants, engineers, and contributors operating on **NexusEdge**.
 
-> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) (123 Mandatory Platform Rules)  
-> **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/.agents/rules/ai-engineering-rules.md)  
+> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](docs/AI_ENGINEERING_RULES.md) (126 Mandatory Platform Rules)  
+> **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](.agents/rules/ai-engineering-rules.md)  
 > **Platform Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
 > **Priority Hierarchy (Rule 1):**  
 > $$\mathbf{Correctness} > \mathbf{Security} > \mathbf{Reliability} > \mathbf{Maintainability} > \mathbf{Performance} > \mathbf{Speed}$$

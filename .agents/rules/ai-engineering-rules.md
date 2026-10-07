@@ -2915,3 +2915,36 @@ Every implementation should ask:
 > **Will this still make sense when this system operates across hundreds of PoPs, thousands of nodes, millions of workloads, multiple continents, and thousands of engineers?**
 
 If the answer is no, redesign it before merging.
+
+---
+
+# 124. Architectural Graph Anchor Mandate
+
+Before generating, modifying, or deleting code for any milestone or subsystem, the agent MUST construct and output a complete architectural relationship graph (Mermaid diagram). The graph must explicitly illustrate:
+* Component boundaries
+* Data-plane vs. control-plane vs. intelligence-plane paths
+* Data stores and state synchronization loops
+* External dependencies and physical boundaries (clearly separating SIMULATED vs. LIVE infrastructure)
+* Failure transitions and fallbacks
+
+This visually anchors the system topology and prevents architectural drift, false assumptions, or blind patching.
+
+---
+
+# 125. The 4-Question Code Justification Mandate
+
+Before writing OR deleting any code in the codebase, the agent MUST explicitly define and document:
+1. **WHERE:** The exact file path, package, and layer (Data Plane / Control Plane / Intelligence).
+2. **WHY:** The concrete technical and business requirement driving this addition/deletion.
+3. **IMPACT:** What happens when this code is written (operational behavior, state transitions, outputs).
+4. **RISK OF OMISSION:** What breaks, what fails, or what security/reliability hole opens up if this code is NOT written.
+
+---
+
+# 126. Cleanliness & Industrial Discipline Mandate
+
+Every file, module, and commit must adhere to strict industrial discipline:
+* **Zero Unused Code:** No dead functions, unused struct fields, orphaned files, or dangling imports.
+* **Zero Zombie Comments:** No commented-out dead code blocks.
+* **No Gratuitous Emojis:** Keep production code, type definitions, log messages, and comments strictly industrial, professional, and free of emoji clutter.
+* **Honest Subsystem Status:** Never label simulated or prototype capabilities as production-ready. Clearly distinguish `SIMULATED` vs `PRODUCTION`.

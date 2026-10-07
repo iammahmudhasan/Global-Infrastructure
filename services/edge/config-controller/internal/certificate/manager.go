@@ -75,7 +75,7 @@ func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.
 		Domains:   []string{domain.Hostname},
 		Status:    model.CertStatusPendingChallenge,
 		KeyType:   model.KeyTypeECDSA,
-		Issuer:    "NexusEdge ACME Automated CA (Let's Encrypt Provider)",
+		Issuer:    "NexusEdge Local Dev CA (Self-Signed Mode)",
 		IssuedAt:  time.Time{},
 		ExpiresAt: time.Time{},
 		AutoRenew: true,
@@ -171,7 +171,7 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 	cert.PrivateKeyPEM = string(privPEM)
 	cert.FingerprintSHA256 = fingerprint
 	cert.SerialNumber = serialNumber.String()
-	cert.Issuer = "NexusEdge ACME Automated CA (Let's Encrypt Provider)"
+	cert.Issuer = "NexusEdge Local Dev CA (Self-Signed Mode)"
 	cert.IssuedAt = now
 	cert.ExpiresAt = expiresAt
 

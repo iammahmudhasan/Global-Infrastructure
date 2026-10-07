@@ -2,8 +2,8 @@
 
 > **Platform Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
 > **Core Intellectual Question:** *"Where should every application, AI inference request, and compute workload run right now?"*  
-> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) (123 Mandatory Platform Rules)  
-> **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/.agents/rules/ai-engineering-rules.md)
+> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](docs/AI_ENGINEERING_RULES.md) (126 Mandatory Platform Rules)  
+> **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](.agents/rules/ai-engineering-rules.md)
 
 ---
 

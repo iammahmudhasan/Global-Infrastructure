@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "mode": "SIMULATION",
+  "description": "NexusEdge simulated multi-region Point of Presence topology fixtures",
+  "pops": [
+    {
+      "id": "dhaka-sim",
+      "name": "Dhaka BDIX Edge 01 (Simulated)",
+      "metro": "Dhaka",
+      "country": "BD",
+      "region": "asia-south1",
+      "latitude": 23.8103,
+      "longitude": 90.4125,
+      "asn": 64512,
+      "anycast_ipv4": "198.51.100.1",
+      "anycast_ipv6": "2001:db8::1",
+      "bgp_state": "ANNOUNCED",
+      "status": "ACTIVE",
+      "is_simulated": true
+    },
+    {
+      "id": "singapore-sim",
+      "name": "Singapore Equinix SG1 (Simulated)",
+      "metro": "Singapore",
+      "country": "SG",
+      "region": "asia-southeast1",
+      "latitude": 1.3521,
+      "longitude": 103.8198,
+      "asn": 64512,
+      "anycast_ipv4": "198.51.100.1",
+      "anycast_ipv6": "2001:db8::1",
+      "bgp_state": "ANNOUNCED",
+      "status": "ACTIVE",
+      "is_simulated": true
+    },
+    {
+      "id": "frankfurt-sim",
+      "name": "Frankfurt DE-CIX Edge 01 (Simulated)",
+      "metro": "Frankfurt",
+      "country": "DE",
+      "region": "europe-west3",
+      "latitude": 50.1109,
+      "longitude": 8.6821,
+      "asn": 64512,
+      "anycast_ipv4": "198.51.100.1",
+      "anycast_ipv6": "2001:db8::1",
+      "bgp_state": "ANNOUNCED",
+      "status": "ACTIVE",
+      "is_simulated": true
+    },
+    {
+      "id": "virginia-sim",
+      "name": "Virginia Equinix Ashburn DC2 (Simulated)",
+      "metro": "Ashburn",
+      "country": "US",
+      "region": "us-east1",
+      "latitude": 39.0438,
+      "longitude": -77.4874,
+      "asn": 64512,
+      "anycast_ipv4": "198.51.100.1",
+      "anycast_ipv6": "2001:db8::1",
+      "bgp_state": "ANNOUNCED",
+      "status": "ACTIVE",
+      "is_simulated": true
+    }
+  ]
+}

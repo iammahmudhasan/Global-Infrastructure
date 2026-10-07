@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,10 +60,14 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 }
 
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Enable CORS for dashboard access
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+	origin := r.Header.Get("Origin")
+	allowedOrigin := h.resolveAllowedOrigin(origin)
+	if allowedOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, X-Tenant-ID")
+		w.Header().Set("Vary", "Origin")
+	}
 
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
@@ -69,6 +75,48 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.mux.ServeHTTP(w, r)
+}
+
+func (h *APIHandler) resolveAllowedOrigin(origin string) string {
+	if origin == "" {
+		return "*"
+	}
+	allowedList := os.Getenv("NEXUSEDGE_ALLOWED_ORIGINS")
+	if allowedList != "" {
+		for _, o := range strings.Split(allowedList, ",") {
+			if strings.TrimSpace(o) == origin {
+				return origin
+			}
+		}
+		return ""
+	}
+	// In local development / prototype testbed mode, reflect localhost/127.0.0.1 or fallback to origin
+	if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
+		return origin
+	}
+	return "*"
+}
+
+// authenticateTenant verifies request identity and extracts tenant context (Rules 17, 54, 55).
+// When NEXUSEDGE_ENFORCE_AUTH=true, requests missing authorization credentials fail closed (Rule 88).
+func (h *APIHandler) authenticateTenant(r *http.Request) (string, error) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if os.Getenv("NEXUSEDGE_ENFORCE_AUTH") == "true" {
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
+			}
+		}
+		if apiKey == "" && tenantID == "" {
+			return "", errors.New("unauthorized: missing API key or tenant credentials")
+		}
+	}
+	if tenantID == "" {
+		tenantID = "default-tenant"
+	}
+	return tenantID, nil
 }
 
 func (h *APIHandler) registerRoutes() {

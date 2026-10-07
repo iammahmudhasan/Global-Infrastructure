@@ -10,9 +10,10 @@ import (
 
 func TestAuthenticationSuccess(t *testing.T) {
 	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenant("test-key-mock-banking-01", "tenant-cbr-banking", "proj-fintech-prod")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workload/dispatch", nil)
-	req.Header.Set("Authorization", "Bearer bank-dhaka-livekey-9812")
+	req.Header.Set("Authorization", "Bearer test-key-mock-banking-01")
 	req.Header.Set("X-Tenant-ID", "tenant-cbr-banking")
 
 	rr := httptest.NewRecorder()
@@ -56,9 +57,10 @@ func TestAuthenticationUnauthorized(t *testing.T) {
 
 func TestTenantMismatchForbidden(t *testing.T) {
 	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenant("test-key-mock-banking-01", "tenant-cbr-banking", "proj-fintech-prod")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/workload/dispatch", nil)
-	req.Header.Set("Authorization", "Bearer bank-dhaka-livekey-9812")
+	req.Header.Set("Authorization", "Bearer test-key-mock-banking-01")
 	req.Header.Set("X-Tenant-ID", "attacker-impersonated-tenant")
 
 	rr := httptest.NewRecorder()

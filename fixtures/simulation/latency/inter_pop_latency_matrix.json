@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "mode": "SIMULATION",
+  "description": "Submarine fiber transit RTT baseline simulation model (SMW6, AAE-1, TAT-14)",
+  "routes": [
+    { "from": "dhaka", "to": "singapore", "latency_ms": 32.0, "source": "SIMULATED_FIBER_PATH" },
+    { "from": "dhaka", "to": "frankfurt", "latency_ms": 125.0, "source": "SIMULATED_FIBER_PATH" },
+    { "from": "dhaka", "to": "virginia", "latency_ms": 190.0, "source": "SIMULATED_FIBER_PATH" },
+    { "from": "singapore", "to": "frankfurt", "latency_ms": 145.0, "source": "SIMULATED_FIBER_PATH" },
+    { "from": "singapore", "to": "virginia", "latency_ms": 180.0, "source": "SIMULATED_FIBER_PATH" },
+    { "from": "frankfurt", "to": "virginia", "latency_ms": 78.0, "source": "SIMULATED_FIBER_PATH" }
+  ]
+}

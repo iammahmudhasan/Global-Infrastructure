@@ -18,11 +18,11 @@ func TestPoPManager_DefaultPoPs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected dhaka PoP to exist: %v", err)
 	}
-	if dhaka.Country != "BD" || dhaka.ASN != 140685 || dhaka.AnycastIPv4 != "103.150.180.1" {
+	if dhaka.Country != "BD" || dhaka.ASN != 64512 || dhaka.AnycastIPv4 != "198.51.100.1" {
 		t.Fatalf("unexpected dhaka PoP configuration: %+v", dhaka)
 	}
-	if dhaka.BGPState != model.BGPStateAnnounced || dhaka.Status != model.PoPStatusActive {
-		t.Fatalf("expected dhaka to be active and announced, got %s / %s", dhaka.Status, dhaka.BGPState)
+	if dhaka.BGPState != model.BGPStateAnnounced || dhaka.Status != model.PoPStatusActive || !dhaka.IsSimulated {
+		t.Fatalf("expected dhaka to be active, announced, and simulated, got %s / %s / %v", dhaka.Status, dhaka.BGPState, dhaka.IsSimulated)
 	}
 }
 
@@ -33,7 +33,7 @@ func TestPoPManager_NodeRegistrationAndHeartbeat(t *testing.T) {
 	node, err := mgr.RegisterNode(model.EdgeNode{
 		PoPID:               "dhaka",
 		Hostname:            "edge-dhk-01.nexusedge.net",
-		IPAddress:           "103.150.180.11",
+		IPAddress:           "198.51.100.11",
 		ActiveConfigVersion: "v1.0.0",
 	})
 	if err != nil {

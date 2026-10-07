@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": "1.0.0",
+  "mode": "SIMULATION",
+  "description": "Synthetic compute backends for multi-objective workload placement optimizer",
+  "backends": [
+    {
+      "id": "bd-dhaka-dgx01-sim",
+      "name": "Dhaka Sovereign DGX Superpod (Simulation)",
+      "provider": "simulated-colocation",
+      "region": "ap-south-2",
+      "jurisdiction": "BD",
+      "endpoint": "https://dgx01.colocation.dhaka.internal/v1",
+      "gpu_model": "H100",
+      "available_gpus": 8,
+      "hourly_cost": 2.10,
+      "latency_p95_ms": 4,
+      "carbon_intensity": 480.0,
+      "source": "SIMULATED"
+    },
+    {
+      "id": "cw-iad-h100-sim",
+      "name": "CoreWeave Virginia H100 Cluster (Simulation)",
+      "provider": "simulated-coreweave",
+      "region": "us-east-1",
+      "jurisdiction": "US",
+      "endpoint": "https://cw-iad.inference.internal/v1",
+      "gpu_model": "H100",
+      "available_gpus": 64,
+      "hourly_cost": 2.25,
+      "latency_p95_ms": 110,
+      "carbon_intensity": 340.0,
+      "source": "SIMULATED"
+    },
+    {
+      "id": "aws-sin-bedrock-sim",
+      "name": "AWS Singapore Bedrock (Simulation)",
+      "provider": "simulated-aws",
+      "region": "ap-southeast-1",
+      "jurisdiction": "SG",
+      "endpoint": "https://bedrock.ap-southeast-1.amazonaws.com",
+      "gpu_model": "L40S",
+      "available_gpus": 32,
+      "hourly_cost": 1.80,
+      "latency_p95_ms": 28,
+      "carbon_intensity": 390.0,
+      "source": "SIMULATED"
+    }
+  ]
+}

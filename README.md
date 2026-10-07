@@ -13,18 +13,18 @@
 
 # NexusEdge: The Intelligent Global Infrastructure Fabric
 
-### High-Throughput Anycast Edge Network, OWASP WAF, RFC 9111 CDN & Universal Workload Placement Engine
+### Intelligent Edge Network & Security Gateway Prototype, OWASP WAF, RFC 9111 CDN & Placement Engine
 
 <br/>
 
-[![CI Pipeline](https://img.shields.io/badge/CI%2FCD-Passing%20(100%25)-00C853?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/iammahmudhasan/My-First-Global-Infrastructure-Project-/actions)
-[![Availability SLA](https://img.shields.io/badge/SLA-99.99%25%20Guaranteed-0091EA?style=for-the-badge&logo=statuspage&logoColor=white)](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
+[![Stage](https://img.shields.io/badge/Stage-Engineering%20Prototype-0288D1?style=for-the-badge&logo=git&logoColor=white)](docs/MASTER_ARCHITECTURE.md)
+[![Target SLO](https://img.shields.io/badge/Target%20SLO-99.99%25%20(Design%20Goal)-0091EA?style=for-the-badge&logo=statuspage&logoColor=white)](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-AA00FF?style=for-the-badge&logo=open-source-initiative&logoColor=white)](LICENSE)
 
-[![Data Plane: Rust + Envoy](https://img.shields.io/badge/Data%20Plane-Rust%20%2B%20Envoy%20%2B%20eBPF-FF6D00?style=flat-square&logo=rust&logoColor=white)](docs/TECH_STACK.md)
-[![Control Plane: Go 1.23](https://img.shields.io/badge/Control%20Plane-Go%201.23%20%2B%20gRPC-00ADD8?style=flat-square&logo=go&logoColor=white)](docs/TECH_STACK.md)
-[![Intelligence Plane: Python 3.14](https://img.shields.io/badge/Intelligence-Python%203.14%20%2B%20PyTorch-3776AB?style=flat-square&logo=python&logoColor=white)](docs/TECH_STACK.md)
-[![Compliance: NDMA 2026 & GDPR](https://img.shields.io/badge/Compliance-NDMA%202026%20%7C%20GDPR-43A047?style=flat-square&logo=shield&logoColor=white)](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
+[![Data Plane: Rust Gateway Prototype](https://img.shields.io/badge/Data%20Plane-Rust%20Gateway%20%2B%20Envoy%20Compiler-FF6D00?style=flat-square&logo=rust&logoColor=white)](docs/TECH_STACK.md)
+[![Control Plane: Go 1.23](https://img.shields.io/badge/Control%20Plane-Go%201.23%20%2B%20Config%20Engine-00ADD8?style=flat-square&logo=go&logoColor=white)](docs/TECH_STACK.md)
+[![Intelligence Plane: Python 3.14](https://img.shields.io/badge/Intelligence-Python%203.14%20%2B%20Optimizer-3776AB?style=flat-square&logo=python&logoColor=white)](docs/TECH_STACK.md)
+[![Compliance Target: NDMA 2026 & GDPR](https://img.shields.io/badge/Compliance%20Target-NDMA%202026%20%7C%20GDPR-43A047?style=flat-square&logo=shield&logoColor=white)](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
 
 <br/>
 
@@ -91,23 +91,23 @@ graph TD
 
     subgraph DataPlane["3. DATA PLANE (Latency Matters)"]
         direction TB
-        AnycastBGP["Global BGP Anycast (185.190.140.0/24, 2a0e:b107::/48)"]
-        PoPDhaka["pop-dhaka (Dhaka BDIX <5ms)"]
-        PoPSG["pop-singapore (Equinix SG1 <32ms)"]
-        PoPFRA["pop-frankfurt (DE-CIX FR5 <115ms)"]
-        PoPIAD["pop-virginia (Equinix DC2 <175ms)"]
-        EnvoyL7["Envoy L7 High-Speed Proxy + Rust Fast-Path"]
+        AnycastBGP["Simulated Topology (RFC 5737 198.51.100.0/24, RFC 3849 2001:db8::/48)"]
+        PoPDhaka["pop-dhaka (Dhaka Simulated BDIX <5ms)"]
+        PoPSG["pop-singapore (Singapore Simulated SG1 <32ms)"]
+        PoPFRA["pop-frankfurt (Frankfurt Simulated DE-CIX <115ms)"]
+        PoPIAD["pop-virginia (Virginia Simulated Ashburn <175ms)"]
+        RustGateway["Rust Hyper/Tokio Edge Gateway Prototype"]
         FastPathEngine["OWASP WAF + RFC 9111 CDN Cache + EWMA Smart Router"]
         
         AnycastBGP --> PoPDhaka
         AnycastBGP --> PoPSG
         AnycastBGP --> PoPFRA
         AnycastBGP --> PoPIAD
-        PoPDhaka --> EnvoyL7
-        PoPSG --> EnvoyL7
-        PoPFRA --> EnvoyL7
-        PoPIAD --> EnvoyL7
-        EnvoyL7 --> FastPathEngine
+        PoPDhaka --> RustGateway
+        PoPSG --> RustGateway
+        PoPFRA --> RustGateway
+        PoPIAD --> RustGateway
+        RustGateway --> FastPathEngine
     end
 
     IntelligencePlane -->|Calculated Placement Graphs & Latency Intent| ControlPlane
@@ -130,7 +130,7 @@ graph TD
 
 ## The 8 Commercial Subsystems
 
-NexusEdge's first commercial product (**Global Edge Network + Security Gateway**) is built across 8 production-verified, hardened milestones:
+NexusEdge's first commercial product (**Edge Security Gateway**) is developed across 8 locally-verified engineering prototype milestones:
 
 ```
 [Milestone 1] ───► [Milestone 2] ───► [Milestone 3] ───► [Milestone 4]
@@ -138,7 +138,7 @@ Domain Onboard      OWASP WAF          RFC 9111 CDN       EWMA Failover
       │                   │                  │                  │
       ▼                   ▼                  ▼                  ▼
 [Milestone 5] ───► [Milestone 6] ───► [Milestone 7] ───► [Milestone 8]
-ACME TLS & SDS      Analytics Engine   Anycast BGP Sync   Chaos & Runbooks
+TLS Dev Lifecycle   Analytics Engine   Simulated PoP Mesh Stress & Hardening
 ```
 
 ### Detailed Engine Capabilities
@@ -147,18 +147,21 @@ ACME TLS & SDS      Analytics Engine   Anycast BGP Sync   Chaos & Runbooks
 |---|---|---|---|
 | **Domain Onboarding** | Milestone 1 | RFC 1123 hostname validation, CNAME target generation (`*.edge.nexusedge.io`), cryptographic verification tokens, dynamic Envoy v3 LDS/CDS compilation. | `TestValidateHostname`<br/>`TestOnboardAndVerifyDomain` |
 | **WAF & Security** | Milestone 2 | OWASP Core Rule Set (CRS 942 SQLi, 941 XSS, 930 LFI/RFI, 932 RCE, 913 Scanners), IP CIDR / Path / Header matchers, Token Bucket Rate Limiter with burst capacity. | `TestWAF_OWASP_Attacks`<br/>`TestRateLimiter` |
-| **RFC 9111 CDN Cache** | Milestone 3 | Deterministic query sorting, header normalization, Cache-Control policy parsing (`no-store`, `private`, `max-age`), sub-second global cache invalidation and purge. | `TestCacheKeyNormalization`<br/>`TestCacheEngineLookupStorePurge` |
+| **RFC 9111 CDN Cache** | Milestone 3 | Deterministic query sorting, header normalization, Cache-Control policy parsing (`no-store`, `private`, `max-age`), sub-second local cache invalidation and purge. | `TestCacheKeyNormalization`<br/>`TestCacheEngineLookupStorePurge` |
 | **EWMA Smart Routing** | Milestone 4 | Active origin health probing, Exponentially Weighted Moving Average ($\alpha = 0.2$) RTT latency smoothing, autonomous sub-ms failover upon consecutive failures. | `TestSmartRouter_LowestLatencyAndFailover`<br/>`TestMonitor_ProbeSuccessAndThreshold` |
-| **Automated TLS & ACME** | Milestone 5 | ACME HTTP-01 challenge orchestration, in-memory ECDSA P-256 private key and x509 leaf generation, Envoy DownstreamTlsContext SDS zero-reload secret rotation. | `TestCertificateManager_Workflow`<br/>`TestChaos_ZeroReloadCertificateRotation` |
+| **TLS Lifecycle (Dev Mode)** | Milestone 5 | HTTP-01 challenge orchestration, in-memory ECDSA P-256 key pair and local development x509 leaf issuance, Envoy DownstreamTlsContext SDS zero-reload secret rotation. | `TestCertificateManager_Workflow`<br/>`TestChaos_ZeroReloadCertificateRotation` |
 | **Traffic Analytics** | Milestone 6 | Vitter's Algorithm R reservoir sampling for exact p50/p95/p99 latency percentiles with zero heap allocations, time-series aggregation, bandwidth metering for billing. | `TestReservoirSampler_Percentiles`<br/>`TestEngine_TimeSeriesAndBilling` |
-| **Multi-PoP Anycast** | Milestone 7 | BGP Route Health Injection (RHI) / Withdrawal lifecycle, Inter-PoP Latency Matrix, Local Metro Geo-Steering across Dhaka, Singapore, Frankfurt, and Virginia. | `TestPoPManager_BGPRouteLifecycle`<br/>`TestPoPManager_LatencyMatrixAndSteering` |
-| **Production Hardening** | Milestone 8 | High-concurrency stress testing (>100k ops/sec), chaos injection testing (origin death, BGP drain, telemetry flood), and master operational runbooks. | `TestHighConcurrency_Pipeline`<br/>`TestChaos_PoPNetworkDrainAndAnycastFailover` |
+| **Simulated Multi-PoP Mesh** | Milestone 7 | In-memory BGP Route Health Injection (RHI) / Withdrawal state model, Inter-PoP Latency Matrix, Local Metro Geo-Steering across simulated Dhaka, Singapore, Frankfurt, and Virginia PoPs. | `TestPoPManager_BGPRouteLifecycle`<br/>`TestPoPManager_LatencyMatrixAndSteering` |
+| **Stress & Hardening** | Milestone 8 | In-process high-concurrency pipeline saturation (>100k ops/sec), chaos injection testing (origin death, BGP drain, telemetry flood), and master operational runbooks. | `TestHighConcurrency_Pipeline`<br/>`TestChaos_PoPNetworkDrainAndAnycastFailover` |
 
 ---
 
 ## Empirical Performance Benchmarks
 
-All benchmark metrics are empirically measured and verified via `go test -bench="." -benchmem ./test/...` on commodity hardware (Intel Core i5-8365U @ 1.60GHz, 8 Threads):
+> [!NOTE]
+> **Synthetic Benchmark Context:** The metrics below represent **local in-process micro-benchmarks** executed on a single host (Intel Core i5-8365U @ 1.60GHz, 8 Threads, Windows 11, Go 1.23). They measure internal pipeline algorithm saturation, **not** real-world global network wire transit throughput or distributed WAN line-rate traffic.
+
+All benchmark metrics are empirically measured and verified via `go test -bench="." -benchmem ./test/...` on commodity hardware:
 
 ```text
 goos: windows
@@ -191,31 +194,47 @@ Reservoir Latency Sampling         148 ns (0.1 µs)       0 B/op      0 allocs (
 
 ---
 
-## Global Anycast Mesh & Bangladesh Sovereignty
+## Simulated Global PoP Topology & Strategic Bangladesh Anchor
 
-NexusEdge operates Anycast IP ranges (`185.190.140.0/24`, `2a0e:b107::/48`) announced simultaneously across 4 global metro hubs:
+NexusEdge models a multi-metro Point of Presence topology using standard IANA simulation prefixes (`198.51.100.0/24` [RFC 5737], `2001:db8::/48` [RFC 3849], and Private ASN `64512` [RFC 6996]) across 4 simulation metro locations:
 
 ```
 +-----------------------------------------------------------------------------------------+
-|                                  GLOBAL ANYCAST FABRIC                                  |
+|                              SIMULATED TOPOLOGY TESTBED                                 |
 |                                                                                         |
 |   +--------------------+     +--------------------+     +---------------------------+   |
 |   |     pop-dhaka      |     |   pop-singapore    |     |       pop-frankfurt       |   |
-|   | Dhaka, BD          |     | Singapore, SG      |     | Frankfurt, DE             |   |
-|   | BDIX Peering       |     | Equinix SG1 / EIX  |     | Interxion / DE-CIX        |   |
-|   | SMW6 Subsea Link   |     | Southeast Asia Hub |     | EU GDPR Sovereign Hub     |   |
+|   | Dhaka (Simulated)  |     | SG (Simulated)     |     | Frankfurt (Simulated)     |   |
+|   | BDIX Peering Model |     | Equinix SG1 Model  |     | DE-CIX Model              |   |
 |   | Latency: <5ms      |     | Latency: <32ms     |     | Latency: <115ms           |   |
 |   +--------------------+     +--------------------+     +---------------------------+   |
 |                                                                                         |
 |                              +--------------------+                                     |
 |                              |    pop-virginia    |                                     |
-|                              | Ashburn, US        |                                     |
-|                              | Equinix DC2 / DC11 |                                     |
-|                              | Americas Core      |                                     |
+|                              | Ashburn (Simulated)|                                     |
+|                              | Equinix DC2 Model  |                                     |
 |                              | Latency: <175ms    |                                     |
 |                              +--------------------+                                     |
 +-----------------------------------------------------------------------------------------+
 ```
+
+### Commercial Product Progression Roadmap
+
+| Phase | Milestone Name | Architectural Focus | Readiness Status |
+|---|---|---|---|
+| **V0** | **Engineering Prototype** | Rust Gateway + Go Config Controller + In-Memory WAF & Cache | **Current State (Locally Verified)** |
+| **V1** | **Customer Beta** | Real Customer Domain + Multi-Tenant Auth + Live TLS + Health Loops | Next Milestone |
+| **V1.5** | **Multi-Origin & Dashboard** | Dynamic Steering + Origin Shielding + Customer Portal | Planned |
+| **V2** | **Multi-PoP Edge** | First 2 Leased Physical PoPs + DNS Failover Steering | Roadmap |
+| **V3** | **Autonomous Anycast** | Dedicated ASN + Upstream BGP Transit + Hardware Scrubbing | Long-term Target |
+| **V4** | **Global Workload Fabric**| Multi-Objective Scheduler + Distributed GPU Inference Placement | Long-term Target |
+
+### Subsystem Verification State Machine
+
+Every subsystem in the repository is strictly tracked against our 6-stage lifecycle:  
+`NOT_IMPLEMENTED` ➔ `SIMULATED` ➔ `LOCALLY_VERIFIED` ➔ `STAGING_VERIFIED` ➔ `REAL_INFRA_VERIFIED` ➔ `PRODUCTION_READY`
+
+*(See [`verification/production-readiness/READINESS_MATRIX.md`](verification/production-readiness/READINESS_MATRIX.md) for full status catalog.)*
 
 ### The Strategic Bangladesh Advantage
 1. **BDIX Fabric:** Direct low-latency peering with 167 members and over 2.27 Tbps cumulative port capacity, yielding $<5\text{ms}$ domestic RTT across Bangladesh.

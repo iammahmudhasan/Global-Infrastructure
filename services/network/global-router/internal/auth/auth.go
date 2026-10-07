@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 )
@@ -40,11 +41,29 @@ func NewAuthenticator() *Authenticator {
 	a := &Authenticator{
 		tenants: make(map[string]*TenantRecord),
 	}
-	// Bootstrap default system tenant and enterprise test tenant
-	a.RegisterTenant("nexusedge-secret-adminkey-2026", "tenant-system", "proj-core")
-	a.RegisterTenant("bank-dhaka-livekey-9812", "tenant-cbr-banking", "proj-fintech-prod")
-	a.RegisterTenant("global-ai-partner-key-4401", "tenant-ai-labs", "proj-reasoning")
+	a.loadFromEnv()
 	return a
+}
+
+// loadFromEnv loads API keys from NEXUSEDGE_API_KEYS (format: key:tenant_id:project_id,...)
+// or loads clearly labeled development mock keys if NEXUSEDGE_DEV_MODE is enabled.
+func (a *Authenticator) loadFromEnv() {
+	rawKeys := os.Getenv("NEXUSEDGE_API_KEYS")
+	if rawKeys != "" {
+		for _, entry := range strings.Split(rawKeys, ",") {
+			parts := strings.Split(strings.TrimSpace(entry), ":")
+			if len(parts) == 3 {
+				a.RegisterTenant(parts[0], parts[1], parts[2])
+			}
+		}
+		return
+	}
+
+	// In explicit local development mode, register synthetic mock fixtures
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+		a.RegisterTenant("dev-fixture-adminkey-mock-01", "tenant-system", "proj-core")
+		a.RegisterTenant("dev-fixture-banking-mock-01", "tenant-cbr-banking", "proj-fintech-prod")
+	}
 }
 
 func (a *Authenticator) RegisterTenant(apiKey, tenantID, projectID string) {

@@ -3,7 +3,7 @@ version: "3.8"
 services:
   nexusedge-gateway:
     build:
-      context: ../core/gateway
+      context: ../dataplane/edge/gateway
       dockerfile: Dockerfile
     container_name: nexusedge-pop-01
     ports:
@@ -11,7 +11,7 @@ services:
     environment:
       - RUST_LOG=info
     volumes:
-      - ../core/gateway/gateway.yaml:/app/gateway.yaml:ro
+      - ../dataplane/edge/gateway/gateway.yaml:/app/gateway.yaml:ro
     restart: unless-stopped
 
   mock-origin:

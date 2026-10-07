@@ -48,6 +48,9 @@ func TestCertificateManager_Workflow(t *testing.T) {
 	if issuedCert.Status != model.CertStatusActive {
 		t.Errorf("expected status ACTIVE, got %s", issuedCert.Status)
 	}
+	if issuedCert.Issuer != "NexusEdge Local Dev CA (Self-Signed Mode)" {
+		t.Errorf("expected issuer 'NexusEdge Local Dev CA (Self-Signed Mode)', got %s", issuedCert.Issuer)
+	}
 	if issuedCert.CertPEM == "" || issuedCert.PrivateKeyPEM == "" {
 		t.Fatalf("expected non-empty CertPEM and PrivateKeyPEM")
 	}

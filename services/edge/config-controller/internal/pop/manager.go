@@ -42,20 +42,26 @@ func NewManager() *Manager {
 func (m *Manager) seedDefaultPoPs() {
 	now := time.Now().UTC()
 
+	// Default simulated testbed topology.
+	// Uses RFC 6996 Private ASN (64512), RFC 5737 TEST-NET-2 (198.51.100.1),
+	// and RFC 3849 documentation IPv6 (2001:db8::1) to avoid real-world IP/ASN collision.
 	defaults := []model.EdgePoP{
 		{
 			ID:               "dhaka",
-			Name:             "Dhaka BDIX Edge 01",
+			Name:             "Dhaka BDIX Edge 01 (Simulated)",
 			Region:           "asia-south1",
 			City:             "Dhaka",
 			Country:          "BD",
 			Latitude:         23.8103,
 			Longitude:        90.4125,
-			ASN:              140685,
-			AnycastIPv4:      "103.150.180.1",
-			AnycastIPv6:      "2a0e:b107::1",
+			ASN:              64512,
+			AnycastIPv4:      "198.51.100.1",
+			AnycastIPv6:      "2001:db8::1",
 			BGPState:         model.BGPStateAnnounced,
 			Status:           model.PoPStatusActive,
+			Mode:             "SIMULATION",
+			Source:           "SIMULATED",
+			IsSimulated:      true,
 			NodeCount:        0,
 			HealthyNodeCount: 0,
 			CreatedAt:        now,
@@ -63,17 +69,20 @@ func (m *Manager) seedDefaultPoPs() {
 		},
 		{
 			ID:               "singapore",
-			Name:             "Singapore Equinix SG1",
+			Name:             "Singapore Equinix SG1 (Simulated)",
 			Region:           "asia-southeast1",
 			City:             "Singapore",
 			Country:          "SG",
 			Latitude:         1.3521,
 			Longitude:        103.8198,
-			ASN:              140685,
-			AnycastIPv4:      "103.150.180.1",
-			AnycastIPv6:      "2a0e:b107::1",
+			ASN:              64512,
+			AnycastIPv4:      "198.51.100.1",
+			AnycastIPv6:      "2001:db8::1",
 			BGPState:         model.BGPStateAnnounced,
 			Status:           model.PoPStatusActive,
+			Mode:             "SIMULATION",
+			Source:           "SIMULATED",
+			IsSimulated:      true,
 			NodeCount:        0,
 			HealthyNodeCount: 0,
 			CreatedAt:        now,
@@ -81,17 +90,20 @@ func (m *Manager) seedDefaultPoPs() {
 		},
 		{
 			ID:               "frankfurt",
-			Name:             "Frankfurt DE-CIX Edge 01",
+			Name:             "Frankfurt DE-CIX Edge 01 (Simulated)",
 			Region:           "europe-west3",
 			City:             "Frankfurt",
 			Country:          "DE",
 			Latitude:         50.1109,
 			Longitude:        8.6821,
-			ASN:              140685,
-			AnycastIPv4:      "103.150.180.1",
-			AnycastIPv6:      "2a0e:b107::1",
+			ASN:              64512,
+			AnycastIPv4:      "198.51.100.1",
+			AnycastIPv6:      "2001:db8::1",
 			BGPState:         model.BGPStateAnnounced,
 			Status:           model.PoPStatusActive,
+			Mode:             "SIMULATION",
+			Source:           "SIMULATED",
+			IsSimulated:      true,
 			NodeCount:        0,
 			HealthyNodeCount: 0,
 			CreatedAt:        now,
@@ -99,17 +111,20 @@ func (m *Manager) seedDefaultPoPs() {
 		},
 		{
 			ID:               "virginia",
-			Name:             "Virginia Equinix Ashburn DC2",
+			Name:             "Virginia Equinix Ashburn DC2 (Simulated)",
 			Region:           "us-east1",
 			City:             "Ashburn",
 			Country:          "US",
 			Latitude:         39.0438,
 			Longitude:        -77.4874,
-			ASN:              140685,
-			AnycastIPv4:      "103.150.180.1",
-			AnycastIPv6:      "2a0e:b107::1",
+			ASN:              64512,
+			AnycastIPv4:      "198.51.100.1",
+			AnycastIPv6:      "2001:db8::1",
 			BGPState:         model.BGPStateAnnounced,
 			Status:           model.PoPStatusActive,
+			Mode:             "SIMULATION",
+			Source:           "SIMULATED",
+			IsSimulated:      true,
 			NodeCount:        0,
 			HealthyNodeCount: 0,
 			CreatedAt:        now,
@@ -246,6 +261,9 @@ func (m *Manager) ListNodes(popID string) []model.EdgeNode {
 	return res
 }
 
+// SetBGPState updates the simulated BGP route announcement state in the local control plane.
+// NOTE: In simulation mode, this toggles in-memory state representation. Production V3 will integrate
+// with external BGP speaker daemons (e.g. ExaBGP/FRRouting) via gRPC/UNIX domain socket.
 func (m *Manager) SetBGPState(popID string, state model.BGPState) (*model.EdgePoP, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -28,6 +28,10 @@ func NewServer() *Server {
 	eval := scheduler.NewEvaluator(reg)
 	authenticator := auth.NewAuthenticator()
 
+	if os.Getenv("NEXUSEDGE_API_KEYS") == "" && os.Getenv("NEXUSEDGE_DEV_MODE") != "true" {
+		log.Println("[INFO] Zero preconfigured API keys loaded. Configure NEXUSEDGE_API_KEYS or set NEXUSEDGE_DEV_MODE=true.")
+	}
+
 	return &Server{
 		auth:      authenticator,
 		registry:  reg,

@@ -370,20 +370,23 @@ const (
 	BGPStatePending   BGPState = "PENDING"
 )
 
-// EdgePoP represents a global physical Point of Presence in the Anycast fabric
+// EdgePoP represents an Edge Point of Presence in the topology mesh
 type EdgePoP struct {
 	ID               string    `json:"id"`                 // e.g. "dhaka", "singapore", "frankfurt", "virginia"
-	Name             string    `json:"name"`               // e.g. "Dhaka BDIX Edge 01"
+	Name             string    `json:"name"`               // e.g. "Dhaka BDIX Edge 01 (Simulated)"
 	Region           string    `json:"region"`             // e.g. "asia-south1"
 	City             string    `json:"city"`               // e.g. "Dhaka"
 	Country          string    `json:"country"`            // e.g. "BD"
 	Latitude         float64   `json:"latitude"`
 	Longitude        float64   `json:"longitude"`
-	ASN              int       `json:"asn"`                // e.g. 140685
-	AnycastIPv4      string    `json:"anycast_ipv4"`       // e.g. "103.150.180.1"
-	AnycastIPv6      string    `json:"anycast_ipv6"`       // e.g. "2a0e:b107::1"
+	ASN              int       `json:"asn"`                // RFC 6996 Private ASN for simulation: 64512
+	AnycastIPv4      string    `json:"anycast_ipv4"`       // RFC 5737 TEST-NET-2: "198.51.100.1"
+	AnycastIPv6      string    `json:"anycast_ipv6"`       // RFC 3849 Documentation Prefix: "2001:db8::1"
 	BGPState         BGPState  `json:"bgp_state"`          // ANNOUNCED or WITHDRAWN
 	Status           PoPStatus `json:"status"`
+	Mode             string    `json:"mode"`               // "SIMULATION" or "PRODUCTION"
+	Source           string    `json:"source"`             // "SIMULATED", "PROBE", or "OPERATOR"
+	IsSimulated      bool      `json:"is_simulated"`       // true for simulated testbeds
 	NodeCount        int       `json:"node_count"`
 	HealthyNodeCount int       `json:"healthy_node_count"`
 	CreatedAt        time.Time `json:"created_at"`
