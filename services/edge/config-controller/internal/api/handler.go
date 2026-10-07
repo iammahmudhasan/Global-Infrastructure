@@ -80,7 +80,6 @@ func (h *APIHandler) PoPManager() *pop.Manager {
 	return h.popManager
 }
 
-
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global 1 MiB body size cap prevents unbounded memory exhaustion across all control plane JSON endpoints
 	const maxControlPlaneBody = 1 << 20 // 1 MiB

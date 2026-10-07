@@ -389,4 +389,3 @@ func TestCompiler_TLSSettingsAndHSTSIntegration(t *testing.T) {
 		t.Errorf("expected VirtualHost to include Strict-Transport-Security response header")
 	}
 }
-

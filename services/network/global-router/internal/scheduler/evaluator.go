@@ -252,7 +252,6 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		return nil, fmt.Errorf("%w: candidate capacity exhausted during reservation race", ErrNoEligibleBackends)
 	}
 
-
 	// 6. Synthesize Explainable Decision Codes (Rule 112)
 	var reasonCodes []string
 	reasonCodes = append(reasonCodes, fmt.Sprintf("OPTIMAL_SCORE_%.2f", bestScore))

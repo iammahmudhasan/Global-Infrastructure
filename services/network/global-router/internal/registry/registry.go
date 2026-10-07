@@ -221,7 +221,6 @@ func (r *Registry) AllowBackend(id string) error {
 	return b.Breaker.Allow()
 }
 
-
 func (r *Registry) Get(id string) (*ComputeBackend, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

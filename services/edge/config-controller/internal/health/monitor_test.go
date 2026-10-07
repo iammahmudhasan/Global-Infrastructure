@@ -305,4 +305,3 @@ func TestMonitor_IPv6ProbeFormatting(t *testing.T) {
 		t.Errorf("expected failure registered for probe to unreachable IPv6 address, got %d", st.ConsecutiveFailures)
 	}
 }
-

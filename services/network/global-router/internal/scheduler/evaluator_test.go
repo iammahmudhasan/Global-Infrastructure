@@ -419,4 +419,3 @@ func TestSchedulerEnforcesCircuitBreakerAdmission(t *testing.T) {
 		t.Fatalf("expected rejection when circuit breaker is OPEN, got nil error")
 	}
 }
-

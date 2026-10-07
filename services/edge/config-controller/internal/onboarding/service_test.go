@@ -247,4 +247,3 @@ func TestVerifyDomain_PositiveAllowlistDevGate(t *testing.T) {
 		t.Errorf("expected ACTIVE status, got %s", domain.Status)
 	}
 }
-

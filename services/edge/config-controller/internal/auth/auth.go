@@ -162,7 +162,6 @@ func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string)
 	}
 }
 
-
 // ValidateKey verifies API key in constant time to prevent timing attacks (Rule 17)
 func (a *Authenticator) ValidateKey(providedKey string) (*TenantRecord, error) {
 	if providedKey == "" {
@@ -304,7 +303,6 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-
 
 		// 6. Fail closed in all other environments (staging, preview, CI)
 		w.Header().Set("Content-Type", "application/json")

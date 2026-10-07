@@ -293,7 +293,6 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 		return domain, nil
 	}
 
-
 	// Recursive DNS check for CNAME target
 	cname, err := net.LookupCNAME(domain.Hostname)
 	if err == nil && strings.TrimSuffix(strings.ToLower(cname), ".") == strings.ToLower(domain.CNAMETarget) {
