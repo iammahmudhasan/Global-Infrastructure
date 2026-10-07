@@ -352,3 +352,83 @@ type BillingUsage struct {
 	TotalCostUSD     float64   `json:"total_cost_usd"`
 	GeneratedAt      time.Time `json:"generated_at"`
 }
+
+type PoPStatus string
+
+const (
+	PoPStatusActive   PoPStatus = "POP_ACTIVE"
+	PoPStatusDraining PoPStatus = "POP_DRAINING"
+	PoPStatusDegraded PoPStatus = "POP_DEGRADED"
+	PoPStatusOffline  PoPStatus = "POP_OFFLINE"
+)
+
+type BGPState string
+
+const (
+	BGPStateAnnounced BGPState = "ANNOUNCED"
+	BGPStateWithdrawn BGPState = "WITHDRAWN"
+	BGPStatePending   BGPState = "PENDING"
+)
+
+// EdgePoP represents a global physical Point of Presence in the Anycast fabric
+type EdgePoP struct {
+	ID               string    `json:"id"`                 // e.g. "dhaka", "singapore", "frankfurt", "virginia"
+	Name             string    `json:"name"`               // e.g. "Dhaka BDIX Edge 01"
+	Region           string    `json:"region"`             // e.g. "asia-south1"
+	City             string    `json:"city"`               // e.g. "Dhaka"
+	Country          string    `json:"country"`            // e.g. "BD"
+	Latitude         float64   `json:"latitude"`
+	Longitude        float64   `json:"longitude"`
+	ASN              int       `json:"asn"`                // e.g. 140685
+	AnycastIPv4      string    `json:"anycast_ipv4"`       // e.g. "103.150.180.1"
+	AnycastIPv6      string    `json:"anycast_ipv6"`       // e.g. "2a0e:b107::1"
+	BGPState         BGPState  `json:"bgp_state"`          // ANNOUNCED or WITHDRAWN
+	Status           PoPStatus `json:"status"`
+	NodeCount        int       `json:"node_count"`
+	HealthyNodeCount int       `json:"healthy_node_count"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+// EdgeNode represents an individual proxy/cache server within a PoP
+type EdgeNode struct {
+	ID                  string    `json:"id"`
+	PoPID               string    `json:"pop_id"`
+	Hostname            string    `json:"hostname"`
+	IPAddress           string    `json:"ip_address"`
+	ActiveConfigVersion string    `json:"active_config_version"`
+	Status              string    `json:"status"` // "HEALTHY", "DEGRADED", "OFFLINE"
+	CPUUsagePercent     float64   `json:"cpu_usage_percent"`
+	MemoryUsageMB       int64     `json:"memory_usage_mb"`
+	ActiveConnections   int       `json:"active_connections"`
+	LastHeartbeat       time.Time `json:"last_heartbeat"`
+}
+
+// PoPConfigSync delivers synchronized Envoy configuration tailored for a specific PoP
+type PoPConfigSync struct {
+	PoPID           string      `json:"pop_id"`
+	ConfigVersion   string      `json:"config_version"`
+	ChecksumSHA256  string      `json:"checksum_sha256"`
+	CompiledAt      time.Time   `json:"compiled_at"`
+	TopologiesCount int         `json:"topologies_count"`
+	EnvoyConfig     interface{} `json:"envoy_config"`
+}
+
+// LatencyRoute models inter-PoP or PoP-to-Origin physical fiber RTT
+type LatencyRoute struct {
+	FromPoP   string  `json:"from_pop"`
+	ToTarget  string  `json:"to_target"` // PoP ID or Origin Region
+	LatencyMs float64 `json:"latency_ms"`
+	Status    string  `json:"status"` // "ACTIVE", "CONGESTED"
+}
+
+// GeoSteeringDecision represents intelligent origin selection for a request at a specific PoP
+type GeoSteeringDecision struct {
+	ClientPoP        string  `json:"client_pop"`
+	DomainID         string  `json:"domain_id"`
+	SelectedOriginID string  `json:"selected_origin_id"`
+	OriginAddress    string  `json:"origin_address"`
+	OriginRegion     string  `json:"origin_region"`
+	DirectLatencyMs  float64 `json:"direct_latency_ms"`
+	Reason           string  `json:"reason"` // "LOWEST_RTT", "FAILOVER_CROSS_POP", "ROUND_ROBIN"
+}

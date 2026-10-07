@@ -166,4 +166,15 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(tlsStr, "/.well-known/acme-challenge/") {
 		t.Errorf("expected JSON to contain ACME challenge route bypass on port 80")
 	}
+
+	// 7. Verify CompileForPoP injects x-nexusedge-pop header
+	popCfg, err := comp.CompileForPoP("dhaka", st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("failed to compile for pop: %v", err)
+	}
+	popJSON, _ := popCfg.ToJSON()
+	popStr := string(popJSON)
+	if !strings.Contains(popStr, "x-nexusedge-pop") || !strings.Contains(popStr, "dhaka") {
+		t.Errorf("expected pop config to contain x-nexusedge-pop: dhaka header")
+	}
 }

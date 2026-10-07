@@ -608,4 +608,133 @@ func TestAPIWorkflow(t *testing.T) {
 	if usage.TotalCostUSD < 20.00 {
 		t.Errorf("expected total cost >= $20.00, got %f", usage.TotalCostUSD)
 	}
+
+	// 31. List Strategic Edge PoPs (GET /v1/edge/pops)
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from list pops, got %d: %s", w.Code, w.Body.String())
+	}
+	var popsResp struct {
+		TotalPoPs int             `json:"total_pops"`
+		PoPs      []model.EdgePoP `json:"pops"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &popsResp)
+	if popsResp.TotalPoPs != 4 || len(popsResp.PoPs) != 4 {
+		t.Fatalf("expected 4 global PoPs, got %d", popsResp.TotalPoPs)
+	}
+
+	// 32. Register and Heartbeat an Edge Node in Dhaka PoP
+	nodePayload, _ := json.Marshal(map[string]interface{}{
+		"hostname":              "node-dhk-01.nexusedge.net",
+		"ip_address":            "103.150.180.12",
+		"active_config_version": "v1.0.0",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes", bytes.NewReader(nodePayload))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from register node, got %d: %s", w.Code, w.Body.String())
+	}
+	var registeredNode model.EdgeNode
+	_ = json.Unmarshal(w.Body.Bytes(), &registeredNode)
+	if registeredNode.ID == "" || registeredNode.PoPID != "dhaka" {
+		t.Fatalf("unexpected registered node: %+v", registeredNode)
+	}
+
+	heartbeatPayload, _ := json.Marshal(map[string]interface{}{
+		"cpu_usage_percent":  24.5,
+		"memory_usage_mb":    8192,
+		"active_connections": 3500,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes/"+registeredNode.ID+"/heartbeat", bytes.NewReader(heartbeatPayload))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from heartbeat, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 33. Synchronize PoP-Specific Envoy Configuration (GET /v1/edge/pops/dhaka/config)
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/config", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from pop config sync, got %d: %s", w.Code, w.Body.String())
+	}
+	var popConfigSync model.PoPConfigSync
+	_ = json.Unmarshal(w.Body.Bytes(), &popConfigSync)
+	if popConfigSync.PoPID != "dhaka" || popConfigSync.ChecksumSHA256 == "" {
+		t.Fatalf("unexpected pop config sync response: %+v", popConfigSync)
+	}
+
+	// 34. Trigger BGP Route Health Withdrawal for Failover (POST /v1/edge/pops/dhaka/bgp/withdraw)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/bgp/withdraw", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from BGP withdraw, got %d: %s", w.Code, w.Body.String())
+	}
+	var bgpWithdrawnPoP model.EdgePoP
+	_ = json.Unmarshal(w.Body.Bytes(), &bgpWithdrawnPoP)
+	if bgpWithdrawnPoP.BGPState != model.BGPStateWithdrawn || bgpWithdrawnPoP.Status != model.PoPStatusDraining {
+		t.Fatalf("expected WITHDRAWN and POP_DRAINING, got %+v", bgpWithdrawnPoP)
+	}
+
+	// 35. Re-announce Anycast BGP Prefix (POST /v1/edge/pops/dhaka/bgp/announce)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/bgp/announce", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from BGP announce, got %d: %s", w.Code, w.Body.String())
+	}
+	var bgpAnnouncedPoP model.EdgePoP
+	_ = json.Unmarshal(w.Body.Bytes(), &bgpAnnouncedPoP)
+	if bgpAnnouncedPoP.BGPState != model.BGPStateAnnounced || bgpAnnouncedPoP.Status != model.PoPStatusActive {
+		t.Fatalf("expected ANNOUNCED and POP_ACTIVE, got %+v", bgpAnnouncedPoP)
+	}
+
+	// 36. Query Latency Matrix & Origin Geo-Steering
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/routing/matrix", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from routing matrix, got %d: %s", w.Code, w.Body.String())
+	}
+	var matrixResp struct {
+		RoutesCount int                  `json:"routes_count"`
+		Routes      []model.LatencyRoute `json:"routes"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &matrixResp)
+	if matrixResp.RoutesCount == 0 {
+		t.Fatalf("expected non-empty latency matrix")
+	}
+
+	steerBody, _ := json.Marshal(map[string]interface{}{
+		"client_pop": "dhaka",
+		"domain_id":  onboardResp.DomainID,
+		"origins": []model.Origin{
+			{
+				ID:      "orig-dhaka-primary",
+				Address: "origin.dhaka.customer.internal",
+				Healthy: true,
+			},
+			{
+				ID:      "orig-singapore-secondary",
+				Address: "origin.singapore.customer.internal",
+				Healthy: true,
+			},
+		},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/routing/steer", bytes.NewReader(steerBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from routing steer, got %d: %s", w.Code, w.Body.String())
+	}
+	var steerDecision model.GeoSteeringDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &steerDecision)
+	if steerDecision.SelectedOriginID != "orig-dhaka-primary" || steerDecision.Reason != "LOCAL_METRO_AFFINITY" {
+		t.Fatalf("expected local Dhaka origin affinity, got %+v", steerDecision)
+	}
 }

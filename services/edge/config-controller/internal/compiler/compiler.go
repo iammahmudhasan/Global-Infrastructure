@@ -56,9 +56,20 @@ type Filter struct {
 }
 
 type VirtualHost struct {
-	Name    string   `json:"name"`
-	Domains []string `json:"domains"`
-	Routes  []Route  `json:"routes"`
+	Name                 string               `json:"name"`
+	Domains              []string             `json:"domains"`
+	Routes               []Route              `json:"routes"`
+	ResponseHeadersToAdd []HeaderValueOption  `json:"response_headers_to_add,omitempty"`
+}
+
+type HeaderValueOption struct {
+	Header HeaderValue `json:"header"`
+	Append bool        `json:"append"`
+}
+
+type HeaderValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 type Route struct {
@@ -250,6 +261,44 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 	// 3. Collect all unique upstream clusters
 	for _, cluster := range clustersMap {
 		config.StaticResources.Clusters = append(config.StaticResources.Clusters, cluster)
+	}
+
+	return config, nil
+}
+
+// CompileForPoP compiles domain topologies into an Envoy configuration tailored for a specific PoP
+func (c *Compiler) CompileForPoP(popID string, topologies []*store.DomainTopology) (*EnvoyConfig, error) {
+	config, err := c.Compile(topologies)
+	if err != nil {
+		return nil, err
+	}
+
+	popHeader := HeaderValueOption{
+		Header: HeaderValue{
+			Key:   "x-nexusedge-pop",
+			Value: strings.ToLower(popID),
+		},
+		Append: false,
+	}
+
+	for i := range config.StaticResources.Listeners {
+		l := &config.StaticResources.Listeners[i]
+		for j := range l.FilterChains {
+			fc := &l.FilterChains[j]
+			for k := range fc.Filters {
+				f := &fc.Filters[k]
+				if f.Name == "envoy.filters.network.http_connection_manager" && f.TypedConfig != nil {
+					if rc, ok := f.TypedConfig["route_config"].(map[string]interface{}); ok {
+						if vhs, ok := rc["virtual_hosts"].([]VirtualHost); ok {
+							for vhIdx := range vhs {
+								vhs[vhIdx].ResponseHeadersToAdd = append(vhs[vhIdx].ResponseHeadersToAdd, popHeader)
+							}
+							rc["virtual_hosts"] = vhs
+						}
+					}
+				}
+			}
+		}
 	}
 
 	return config, nil

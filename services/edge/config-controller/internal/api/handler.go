@@ -2,6 +2,7 @@ package api
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"io"
@@ -19,6 +20,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/pop"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
@@ -33,6 +35,7 @@ type APIHandler struct {
 	smartRouter     *health.SmartRouter
 	certManager     *certificate.Manager
 	analyticsEngine *analytics.Engine
+	popManager      *pop.Manager
 	mux             *http.ServeMux
 }
 
@@ -47,6 +50,7 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		smartRouter:     health.NewSmartRouter(),
 		certManager:     certificate.NewManager(s),
 		analyticsEngine: analytics.NewEngine(),
+		popManager:      pop.NewManager(),
 		mux:             http.NewServeMux(),
 	}
 	h.registerRoutes()
@@ -79,6 +83,9 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/.well-known/acme-challenge/", h.handleACMEChallenge)
 	h.mux.HandleFunc("/v1/edge/acme/validate", h.handleACMEValidate)
 	h.mux.HandleFunc("/v1/edge/telemetry", h.handleEdgeTelemetry)
+	h.mux.HandleFunc("/v1/edge/pops", h.handleListPoPs)
+	h.mux.HandleFunc("/v1/edge/pops/", h.handlePoPsRoute)
+	h.mux.HandleFunc("/v1/edge/routing/", h.handleRoutingRoute)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -1259,6 +1266,204 @@ func (h *APIHandler) handleBillingRoute(w http.ResponseWriter, r *http.Request, 
 	}
 
 	writeJSON(w, http.StatusOK, usage)
+}
+
+// GET /v1/edge/pops
+func (h *APIHandler) handleListPoPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pops := h.popManager.ListPoPs()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total_pops": len(pops),
+		"pops":       pops,
+	})
+}
+
+// /v1/edge/pops/{pop_id}/...
+func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v1/edge/pops/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		h.handleListPoPs(w, r)
+		return
+	}
+
+	popID := strings.ToLower(parts[0])
+
+	if len(parts) == 1 {
+		if r.Method == http.MethodGet {
+			pop, err := h.popManager.GetPoP(popID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, pop)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	action := parts[1]
+	switch action {
+	case "nodes":
+		if len(parts) == 2 {
+			if r.Method == http.MethodGet {
+				nodes := h.popManager.ListNodes(popID)
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"pop_id":      popID,
+					"total_nodes": len(nodes),
+					"nodes":       nodes,
+				})
+				return
+			}
+			if r.Method == http.MethodPost {
+				var node model.EdgeNode
+				if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
+					writeError(w, http.StatusBadRequest, "invalid node payload: "+err.Error())
+					return
+				}
+				node.PoPID = popID
+				registered, err := h.popManager.RegisterNode(node)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeJSON(w, http.StatusCreated, registered)
+				return
+			}
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		if len(parts) == 4 && parts[3] == "heartbeat" {
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			nodeID := parts[2]
+			var payload struct {
+				CPUUsagePercent   float64 `json:"cpu_usage_percent"`
+				MemoryUsageMB     int64   `json:"memory_usage_mb"`
+				ActiveConnections int     `json:"active_connections"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if err := h.popManager.HeartbeatNode(popID, nodeID, payload.CPUUsagePercent, payload.MemoryUsageMB, payload.ActiveConnections); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":  "heartbeat_acknowledged",
+				"pop_id":  popID,
+				"node_id": nodeID,
+			})
+			return
+		}
+		writeError(w, http.StatusNotFound, "unknown node route")
+
+	case "bgp":
+		if len(parts) == 3 {
+			bgpAction := parts[2]
+			if r.Method != http.MethodPost {
+				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			var updated *model.EdgePoP
+			var err error
+			if bgpAction == "announce" {
+				updated, err = h.popManager.SetBGPState(popID, model.BGPStateAnnounced)
+			} else if bgpAction == "withdraw" {
+				updated, err = h.popManager.SetBGPState(popID, model.BGPStateWithdrawn)
+			} else {
+				writeError(w, http.StatusBadRequest, "invalid bgp action: must be announce or withdraw")
+				return
+			}
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, updated)
+			return
+		}
+		writeError(w, http.StatusNotFound, "unknown bgp route")
+
+	case "config":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		pop, err := h.popManager.GetPoP(popID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		topologies := h.store.GetActiveTopologies()
+		envoyCfg, err := h.compiler.CompileForPoP(popID, topologies)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to compile pop config: "+err.Error())
+			return
+		}
+		cfgJSON, _ := envoyCfg.ToJSON()
+		hash := sha256.Sum256(cfgJSON)
+		checksum := hex.EncodeToString(hash[:])
+		syncResult := model.PoPConfigSync{
+			PoPID:           pop.ID,
+			ConfigVersion:   "v1.0.0-" + checksum[:8],
+			ChecksumSHA256:  checksum,
+			CompiledAt:      time.Now().UTC(),
+			TopologiesCount: len(topologies),
+			EnvoyConfig:     envoyCfg,
+		}
+		writeJSON(w, http.StatusOK, syncResult)
+
+	default:
+		writeError(w, http.StatusNotFound, "unknown pop action: "+action)
+	}
+}
+
+// /v1/edge/routing/...
+func (h *APIHandler) handleRoutingRoute(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v1/edge/routing/")
+	sub := strings.Trim(path, "/")
+
+	switch sub {
+	case "matrix":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		matrix := h.popManager.GetLatencyMatrix()
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"routes_count": len(matrix),
+			"routes":       matrix,
+		})
+
+	case "steer":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req struct {
+			ClientPoP string         `json:"client_pop"`
+			DomainID  string         `json:"domain_id"`
+			Origins   []model.Origin `json:"origins"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid steer payload: "+err.Error())
+			return
+		}
+		decision, err := h.popManager.CalculateSteering(req.ClientPoP, req.DomainID, req.Origins)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, decision)
+
+	default:
+		writeError(w, http.StatusNotFound, "unknown routing sub-resource: "+sub)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
