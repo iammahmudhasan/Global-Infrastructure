@@ -3,6 +3,7 @@ package compiler_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
@@ -133,5 +134,33 @@ func TestCompiler(t *testing.T) {
 		if !strings.Contains(string(hcJSON), "http_health_check") || !strings.Contains(string(hcJSON), "/healthz") {
 			t.Errorf("expected JSON to contain http_health_check with /healthz")
 		}
+	}
+
+	// 6. Attach active TLS Certificate and verify DownstreamTlsContext + SNI filter chains
+	st.SaveCertificate(&model.Certificate{
+		ID:            "cert-active-1",
+		DomainID:      res.DomainID,
+		Domains:       []string{"api.customer.com"},
+		Status:        model.CertStatusActive,
+		KeyType:       model.KeyTypeECDSA,
+		CertPEM:       "-----BEGIN CERTIFICATE-----\nMIIC...dummy-cert\n-----END CERTIFICATE-----",
+		PrivateKeyPEM: "-----BEGIN EC PRIVATE KEY-----\nMHQC...dummy-key\n-----END EC PRIVATE KEY-----",
+		ExpiresAt:     time.Now().Add(90 * 24 * time.Hour),
+	})
+
+	cfgWithTLS, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("failed to compile with certificate: %v", err)
+	}
+	tlsJSON, _ := cfgWithTLS.ToJSON()
+	tlsStr := string(tlsJSON)
+	if !strings.Contains(tlsStr, "DownstreamTlsContext") {
+		t.Errorf("expected JSON to contain DownstreamTlsContext")
+	}
+	if !strings.Contains(tlsStr, "api.customer.com") {
+		t.Errorf("expected JSON to contain SNI server_names for api.customer.com")
+	}
+	if !strings.Contains(tlsStr, "/.well-known/acme-challenge/") {
+		t.Errorf("expected JSON to contain ACME challenge route bypass on port 80")
 	}
 }

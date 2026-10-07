@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
@@ -359,5 +360,101 @@ func TestAPIWorkflow(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &routingResp)
 	if routingResp.SelectedOriginID == "" || routingResp.OriginAddress == "" {
 		t.Errorf("expected valid routing decision, got %+v", routingResp)
+	}
+
+	// 21. Order Certificate via ACME HTTP-01 Flow
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/certificates/order", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created from cert order, got %d: %s", w.Code, w.Body.String())
+	}
+	var orderResult struct {
+		Certificate model.Certificate   `json:"certificate"`
+		Challenge   model.ACMEChallenge `json:"challenge"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &orderResult)
+	if orderResult.Certificate.Status != model.CertStatusPendingChallenge || orderResult.Challenge.Token == "" {
+		t.Fatalf("expected pending cert and challenge token, got %+v", orderResult)
+	}
+
+	// 22. Probe ACME Challenge via HTTP-01 Endpoint
+	req = httptest.NewRequest(http.MethodGet, "/.well-known/acme-challenge/"+orderResult.Challenge.Token, nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from ACME challenge endpoint, got %d", w.Code)
+	}
+	if w.Body.String() != orderResult.Challenge.KeyAuthorization {
+		t.Errorf("expected key auth %s, got %s", orderResult.Challenge.KeyAuthorization, w.Body.String())
+	}
+
+	// 23. Validate Challenge & Issue x509 Certificate
+	validateBody, _ := json.Marshal(map[string]interface{}{
+		"token": orderResult.Challenge.Token,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/acme/validate", bytes.NewReader(validateBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from acme validate, got %d: %s", w.Code, w.Body.String())
+	}
+	var validateResult struct {
+		Status      string            `json:"status"`
+		Certificate model.Certificate `json:"certificate"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &validateResult)
+	if validateResult.Status != "VALIDATED" || validateResult.Certificate.Status != model.CertStatusActive {
+		t.Fatalf("expected VALIDATED status and active certificate, got %+v", validateResult)
+	}
+	if validateResult.Certificate.CertPEM == "" {
+		t.Errorf("expected non-empty certificate PEM")
+	}
+
+	// 24. Inspect Current Certificate & Expiration Tracking
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+onboardResp.DomainID+"/certificates/current", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from get current certificate, got %d", w.Code)
+	}
+	var currentCertResp struct {
+		Certificate         model.Certificate `json:"certificate"`
+		IsExpiringSoon      bool              `json:"is_expiring_soon"`
+		DaysUntilExpiration int               `json:"days_until_expiration"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &currentCertResp)
+	if currentCertResp.IsExpiringSoon {
+		t.Errorf("freshly issued certificate should not be expiring soon")
+	}
+	if currentCertResp.DaysUntilExpiration < 85 {
+		t.Errorf("expected ~90 days remaining, got %d", currentCertResp.DaysUntilExpiration)
+	}
+
+	// 25. Update TLS Settings (Enforce HTTPS)
+	tlsBody, _ := json.Marshal(map[string]interface{}{
+		"enforce_https":   true,
+		"min_tls_version": "TLSv1.3",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+onboardResp.DomainID+"/tls", bytes.NewReader(tlsBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from update TLS settings, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 26. Verify Envoy Config has Downstream TLS Context and SNI matching
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/envoy-config", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from envoy-config, got %d", w.Code)
+	}
+	envoyJSONStr := w.Body.String()
+	if !strings.Contains(envoyJSONStr, "DownstreamTlsContext") {
+		t.Errorf("expected Envoy config to contain DownstreamTlsContext after cert issuance")
+	}
+	if !strings.Contains(envoyJSONStr, "api.customer.com") {
+		t.Errorf("expected Envoy config to contain customer SNI hostname")
 	}
 }

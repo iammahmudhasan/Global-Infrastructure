@@ -28,6 +28,8 @@ type Store struct {
 	monitors     map[string]*model.HealthMonitor          // pool ID -> HealthMonitor
 	healthStates map[string]*model.OriginEndpointState    // origin ID -> OriginEndpointState
 	certificates map[string]*model.Certificate            // domain ID -> certificate
+	challenges   map[string]*model.ACMEChallenge          // token -> ACMEChallenge
+	tlsSettings  map[string]*model.TLSSettings            // domain ID -> TLSSettings
 }
 
 func NewStore() *Store {
@@ -46,6 +48,8 @@ func NewStore() *Store {
 		monitors:     make(map[string]*model.HealthMonitor),
 		healthStates: make(map[string]*model.OriginEndpointState),
 		certificates: make(map[string]*model.Certificate),
+		challenges:   make(map[string]*model.ACMEChallenge),
+		tlsSettings:  make(map[string]*model.TLSSettings),
 	}
 }
 
@@ -411,12 +415,64 @@ func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
 	return nil
 }
 
+func (s *Store) SaveCertificate(cert *model.Certificate) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.certificates[cert.DomainID] = cert
+}
+
+func (s *Store) GetCertificate(domainID string) *model.Certificate {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.certificates[domainID]
+}
+
+func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.challenges[ch.Token] = ch
+}
+
+func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.challenges[token]
+}
+
+func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeStatus) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ch, exists := s.challenges[token]; exists {
+		ch.Status = status
+	}
+}
+
+func (s *Store) SaveTLSSettings(domainID string, settings *model.TLSSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tlsSettings[domainID] = settings
+}
+
+func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if st, exists := s.tlsSettings[domainID]; exists {
+		return st
+	}
+	return &model.TLSSettings{
+		EnforceHTTPS:  false,
+		MinTLSVersion: "TLSv1.2",
+	}
+}
+
 type DomainTopology struct {
-	Domain   *model.Domain
-	Routes   []*model.Route
-	Pools    map[string]*model.OriginPool // poolID -> OriginPool
-	Security *model.SecurityPolicy
-	Cache    *model.CachePolicy
+	Domain      *model.Domain
+	Routes      []*model.Route
+	Pools       map[string]*model.OriginPool // poolID -> OriginPool
+	Security    *model.SecurityPolicy
+	Cache       *model.CachePolicy
+	Certificate *model.Certificate
+	TLSSettings *model.TLSSettings
 }
 
 // GetActiveTopologies extracts all verified and active domains for Envoy compilation
@@ -443,11 +499,13 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 		}
 
 		topo := &DomainTopology{
-			Domain:   d,
-			Routes:   s.routes[d.ID],
-			Pools:    make(map[string]*model.OriginPool),
-			Security: secPolicy,
-			Cache:    cachePolicy,
+			Domain:      d,
+			Routes:      s.routes[d.ID],
+			Pools:       make(map[string]*model.OriginPool),
+			Security:    secPolicy,
+			Cache:       cachePolicy,
+			Certificate: s.certificates[d.ID],
+			TLSSettings: s.tlsSettings[d.ID],
 		}
 
 		for _, r := range topo.Routes {

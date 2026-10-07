@@ -41,8 +41,9 @@ type SocketAddress struct {
 }
 
 type FilterChain struct {
-	FilterChainMatch *FilterChainMatch `json:"filter_chain_match,omitempty"`
-	Filters          []Filter          `json:"filters"`
+	FilterChainMatch *FilterChainMatch      `json:"filter_chain_match,omitempty"`
+	Filters          []Filter               `json:"filters"`
+	TransportSocket  map[string]interface{} `json:"transport_socket,omitempty"`
 }
 
 type FilterChainMatch struct {
@@ -178,11 +179,18 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			Routes:  make([]Route, 0),
 		}
 
-		// Also build an HTTP redirect virtual host
+		// Also build an HTTP redirect virtual host with ACME challenge bypass
 		httpVh := VirtualHost{
 			Name:    fmt.Sprintf("http_redirect_%s", sanitizeName(hostname)),
 			Domains: []string{hostname, fmt.Sprintf("%s:*", hostname)},
 			Routes: []Route{
+				{
+					Match: RouteMatch{Prefix: "/.well-known/acme-challenge/"},
+					Route: &RouteAction{
+						Cluster: "acme_challenge_service",
+						Timeout: "5s",
+					},
+				},
 				{
 					Match: RouteMatch{Prefix: "/"},
 					Redirect: &RedirectAction{
@@ -417,6 +425,42 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 		"http_filters": httpFilters,
 	}
 
+	filterChains := make([]FilterChain, 0)
+	hasCertificates := false
+
+	for _, topo := range topologies {
+		if topo.Certificate != nil && topo.Certificate.Status == model.CertStatusActive && topo.Certificate.CertPEM != "" {
+			hasCertificates = true
+			hostname := strings.ToLower(topo.Domain.Hostname)
+			tlsContext := c.buildDownstreamTLSContext(topo.Certificate)
+			filterChains = append(filterChains, FilterChain{
+				FilterChainMatch: &FilterChainMatch{
+					ServerNames: []string{hostname, fmt.Sprintf("%s:*", hostname)},
+				},
+				Filters: []Filter{
+					{
+						Name:        "envoy.filters.network.http_connection_manager",
+						TypedConfig: hcmConfig,
+					},
+				},
+				TransportSocket: tlsContext,
+			})
+		}
+	}
+
+	if !hasCertificates || len(filterChains) == 0 {
+		filterChains = []FilterChain{
+			{
+				Filters: []Filter{
+					{
+						Name:        "envoy.filters.network.http_connection_manager",
+						TypedConfig: hcmConfig,
+					},
+				},
+			},
+		}
+	}
+
 	return Listener{
 		Name: "edge_https_listener",
 		Address: Address{
@@ -425,13 +469,32 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 				PortValue: c.httpsPort,
 			},
 		},
-		FilterChains: []FilterChain{
-			{
-				Filters: []Filter{
+		FilterChains: filterChains,
+	}
+}
+
+func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate) map[string]interface{} {
+	if cert == nil || cert.CertPEM == "" || cert.PrivateKeyPEM == "" {
+		return nil
+	}
+	return map[string]interface{}{
+		"name": "envoy.transport_sockets.tls",
+		"typed_config": map[string]interface{}{
+			"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
+			"common_tls_context": map[string]interface{}{
+				"tls_certificates": []map[string]interface{}{
 					{
-						Name:        "envoy.filters.network.http_connection_manager",
-						TypedConfig: hcmConfig,
+						"certificate_chain": map[string]interface{}{
+							"inline_string": cert.CertPEM,
+						},
+						"private_key": map[string]interface{}{
+							"inline_string": cert.PrivateKeyPEM,
+						},
 					},
+				},
+				"tls_params": map[string]interface{}{
+					"tls_minimum_protocol_version": "TLSv1_2",
+					"tls_maximum_protocol_version": "TLSv1_3",
 				},
 			},
 		},

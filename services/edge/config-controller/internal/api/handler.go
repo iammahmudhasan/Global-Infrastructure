@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
@@ -28,6 +29,7 @@ type APIHandler struct {
 	cacheEngine *cache.CacheEngine
 	monitor     *health.Monitor
 	smartRouter *health.SmartRouter
+	certManager *certificate.Manager
 	mux         *http.ServeMux
 }
 
@@ -40,6 +42,7 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		cacheEngine: cache.NewCacheEngine(100000),
 		monitor:     health.NewMonitor(),
 		smartRouter: health.NewSmartRouter(),
+		certManager: certificate.NewManager(s),
 		mux:         http.NewServeMux(),
 	}
 	h.registerRoutes()
@@ -69,6 +72,8 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/topologies", h.handleTopologies)
 	h.mux.HandleFunc("/v1/edge/evaluate", h.handleEvaluate)
 	h.mux.HandleFunc("/v1/edge/cache-lookup", h.handleCacheLookup)
+	h.mux.HandleFunc("/.well-known/acme-challenge/", h.handleACMEChallenge)
+	h.mux.HandleFunc("/v1/edge/acme/validate", h.handleACMEValidate)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -250,9 +255,156 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 			}
 		}
 		writeError(w, http.StatusNotFound, "unknown cache endpoint")
+	case "certificates":
+		h.handleCertificatesRoute(w, r, domainID, parts)
+		return
+	case "tls":
+		h.handleTLSSettingsRoute(w, r, domainID)
+		return
 	default:
 		writeError(w, http.StatusNotFound, "unknown domain action")
 	}
+}
+
+func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Request, domainID string, parts []string) {
+	if len(parts) == 2 {
+		if r.Method == http.MethodGet {
+			cert := h.store.GetCertificate(domainID)
+			if cert == nil {
+				writeError(w, http.StatusNotFound, "no certificate found for domain")
+				return
+			}
+			writeJSON(w, http.StatusOK, cert)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	action := parts[2]
+	switch action {
+	case "order":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		cert, challenge, err := h.certManager.OrderCertificate(domainID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"certificate": cert,
+			"challenge":   challenge,
+		})
+
+	case "current":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		cert := h.store.GetCertificate(domainID)
+		if cert == nil {
+			writeError(w, http.StatusNotFound, "no active certificate for domain")
+			return
+		}
+		daysRemaining := 0
+		if !cert.ExpiresAt.IsZero() {
+			daysRemaining = int(time.Until(cert.ExpiresAt).Hours() / 24)
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"certificate":           cert,
+			"is_expiring_soon":      h.certManager.IsExpiringSoon(cert),
+			"days_until_expiration": daysRemaining,
+		})
+
+	case "renew":
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		renewedCert, err := h.certManager.RenewCertificate(domainID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to renew certificate: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, renewedCert)
+
+	default:
+		writeError(w, http.StatusNotFound, "unknown certificate action: "+action)
+	}
+}
+
+func (h *APIHandler) handleTLSSettingsRoute(w http.ResponseWriter, r *http.Request, domainID string) {
+	switch r.Method {
+	case http.MethodGet:
+		settings := h.store.GetTLSSettings(domainID)
+		writeJSON(w, http.StatusOK, settings)
+
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		var settings model.TLSSettings
+		if err := json.NewDecoder(r.Body).Decode(&settings); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid tls settings payload")
+			return
+		}
+		if settings.MinTLSVersion == "" {
+			settings.MinTLSVersion = "TLSv1.2"
+		}
+		h.store.SaveTLSSettings(domainID, &settings)
+		writeJSON(w, http.StatusOK, settings)
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *APIHandler) handleACMEChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	token := strings.TrimPrefix(r.URL.Path, "/.well-known/acme-challenge/")
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "challenge token required")
+		return
+	}
+
+	challenge := h.store.GetACMEChallengeByToken(token)
+	if challenge == nil {
+		writeError(w, http.StatusNotFound, "acme challenge not found or expired")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(challenge.KeyAuthorization))
+}
+
+func (h *APIHandler) handleACMEValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Token == "" {
+		writeError(w, http.StatusBadRequest, "valid challenge token is required")
+		return
+	}
+
+	cert, err := h.certManager.ValidateAndIssueCertificate(req.Token)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":      "VALIDATED",
+		"certificate": cert,
+	})
 }
 
 // /v1/pools/{pool_id}[/health-monitor, /health, /probe, /route]

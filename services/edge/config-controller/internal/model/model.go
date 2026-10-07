@@ -220,10 +220,65 @@ type CachePolicy struct {
 	CacheRules           []CacheRule         `json:"cache_rules"`
 }
 
+type CertificateStatus string
+
+const (
+	CertStatusPendingChallenge CertificateStatus = "PENDING_CHALLENGE"
+	CertStatusChallengeReady   CertificateStatus = "CHALLENGE_READY"
+	CertStatusIssuing          CertificateStatus = "ISSUING"
+	CertStatusActive           CertificateStatus = "ACTIVE"
+	CertStatusRenewing         CertificateStatus = "RENEWING"
+	CertStatusExpired          CertificateStatus = "EXPIRED"
+	CertStatusRevoked          CertificateStatus = "REVOKED"
+)
+
+type KeyType string
+
+const (
+	KeyTypeECDSA KeyType = "ECDSA_P256"
+	KeyTypeRSA   KeyType = "RSA_2048"
+)
+
 type Certificate struct {
-	ID        string    `json:"id"`
-	DomainID  string    `json:"domain_id"`
-	Status    string    `json:"status"` // "PENDING_ISSUANCE", "ACTIVE"
-	Issuer    string    `json:"issuer"`
-	ExpiresAt time.Time `json:"expires_at"`
+	ID                string            `json:"id"`
+	DomainID          string            `json:"domain_id"`
+	Domains           []string          `json:"domains"`
+	Status            CertificateStatus `json:"status"`
+	KeyType           KeyType           `json:"key_type"`
+	CertPEM           string            `json:"cert_pem"`
+	PrivateKeyPEM     string            `json:"private_key_pem,omitempty"`
+	FingerprintSHA256 string            `json:"fingerprint_sha256"`
+	SerialNumber      string            `json:"serial_number"`
+	Issuer            string            `json:"issuer"`
+	IssuedAt          time.Time         `json:"issued_at"`
+	ExpiresAt         time.Time         `json:"expires_at"`
+	AutoRenew         bool              `json:"auto_renew"`
+}
+
+type ChallengeStatus string
+
+const (
+	ChallengeStatusPending   ChallengeStatus = "PENDING"
+	ChallengeStatusValidated ChallengeStatus = "VALIDATED"
+	ChallengeStatusFailed    ChallengeStatus = "FAILED"
+)
+
+type ACMEChallenge struct {
+	ID               string          `json:"id"`
+	CertificateID    string          `json:"certificate_id"`
+	DomainID         string          `json:"domain_id"`
+	Hostname         string          `json:"hostname"`
+	Type             string          `json:"type"` // "HTTP-01"
+	Token            string          `json:"token"`
+	KeyAuthorization string          `json:"key_authorization"`
+	Status           ChallengeStatus `json:"status"`
+	CreatedAt        time.Time       `json:"created_at"`
+	ExpiresAt        time.Time       `json:"expires_at"`
+}
+
+type TLSSettings struct {
+	EnforceHTTPS  bool   `json:"enforce_https"`  // 301 redirect HTTP to HTTPS
+	MinTLSVersion string `json:"min_tls_version"` // "TLSv1.2", "TLSv1.3"
+	HSTS          bool   `json:"hsts"`
+	HSTSMaxAge    int    `json:"hsts_max_age"`
 }
