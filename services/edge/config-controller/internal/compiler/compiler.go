@@ -219,6 +219,21 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			},
 		}
 
+		// HSTS Policy Integration (P1 TLS settings)
+		if topo.TLSSettings != nil && topo.TLSSettings.HSTS {
+			maxAge := topo.TLSSettings.HSTSMaxAge
+			if maxAge <= 0 {
+				maxAge = 31536000 // 1 year default
+			}
+			vh.ResponseHeadersToAdd = append(vh.ResponseHeadersToAdd, HeaderValueOption{
+				Header: HeaderValue{
+					Key:   "Strict-Transport-Security",
+					Value: fmt.Sprintf("max-age=%d; includeSubDomains", maxAge),
+				},
+				Append: false,
+			})
+		}
+
 		// Per-Domain VirtualHost Rate Limit Isolation (Finding 9, 14, P1 RPM Audit)
 		if topo.Security != nil && topo.Security.RateLimitEnabled && topo.Security.RateLimitRPM > 0 {
 			rpm := topo.Security.RateLimitRPM
@@ -586,7 +601,7 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 	for _, topo := range topologies {
 		if topo.Certificate != nil && topo.Certificate.Status == model.CertStatusActive && topo.Certificate.CertPEM != "" {
 			hostname := strings.ToLower(topo.Domain.Hostname)
-			tlsContext := c.buildDownstreamTLSContext(topo.Certificate)
+			tlsContext := c.buildDownstreamTLSContext(topo.Certificate, topo.TLSSettings)
 			filterChains = append(filterChains, FilterChain{
 				FilterChainMatch: &FilterChainMatch{
 					ServerNames: []string{hostname, fmt.Sprintf("%s:*", hostname)},
@@ -614,9 +629,18 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 	}
 }
 
-func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate) map[string]interface{} {
+func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate, settings *model.TLSSettings) map[string]interface{} {
 	if cert == nil || cert.CertPEM == "" {
 		return nil
+	}
+	minTLS := "TLSv1_2"
+	if settings != nil {
+		switch settings.MinTLSVersion {
+		case "TLSv1.3":
+			minTLS = "TLSv1_3"
+		case "TLSv1.2", "":
+			minTLS = "TLSv1_2"
+		}
 	}
 	// Production Envoy v3 SDS Secret Architecture (Rule 18 Zero Secrets in Config/Logs).
 	// Downstream TLS delegates private key discovery to SDS and never inlines plaintext private keys.
@@ -645,7 +669,7 @@ func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate) map[string
 					},
 				},
 				"tls_params": map[string]interface{}{
-					"tls_minimum_protocol_version": "TLSv1_2",
+					"tls_minimum_protocol_version": minTLS,
 					"tls_maximum_protocol_version": "TLSv1_3",
 				},
 			},

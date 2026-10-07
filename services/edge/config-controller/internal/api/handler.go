@@ -72,6 +72,15 @@ func (h *APIHandler) SetAuthenticator(a *auth.Authenticator) {
 	h.handlerChain = a.Middleware(h.mux)
 }
 
+func (h *APIHandler) Authenticator() *auth.Authenticator {
+	return h.authenticator
+}
+
+func (h *APIHandler) PoPManager() *pop.Manager {
+	return h.popManager
+}
+
+
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global 1 MiB body size cap prevents unbounded memory exhaustion across all control plane JSON endpoints
 	const maxControlPlaneBody = 1 << 20 // 1 MiB
@@ -472,6 +481,12 @@ func (h *APIHandler) handleTLSSettingsRoute(w http.ResponseWriter, r *http.Reque
 			writeError(w, http.StatusBadRequest, "invalid tls settings payload")
 			return
 		}
+		switch settings.MinTLSVersion {
+		case "", "TLSv1.2", "TLSv1.3":
+		default:
+			writeError(w, http.StatusBadRequest, "min_tls_version must be TLSv1.2 or TLSv1.3")
+			return
+		}
 		if settings.MinTLSVersion == "" {
 			settings.MinTLSVersion = "TLSv1.2"
 		}
@@ -603,6 +618,12 @@ func (h *APIHandler) handleSetHealthMonitor(w http.ResponseWriter, r *http.Reque
 
 	hm.ID = "hm-" + generateHex(4)
 	hm.PoolID = pool.ID
+	switch hm.Protocol {
+	case "", model.HealthCheckProtocolHTTP, model.HealthCheckProtocolHTTPS:
+	default:
+		writeError(w, http.StatusBadRequest, "health monitor protocol must be HTTP or HTTPS")
+		return
+	}
 	if hm.Protocol == "" {
 		hm.Protocol = model.HealthCheckProtocolHTTP
 	}
@@ -708,7 +729,11 @@ func (h *APIHandler) handleGetDomain(w http.ResponseWriter, r *http.Request, dom
 func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, domainID string) {
 	domain, err := h.service.VerifyDomain(domainID)
 	if err != nil {
-		writeError(w, http.StatusNotFound, "domain not found")
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "domain not found")
+			return
+		}
+		writeError(w, http.StatusUnprocessableEntity, "domain verification failed: "+err.Error())
 		return
 	}
 
@@ -1530,6 +1555,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			nodeID := parts[2]
+
+			// Validate EdgeNode identity binding (P1 finding): EdgeNode callers can only heartbeat their own node
+			tc, ok := auth.FromContext(r.Context())
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "authentication context missing")
+				return
+			}
+			if tc.Role == auth.RoleEdgeNode && (tc.NodeID == "" || tc.NodeID != nodeID) {
+				writeError(w, http.StatusForbidden, "edge node credential cannot update another node")
+				return
+			}
+
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			var payload struct {
 				CPUUsagePercent   float64 `json:"cpu_usage_percent"`

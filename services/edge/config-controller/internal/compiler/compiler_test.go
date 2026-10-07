@@ -48,6 +48,7 @@ func TestCompiler(t *testing.T) {
 
 	// 3. Verify domain: now ACTIVE -> must generate virtual hosts & clusters
 	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
 	_, err = svc.VerifyDomain(res.DomainID)
 	if err != nil {
 		t.Fatalf("verify error: %v", err)
@@ -234,6 +235,7 @@ func TestCompiler_ExactRateLimitAndClusterTLS(t *testing.T) {
 	st := store.NewStore()
 	svc := onboarding.NewDomainService(st)
 	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
 
 	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj_test",
@@ -329,3 +331,62 @@ func TestCompiler_ExactRateLimitAndClusterTLS(t *testing.T) {
 		}
 	}
 }
+
+func TestCompiler_TLSSettingsAndHSTSIntegration(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_tls_test",
+		Hostname:       "secure.example.com",
+		OriginAddress:  "origin.secure.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard error: %v", err)
+	}
+
+	_, err = svc.VerifyDomain(res.DomainID)
+	if err != nil {
+		t.Fatalf("verify error: %v", err)
+	}
+
+	// Attach active certificate
+	st.SaveCertificate(&model.Certificate{
+		ID:        "cert-secure-1",
+		DomainID:  res.DomainID,
+		Status:    model.CertStatusActive,
+		CertPEM:   "-----BEGIN CERTIFICATE-----\nMOCK_CERT\n-----END CERTIFICATE-----",
+		ExpiresAt: time.Now().Add(90 * 24 * time.Hour),
+	})
+
+	// Configure TLSv1.3 and HSTS
+	st.SaveTLSSettings(res.DomainID, &model.TLSSettings{
+		MinTLSVersion: "TLSv1.3",
+		HSTS:          true,
+		HSTSMaxAge:    63072000,
+	})
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("failed to compile topology with TLS settings: %v", err)
+	}
+
+	cfgJSON, _ := cfg.ToJSON()
+	cfgStr := string(cfgJSON)
+
+	// Verify TLSv1_3 in DownstreamTlsContext
+	if !strings.Contains(cfgStr, `"tls_minimum_protocol_version": "TLSv1_3"`) {
+		t.Errorf("expected compiled config to reflect TLSv1_3 minimum protocol version")
+	}
+
+	// Verify HSTS response header injection
+	if !strings.Contains(cfgStr, "Strict-Transport-Security") || !strings.Contains(cfgStr, "max-age=63072000; includeSubDomains") {
+		t.Errorf("expected VirtualHost to include Strict-Transport-Security response header")
+	}
+}
+

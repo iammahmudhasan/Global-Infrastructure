@@ -269,6 +269,14 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 	}, nil
 }
 
+func isExplicitDevEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "development" || env == "test"
+}
+
 // VerifyDomain verifies customer DNS CNAME pointing or TXT challenge and activates the edge route (Finding 10)
 func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 	domain, err := s.store.GetDomain(domainID)
@@ -276,16 +284,15 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 		return nil, err
 	}
 
-	// In automated local development mode only, permit bypass of external recursive DNS
-	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" &&
-		os.Getenv("NEXUSEDGE_ENV") != "production" &&
-		os.Getenv("ENV") != "production" {
+	// In automated local development mode only, permit bypass of external recursive DNS (positive allowlist)
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
 		if err := s.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
 			return nil, err
 		}
 		domain.Status = model.DomainStatusActive
 		return domain, nil
 	}
+
 
 	// Recursive DNS check for CNAME target
 	cname, err := net.LookupCNAME(domain.Hostname)

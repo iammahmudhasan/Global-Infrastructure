@@ -31,11 +31,20 @@ const (
 	RoleEdgeNode         Role = "EDGE_NODE"
 )
 
+func isExplicitDevEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "development" || env == "test"
+}
+
 // TenantRecord represents an authenticated organizational identity
 type TenantRecord struct {
 	TenantID        string
 	ProjectID       string
 	Role            Role
+	NodeID          string
 	APIKey          string
 	AllowedProjects map[string]bool
 	Active          bool
@@ -46,6 +55,7 @@ type TenantContext struct {
 	TenantID        string
 	ProjectID       string
 	Role            Role
+	NodeID          string
 	AllowedProjects map[string]bool
 	IsDevBypass     bool
 }
@@ -71,32 +81,40 @@ func (a *Authenticator) loadFromEnv() {
 			parts := strings.Split(strings.TrimSpace(entry), ":")
 			if len(parts) >= 3 {
 				role := RoleTenant
+				nodeID := ""
 				extra := []string{}
 				if len(parts) > 3 {
-					// Format: key:tenant:proj:role:extraProj1...
+					// Format: key:tenant:proj:role:extraProj1/nodeID...
 					switch strings.ToUpper(parts[3]) {
 					case "PLATFORM_OPERATOR", "OPERATOR", "ADMIN":
 						role = RolePlatformOperator
 					case "EDGE_NODE", "NODE":
 						role = RoleEdgeNode
+						if len(parts) > 4 {
+							nodeID = parts[4]
+						}
 					default:
 						extra = append(extra, parts[3])
 					}
-					if len(parts) > 4 {
+					if role != RoleEdgeNode && len(parts) > 4 {
 						extra = append(extra, parts[4:]...)
 					}
 				}
-				a.RegisterTenantWithRole(parts[0], parts[1], parts[2], role, extra...)
+				if role == RoleEdgeNode && nodeID != "" {
+					a.RegisterNode(parts[0], parts[1], parts[2], nodeID)
+				} else {
+					a.RegisterTenantWithRole(parts[0], parts[1], parts[2], role, extra...)
+				}
 			}
 		}
 		return
 	}
 
-	// In explicit local development mode, register synthetic mock fixtures
-	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+	// In explicit local development mode, register synthetic mock fixtures (positive allowlist)
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
 		a.RegisterTenantWithRole("dev-fixture-key-01", "tenant-system", "proj-core", RolePlatformOperator, "prj-enterprise-01")
 		a.RegisterTenantWithRole("dev-fixture-key-banking", "tenant-cbr-banking", "proj-fintech-prod", RoleTenant)
-		a.RegisterTenantWithRole("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", RoleEdgeNode)
+		a.RegisterNode("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", "edge-node-01")
 	}
 }
 
@@ -125,6 +143,25 @@ func (a *Authenticator) RegisterTenantWithRole(apiKey, tenantID, projectID strin
 		Active:          true,
 	}
 }
+
+func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	allowed := make(map[string]bool)
+	allowed[projectID] = true
+
+	a.tenants[apiKey] = &TenantRecord{
+		TenantID:        tenantID,
+		ProjectID:       projectID,
+		Role:            RoleEdgeNode,
+		NodeID:          nodeID,
+		APIKey:          apiKey,
+		AllowedProjects: allowed,
+		Active:          true,
+	}
+}
+
 
 // ValidateKey verifies API key in constant time to prevent timing attacks (Rule 17)
 func (a *Authenticator) ValidateKey(providedKey string) (*TenantRecord, error) {
@@ -226,6 +263,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 				TenantID:        record.TenantID,
 				ProjectID:       record.ProjectID,
 				Role:            record.Role,
+				NodeID:          record.NodeID,
 				AllowedProjects: record.AllowedProjects,
 				IsDevBypass:     false,
 			}
@@ -253,8 +291,8 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 5. Strict Dev Bypass Gate (Finding 18): Only permitted when NEXUSEDGE_DEV_MODE=true
-		if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+		// 5. Strict Dev Bypass Gate (Finding 3): Only permitted when NEXUSEDGE_DEV_MODE=true AND in explicit dev/test environment
+		if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
 			tc := &TenantContext{
 				TenantID:        "dev-tenant",
 				ProjectID:       "proj-default",
@@ -266,6 +304,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
+
 
 		// 6. Fail closed in all other environments (staging, preview, CI)
 		w.Header().Set("Content-Type", "application/json")

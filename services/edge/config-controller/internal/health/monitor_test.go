@@ -268,3 +268,41 @@ func TestMonitor_RuntimeSSRFBlocked(t *testing.T) {
 		}
 	}
 }
+
+func TestMonitor_IPv6ProbeFormatting(t *testing.T) {
+	// Verify that IPv6 address properly formats with brackets and does not panic or fail with invalid URL syntax
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	m := health.NewMonitor()
+	ctx := context.Background()
+
+	origin := &model.Origin{
+		ID:       "orig-ipv6-test",
+		PoolID:   "pool-ipv6",
+		Address:  "2001:db8::1",
+		Port:     8080,
+		Protocol: model.ProtocolHTTP,
+		Healthy:  true,
+	}
+
+	monitorConfig := &model.HealthMonitor{
+		ID:                  "hm-ipv6",
+		PoolID:              "pool-ipv6",
+		Protocol:            model.HealthCheckProtocolHTTP,
+		Path:                "/healthz",
+		Port:                8080,
+		TimeoutSeconds:      1,
+		HealthyThreshold:    2,
+		UnhealthyThreshold:  1,
+		ExpectedStatusCodes: []int{200},
+	}
+
+	st := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	if st == nil {
+		t.Fatalf("expected state returned from IPv6 probe")
+	}
+	// Because 2001:db8::1 is unreachable/testnet, it fails to connect, but must NOT fail due to malformed URL parsing
+	if st.ConsecutiveFailures != 1 {
+		t.Errorf("expected failure registered for probe to unreachable IPv6 address, got %d", st.ConsecutiveFailures)
+	}
+}
+

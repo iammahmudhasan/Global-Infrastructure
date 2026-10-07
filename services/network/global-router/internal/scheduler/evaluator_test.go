@@ -330,3 +330,93 @@ func TestDeterministicFallbackOrdering(t *testing.T) {
 		}
 	}
 }
+
+func TestDeterministicScoreTieBreak(t *testing.T) {
+	// Construct two eligible backends with identical metrics (identical composite score)
+	// Evaluate repeatedly and assert the lexicographically lower backend ID is always chosen
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	// Register two backends with identical properties except ID
+	reg.Register(&registry.ComputeBackend{
+		ID:              "cluster-z-backend",
+		Name:            "Cluster Z",
+		Provider:        "custom",
+		Region:          "us-east-1",
+		Jurisdiction:    registry.ResidencyUS,
+		Endpoint:        "https://z.internal/v1",
+		GPUModel:        "A100",
+		AvailableGPUs:   16,
+		HourlyCost:      2.00,
+		CostPer1kTokens: 0.002,
+		LatencyP95Ms:    50,
+		CarbonIntensity: 100.0,
+		Healthy:         true,
+	})
+	reg.Register(&registry.ComputeBackend{
+		ID:              "cluster-a-backend",
+		Name:            "Cluster A",
+		Provider:        "custom",
+		Region:          "us-east-1",
+		Jurisdiction:    registry.ResidencyUS,
+		Endpoint:        "https://a.internal/v1",
+		GPUModel:        "A100",
+		AvailableGPUs:   16,
+		HourlyCost:      2.00,
+		CostPer1kTokens: 0.002,
+		LatencyP95Ms:    50,
+		CarbonIntensity: 100.0,
+		Healthy:         true,
+	})
+
+	for i := 0; i < 5; i++ {
+		policy := scheduler.DispatchPolicy{
+			WorkloadID:    fmt.Sprintf("tie-break-workload-%d", i),
+			TenantID:      "tenant-tie",
+			RequiredGPU:   "A100",
+			GPUsRequested: 1,
+			Objective:     scheduler.ObjectiveBalanced,
+		}
+
+		decision, err := eval.Evaluate(policy)
+		if err != nil {
+			t.Fatalf("run %d: evaluate failed: %v", i, err)
+		}
+
+		// "cluster-a-backend" < "cluster-z-backend" lexicographically
+		if decision.AssignedBackend.ID != "cluster-a-backend" {
+			t.Fatalf("run %d: expected deterministic tie-break to select cluster-a-backend, got %s",
+				i, decision.AssignedBackend.ID)
+		}
+	}
+}
+
+func TestSchedulerEnforcesCircuitBreakerAdmission(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	// Trip the breaker on "bd-dhaka-dgx01" by reporting consecutive failures
+	for i := 0; i < 3; i++ {
+		reg.UpdateHealth("bd-dhaka-dgx01", 999, false)
+	}
+
+	state := reg.CircuitState("bd-dhaka-dgx01")
+	if state != circuitbreaker.StateOpen {
+		t.Fatalf("expected breaker OPEN, got %s", state)
+	}
+
+	// Verify that scheduler rejects assigning to bd-dhaka-dgx01 while breaker is OPEN
+	policy := scheduler.DispatchPolicy{
+		WorkloadID:        "cb-guard-workload-1",
+		TenantID:          "tenant-cbr-banking",
+		Residency:         registry.ResidencyBangladesh,
+		StrictSovereignty: true,
+		Objective:         scheduler.ObjectiveLatency,
+	}
+
+	_, err := eval.Evaluate(policy)
+	if err == nil {
+		t.Fatalf("expected rejection when circuit breaker is OPEN, got nil error")
+	}
+}
+

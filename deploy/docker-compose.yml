@@ -9,6 +9,7 @@ services:
     environment:
       - PORT=9091
       - NEXUSEDGE_DEV_MODE=true
+      - NEXUSEDGE_ENV=development
       - NEXUSEDGE_ACME_HOST=config-controller
       - NEXUSEDGE_ACME_PORT=9091
     restart: unless-stopped

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -154,7 +155,8 @@ func (m *Monitor) ProbeEndpoint(ctx context.Context, origin *model.Origin, monit
 		path = "/" + path
 	}
 
-	probeURL := fmt.Sprintf("%s://%s:%d%s", scheme, origin.Address, port, path)
+	hostPort := net.JoinHostPort(origin.Address, strconv.Itoa(port))
+	probeURL := fmt.Sprintf("%s://%s%s", scheme, hostPort, path)
 	timeout := time.Duration(monitor.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = 2 * time.Second

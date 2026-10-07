@@ -205,6 +205,23 @@ func (r *Registry) CircuitState(id string) circuitbreaker.State {
 	return b.Breaker.State()
 }
 
+// AllowBackend checks whether an outgoing request should proceed through the backend's circuit breaker
+func (r *Registry) AllowBackend(id string) error {
+	r.mu.RLock()
+	b, ok := r.backends[id]
+	r.mu.RUnlock()
+
+	if !ok {
+		return ErrBackendNotFound
+	}
+	if b.Breaker == nil {
+		return nil
+	}
+
+	return b.Breaker.Allow()
+}
+
+
 func (r *Registry) Get(id string) (*ComputeBackend, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

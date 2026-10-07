@@ -126,7 +126,18 @@ impl EdgeCache {
 
         let mut store = self.store.write().unwrap();
 
-        // Count total active variants across all keys
+        // 1. If an exact variant already exists for this key, update in-place without evicting others (Finding 8)
+        if let Some(variants) = store.get_mut(&key) {
+            if let Some(existing) = variants
+                .iter_mut()
+                .find(|v| v.vary_headers == entry.vary_headers)
+            {
+                *existing = entry;
+                return;
+            }
+        }
+
+        // 2. Count total active variants across all keys for new variant insertion
         let mut total_entries: usize = store.values().map(|v| v.len()).sum();
 
         if total_entries >= self.max_entries {
@@ -172,15 +183,7 @@ impl EdgeCache {
         }
 
         let variants = store.entry(key).or_default();
-        // Replace existing variant if matching same vary headers
-        if let Some(existing) = variants
-            .iter_mut()
-            .find(|v| v.vary_headers == entry.vary_headers)
-        {
-            *existing = entry;
-        } else {
-            variants.push(entry);
-        }
+        variants.push(entry);
     }
 
     #[allow(dead_code)]
@@ -388,5 +391,63 @@ mod tests {
             .get("http://example.com/resource", Some(&req_empty))
             .unwrap();
         assert_eq!(hit_empty.body, Bytes::from("body-empty-val"));
+    }
+
+    #[test]
+    fn test_in_place_variant_replacement_does_not_evict_other_entries() {
+        // Cache at capacity limit 2
+        let cache = EdgeCache::new(true, 3600, 2);
+
+        // Insert key1
+        cache.put(
+            "key1".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from("initial-payload-1"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        // Insert key2
+        cache.put(
+            "key2".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from("initial-payload-2"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        assert_eq!(cache.len(), 2, "cache should be at capacity 2");
+
+        // Update key1 in-place (same variant)
+        cache.put(
+            "key1".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from("updated-payload-1"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        // Cache length should remain 2 (no eviction of key2!)
+        assert_eq!(
+            cache.len(),
+            2,
+            "in-place update must not evict other entries"
+        );
+
+        // key2 must still be present and intact
+        let hit_k2 = cache.get("key2", None);
+        assert!(
+            hit_k2.is_some(),
+            "key2 must NOT be evicted when key1 is updated in-place"
+        );
+        assert_eq!(hit_k2.unwrap().body, Bytes::from("initial-payload-2"));
+
+        // key1 must have the updated payload
+        let hit_k1 = cache.get("key1", None);
+        assert!(hit_k1.is_some());
+        assert_eq!(hit_k1.unwrap().body, Bytes::from("updated-payload-1"));
     }
 }

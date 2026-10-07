@@ -78,6 +78,7 @@ func TestOnboardAndVerifyDomain(t *testing.T) {
 
 	// Verify domain activation
 	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
 	verifiedDomain, err := svc.VerifyDomain(resp.DomainID)
 	if err != nil {
 		t.Fatalf("failed to verify domain: %v", err)
@@ -212,3 +213,38 @@ func TestVerifyDomain_DefaultEnvironmentMustNotAutoActivate(t *testing.T) {
 		t.Fatal("domain verification must fail closed when DNS proof is absent in default environment")
 	}
 }
+
+func TestVerifyDomain_PositiveAllowlistDevGate(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+
+	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj-test",
+		Hostname:       "dev-gate-check.example.com",
+		OriginAddress:  "198.51.100.30",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	// 1. NEXUSEDGE_DEV_MODE=true but NEXUSEDGE_ENV is empty -> MUST FAIL CLOSED
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "")
+	_, err = svc.VerifyDomain(resp.DomainID)
+	if err == nil {
+		t.Fatal("expected failure when NEXUSEDGE_ENV is not explicitly development/test")
+	}
+
+	// 2. NEXUSEDGE_DEV_MODE=true and NEXUSEDGE_ENV=development -> Succeeds
+	t.Setenv("NEXUSEDGE_ENV", "development")
+	domain, err := svc.VerifyDomain(resp.DomainID)
+	if err != nil {
+		t.Fatalf("expected success with explicit development environment, got: %v", err)
+	}
+	if domain.Status != model.DomainStatusActive {
+		t.Errorf("expected ACTIVE status, got %s", domain.Status)
+	}
+}
+

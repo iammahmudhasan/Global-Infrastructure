@@ -166,6 +166,10 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 
 		for _, item := range fallbackList {
 			b := item.backend
+			// Enforce circuit breaker admission guard (Trial probe in HALF_OPEN state)
+			if err := e.reg.AllowBackend(b.ID); err != nil {
+				continue
+			}
 			if err := e.reg.Reserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
 				decision := &DispatchDecision{
 					WorkloadID:      policy.WorkloadID,
@@ -218,16 +222,25 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		})
 	}
 
-	// Sort eligible candidates by score: lowest penalty score first (Finding 6)
+	// Sort eligible candidates by score: lowest penalty score first, tie-break by backend ID (Finding 1)
 	sort.Slice(scored, func(i, j int) bool {
-		return scored[i].score < scored[j].score
+		if scored[i].score != scored[j].score {
+			return scored[i].score < scored[j].score
+		}
+		return scored[i].backend.ID < scored[j].backend.ID
 	})
 
 	// 5. Reserve Capacity with Fallback to Next Best Candidate (Finding 6, 7)
+	// Note on V1 Lifecycle: Allow() guards admission and admits a single trial probe when in HALF_OPEN state.
+	// Downstream execution feedback (invoking RecordSuccess / RecordFailure via Registry.UpdateHealth or execution
+	// response hooks) belongs to the workload execution layer.
 	var bestBackend *registry.ComputeBackend
 	var bestScore float64
 
 	for _, item := range scored {
+		if err := e.reg.AllowBackend(item.backend.ID); err != nil {
+			continue
+		}
 		if err := e.reg.Reserve(policy.WorkloadID, item.backend.ID, gpusReq); err == nil {
 			bestBackend = item.backend
 			bestScore = item.score
@@ -238,6 +251,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	if bestBackend == nil {
 		return nil, fmt.Errorf("%w: candidate capacity exhausted during reservation race", ErrNoEligibleBackends)
 	}
+
 
 	// 6. Synthesize Explainable Decision Codes (Rule 112)
 	var reasonCodes []string

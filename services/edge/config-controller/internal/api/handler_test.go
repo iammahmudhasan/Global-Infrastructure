@@ -20,6 +20,7 @@ import (
 
 func setupTestServer() *api.APIHandler {
 	os.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	os.Setenv("NEXUSEDGE_ENV", "test")
 	st := store.NewStore()
 	svc := onboarding.NewDomainService(st)
 	comp := compiler.NewCompiler(9901, 80, 443)
@@ -1151,3 +1152,181 @@ func TestAddOrigin_PortAndProtocolValidation(t *testing.T) {
 		t.Fatalf("expected 201 Created for valid origin, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestTLSSettings_Validation(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Onboard Domain
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "tls-val.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-tls/domains", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("onboard failed: %d", w.Code)
+	}
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	// 2. Reject unsupported TLS version (TLSv1.1)
+	badTLS, _ := json.Marshal(map[string]interface{}{
+		"min_tls_version": "TLSv1.1",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+res.DomainID+"/tls", bytes.NewReader(badTLS))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "min_tls_version must be TLSv1.2 or TLSv1.3") {
+		t.Fatalf("expected 400 for TLSv1.1, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Accept TLSv1.3
+	goodTLS, _ := json.Marshal(map[string]interface{}{
+		"min_tls_version": "TLSv1.3",
+		"hsts":            true,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+res.DomainID+"/tls", bytes.NewReader(goodTLS))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for TLSv1.3, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHealthMonitor_ProtocolValidation(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Onboard Domain
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "tcp-gate.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-tcp/domains", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var res struct {
+		DomainID     string `json:"domain_id"`
+		OriginPoolID string `json:"origin_pool_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	// 2. Reject TCP health monitor protocol
+	tcpMonitor, _ := json.Marshal(map[string]interface{}{
+		"protocol": "TCP",
+		"port":     443,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/pools/"+res.OriginPoolID+"/health-monitor", bytes.NewReader(tcpMonitor))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "health monitor protocol must be HTTP or HTTPS") {
+		t.Fatalf("expected 400 for TCP monitor, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestDomainVerification_StatusCodes(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Nonexistent domain returns 404
+	req := httptest.NewRequest(http.MethodPost, "/v1/domains/nonexistent-dom-id/verify", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent domain, got %d", w.Code)
+	}
+
+	// 2. Existing domain with failed verification under non-dev mode returns 422
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "unverified-unique-test.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/projects/prj-verify/domains", bytes.NewReader(body))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	// Explicitly disable dev mode for verification check and authenticate request
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	handler.Authenticator().RegisterTenantWithRole("key-verify-test", "tenant-verify", "prj-verify", auth.RolePlatformOperator, "*")
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+res.DomainID+"/verify", nil)
+	req.Header.Set("X-API-Key", "key-verify-test")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "domain verification failed") {
+		t.Fatalf("expected 422 Unprocessable Entity for failed DNS proof, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEdgeNodeHeartbeat_IdentityBinding(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	// Register test nodes in Dhaka PoP
+	node1 := model.EdgeNode{
+		ID:        "edge-node-01",
+		PoPID:     "dhaka",
+		Hostname:  "node-01.dhaka.nexusedge.net",
+		IPAddress: "192.0.2.10",
+	}
+	node2 := model.EdgeNode{
+		ID:        "edge-node-02",
+		PoPID:     "dhaka",
+		Hostname:  "node-02.dhaka.nexusedge.net",
+		IPAddress: "192.0.2.20",
+	}
+	_, _ = handler.PoPManager().RegisterNode(node1)
+	_, _ = handler.PoPManager().RegisterNode(node2)
+
+	// Register specific EdgeNode credentials
+	authInst := handler.Authenticator()
+	authInst.RegisterNode("key-node-01", "tenant-infra", "proj-infra", "edge-node-01")
+	authInst.RegisterTenantWithRole("key-operator", "tenant-sys", "proj-core", auth.RolePlatformOperator, "*")
+
+	heartbeatPayload, _ := json.Marshal(map[string]interface{}{
+		"cpu_usage_percent":  15.5,
+		"memory_usage_mb":    512,
+		"active_connections": 100,
+	})
+
+	// 1. edge-node-01 heartbeats its own node -> 200 OK
+	req := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes/edge-node-01/heartbeat", bytes.NewReader(heartbeatPayload))
+	req.Header.Set("X-API-Key", "key-node-01")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for node-01 self-heartbeat, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. edge-node-01 attempts to heartbeat edge-node-02 -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes/edge-node-02/heartbeat", bytes.NewReader(heartbeatPayload))
+	req.Header.Set("X-API-Key", "key-node-01")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "edge node credential cannot update another node") {
+		t.Fatalf("expected 403 Forbidden for cross-node heartbeat, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Platform Operator can heartbeat edge-node-02 -> 200 OK
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/nodes/edge-node-02/heartbeat", bytes.NewReader(heartbeatPayload))
+	req.Header.Set("X-API-Key", "key-operator")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for operator heartbeat, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
