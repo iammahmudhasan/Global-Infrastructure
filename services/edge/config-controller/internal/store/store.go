@@ -1,0 +1,203 @@
+package store
+
+import (
+	"errors"
+	"sync"
+
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+)
+
+var (
+	ErrNotFound      = errors.New("entity not found")
+	ErrAlreadyExists = errors.New("entity already exists")
+)
+
+type Store struct {
+	mu           sync.RWMutex
+	domains      map[string]*model.Domain
+	hostIndex    map[string]string // hostname -> domain ID
+	pools        map[string]*model.OriginPool
+	origins      map[string]*model.Origin
+	routes       map[string][]*model.Route          // domain ID -> routes
+	security     map[string]*model.SecurityPolicy   // domain ID -> policy
+	cache        map[string]*model.CachePolicy      // domain ID -> policy
+	certificates map[string]*model.Certificate      // domain ID -> certificate
+}
+
+func NewStore() *Store {
+	return &Store{
+		domains:      make(map[string]*model.Domain),
+		hostIndex:    make(map[string]string),
+		pools:        make(map[string]*model.OriginPool),
+		origins:      make(map[string]*model.Origin),
+		routes:       make(map[string][]*model.Route),
+		security:     make(map[string]*model.SecurityPolicy),
+		cache:        make(map[string]*model.CachePolicy),
+		certificates: make(map[string]*model.Certificate),
+	}
+}
+
+func (s *Store) SaveDomain(d *model.Domain) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.hostIndex[d.Hostname]; exists {
+		return ErrAlreadyExists
+	}
+
+	s.domains[d.ID] = d
+	s.hostIndex[d.Hostname] = d.ID
+	return nil
+}
+
+func (s *Store) GetDomain(id string) (*model.Domain, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	d, exists := s.domains[id]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	return d, nil
+}
+
+func (s *Store) GetDomainByHost(hostname string) (*model.Domain, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	id, exists := s.hostIndex[hostname]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	return s.domains[id], nil
+}
+
+func (s *Store) ListDomainsByProject(projectID string) []*model.Domain {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var list []*model.Domain
+	for _, d := range s.domains {
+		if d.ProjectID == projectID {
+			list = append(list, d)
+		}
+	}
+	return list
+}
+
+func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	d, exists := s.domains[id]
+	if !exists {
+		return ErrNotFound
+	}
+	d.Status = status
+	return nil
+}
+
+func (s *Store) SaveOriginPool(p *model.OriginPool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pools[p.ID] = p
+}
+
+func (s *Store) AddOrigin(o *model.Origin) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pool, exists := s.pools[o.PoolID]
+	if !exists {
+		return ErrNotFound
+	}
+
+	s.origins[o.ID] = o
+	pool.Origins = append(pool.Origins, *o)
+	return nil
+}
+
+func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, exists := s.pools[poolID]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	return p, nil
+}
+
+func (s *Store) SaveRoute(r *model.Route) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.routes[r.DomainID] = append(s.routes[r.DomainID], r)
+}
+
+func (s *Store) GetRoutes(domainID string) []*model.Route {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.routes[domainID]
+}
+
+func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.security[sp.DomainID] = sp
+}
+
+func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.security[domainID]
+}
+
+func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache[cp.DomainID] = cp
+}
+
+func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cache[domainID]
+}
+
+type DomainTopology struct {
+	Domain   *model.Domain
+	Routes   []*model.Route
+	Pools    map[string]*model.OriginPool // poolID -> OriginPool
+	Security *model.SecurityPolicy
+	Cache    *model.CachePolicy
+}
+
+// GetActiveTopologies extracts all verified and active domains for Envoy compilation
+func (s *Store) GetActiveTopologies() []*DomainTopology {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var topologies []*DomainTopology
+	for _, d := range s.domains {
+		if d.Status != model.DomainStatusActive {
+			continue // Only compile active, verified domains (Rule 17)
+		}
+
+		topo := &DomainTopology{
+			Domain:   d,
+			Routes:   s.routes[d.ID],
+			Pools:    make(map[string]*model.OriginPool),
+			Security: s.security[d.ID],
+			Cache:    s.cache[d.ID],
+		}
+
+		for _, r := range topo.Routes {
+			if pool, exists := s.pools[r.PoolID]; exists {
+				topo.Pools[r.PoolID] = pool
+			}
+		}
+
+		topologies = append(topologies, topo)
+	}
+	return topologies
+}

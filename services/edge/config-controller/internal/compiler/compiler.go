@@ -1,0 +1,415 @@
+package compiler
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
+)
+
+// EnvoyConfig represents the top-level Envoy v3 bootstrap / static configuration.
+type EnvoyConfig struct {
+	Admin           Admin           `json:"admin"`
+	StaticResources StaticResources `json:"static_resources"`
+}
+
+type Admin struct {
+	Address Address `json:"address"`
+}
+
+type StaticResources struct {
+	Listeners []Listener `json:"listeners"`
+	Clusters  []Cluster  `json:"clusters"`
+}
+
+type Listener struct {
+	Name         string        `json:"name"`
+	Address      Address       `json:"address"`
+	FilterChains []FilterChain `json:"filter_chains"`
+}
+
+type Address struct {
+	SocketAddress SocketAddress `json:"socket_address"`
+}
+
+type SocketAddress struct {
+	Address   string `json:"address"`
+	PortValue int    `json:"port_value"`
+}
+
+type FilterChain struct {
+	FilterChainMatch *FilterChainMatch `json:"filter_chain_match,omitempty"`
+	Filters          []Filter          `json:"filters"`
+}
+
+type FilterChainMatch struct {
+	ServerNames []string `json:"server_names,omitempty"`
+}
+
+type Filter struct {
+	Name        string                 `json:"name"`
+	TypedConfig map[string]interface{} `json:"typed_config"`
+}
+
+type VirtualHost struct {
+	Name    string   `json:"name"`
+	Domains []string `json:"domains"`
+	Routes  []Route  `json:"routes"`
+}
+
+type Route struct {
+	Match  RouteMatch  `json:"match"`
+	Route  *RouteAction `json:"route,omitempty"`
+	Redirect *RedirectAction `json:"redirect,omitempty"`
+}
+
+type RouteMatch struct {
+	Prefix string `json:"prefix"`
+}
+
+type RouteAction struct {
+	Cluster        string       `json:"cluster"`
+	Timeout        string       `json:"timeout"`
+	RetryPolicy    *RetryPolicy `json:"retry_policy,omitempty"`
+	HostRewriteLiteral string  `json:"host_rewrite_literal,omitempty"`
+}
+
+type RedirectAction struct {
+	HttpsRedirect bool `json:"https_redirect"`
+}
+
+type RetryPolicy struct {
+	RetryOn    string `json:"retry_on"`
+	NumRetries int    `json:"num_retries"`
+}
+
+type Cluster struct {
+	Name           string           `json:"name"`
+	ConnectTimeout string           `json:"connect_timeout"`
+	Type           string           `json:"type"`
+	LbPolicy       string           `json:"lb_policy"`
+	LoadAssignment LoadAssignment   `json:"load_assignment"`
+	TransportSocket *TransportSocket `json:"transport_socket,omitempty"`
+}
+
+type TransportSocket struct {
+	Name        string                 `json:"name"`
+	TypedConfig map[string]interface{} `json:"typed_config"`
+}
+
+type LoadAssignment struct {
+	ClusterName string        `json:"cluster_name"`
+	Endpoints   []LocalityEndpoints `json:"endpoints"`
+}
+
+type LocalityEndpoints struct {
+	LbEndpoints []LbEndpoint `json:"lb_endpoints"`
+}
+
+type LbEndpoint struct {
+	Endpoint            Endpoint `json:"endpoint"`
+	LoadBalancingWeight int      `json:"load_balancing_weight,omitempty"`
+}
+
+type Endpoint struct {
+	Address Address `json:"address"`
+}
+
+// Compiler transforms domain topologies from the control plane into Envoy v3 configuration
+type Compiler struct {
+	adminPort   int
+	httpPort    int
+	httpsPort   int
+	edgeVersion string
+}
+
+func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
+	if adminPort == 0 {
+		adminPort = 9901
+	}
+	if httpPort == 0 {
+		httpPort = 80
+	}
+	if httpsPort == 0 {
+		httpsPort = 443
+	}
+	return &Compiler{
+		adminPort:   adminPort,
+		httpPort:    httpPort,
+		httpsPort:   httpsPort,
+		edgeVersion: "v1.0.0",
+	}
+}
+
+// Compile compiles active domain topologies into an Envoy v3 configuration
+func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, error) {
+	config := &EnvoyConfig{
+		Admin: Admin{
+			Address: Address{
+				SocketAddress: SocketAddress{
+					Address:   "127.0.0.1",
+					PortValue: c.adminPort,
+				},
+			},
+		},
+		StaticResources: StaticResources{
+			Listeners: make([]Listener, 0),
+			Clusters:  make([]Cluster, 0),
+		},
+	}
+
+	clustersMap := make(map[string]Cluster)
+	httpsVirtualHosts := make([]VirtualHost, 0)
+	httpVirtualHosts := make([]VirtualHost, 0)
+
+	for _, topo := range topologies {
+		if topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
+			continue // Invariant: Only compile active domains (Rule 17)
+		}
+
+		hostname := strings.ToLower(topo.Domain.Hostname)
+		vh := VirtualHost{
+			Name:    fmt.Sprintf("vhost_%s", sanitizeName(hostname)),
+			Domains: []string{hostname, fmt.Sprintf("%s:*", hostname)},
+			Routes:  make([]Route, 0),
+		}
+
+		// Also build an HTTP redirect virtual host
+		httpVh := VirtualHost{
+			Name:    fmt.Sprintf("http_redirect_%s", sanitizeName(hostname)),
+			Domains: []string{hostname, fmt.Sprintf("%s:*", hostname)},
+			Routes: []Route{
+				{
+					Match: RouteMatch{Prefix: "/"},
+					Redirect: &RedirectAction{
+						HttpsRedirect: true,
+					},
+				},
+			},
+		}
+		httpVirtualHosts = append(httpVirtualHosts, httpVh)
+
+		// Process routes and their upstream clusters
+		for _, r := range topo.Routes {
+			pool, exists := topo.Pools[r.PoolID]
+			if !exists || pool == nil || len(pool.Origins) == 0 {
+				continue
+			}
+
+			clusterName := fmt.Sprintf("cluster_%s", pool.ID)
+
+			timeoutStr := "15s"
+			if r.TimeoutMs > 0 {
+				timeoutStr = fmt.Sprintf("%.2fs", float64(r.TimeoutMs)/1000.0)
+			}
+
+			vh.Routes = append(vh.Routes, Route{
+				Match: RouteMatch{
+					Prefix: r.PathPrefix,
+				},
+				Route: &RouteAction{
+					Cluster: clusterName,
+					Timeout: timeoutStr,
+					RetryPolicy: &RetryPolicy{
+						RetryOn:    "5xx,connect-failure,refused-stream,gateway-error",
+						NumRetries: 2,
+					},
+				},
+			})
+
+			// Add cluster to map if not already built
+			if _, alreadyExists := clustersMap[clusterName]; !alreadyExists {
+				cluster := c.buildCluster(clusterName, pool)
+				clustersMap[clusterName] = cluster
+			}
+		}
+
+		httpsVirtualHosts = append(httpsVirtualHosts, vh)
+	}
+
+	// 1. Build Port 80 HTTP Ingress Listener (Redirects to HTTPS)
+	httpListener := c.buildHTTPListener(httpVirtualHosts)
+	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
+
+	// 2. Build Port 443 HTTPS Ingress Listener
+	httpsListener := c.buildHTTPSListener(httpsVirtualHosts)
+	config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
+
+	// 3. Collect all unique upstream clusters
+	for _, cluster := range clustersMap {
+		config.StaticResources.Clusters = append(config.StaticResources.Clusters, cluster)
+	}
+
+	return config, nil
+}
+
+func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost) Listener {
+	routeConfig := map[string]interface{}{
+		"name":          "edge_http_routes",
+		"virtual_hosts": virtualHosts,
+	}
+
+	hcmConfig := map[string]interface{}{
+		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+		"stat_prefix":  "edge_http_ingress",
+		"route_config": routeConfig,
+		"http_filters": []map[string]interface{}{
+			{
+				"name": "envoy.filters.http.router",
+				"typed_config": map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+				},
+			},
+		},
+	}
+
+	return Listener{
+		Name: "edge_http_listener",
+		Address: Address{
+			SocketAddress: SocketAddress{
+				Address:   "0.0.0.0",
+				PortValue: c.httpPort,
+			},
+		},
+		FilterChains: []FilterChain{
+			{
+				Filters: []Filter{
+					{
+						Name:        "envoy.filters.network.http_connection_manager",
+						TypedConfig: hcmConfig,
+					},
+				},
+			},
+		},
+	}
+}
+
+func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost) Listener {
+	routeConfig := map[string]interface{}{
+		"name":          "edge_https_routes",
+		"virtual_hosts": virtualHosts,
+	}
+
+	hcmConfig := map[string]interface{}{
+		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+		"stat_prefix":  "edge_https_ingress",
+		"route_config": routeConfig,
+		"http_filters": []map[string]interface{}{
+			{
+				"name": "envoy.filters.http.router",
+				"typed_config": map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router",
+				},
+			},
+		},
+	}
+
+	return Listener{
+		Name: "edge_https_listener",
+		Address: Address{
+			SocketAddress: SocketAddress{
+				Address:   "0.0.0.0",
+				PortValue: c.httpsPort,
+			},
+		},
+		FilterChains: []FilterChain{
+			{
+				Filters: []Filter{
+					{
+						Name:        "envoy.filters.network.http_connection_manager",
+						TypedConfig: hcmConfig,
+					},
+				},
+			},
+		},
+	}
+}
+
+func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Cluster {
+	// Determine cluster discovery type: STRICT_DNS for domain origins, STATIC for raw IPs
+	clusterType := "STRICT_DNS"
+	isAllIPs := true
+	hasHTTPS := false
+
+	lbEndpoints := make([]LbEndpoint, 0)
+	for _, o := range pool.Origins {
+		if !o.Healthy {
+			continue // Exclude unhealthy endpoints from active rotation (Rule 16)
+		}
+
+		if net.ParseIP(o.Address) == nil {
+			isAllIPs = false
+		}
+		if o.Protocol == model.ProtocolHTTPS {
+			hasHTTPS = true
+		}
+
+		weight := o.Weight
+		if weight <= 0 {
+			weight = 100
+		}
+
+		lbEndpoints = append(lbEndpoints, LbEndpoint{
+			Endpoint: Endpoint{
+				Address: Address{
+					SocketAddress: SocketAddress{
+						Address:   o.Address,
+						PortValue: o.Port,
+					},
+				},
+			},
+			LoadBalancingWeight: weight,
+		})
+	}
+
+	if isAllIPs && len(lbEndpoints) > 0 {
+		clusterType = "STATIC"
+	}
+
+	lbPolicy := "ROUND_ROBIN"
+	if pool.LBAlgorithm == model.LBAlgorithmLeastLatency {
+		lbPolicy = "LEAST_REQUEST"
+	}
+
+	cluster := Cluster{
+		Name:           clusterName,
+		ConnectTimeout: "3s",
+		Type:           clusterType,
+		LbPolicy:       lbPolicy,
+		LoadAssignment: LoadAssignment{
+			ClusterName: clusterName,
+			Endpoints: []LocalityEndpoints{
+				{
+					LbEndpoints: lbEndpoints,
+				},
+			},
+		},
+	}
+
+	// If origin protocol is HTTPS, attach Upstream TLS context with SNI
+	if hasHTTPS && len(pool.Origins) > 0 {
+		sniHost := pool.Origins[0].Address
+		cluster.TransportSocket = &TransportSocket{
+			Name: "envoy.transport_sockets.tls",
+			TypedConfig: map[string]interface{}{
+				"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+				"sni":   sniHost,
+			},
+		}
+	}
+
+	return cluster
+}
+
+func sanitizeName(s string) string {
+	r := strings.NewReplacer(".", "_", "-", "_", ":", "_")
+	return r.Replace(s)
+}
+
+// ToJSON returns indented JSON representation of the compiled Envoy configuration
+func (c *EnvoyConfig) ToJSON() ([]byte, error) {
+	return json.MarshalIndent(c, "", "  ")
+}

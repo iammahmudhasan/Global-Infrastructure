@@ -2,5 +2,6 @@ go 1.23
 
 use (
 	./services/network/global-router
+	./services/edge/config-controller
 	./apps/cli
 )
