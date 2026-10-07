@@ -46,12 +46,57 @@ type DomainVerification struct {
 	VerifiedAt       time.Time `json:"verified_at,omitempty"`
 }
 
+type HealthCheckProtocol string
+
+const (
+	HealthCheckProtocolHTTP  HealthCheckProtocol = "HTTP"
+	HealthCheckProtocolHTTPS HealthCheckProtocol = "HTTPS"
+	HealthCheckProtocolTCP   HealthCheckProtocol = "TCP"
+)
+
+type HealthMonitor struct {
+	ID                  string              `json:"id"`
+	PoolID              string              `json:"pool_id"`
+	Protocol            HealthCheckProtocol `json:"protocol"`
+	Path                string              `json:"path"` // default "/healthz"
+	Port                int                 `json:"port"`
+	IntervalSeconds     int                 `json:"interval_seconds"`     // default 10s
+	TimeoutSeconds      int                 `json:"timeout_seconds"`      // default 2s
+	HealthyThreshold    int                 `json:"healthy_threshold"`    // consecutive passes, default 2
+	UnhealthyThreshold  int                 `json:"unhealthy_threshold"`  // consecutive failures, default 3
+	ExpectedStatusCodes []int               `json:"expected_status_codes"` // default [200]
+}
+
+type OriginEndpointState struct {
+	OriginID            string    `json:"origin_id"`
+	PoolID              string    `json:"pool_id"`
+	Address             string    `json:"address"`
+	Port                int       `json:"port"`
+	Healthy             bool      `json:"healthy"`
+	ConsecutivePasses   int       `json:"consecutive_passes"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	EWMALatencyMs       float64   `json:"ewma_latency_ms"`
+	LastStatusCode      int       `json:"last_status_code"`
+	LastChecked         time.Time `json:"last_checked"`
+	LastError           string    `json:"last_error,omitempty"`
+}
+
+type RoutingDecision struct {
+	SelectedOriginID string  `json:"selected_origin_id"`
+	OriginAddress    string  `json:"origin_address"`
+	OriginPort       int     `json:"origin_port"`
+	PoolID           string  `json:"pool_id"`
+	Reason           string  `json:"reason"` // "LOWEST_EWMA_LATENCY", "FAILOVER", "ROUND_ROBIN"
+	LatencyMs        float64 `json:"latency_ms"`
+}
+
 type OriginPool struct {
-	ID          string      `json:"id"`
-	ProjectID   string      `json:"project_id"`
-	Name        string      `json:"name"`
-	LBAlgorithm LBAlgorithm `json:"lb_algorithm"`
-	Origins     []Origin    `json:"origins"`
+	ID            string         `json:"id"`
+	ProjectID     string         `json:"project_id"`
+	Name          string         `json:"name"`
+	LBAlgorithm   LBAlgorithm    `json:"lb_algorithm"`
+	HealthMonitor *HealthMonitor `json:"health_monitor,omitempty"`
+	Origins       []Origin       `json:"origins"`
 }
 
 type Origin struct {

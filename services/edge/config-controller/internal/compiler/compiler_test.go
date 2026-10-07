@@ -102,4 +102,36 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(string(wafJsonBytes), "envoy.filters.http.rbac") {
 		t.Errorf("expected JSON config to contain envoy.filters.http.rbac filter when WAF block rule is active")
 	}
+
+	// 5. Add HealthMonitor to origin pool and verify Envoy health_checks block
+	routes := st.GetRoutes(res.DomainID)
+	if len(routes) > 0 {
+		poolID := routes[0].PoolID
+		st.SaveHealthMonitor(&model.HealthMonitor{
+			ID:                 "hm-pool-1",
+			PoolID:             poolID,
+			Protocol:           model.HealthCheckProtocolHTTP,
+			Path:               "/healthz",
+			IntervalSeconds:    5,
+			TimeoutSeconds:     1,
+			HealthyThreshold:   2,
+			UnhealthyThreshold: 3,
+		})
+
+		cfgWithHC, err := comp.Compile(st.GetActiveTopologies())
+		if err != nil {
+			t.Fatalf("failed to compile with health monitor: %v", err)
+		}
+		if len(cfgWithHC.StaticResources.Clusters) == 0 {
+			t.Fatalf("expected at least 1 cluster")
+		}
+		clusterHC := cfgWithHC.StaticResources.Clusters[0]
+		if len(clusterHC.HealthChecks) == 0 {
+			t.Fatalf("expected cluster to have health_checks configured")
+		}
+		hcJSON, _ := cfgWithHC.ToJSON()
+		if !strings.Contains(string(hcJSON), "http_health_check") || !strings.Contains(string(hcJSON), "/healthz") {
+			t.Errorf("expected JSON to contain http_health_check with /healthz")
+		}
+	}
 }

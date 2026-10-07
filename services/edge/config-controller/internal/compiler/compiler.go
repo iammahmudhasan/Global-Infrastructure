@@ -87,12 +87,13 @@ type RetryPolicy struct {
 }
 
 type Cluster struct {
-	Name           string           `json:"name"`
-	ConnectTimeout string           `json:"connect_timeout"`
-	Type           string           `json:"type"`
-	LbPolicy       string           `json:"lb_policy"`
-	LoadAssignment LoadAssignment   `json:"load_assignment"`
-	TransportSocket *TransportSocket `json:"transport_socket,omitempty"`
+	Name            string                   `json:"name"`
+	ConnectTimeout  string                   `json:"connect_timeout"`
+	Type            string                   `json:"type"`
+	LbPolicy        string                   `json:"lb_policy"`
+	LoadAssignment  LoadAssignment           `json:"load_assignment"`
+	HealthChecks    []map[string]interface{} `json:"health_checks,omitempty"`
+	TransportSocket *TransportSocket         `json:"transport_socket,omitempty"`
 }
 
 type TransportSocket struct {
@@ -496,6 +497,43 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 				},
 			},
 		},
+	}
+
+	// Attach active upstream Health Checks if monitor is configured
+	if pool.HealthMonitor != nil {
+		hm := pool.HealthMonitor
+		interval := "10s"
+		if hm.IntervalSeconds > 0 {
+			interval = fmt.Sprintf("%ds", hm.IntervalSeconds)
+		}
+		timeout := "2s"
+		if hm.TimeoutSeconds > 0 {
+			timeout = fmt.Sprintf("%ds", hm.TimeoutSeconds)
+		}
+		unhealthyThresh := 3
+		if hm.UnhealthyThreshold > 0 {
+			unhealthyThresh = hm.UnhealthyThreshold
+		}
+		healthyThresh := 2
+		if hm.HealthyThreshold > 0 {
+			healthyThresh = hm.HealthyThreshold
+		}
+		hcPath := hm.Path
+		if hcPath == "" {
+			hcPath = "/healthz"
+		}
+
+		cluster.HealthChecks = []map[string]interface{}{
+			{
+				"timeout":             timeout,
+				"interval":            interval,
+				"unhealthy_threshold": unhealthyThresh,
+				"healthy_threshold":   healthyThresh,
+				"http_health_check": map[string]interface{}{
+					"path": hcPath,
+				},
+			},
+		}
 	}
 
 	// If origin protocol is HTTPS, attach Upstream TLS context with SNI

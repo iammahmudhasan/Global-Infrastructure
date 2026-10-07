@@ -277,4 +277,87 @@ func TestAPIWorkflow(t *testing.T) {
 	if postPurgeResult.CacheStatus != "MISS" {
 		t.Fatalf("expected post-purge lookup to be MISS, got %s", postPurgeResult.CacheStatus)
 	}
+
+	// 17. Configure Health Monitor on Origin Pool
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/topologies", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from topologies: %s", w.Body.String())
+	}
+	var toposResp struct {
+		Topologies []struct {
+			Pools map[string]interface{} `json:"pools"`
+		} `json:"topologies"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &toposResp)
+	if len(toposResp.Topologies) == 0 || len(toposResp.Topologies[0].Pools) == 0 {
+		t.Fatalf("expected active topology with pool, got %+v", toposResp)
+	}
+
+	var poolID string
+	for pid := range toposResp.Topologies[0].Pools {
+		poolID = pid
+		break
+	}
+
+	hmBody, _ := json.Marshal(map[string]interface{}{
+		"protocol":              "HTTP",
+		"path":                  "/healthz",
+		"interval_seconds":      5,
+		"timeout_seconds":       1,
+		"healthy_threshold":     2,
+		"unhealthy_threshold":   3,
+		"expected_status_codes": []int{200},
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/pools/"+poolID+"/health-monitor", bytes.NewReader(hmBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated && w.Code != http.StatusOK {
+		t.Fatalf("expected 201 Created or 200 OK from set health monitor, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 18. Retrieve configured Health Monitor
+	req = httptest.NewRequest(http.MethodGet, "/v1/pools/"+poolID+"/health-monitor", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from get health monitor, got %d", w.Code)
+	}
+	var hmResp model.HealthMonitor
+	_ = json.Unmarshal(w.Body.Bytes(), &hmResp)
+	if hmResp.Path != "/healthz" || hmResp.IntervalSeconds != 5 {
+		t.Errorf("unexpected health monitor returned: %+v", hmResp)
+	}
+
+	// 19. Check Pool Health Status
+	req = httptest.NewRequest(http.MethodGet, "/v1/pools/"+poolID+"/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from get pool health, got %d", w.Code)
+	}
+	var poolHealthResp struct {
+		PoolID           string                        `json:"pool_id"`
+		TotalEndpoints   int                           `json:"total_endpoints"`
+		HealthyEndpoints int                           `json:"healthy_endpoints"`
+		Endpoints        []*model.OriginEndpointState `json:"endpoints"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &poolHealthResp)
+	if poolHealthResp.TotalEndpoints != 2 {
+		t.Errorf("expected 2 total endpoints in pool health, got %d", poolHealthResp.TotalEndpoints)
+	}
+
+	// 20. Smart Routing Request
+	req = httptest.NewRequest(http.MethodPost, "/v1/pools/"+poolID+"/route", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from smart routing, got %d: %s", w.Code, w.Body.String())
+	}
+	var routingResp model.RoutingDecision
+	_ = json.Unmarshal(w.Body.Bytes(), &routingResp)
+	if routingResp.SelectedOriginID == "" || routingResp.OriginAddress == "" {
+		t.Errorf("expected valid routing decision, got %+v", routingResp)
+	}
 }

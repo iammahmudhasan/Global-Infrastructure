@@ -24,8 +24,10 @@ type Store struct {
 	rateLimits   map[string][]model.RateLimitRule   // domain ID -> Rate limit rules
 	events       map[string][]model.SecurityEvent   // domain ID -> Security events
 	cache        map[string]*model.CachePolicy      // domain ID -> policy
-	cacheRules   map[string][]model.CacheRule       // domain ID -> Cache rules
-	certificates map[string]*model.Certificate      // domain ID -> certificate
+	cacheRules   map[string][]model.CacheRule             // domain ID -> Cache rules
+	monitors     map[string]*model.HealthMonitor          // pool ID -> HealthMonitor
+	healthStates map[string]*model.OriginEndpointState    // origin ID -> OriginEndpointState
+	certificates map[string]*model.Certificate            // domain ID -> certificate
 }
 
 func NewStore() *Store {
@@ -41,6 +43,8 @@ func NewStore() *Store {
 		events:       make(map[string][]model.SecurityEvent),
 		cache:        make(map[string]*model.CachePolicy),
 		cacheRules:   make(map[string][]model.CacheRule),
+		monitors:     make(map[string]*model.HealthMonitor),
+		healthStates: make(map[string]*model.OriginEndpointState),
 		certificates: make(map[string]*model.Certificate),
 	}
 }
@@ -133,7 +137,93 @@ func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
+	p.HealthMonitor = s.monitors[poolID]
 	return p, nil
+}
+
+func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.monitors[hm.PoolID] = hm
+	if pool, exists := s.pools[hm.PoolID]; exists {
+		pool.HealthMonitor = hm
+	}
+}
+
+func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.monitors[poolID]
+}
+
+func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthStates[st.OriginID] = st
+
+	// Synchronize with origin entity healthy flag
+	if orig, exists := s.origins[st.OriginID]; exists {
+		orig.Healthy = st.Healthy
+	}
+	if pool, exists := s.pools[st.PoolID]; exists {
+		for i := range pool.Origins {
+			if pool.Origins[i].ID == st.OriginID {
+				pool.Origins[i].Healthy = st.Healthy
+			}
+		}
+	}
+}
+
+func (s *Store) GetOriginHealthState(originID string) *model.OriginEndpointState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.healthStates[originID]
+}
+
+func (s *Store) ListPoolHealthStates(poolID string) []*model.OriginEndpointState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var states []*model.OriginEndpointState
+	pool, exists := s.pools[poolID]
+	if !exists {
+		return states
+	}
+
+	for _, o := range pool.Origins {
+		if st, exists := s.healthStates[o.ID]; exists {
+			states = append(states, st)
+		} else {
+			// Return default initial state
+			states = append(states, &model.OriginEndpointState{
+				OriginID: o.ID,
+				PoolID:   poolID,
+				Address:  o.Address,
+				Port:     o.Port,
+				Healthy:  o.Healthy,
+			})
+		}
+	}
+	return states
+}
+
+func (s *Store) UpdateOriginHealthy(originID string, healthy bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if orig, exists := s.origins[originID]; exists {
+		orig.Healthy = healthy
+		if pool, exists := s.pools[orig.PoolID]; exists {
+			for i := range pool.Origins {
+				if pool.Origins[i].ID == originID {
+					pool.Origins[i].Healthy = healthy
+				}
+			}
+		}
+	}
+	if st, exists := s.healthStates[originID]; exists {
+		st.Healthy = healthy
+	}
 }
 
 func (s *Store) SaveRoute(r *model.Route) {
@@ -362,6 +452,7 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 
 		for _, r := range topo.Routes {
 			if pool, exists := s.pools[r.PoolID]; exists {
+				pool.HealthMonitor = s.monitors[pool.ID]
 				topo.Pools[r.PoolID] = pool
 			}
 		}

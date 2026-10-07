@@ -8,10 +8,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
@@ -24,6 +26,8 @@ type APIHandler struct {
 	compiler    *compiler.Compiler
 	wafEngine   *security.WAFEngine
 	cacheEngine *cache.CacheEngine
+	monitor     *health.Monitor
+	smartRouter *health.SmartRouter
 	mux         *http.ServeMux
 }
 
@@ -34,6 +38,8 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		compiler:    c,
 		wafEngine:   security.NewWAFEngine(),
 		cacheEngine: cache.NewCacheEngine(100000),
+		monitor:     health.NewMonitor(),
+		smartRouter: health.NewSmartRouter(),
 		mux:         http.NewServeMux(),
 	}
 	h.registerRoutes()
@@ -58,6 +64,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/healthz", h.handleHealthz)
 	h.mux.HandleFunc("/v1/projects/", h.handleProjectsRoute)
 	h.mux.HandleFunc("/v1/domains/", h.handleDomainsRoute)
+	h.mux.HandleFunc("/v1/pools/", h.handlePoolsRoute)
 	h.mux.HandleFunc("/v1/edge/envoy-config", h.handleEnvoyConfig)
 	h.mux.HandleFunc("/v1/edge/topologies", h.handleTopologies)
 	h.mux.HandleFunc("/v1/edge/evaluate", h.handleEvaluate)
@@ -246,6 +253,164 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 	default:
 		writeError(w, http.StatusNotFound, "unknown domain action")
 	}
+}
+
+// /v1/pools/{pool_id}[/health-monitor, /health, /probe, /route]
+func (h *APIHandler) handlePoolsRoute(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/v1/pools/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeError(w, http.StatusBadRequest, "pool_id is required")
+		return
+	}
+
+	poolID := parts[0]
+	pool, err := h.store.GetOriginPool(poolID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "origin pool not found")
+		return
+	}
+
+	if len(parts) == 1 {
+		writeJSON(w, http.StatusOK, pool)
+		return
+	}
+
+	action := parts[1]
+	switch action {
+	case "health-monitor":
+		if r.Method == http.MethodPost {
+			h.handleSetHealthMonitor(w, r, pool)
+			return
+		}
+		if r.Method == http.MethodGet {
+			h.handleGetHealthMonitor(w, r, pool)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	case "health":
+		if r.Method == http.MethodGet {
+			h.handleGetPoolHealth(w, r, pool)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	case "probe":
+		if r.Method == http.MethodPost {
+			h.handleProbePool(w, r, pool)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	case "route":
+		if r.Method == http.MethodPost {
+			h.handleSmartRoute(w, r, pool)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	default:
+		writeError(w, http.StatusNotFound, "unknown pool action")
+	}
+}
+
+func (h *APIHandler) handleSetHealthMonitor(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	var hm model.HealthMonitor
+	if err := json.NewDecoder(r.Body).Decode(&hm); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid health monitor payload")
+		return
+	}
+
+	hm.ID = "hm-" + generateHex(4)
+	hm.PoolID = pool.ID
+	if hm.Protocol == "" {
+		hm.Protocol = model.HealthCheckProtocolHTTP
+	}
+	if hm.Path == "" {
+		hm.Path = "/healthz"
+	}
+	if hm.IntervalSeconds <= 0 {
+		hm.IntervalSeconds = 10
+	}
+	if hm.TimeoutSeconds <= 0 {
+		hm.TimeoutSeconds = 2
+	}
+	if hm.HealthyThreshold <= 0 {
+		hm.HealthyThreshold = 2
+	}
+	if hm.UnhealthyThreshold <= 0 {
+		hm.UnhealthyThreshold = 3
+	}
+	if len(hm.ExpectedStatusCodes) == 0 {
+		hm.ExpectedStatusCodes = []int{200}
+	}
+
+	h.store.SaveHealthMonitor(&hm)
+	writeJSON(w, http.StatusCreated, hm)
+}
+
+func (h *APIHandler) handleGetHealthMonitor(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	hm := h.store.GetHealthMonitor(pool.ID)
+	if hm == nil {
+		writeError(w, http.StatusNotFound, "health monitor not configured for this pool")
+		return
+	}
+	writeJSON(w, http.StatusOK, hm)
+}
+
+func (h *APIHandler) handleGetPoolHealth(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	states := h.store.ListPoolHealthStates(pool.ID)
+	healthyCount := 0
+	for _, st := range states {
+		if st.Healthy {
+			healthyCount++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pool_id":           pool.ID,
+		"total_endpoints":   len(pool.Origins),
+		"healthy_endpoints": healthyCount,
+		"origins":           states,
+		"endpoints":         states,
+		"count":             len(states),
+	})
+}
+
+func (h *APIHandler) handleProbePool(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	hm := h.store.GetHealthMonitor(pool.ID)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make([]*model.OriginEndpointState, 0, len(pool.Origins))
+
+	for i := range pool.Origins {
+		orig := pool.Origins[i]
+		wg.Add(1)
+		go func(o model.Origin) {
+			defer wg.Done()
+			current := h.store.GetOriginHealthState(o.ID)
+			newState := h.monitor.ProbeEndpoint(r.Context(), &o, hm, current)
+			h.store.SaveOriginHealthState(newState)
+
+			mu.Lock()
+			results = append(results, newState)
+			mu.Unlock()
+		}(orig)
+	}
+	wg.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pool_id": pool.ID,
+		"probed":  len(results),
+		"results": results,
+	})
+}
+
+func (h *APIHandler) handleSmartRoute(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	states := h.store.ListPoolHealthStates(pool.ID)
+	decision, err := h.smartRouter.SelectOptimalOrigin(pool, states)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, decision)
 }
 
 func (h *APIHandler) handleGetDomain(w http.ResponseWriter, r *http.Request, domainID string) {
