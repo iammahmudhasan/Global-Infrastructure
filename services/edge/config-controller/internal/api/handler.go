@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/analytics"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
@@ -22,28 +24,30 @@ import (
 )
 
 type APIHandler struct {
-	store       *store.Store
-	service     *onboarding.DomainService
-	compiler    *compiler.Compiler
-	wafEngine   *security.WAFEngine
-	cacheEngine *cache.CacheEngine
-	monitor     *health.Monitor
-	smartRouter *health.SmartRouter
-	certManager *certificate.Manager
-	mux         *http.ServeMux
+	store           *store.Store
+	service         *onboarding.DomainService
+	compiler        *compiler.Compiler
+	wafEngine       *security.WAFEngine
+	cacheEngine     *cache.CacheEngine
+	monitor         *health.Monitor
+	smartRouter     *health.SmartRouter
+	certManager     *certificate.Manager
+	analyticsEngine *analytics.Engine
+	mux             *http.ServeMux
 }
 
 func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
 	h := &APIHandler{
-		store:       s,
-		service:     svc,
-		compiler:    c,
-		wafEngine:   security.NewWAFEngine(),
-		cacheEngine: cache.NewCacheEngine(100000),
-		monitor:     health.NewMonitor(),
-		smartRouter: health.NewSmartRouter(),
-		certManager: certificate.NewManager(s),
-		mux:         http.NewServeMux(),
+		store:           s,
+		service:         svc,
+		compiler:        c,
+		wafEngine:       security.NewWAFEngine(),
+		cacheEngine:     cache.NewCacheEngine(100000),
+		monitor:         health.NewMonitor(),
+		smartRouter:     health.NewSmartRouter(),
+		certManager:     certificate.NewManager(s),
+		analyticsEngine: analytics.NewEngine(),
+		mux:             http.NewServeMux(),
 	}
 	h.registerRoutes()
 	return h
@@ -74,6 +78,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/cache-lookup", h.handleCacheLookup)
 	h.mux.HandleFunc("/.well-known/acme-challenge/", h.handleACMEChallenge)
 	h.mux.HandleFunc("/v1/edge/acme/validate", h.handleACMEValidate)
+	h.mux.HandleFunc("/v1/edge/telemetry", h.handleEdgeTelemetry)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +265,12 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 		return
 	case "tls":
 		h.handleTLSSettingsRoute(w, r, domainID)
+		return
+	case "analytics":
+		h.handleAnalyticsRoute(w, r, domainID, parts)
+		return
+	case "billing":
+		h.handleBillingRoute(w, r, domainID, parts)
 		return
 	default:
 		writeError(w, http.StatusNotFound, "unknown domain action")
@@ -1122,6 +1133,132 @@ func (h *APIHandler) handleTopologies(w http.ResponseWriter, r *http.Request) {
 		"active_topologies_count": len(topologies),
 		"topologies":              topologies,
 	})
+}
+
+// POST /v1/edge/telemetry
+func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	trimmed := strings.TrimSpace(string(bodyBytes))
+	if strings.HasPrefix(trimmed, "[") {
+		var events []model.TelemetryEvent
+		if err := json.Unmarshal(bodyBytes, &events); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid telemetry events batch: "+err.Error())
+			return
+		}
+		count, err := h.analyticsEngine.IngestBatch(events)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":   "ingested",
+			"ingested": count,
+		})
+		return
+	}
+
+	var event model.TelemetryEvent
+	if err := json.Unmarshal(bodyBytes, &event); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid telemetry event: "+err.Error())
+		return
+	}
+	if err := h.analyticsEngine.Ingest(event); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":   "ingested",
+		"ingested": 1,
+	})
+}
+
+func (h *APIHandler) handleAnalyticsRoute(w http.ResponseWriter, r *http.Request, domainID string, parts []string) {
+	if len(parts) < 3 {
+		writeError(w, http.StatusNotFound, "analytics sub-resource required")
+		return
+	}
+
+	domain, err := h.store.GetDomain(domainID)
+	if err != nil || domain == nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+
+	switch parts[2] {
+	case "summary":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		summary, err := h.analyticsEngine.GetSummary(domainID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, summary)
+
+	case "timeseries":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		limit := 60
+		if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+			if l, err := strconv.Atoi(limitStr); err == nil && l > 0 {
+				limit = l
+			}
+		}
+		series, err := h.analyticsEngine.GetTimeSeries(domainID, limit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"domain_id":     domainID,
+			"points_count": len(series),
+			"points":        series,
+		})
+
+	default:
+		writeError(w, http.StatusNotFound, "unknown analytics sub-resource: "+parts[2])
+	}
+}
+
+func (h *APIHandler) handleBillingRoute(w http.ResponseWriter, r *http.Request, domainID string, parts []string) {
+	if len(parts) < 3 || parts[2] != "usage" {
+		writeError(w, http.StatusNotFound, "billing usage endpoint required")
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	domain, err := h.store.GetDomain(domainID)
+	if err != nil || domain == nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+
+	period := r.URL.Query().Get("period")
+	usage, err := h.analyticsEngine.GetBillingUsage(domainID, period)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, usage)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
@@ -456,5 +457,155 @@ func TestAPIWorkflow(t *testing.T) {
 	}
 	if !strings.Contains(envoyJSONStr, "api.customer.com") {
 		t.Errorf("expected Envoy config to contain customer SNI hostname")
+	}
+
+	// 27. Ingest Edge Telemetry Batch (POST /v1/edge/telemetry)
+	now := time.Now().UTC()
+	telemetryBatch := []model.TelemetryEvent{
+		{
+			DomainID:      onboardResp.DomainID,
+			RequestID:     "req-edge-001",
+			ClientIP:      "203.0.113.10",
+			Method:        "GET",
+			Path:          "/api/v1/users",
+			StatusCode:    200,
+			LatencyMs:     14.2,
+			BytesSent:     5242880, // 5 MB
+			BytesReceived: 1024,
+			CacheStatus:   "HIT",
+			WAFAction:     "ALLOW",
+			Timestamp:     now,
+		},
+		{
+			DomainID:      onboardResp.DomainID,
+			RequestID:     "req-edge-002",
+			ClientIP:      "203.0.113.11",
+			Method:        "GET",
+			Path:          "/api/v1/orders",
+			StatusCode:    200,
+			LatencyMs:     48.5,
+			BytesSent:     10485760, // 10 MB
+			BytesReceived: 2048,
+			CacheStatus:   "MISS",
+			WAFAction:     "ALLOW",
+			Timestamp:     now,
+		},
+		{
+			DomainID:      onboardResp.DomainID,
+			RequestID:     "req-edge-003",
+			ClientIP:      "198.51.100.22",
+			Method:        "GET",
+			Path:          "/admin/config",
+			StatusCode:    403,
+			LatencyMs:     1.1,
+			BytesSent:     450,
+			BytesReceived: 350,
+			CacheStatus:   "BYPASS",
+			WAFAction:     "BLOCK",
+			Timestamp:     now,
+		},
+		{
+			DomainID:      onboardResp.DomainID,
+			RequestID:     "req-edge-004",
+			ClientIP:      "203.0.113.12",
+			Method:        "POST",
+			Path:          "/api/v1/payments",
+			StatusCode:    502,
+			LatencyMs:     125.0,
+			BytesSent:     800,
+			BytesReceived: 1500,
+			CacheStatus:   "BYPASS",
+			WAFAction:     "ALLOW",
+			Timestamp:     now,
+		},
+	}
+
+	batchBody, _ := json.Marshal(telemetryBatch)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(batchBody))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from telemetry ingest, got %d: %s", w.Code, w.Body.String())
+	}
+	var ingestResult struct {
+		Status   string `json:"status"`
+		Ingested int    `json:"ingested"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &ingestResult)
+	if ingestResult.Status != "ingested" || ingestResult.Ingested != 4 {
+		t.Fatalf("expected 4 ingested events, got %+v", ingestResult)
+	}
+
+	// 28. Query Domain Analytics Summary (GET /v1/domains/{domain_id}/analytics/summary)
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+onboardResp.DomainID+"/analytics/summary", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from analytics summary, got %d: %s", w.Code, w.Body.String())
+	}
+	var summary model.AnalyticsSummary
+	_ = json.Unmarshal(w.Body.Bytes(), &summary)
+	if summary.TotalRequests != 4 {
+		t.Fatalf("expected 4 total requests, got %d", summary.TotalRequests)
+	}
+	if summary.Status2xx != 2 || summary.Status4xx != 1 || summary.Status5xx != 1 {
+		t.Errorf("unexpected status breakdown: 2xx=%d, 4xx=%d, 5xx=%d", summary.Status2xx, summary.Status4xx, summary.Status5xx)
+	}
+	if summary.ErrorRate != 0.50 {
+		t.Errorf("expected error rate 0.50, got %f", summary.ErrorRate)
+	}
+	if summary.CacheHits != 1 || summary.CacheMisses != 1 {
+		t.Errorf("expected 1 hit and 1 miss, got %d hits, %d misses", summary.CacheHits, summary.CacheMisses)
+	}
+	if summary.CacheHitRate != 0.50 {
+		t.Errorf("expected cache hit rate 0.50, got %f", summary.CacheHitRate)
+	}
+	if summary.SecurityBlocked != 1 {
+		t.Errorf("expected 1 security block, got %d", summary.SecurityBlocked)
+	}
+	if summary.Latency.P50 <= 0 || summary.Latency.P90 <= 0 {
+		t.Errorf("expected calculated latency percentiles, got %+v", summary.Latency)
+	}
+
+	// 29. Query Domain TimeSeries (GET /v1/domains/{domain_id}/analytics/timeseries)
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+onboardResp.DomainID+"/analytics/timeseries?limit=5", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from analytics timeseries, got %d: %s", w.Code, w.Body.String())
+	}
+	var tsResp struct {
+		DomainID    string                  `json:"domain_id"`
+		PointsCount int                     `json:"points_count"`
+		Points      []model.TimeSeriesPoint `json:"points"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &tsResp)
+	if tsResp.PointsCount != 1 || len(tsResp.Points) != 1 {
+		t.Fatalf("expected 1 time series point, got %d", tsResp.PointsCount)
+	}
+	if tsResp.Points[0].Requests != 4 {
+		t.Errorf("expected 4 requests in time series point, got %d", tsResp.Points[0].Requests)
+	}
+
+	// 30. Query Billing Usage (GET /v1/domains/{domain_id}/billing/usage)
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+onboardResp.DomainID+"/billing/usage?period=2026-10", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from billing usage, got %d: %s", w.Code, w.Body.String())
+	}
+	var usage model.BillingUsage
+	_ = json.Unmarshal(w.Body.Bytes(), &usage)
+	if usage.DomainID != onboardResp.DomainID || usage.BillingPeriod != "2026-10" {
+		t.Fatalf("unexpected billing metadata: %+v", usage)
+	}
+	if usage.TotalRequests != 4 {
+		t.Errorf("expected 4 billed requests, got %d", usage.TotalRequests)
+	}
+	if usage.BaseFeeUSD != 20.00 {
+		t.Errorf("expected base fee $20.00, got %f", usage.BaseFeeUSD)
+	}
+	if usage.TotalCostUSD < 20.00 {
+		t.Errorf("expected total cost >= $20.00, got %f", usage.TotalCostUSD)
 	}
 }

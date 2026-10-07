@@ -84,6 +84,9 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(jsonStr, "envoy.filters.http.cache") {
 		t.Errorf("expected JSON config to contain cache HTTP filter")
 	}
+	if !strings.Contains(jsonStr, "envoy.access_loggers.file") || !strings.Contains(jsonStr, "bytes_sent") {
+		t.Errorf("expected JSON config to contain structured access log configuration")
+	}
 
 	// 4. Add a custom WAF block rule and verify Envoy RBAC filter is generated
 	_ = st.AddWAFRule(res.DomainID, model.WAFRule{

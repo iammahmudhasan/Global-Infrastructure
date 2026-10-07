@@ -265,6 +265,7 @@ func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost) Listener {
 		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 		"stat_prefix":  "edge_http_ingress",
 		"route_config": routeConfig,
+		"access_log":   c.buildAccessLogConfig(),
 		"http_filters": []map[string]interface{}{
 			{
 				"name": "envoy.filters.http.router",
@@ -422,6 +423,7 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
 		"stat_prefix":  "edge_https_ingress",
 		"route_config": routeConfig,
+		"access_log":   c.buildAccessLogConfig(),
 		"http_filters": httpFilters,
 	}
 
@@ -617,6 +619,37 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 func sanitizeName(s string) string {
 	r := strings.NewReplacer(".", "_", "-", "_", ":", "_")
 	return r.Replace(s)
+}
+
+func (c *Compiler) buildAccessLogConfig() []map[string]interface{} {
+	return []map[string]interface{}{
+		{
+			"name": "envoy.access_loggers.file",
+			"typed_config": map[string]interface{}{
+				"@type": "type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog",
+				"path":  "/var/log/envoy/access.log",
+				"log_format": map[string]interface{}{
+					"json_format": map[string]interface{}{
+						"start_time":               "%START_TIME%",
+						"method":                   "%REQ(:METHOD)%",
+						"path":                     "%REQ(X-ENVOY-ORIGINAL-PATH?:PATH)%",
+						"protocol":                 "%PROTOCOL%",
+						"response_code":            "%RESPONSE_CODE%",
+						"response_flags":           "%RESPONSE_FLAGS%",
+						"bytes_received":           "%BYTES_RECEIVED%",
+						"bytes_sent":               "%BYTES_SENT%",
+						"duration_ms":              "%DURATION%",
+						"upstream_service_time_ms": "%RESP(X-ENVOY-UPSTREAM-SERVICE-TIME)%",
+						"client_ip":                "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%",
+						"user_agent":               "%REQ(USER-AGENT)%",
+						"request_id":               "%REQ(X-REQUEST-ID)%",
+						"authority":                "%REQ(:AUTHORITY)%",
+						"upstream_cluster":         "%UPSTREAM_CLUSTER%",
+					},
+				},
+			},
+		},
+	}
 }
 
 // ToJSON returns indented JSON representation of the compiled Envoy configuration

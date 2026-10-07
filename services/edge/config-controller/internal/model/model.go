@@ -282,3 +282,73 @@ type TLSSettings struct {
 	HSTS          bool   `json:"hsts"`
 	HSTSMaxAge    int    `json:"hsts_max_age"`
 }
+
+// TelemetryEvent represents an individual HTTP transaction recorded at the edge
+type TelemetryEvent struct {
+	DomainID      string    `json:"domain_id"`
+	RequestID     string    `json:"request_id"`
+	ClientIP      string    `json:"client_ip"`
+	Method        string    `json:"method"`
+	Path          string    `json:"path"`
+	StatusCode    int       `json:"status_code"`
+	LatencyMs     float64   `json:"latency_ms"`
+	BytesSent     int64     `json:"bytes_sent"`
+	BytesReceived int64     `json:"bytes_received"`
+	CacheStatus   string    `json:"cache_status"`   // "HIT", "MISS", "BYPASS"
+	WAFAction     string    `json:"waf_action"`      // "ALLOW", "BLOCK", "LOG"
+	OriginID      string    `json:"origin_id,omitempty"`
+	Timestamp     time.Time `json:"timestamp"`
+}
+
+// LatencyPercentiles represents latency distribution metrics
+type LatencyPercentiles struct {
+	P50 float64 `json:"p50"`
+	P90 float64 `json:"p90"`
+	P99 float64 `json:"p99"`
+	Min float64 `json:"min"`
+	Max float64 `json:"max"`
+	Avg float64 `json:"avg"`
+}
+
+// AnalyticsSummary aggregates traffic metrics for a domain
+type AnalyticsSummary struct {
+	DomainID        string             `json:"domain_id"`
+	TotalRequests   int64              `json:"total_requests"`
+	Status2xx       int64              `json:"status_2xx"`
+	Status3xx       int64              `json:"status_3xx"`
+	Status4xx       int64              `json:"status_4xx"`
+	Status5xx       int64              `json:"status_5xx"`
+	ErrorRate       float64            `json:"error_rate"`        // (4xx + 5xx) / total
+	CacheHitRate    float64            `json:"cache_hit_rate"`    // HIT / total
+	CacheHits       int64              `json:"cache_hits"`
+	CacheMisses     int64              `json:"cache_misses"`
+	BytesSent       int64              `json:"bytes_sent"`        // Egress
+	BytesReceived   int64              `json:"bytes_received"`    // Ingress
+	SecurityBlocked int64              `json:"security_blocked"`  // WAF blocks
+	Latency         LatencyPercentiles `json:"latency"`
+	LastUpdated     time.Time          `json:"last_updated"`
+}
+
+// TimeSeriesPoint represents aggregated traffic metrics over a single time window
+type TimeSeriesPoint struct {
+	Timestamp     time.Time `json:"timestamp"`
+	Requests      int64     `json:"requests"`
+	BytesSent     int64     `json:"bytes_sent"`
+	BytesReceived int64     `json:"bytes_received"`
+	AvgLatencyMs  float64   `json:"avg_latency_ms"`
+	ErrorCount    int64     `json:"error_count"`
+}
+
+// BillingUsage represents metered resource utilization for customer invoicing ($1M ARR Engine)
+type BillingUsage struct {
+	DomainID         string    `json:"domain_id"`
+	BillingPeriod    string    `json:"billing_period"`
+	TotalRequests    int64     `json:"total_requests"`
+	EgressGB         float64   `json:"egress_gb"`
+	IngressGB        float64   `json:"ingress_gb"`
+	BaseFeeUSD       float64   `json:"base_fee_usd"`
+	BandwidthCostUSD float64   `json:"bandwidth_cost_usd"`
+	RequestCostUSD   float64   `json:"request_cost_usd"`
+	TotalCostUSD     float64   `json:"total_cost_usd"`
+	GeneratedAt      time.Time `json:"generated_at"`
+}
