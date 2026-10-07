@@ -1,6 +1,32 @@
-version: "3.8"
-
 services:
+  config-controller:
+    build:
+      context: ../services/edge/config-controller
+      dockerfile: Dockerfile
+    container_name: nexusedge-config-controller
+    ports:
+      - "9091:9091"
+    environment:
+      - PORT=9091
+      - NEXUSEDGE_DEV_MODE=true
+      - NEXUSEDGE_ACME_HOST=config-controller
+      - NEXUSEDGE_ACME_PORT=9091
+    restart: unless-stopped
+
+  envoy:
+    image: envoyproxy/envoy:v1.31-latest
+    container_name: nexusedge-envoy-ingress
+    ports:
+      - "10000:10000"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
+    depends_on:
+      - config-controller
+      - nexusedge-gateway
+    restart: unless-stopped
+
   nexusedge-gateway:
     build:
       context: ../dataplane/edge/gateway

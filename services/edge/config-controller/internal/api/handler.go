@@ -984,21 +984,21 @@ func (h *APIHandler) handlePurgeCache(w http.ResponseWriter, r *http.Request, do
 
 	purged := h.cacheEngine.Purge(target)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":        "purged",
-		"domain_id":     domainID,
-		"target":        target,
-		"purged_count":  purged,
-		"invalidation":  "immediate",
+		"status":       "purged",
+		"domain_id":    domainID,
+		"target":       target,
+		"purged_count": purged,
+		"invalidation": "immediate",
 	})
 }
 
 type CacheLookupRequest struct {
-	DomainID        string            `json:"domain_id"`
-	Method          string            `json:"method"`
-	Path            string            `json:"path"`
-	Query           string            `json:"query"`
-	Headers         map[string]string `json:"headers"`
-	OriginResponse  *OriginResponse   `json:"origin_response,omitempty"`
+	DomainID       string            `json:"domain_id"`
+	Method         string            `json:"method"`
+	Path           string            `json:"path"`
+	Query          string            `json:"query"`
+	Headers        map[string]string `json:"headers"`
+	OriginResponse *OriginResponse   `json:"origin_response,omitempty"`
 }
 
 type OriginResponse struct {
@@ -1357,9 +1357,9 @@ func (h *APIHandler) handleAnalyticsRoute(w http.ResponseWriter, r *http.Request
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"domain_id":     domainID,
+			"domain_id":    domainID,
 			"points_count": len(series),
-			"points":        series,
+			"points":       series,
 		})
 
 	default:

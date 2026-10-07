@@ -40,7 +40,8 @@ All components and capabilities transition strictly through the following six ve
 | **Control Plane: EWMA Health Router**| `LOCALLY_VERIFIED` | `router_test.go`, `TestSmartRouter_LowestLatencyAndFailover` | V0 / V1 | In-memory EWMA smoothing & autonomous failover passes locally. |
 | **Control Plane: TLS Dev Lifecycle** | `LOCALLY_VERIFIED` | `manager_test.go`, `TestCertificateManager_Workflow` | V0 | Generates local ECDSA P-256 self-signed leaf certificates for testing. |
 | **Control Plane: Production ACME (RFC 8555)** | `NOT_IMPLEMENTED` | - | V1 | Real Let's Encrypt / external WebPKI integration scheduled for V1. |
-| **Control Plane: Traffic Analytics** | `LOCALLY_VERIFIED` | `engine_test.go`, `TestReservoirSampler_Percentiles` | V0 / V1 | Vitter Algorithm R reservoir p50/p95/p99 sampling passes locally. |
+| **Control Plane: SDS Secret Distribution** | `SIMULATED_DECLARATIVE / NOT_IMPLEMENTED` | `compiler_test.go` | V1 | Envoy v3 SDS gRPC cluster declared with HTTP/2; live secret serving daemon scheduled for V1. |
+| **Control Plane: Traffic Analytics** | `LOCALLY_VERIFIED` | `engine_test.go`, `TestReservoirSampler_Percentiles` | V0 / V1 | Estimated p50/p95/p99 from bounded Algorithm R reservoir sampling with isolated monthly billing. |
 | **Persistence Layer (PostgreSQL)** | `NOT_IMPLEMENTED` | - | V1 | In-memory sync.RWMutex store in V0; PostgreSQL repository layer planned for V1 Customer Beta. |
 | **Network: Multi-PoP Topology** | `SIMULATED` | `manager_test.go` with RFC 5737/6996 test prefixes | V0 / V1 | In-memory 4-metro topology model (Dhaka, SG, Frankfurt, Virginia). |
 | **Network: BGP Route Health Injection** | `SIMULATED` | `TestPoPManager_BGPRouteLifecycle` | V3 | In-memory state machine. Hardware BGP speaker planned for V3. |

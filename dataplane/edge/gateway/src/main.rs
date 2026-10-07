@@ -41,21 +41,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         GatewayConfig::default()
     };
 
-    println!(r#"
+    println!(
+        r#"
   ███╗   ██╗███████╗██╗   ██╗██╗   ██╗███████╗███████╗██████╗  ██████╗ ███████╗
   ████╗  ██║██╔════╝╚██╗ ██╔╝██║   ██║██╔════╝██╔════╝██╔══██╗██╔════╝ ██╔════╝
   ██╔██╗ ██║█████╗   ╚████╔╝ ██║   ██║███████╗█████╗  ██║  ██║██║  ███╗█████╗  
   ██║╚██╗██║██╔══╝    ╚██╔╝  ██║   ██║╚════██║██╔══╝  ██║  ██║██║   ██║██╔══╝  
   ██║ ╚████║███████╗   ██║   ╚██████╔╝███████║███████╗██████╔╝╚██████╔╝███████╗
   ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚═════╝ ╚══════╝╚══════╝╚═════╝  ╚═════╝ ╚══════╝
-    "#);
+    "#
+    );
     info!("Starting NexusEdge Global Ingress Gateway");
     info!("Node ID:    {}", config.server.node_id);
     info!("Region:     {}", config.server.region);
     info!("Listening:  {}", config.server.listen_addr);
-    info!("WAF Shield: {}", if config.waf.enabled { "ACTIVE" } else { "DISABLED" });
-    info!("DDoS Guard: {}", if config.rate_limit.enabled { "ACTIVE" } else { "DISABLED" });
-    info!("Edge Cache: {}", if config.cache.enabled { "ACTIVE" } else { "DISABLED" });
+    info!(
+        "WAF Shield: {}",
+        if config.waf.enabled {
+            "ACTIVE"
+        } else {
+            "DISABLED"
+        }
+    );
+    info!(
+        "DDoS Guard: {}",
+        if config.rate_limit.enabled {
+            "ACTIVE"
+        } else {
+            "DISABLED"
+        }
+    );
+    info!(
+        "Edge Cache: {}",
+        if config.cache.enabled {
+            "ACTIVE"
+        } else {
+            "DISABLED"
+        }
+    );
 
     // 3. Initialize Shared State Engines
     let rate_limiter = RateLimiter::new(
@@ -69,10 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.cache.default_ttl_seconds,
         config.cache.max_entries,
     );
-    let router = Router::new(
-        config.upstream.targets.clone(),
-        config.upstream.timeout_ms,
-    );
+    let router = Router::new(config.upstream.targets.clone(), config.upstream.timeout_ms);
 
     let http_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
@@ -99,24 +119,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // 5. Autonomous Upstream Health Probing Loop (Finding 14)
+    // 5. Autonomous Upstream Health Probing Loop (Findings 8, 9, 14)
     let health_router = router.clone();
-    let health_client = http_client.clone();
+    let health_client = HttpClient::builder()
+        .timeout(Duration::from_millis(config.upstream.timeout_ms))
+        .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF / open-redirect attacks
+        .pool_max_idle_per_host(64)
+        .tcp_nodelay(true)
+        .build()?;
     let health_path = config.upstream.health_check_path.clone();
     let targets = config.upstream.targets.clone();
+
     tokio::spawn(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            for target in &targets {
-                let check_url = format!("{}{}", target.trim_end_matches('/'), health_path);
-                let start = std::time::Instant::now();
-                let is_healthy = match health_client.get(&check_url).send().await {
-                    Ok(resp) => resp.status().is_success(),
-                    Err(_) => false,
-                };
-                let latency_ms = start.elapsed().as_millis() as u64;
-                health_router.mark_health(target, is_healthy, latency_ms);
+            let mut join_set = tokio::task::JoinSet::new();
+            for target in targets.clone() {
+                let client = health_client.clone();
+                let path = health_path.clone();
+                let permit = semaphore.clone();
+                join_set.spawn(async move {
+                    let _permit = permit.acquire().await;
+                    let check_url = format!("{}{}", target.trim_end_matches('/'), path);
+                    let start = std::time::Instant::now();
+                    let is_healthy = match client.get(&check_url).send().await {
+                        Ok(resp) => resp.status().is_success(),
+                        Err(_) => false,
+                    };
+                    let latency_ms = start.elapsed().as_millis() as u64;
+                    (target, is_healthy, latency_ms)
+                });
+            }
+            while let Some(res) = join_set.join_next().await {
+                if let Ok((target, is_healthy, latency_ms)) = res {
+                    health_router.mark_health(&target, is_healthy, latency_ms);
+                }
             }
         }
     });

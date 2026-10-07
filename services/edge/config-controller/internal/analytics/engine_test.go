@@ -276,3 +276,92 @@ func TestEngine_Validation(t *testing.T) {
 	// Reset
 	engine.Reset("non_existent")
 }
+
+func TestEngine_MonthlyBillingIsolation(t *testing.T) {
+	engine := NewEngine()
+	domainID := "dom_monthly_isolation"
+
+	septTime := time.Date(2026, 9, 15, 10, 0, 0, 0, time.UTC)
+	octTime := time.Date(2026, 10, 5, 14, 0, 0, 0, time.UTC)
+
+	// Ingest September event: 50 requests, 2 GB egress
+	for i := 0; i < 50; i++ {
+		err := engine.Ingest(model.TelemetryEvent{
+			DomainID:      domainID,
+			RequestID:     fmt.Sprintf("req_sep_%d", i),
+			StatusCode:    200,
+			BytesSent:     40000000, // 40 MB * 50 = 2,000,000,000 bytes (2 GB)
+			BytesReceived: 1000000,
+			Timestamp:     septTime,
+		})
+		if err != nil {
+			t.Fatalf("failed to ingest sept event: %v", err)
+		}
+	}
+
+	// Ingest October event: 100 requests, 5 GB egress
+	for i := 0; i < 100; i++ {
+		err := engine.Ingest(model.TelemetryEvent{
+			DomainID:      domainID,
+			RequestID:     fmt.Sprintf("req_oct_%d", i),
+			StatusCode:    200,
+			BytesSent:     50000000, // 50 MB * 100 = 5,000,000,000 bytes (5 GB)
+			BytesReceived: 1000000,
+			Timestamp:     octTime,
+		})
+		if err != nil {
+			t.Fatalf("failed to ingest oct event: %v", err)
+		}
+	}
+
+	// 1. Verify September Billing (only September traffic)
+	sepUsage, err := engine.GetBillingUsage(domainID, "2026-09")
+	if err != nil {
+		t.Fatalf("failed to get september usage: %v", err)
+	}
+	if sepUsage.TotalRequests != 50 {
+		t.Errorf("expected 50 requests in Sep, got %d", sepUsage.TotalRequests)
+	}
+	if sepUsage.EgressGB != 2.0 {
+		t.Errorf("expected 2.0 GB in Sep, got %f", sepUsage.EgressGB)
+	}
+	if sepUsage.BandwidthCostUSD != 0.10 {
+		t.Errorf("expected $0.10 bandwidth in Sep, got %f", sepUsage.BandwidthCostUSD)
+	}
+	if sepUsage.TotalCostUSD != 20.10 {
+		t.Errorf("expected $20.10 total cost in Sep, got %f", sepUsage.TotalCostUSD)
+	}
+
+	// 2. Verify October Billing (only October traffic)
+	octUsage, err := engine.GetBillingUsage(domainID, "2026-10")
+	if err != nil {
+		t.Fatalf("failed to get october usage: %v", err)
+	}
+	if octUsage.TotalRequests != 100 {
+		t.Errorf("expected 100 requests in Oct, got %d", octUsage.TotalRequests)
+	}
+	if octUsage.EgressGB != 5.0 {
+		t.Errorf("expected 5.0 GB in Oct, got %f", octUsage.EgressGB)
+	}
+	if octUsage.BandwidthCostUSD != 0.25 {
+		t.Errorf("expected $0.25 bandwidth in Oct, got %f", octUsage.BandwidthCostUSD)
+	}
+	if octUsage.TotalCostUSD != 20.25 {
+		t.Errorf("expected $20.25 total cost in Oct, got %f", octUsage.TotalCostUSD)
+	}
+
+	// 3. Verify November Billing (zero traffic, base fee only)
+	novUsage, err := engine.GetBillingUsage(domainID, "2026-11")
+	if err != nil {
+		t.Fatalf("failed to get november usage: %v", err)
+	}
+	if novUsage.TotalRequests != 0 {
+		t.Errorf("expected 0 requests in Nov, got %d", novUsage.TotalRequests)
+	}
+	if novUsage.EgressGB != 0.0 {
+		t.Errorf("expected 0.0 GB in Nov, got %f", novUsage.EgressGB)
+	}
+	if novUsage.TotalCostUSD != 20.00 {
+		t.Errorf("expected $20.00 base fee only in Nov, got %f", novUsage.TotalCostUSD)
+	}
+}

@@ -155,7 +155,7 @@ TLS Dev Lifecycle   Analytics Engine   Simulated PoP Mesh Stress & Hardening
 | **RFC 9111 CDN Cache** | Milestone 3 | Deterministic query sorting, header normalization, Cache-Control policy parsing (`no-store`, `private`, `max-age`), sub-second local cache invalidation and purge. | `TestCacheKeyNormalization`<br/>`TestCacheEngineLookupStorePurge` |
 | **EWMA Smart Routing** | Milestone 4 | Active origin health probing, Exponentially Weighted Moving Average ($\alpha = 0.2$) RTT latency smoothing, autonomous sub-ms failover upon consecutive failures. | `TestSmartRouter_LowestLatencyAndFailover`<br/>`TestMonitor_ProbeSuccessAndThreshold` |
 | **TLS Lifecycle (Dev Mode)** | Milestone 5 | HTTP-01 challenge orchestration, in-memory ECDSA P-256 key pair and local development x509 leaf issuance, Envoy DownstreamTlsContext SDS zero-reload secret rotation. | `TestCertificateManager_Workflow`<br/>`TestChaos_ZeroReloadCertificateRotation` |
-| **Traffic Analytics** | Milestone 6 | Vitter's Algorithm R reservoir sampling for exact p50/p90/p95/p99 latency percentiles with zero heap allocations, time-series aggregation, bandwidth metering for billing. | `TestReservoirSampler_Percentiles`<br/>`TestEngine_TimeSeriesAndBilling` |
+| **Traffic Analytics** | Milestone 6 | Estimated p50/p90/p95/p99 latency percentiles from bounded Algorithm R reservoir sampling (0 B/op in the measured reservoir-sampling benchmark), time-series aggregation, isolated monthly bandwidth and request metering for billing. | `TestReservoirSampler_Percentiles`<br/>`TestEngine_TimeSeriesAndBilling`<br/>`TestEngine_MonthlyBillingIsolation` |
 | **Simulated Multi-PoP Mesh** | Milestone 7 | In-memory BGP Route Health Injection (RHI) / Withdrawal state model, Inter-PoP Latency Matrix, Local Metro Geo-Steering across simulated Dhaka, Singapore, Frankfurt, and Virginia PoPs. | `TestPoPManager_BGPRouteLifecycle`<br/>`TestPoPManager_LatencyMatrixAndSteering` |
 | **Stress & Hardening** | Milestone 8 | In-process high-concurrency pipeline saturation (>100k ops/sec), chaos injection testing (origin death, BGP drain, telemetry flood), and master operational runbooks. | `TestHighConcurrency_Pipeline`<br/>`TestChaos_PoPNetworkDrainAndAnycastFailover` |
 
@@ -189,7 +189,7 @@ Operation                         Latency (ns/op)   Memory (B/op)   Allocations
 OWASP-Aligned WAF Inspection     4,658 ns (4.6 µs)     205 B/op      9 allocs
 RFC 9111 Cache Key Normalization 2,110 ns (2.1 µs)     301 B/op     15 allocs
 EWMA Smart Origin Routing        1,121 ns (1.1 µs)     704 B/op      4 allocs
-Reservoir Latency Sampling         148 ns (0.1 µs)       0 B/op      0 allocs (Zero-GC)
+Reservoir Latency Sampling         148 ns (0.1 µs)       0 B/op      0 allocs (in measured micro-benchmark)
 ```
 
 ### High-Concurrency Pipeline Saturation

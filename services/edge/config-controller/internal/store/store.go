@@ -18,18 +18,18 @@ type Store struct {
 	hostIndex    map[string]string // hostname -> domain ID
 	pools        map[string]*model.OriginPool
 	origins      map[string]*model.Origin
-	routes       map[string][]*model.Route          // domain ID -> routes
-	security     map[string]*model.SecurityPolicy   // domain ID -> policy
-	wafRules     map[string][]model.WAFRule         // domain ID -> WAF rules
-	rateLimits   map[string][]model.RateLimitRule   // domain ID -> Rate limit rules
-	events       map[string][]model.SecurityEvent   // domain ID -> Security events
-	cache        map[string]*model.CachePolicy      // domain ID -> policy
-	cacheRules   map[string][]model.CacheRule             // domain ID -> Cache rules
-	monitors     map[string]*model.HealthMonitor          // pool ID -> HealthMonitor
-	healthStates map[string]*model.OriginEndpointState    // origin ID -> OriginEndpointState
-	certificates map[string]*model.Certificate            // domain ID -> certificate
-	challenges   map[string]*model.ACMEChallenge          // token -> ACMEChallenge
-	tlsSettings  map[string]*model.TLSSettings            // domain ID -> TLSSettings
+	routes       map[string][]*model.Route             // domain ID -> routes
+	security     map[string]*model.SecurityPolicy      // domain ID -> policy
+	wafRules     map[string][]model.WAFRule            // domain ID -> WAF rules
+	rateLimits   map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
+	events       map[string][]model.SecurityEvent      // domain ID -> Security events
+	cache        map[string]*model.CachePolicy         // domain ID -> policy
+	cacheRules   map[string][]model.CacheRule          // domain ID -> Cache rules
+	monitors     map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
+	healthStates map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
+	certificates map[string]*model.Certificate         // domain ID -> certificate
+	challenges   map[string]*model.ACMEChallenge       // token -> ACMEChallenge
+	tlsSettings  map[string]*model.TLSSettings         // domain ID -> TLSSettings
 }
 
 func NewStore() *Store {

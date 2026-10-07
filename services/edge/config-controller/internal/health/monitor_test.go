@@ -157,18 +157,18 @@ func TestSmartRouter_LowestLatencyAndFailover(t *testing.T) {
 		LBAlgorithm: model.LBAlgorithmRoundRobin,
 		Origins: []model.Origin{
 			{
-				ID:       "orig-fast",
-				PoolID:   "pool-primary",
-				Address:  "10.0.1.10",
-				Port:     8080,
-				Healthy:  true,
+				ID:      "orig-fast",
+				PoolID:  "pool-primary",
+				Address: "10.0.1.10",
+				Port:    8080,
+				Healthy: true,
 			},
 			{
-				ID:       "orig-slow",
-				PoolID:   "pool-primary",
-				Address:  "10.0.1.20",
-				Port:     8080,
-				Healthy:  true,
+				ID:      "orig-slow",
+				PoolID:  "pool-primary",
+				Address: "10.0.1.20",
+				Port:    8080,
+				Healthy: true,
 			},
 		},
 	}
@@ -234,7 +234,7 @@ func TestMonitor_RuntimeSSRFBlocked(t *testing.T) {
 	blockedTargets := []string{
 		"127.0.0.1",
 		"169.254.169.254", // Cloud metadata
-		"10.0.0.1",       // RFC 1918
+		"10.0.0.1",        // RFC 1918
 	}
 
 	for _, addr := range blockedTargets {

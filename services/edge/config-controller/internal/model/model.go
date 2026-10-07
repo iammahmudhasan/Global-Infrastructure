@@ -60,10 +60,10 @@ type HealthMonitor struct {
 	Protocol            HealthCheckProtocol `json:"protocol"`
 	Path                string              `json:"path"` // default "/healthz"
 	Port                int                 `json:"port"`
-	IntervalSeconds     int                 `json:"interval_seconds"`     // default 10s
-	TimeoutSeconds      int                 `json:"timeout_seconds"`      // default 2s
-	HealthyThreshold    int                 `json:"healthy_threshold"`    // consecutive passes, default 2
-	UnhealthyThreshold  int                 `json:"unhealthy_threshold"`  // consecutive failures, default 3
+	IntervalSeconds     int                 `json:"interval_seconds"`      // default 10s
+	TimeoutSeconds      int                 `json:"timeout_seconds"`       // default 2s
+	HealthyThreshold    int                 `json:"healthy_threshold"`     // consecutive passes, default 2
+	UnhealthyThreshold  int                 `json:"unhealthy_threshold"`   // consecutive failures, default 3
 	ExpectedStatusCodes []int               `json:"expected_status_codes"` // default [200]
 }
 
@@ -130,7 +130,7 @@ const (
 type WAFMatchType string
 
 const (
-	WAFMatchIPCIDR    WAFMatchType = "IP_CIDR"
+	WAFMatchIPCIDR     WAFMatchType = "IP_CIDR"
 	WAFMatchPathPrefix WAFMatchType = "PATH_PREFIX"
 	WAFMatchHeader     WAFMatchType = "HEADER"
 	WAFMatchQueryParam WAFMatchType = "QUERY_PARAM"
@@ -277,7 +277,7 @@ type ACMEChallenge struct {
 }
 
 type TLSSettings struct {
-	EnforceHTTPS  bool   `json:"enforce_https"`  // 301 redirect HTTP to HTTPS
+	EnforceHTTPS  bool   `json:"enforce_https"`   // 301 redirect HTTP to HTTPS
 	MinTLSVersion string `json:"min_tls_version"` // "TLSv1.2", "TLSv1.3"
 	HSTS          bool   `json:"hsts"`
 	HSTSMaxAge    int    `json:"hsts_max_age"`
@@ -294,8 +294,8 @@ type TelemetryEvent struct {
 	LatencyMs     float64   `json:"latency_ms"`
 	BytesSent     int64     `json:"bytes_sent"`
 	BytesReceived int64     `json:"bytes_received"`
-	CacheStatus   string    `json:"cache_status"`   // "HIT", "MISS", "BYPASS"
-	WAFAction     string    `json:"waf_action"`      // "ALLOW", "BLOCK", "LOG"
+	CacheStatus   string    `json:"cache_status"` // "HIT", "MISS", "BYPASS"
+	WAFAction     string    `json:"waf_action"`   // "ALLOW", "BLOCK", "LOG"
 	OriginID      string    `json:"origin_id,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 }
@@ -319,13 +319,13 @@ type AnalyticsSummary struct {
 	Status3xx       int64              `json:"status_3xx"`
 	Status4xx       int64              `json:"status_4xx"`
 	Status5xx       int64              `json:"status_5xx"`
-	ErrorRate       float64            `json:"error_rate"`        // (4xx + 5xx) / total
-	CacheHitRate    float64            `json:"cache_hit_rate"`    // HIT / total
+	ErrorRate       float64            `json:"error_rate"`     // (4xx + 5xx) / total
+	CacheHitRate    float64            `json:"cache_hit_rate"` // HIT / total
 	CacheHits       int64              `json:"cache_hits"`
 	CacheMisses     int64              `json:"cache_misses"`
-	BytesSent       int64              `json:"bytes_sent"`        // Egress
-	BytesReceived   int64              `json:"bytes_received"`    // Ingress
-	SecurityBlocked int64              `json:"security_blocked"`  // WAF blocks
+	BytesSent       int64              `json:"bytes_sent"`       // Egress
+	BytesReceived   int64              `json:"bytes_received"`   // Ingress
+	SecurityBlocked int64              `json:"security_blocked"` // WAF blocks
 	Latency         LatencyPercentiles `json:"latency"`
 	LastUpdated     time.Time          `json:"last_updated"`
 }
@@ -373,21 +373,21 @@ const (
 
 // EdgePoP represents an Edge Point of Presence in the topology mesh
 type EdgePoP struct {
-	ID               string    `json:"id"`                 // e.g. "dhaka", "singapore", "frankfurt", "virginia"
-	Name             string    `json:"name"`               // e.g. "Dhaka BDIX Edge 01 (Simulated)"
-	Region           string    `json:"region"`             // e.g. "asia-south1"
-	City             string    `json:"city"`               // e.g. "Dhaka"
-	Country          string    `json:"country"`            // e.g. "BD"
+	ID               string    `json:"id"`      // e.g. "dhaka", "singapore", "frankfurt", "virginia"
+	Name             string    `json:"name"`    // e.g. "Dhaka BDIX Edge 01 (Simulated)"
+	Region           string    `json:"region"`  // e.g. "asia-south1"
+	City             string    `json:"city"`    // e.g. "Dhaka"
+	Country          string    `json:"country"` // e.g. "BD"
 	Latitude         float64   `json:"latitude"`
 	Longitude        float64   `json:"longitude"`
-	ASN              int       `json:"asn"`                // RFC 6996 Private ASN for simulation: 64512
-	AnycastIPv4      string    `json:"anycast_ipv4"`       // RFC 5737 TEST-NET-2: "198.51.100.1"
-	AnycastIPv6      string    `json:"anycast_ipv6"`       // RFC 3849 Documentation Prefix: "2001:db8::1"
-	BGPState         BGPState  `json:"bgp_state"`          // ANNOUNCED or WITHDRAWN
+	ASN              int       `json:"asn"`          // RFC 6996 Private ASN for simulation: 64512
+	AnycastIPv4      string    `json:"anycast_ipv4"` // RFC 5737 TEST-NET-2: "198.51.100.1"
+	AnycastIPv6      string    `json:"anycast_ipv6"` // RFC 3849 Documentation Prefix: "2001:db8::1"
+	BGPState         BGPState  `json:"bgp_state"`    // ANNOUNCED or WITHDRAWN
 	Status           PoPStatus `json:"status"`
-	Mode             string    `json:"mode"`               // "SIMULATION" or "PRODUCTION"
-	Source           string    `json:"source"`             // "SIMULATED", "PROBE", or "OPERATOR"
-	IsSimulated      bool      `json:"is_simulated"`       // true for simulated testbeds
+	Mode             string    `json:"mode"`         // "SIMULATION" or "PRODUCTION"
+	Source           string    `json:"source"`       // "SIMULATED", "PROBE", or "OPERATOR"
+	IsSimulated      bool      `json:"is_simulated"` // true for simulated testbeds
 	NodeCount        int       `json:"node_count"`
 	HealthyNodeCount int       `json:"healthy_node_count"`
 	CreatedAt        time.Time `json:"created_at"`

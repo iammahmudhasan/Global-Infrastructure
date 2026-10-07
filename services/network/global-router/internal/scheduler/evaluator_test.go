@@ -244,3 +244,52 @@ func TestCapacityDepletionAndReservation(t *testing.T) {
 		t.Fatalf("expected failure due to capacity exhaustion, got nil error")
 	}
 }
+
+func TestCandidateReservationFallback(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	// Register a second EU backend so there are multiple eligible candidates
+	reg.Register(&registry.ComputeBackend{
+		ID:              "hetzner-hel-h100",
+		Name:            "Hetzner Helsinki H100",
+		Provider:        "hetzner",
+		Region:          "eu-north-1",
+		Jurisdiction:    registry.ResidencyEU,
+		Endpoint:        "https://hel.hetzner.internal/v1",
+		GPUModel:        "H100",
+		AvailableGPUs:   8,
+		HourlyCost:      1.90,
+		LatencyP95Ms:    135,
+		CarbonIntensity: 150.0,
+		Healthy:         true,
+	})
+
+	// Pre-reserve all 16 GPUs on the primary EU backend (gcp-fra-vertex-ai)
+	err := reg.Reserve("concurrent-workload-x", "gcp-fra-vertex-ai", 16)
+	if err != nil {
+		t.Fatalf("failed to pre-reserve Frankfurt GPUs: %v", err)
+	}
+
+	policy := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-fallback-test",
+		TenantID:          "tenant-ai",
+		Residency:         registry.ResidencyEU,
+		StrictSovereignty: true,
+		GPUsRequested:     4,
+		Objective:         scheduler.ObjectiveCost,
+	}
+
+	decision, err := eval.Evaluate(policy)
+	if err != nil {
+		t.Fatalf("expected placement on alternate candidate, got: %v", err)
+	}
+
+	if decision.AssignedBackend.ID != "hetzner-hel-h100" {
+		t.Fatalf("expected placement on hetzner-hel-h100, got: %s", decision.AssignedBackend.ID)
+	}
+
+	if decision.GPUsAllocated != 4 {
+		t.Errorf("expected 4 GPUs allocated, got %d", decision.GPUsAllocated)
+	}
+}

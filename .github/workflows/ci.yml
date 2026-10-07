@@ -28,7 +28,11 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
-          cache-dependency-path: ${{ matrix.service }}/go.sum
+
+      - name: Go Format Check
+        run: |
+          cd ${{ matrix.service }}
+          test -z "$(gofmt -l .)"
 
       - name: Run Go Vet
         run: |
@@ -49,6 +53,14 @@ jobs:
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Format Check
+        run: cargo fmt --manifest-path dataplane/edge/gateway/Cargo.toml --all -- --check
+
+      - name: Rust Clippy
+        run: cargo clippy --manifest-path dataplane/edge/gateway/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Rust Check
         run: cargo check --manifest-path dataplane/edge/gateway/Cargo.toml

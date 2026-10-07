@@ -21,9 +21,19 @@ const (
 
 var (
 	ErrBackendNotFound      = errors.New("compute backend not found")
-	ErrDuplicateBackend    = errors.New("backend with ID already exists")
+	ErrDuplicateBackend     = errors.New("backend with ID already exists")
 	ErrInsufficientCapacity = errors.New("insufficient GPU capacity on backend")
+	ErrReservationExists    = errors.New("workload reservation already exists")
+	ErrReservationNotFound  = errors.New("workload reservation not found")
 )
+
+// Reservation tracks capacity ownership by a specific workload
+type Reservation struct {
+	WorkloadID string    `json:"workload_id"`
+	BackendID  string    `json:"backend_id"`
+	GPUs       int       `json:"gpus"`
+	ReservedAt time.Time `json:"reserved_at"`
+}
 
 // ComputeBackend represents a registered heterogeneous execution target (Bare-metal, Cloud, Edge)
 type ComputeBackend struct {
@@ -48,13 +58,15 @@ type ComputeBackend struct {
 }
 
 type Registry struct {
-	mu       sync.RWMutex
-	backends map[string]*ComputeBackend
+	mu           sync.RWMutex
+	backends     map[string]*ComputeBackend
+	reservations map[string]*Reservation
 }
 
 func NewRegistry() *Registry {
 	r := &Registry{
-		backends: make(map[string]*ComputeBackend),
+		backends:     make(map[string]*ComputeBackend),
+		reservations: make(map[string]*Reservation),
 	}
 	r.bootstrapDefaults()
 	return r
@@ -167,6 +179,14 @@ func (r *Registry) Register(b *ComputeBackend) error {
 	return nil
 }
 
+func cloneBackend(b *ComputeBackend) *ComputeBackend {
+	if b == nil {
+		return nil
+	}
+	cp := *b
+	return &cp
+}
+
 func (r *Registry) Get(id string) (*ComputeBackend, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -175,7 +195,7 @@ func (r *Registry) Get(id string) (*ComputeBackend, error) {
 	if !exists {
 		return nil, ErrBackendNotFound
 	}
-	return b, nil
+	return cloneBackend(b), nil
 }
 
 func (r *Registry) List() []*ComputeBackend {
@@ -184,7 +204,7 @@ func (r *Registry) List() []*ComputeBackend {
 
 	list := make([]*ComputeBackend, 0, len(r.backends))
 	for _, b := range r.backends {
-		list = append(list, b)
+		list = append(list, cloneBackend(b))
 	}
 	return list
 }
@@ -203,6 +223,57 @@ func (r *Registry) UpdateHealth(id string, latencyMs int, healthy bool) {
 			b.Breaker.RecordFailure()
 		}
 	}
+}
+
+// Reserve tracks capacity ownership by a specific workload, preventing double reservations
+func (r *Registry) Reserve(workloadID, backendID string, count int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, exists := r.reservations[workloadID]; exists {
+		return ErrReservationExists
+	}
+
+	b, ok := r.backends[backendID]
+	if !ok {
+		return ErrBackendNotFound
+	}
+	if count <= 0 {
+		count = 1
+	}
+	if b.AvailableGPUs < count {
+		return ErrInsufficientCapacity
+	}
+
+	b.AvailableGPUs -= count
+	b.ActiveWorkloads++
+	r.reservations[workloadID] = &Reservation{
+		WorkloadID: workloadID,
+		BackendID:  backendID,
+		GPUs:       count,
+		ReservedAt: time.Now().UTC(),
+	}
+	return nil
+}
+
+// Release restores reserved GPU capacity using workload reservation ownership validation
+func (r *Registry) Release(workloadID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	res, exists := r.reservations[workloadID]
+	if !exists {
+		return ErrReservationNotFound
+	}
+
+	if b, ok := r.backends[res.BackendID]; ok {
+		b.AvailableGPUs += res.GPUs
+		if b.ActiveWorkloads > 0 {
+			b.ActiveWorkloads--
+		}
+	}
+	delete(r.reservations, workloadID)
+	return nil
 }
 
 // ReserveGPU decrements available GPU capacity and tracks active workloads atomically.
@@ -243,4 +314,3 @@ func (r *Registry) ReleaseGPU(id string, count int) error {
 	}
 	return nil
 }
-

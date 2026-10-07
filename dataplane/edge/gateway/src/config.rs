@@ -81,7 +81,9 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
-    pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn load_from_file<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(path)?;
         let config: GatewayConfig = serde_yaml::from_str(&content)?;
         Ok(config)

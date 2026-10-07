@@ -95,7 +95,7 @@ func TestValidateOriginAddress_SSRFProtection(t *testing.T) {
 		"172.16.0.5",
 		"192.168.1.1",
 		"169.254.169.254", // Cloud metadata
-		"100.64.0.1",     // CGNAT
+		"100.64.0.1",      // CGNAT
 		"localhost",
 		"backend.internal",
 		"app.local",
@@ -164,4 +164,3 @@ func TestOnboardPortAndProtocolValidation(t *testing.T) {
 		t.Errorf("expected protocol FTP to be rejected")
 	}
 }
-

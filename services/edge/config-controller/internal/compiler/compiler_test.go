@@ -189,6 +189,9 @@ func TestCompiler(t *testing.T) {
 	for _, c := range cfgWithTLS.StaticResources.Clusters {
 		if c.Name == "sds-grpc-cluster" {
 			hasSDSCluster = true
+			if c.Http2ProtocolOptions == nil {
+				t.Fatalf("expected sds-grpc-cluster to have HTTP/2 protocol options enabled for gRPC")
+			}
 			break
 		}
 	}

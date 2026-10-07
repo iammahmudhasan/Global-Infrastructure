@@ -29,13 +29,13 @@ impl WafEngine {
             r"(?i)(<script[\s>]|javascript:|onload\s*=|onerror\s*=|onclick\s*=|eval\s*\(|alert\s*\(|<img\s+[^>]*onerror)"
         ).expect("Valid XSS regex");
 
-        let path_traversal_regex = Regex::new(
-            r"(?i)(\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c)"
-        ).expect("Valid Path Traversal regex");
+        let path_traversal_regex =
+            Regex::new(r"(?i)(\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%2e%2e%5c)")
+                .expect("Valid Path Traversal regex");
 
-        let bad_agents_regex = Regex::new(
-            r"(?i)(sqlmap|nikto|dirbuster|gobuster|masscan|zgrab|nmap|acunetix)"
-        ).expect("Valid Scanner regex");
+        let bad_agents_regex =
+            Regex::new(r"(?i)(sqlmap|nikto|dirbuster|gobuster|masscan|zgrab|nmap|acunetix)")
+                .expect("Valid Scanner regex");
 
         Self {
             enabled: config.enabled,
@@ -49,7 +49,12 @@ impl WafEngine {
         }
     }
 
-    pub fn inspect(&self, uri_str: &str, user_agent: Option<&str>, body_sample: Option<&str>) -> WafResult {
+    pub fn inspect(
+        &self,
+        uri_str: &str,
+        user_agent: Option<&str>,
+        body_sample: Option<&str>,
+    ) -> WafResult {
         if !self.enabled {
             return WafResult::Allowed;
         }

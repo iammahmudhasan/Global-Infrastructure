@@ -299,6 +299,6 @@ The NexusEdge Edge Engine has been empirically stress-tested and benchmarked on 
 - **OWASP-Aligned WAF Inspection:** `4,658 ns/op` (~4.6 microseconds per deep regex payload inspection).
 - **RFC 9111 Cache Key Normalization:** `2,110 ns/op` (~2.1 microseconds per URI path, query sorting, header normalization).
 - **EWMA Smart Origin Routing:** `1,121 ns/op` (~1.1 microseconds per multi-origin latency calculation).
-- **Reservoir Latency Sampling (Vitter Algorithm R):** `148.2 ns/op`, `0 B/op`, `0 allocs/op` (Zero GC footprint).
+- **Reservoir Latency Sampling (Vitter Algorithm R):** `148.2 ns/op`, `0 B/op`, `0 allocs/op` in the measured reservoir-sampling benchmark.
 - **High-Concurrency Pipeline Throughput:** `149,572.41 ops/sec` under 50-worker parallel saturation with bounded memory.
 - **Availability Target:** 99.99% Edge Availability design target backed by simulated Anycast and EWMA multi-origin failover.

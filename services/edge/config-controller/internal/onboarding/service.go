@@ -16,9 +16,9 @@ import (
 )
 
 var (
-	ErrInvalidHostname  = errors.New("invalid hostname: must be a valid fully-qualified domain name (FQDN)")
-	ErrInvalidOrigin    = errors.New("invalid origin: must specify a valid host and port")
-	hostnameRegex       = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
+	ErrInvalidHostname = errors.New("invalid hostname: must be a valid fully-qualified domain name (FQDN)")
+	ErrInvalidOrigin   = errors.New("invalid origin: must specify a valid host and port")
+	hostnameRegex      = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 )
 
 type OnboardRequest struct {
@@ -30,14 +30,14 @@ type OnboardRequest struct {
 }
 
 type OnboardResponse struct {
-	DomainID            string             `json:"domain_id"`
-	Hostname            string             `json:"hostname"`
-	Status              model.DomainStatus `json:"status"`
-	CNAMETarget         string             `json:"cname_target"`
-	VerificationToken   string             `json:"verification_token"`
-	DefaultRouteID      string             `json:"default_route_id"`
-	OriginPoolID        string             `json:"origin_pool_id"`
-	DNSRecordToCreate   map[string]string  `json:"dns_record_to_create"`
+	DomainID          string             `json:"domain_id"`
+	Hostname          string             `json:"hostname"`
+	Status            model.DomainStatus `json:"status"`
+	CNAMETarget       string             `json:"cname_target"`
+	VerificationToken string             `json:"verification_token"`
+	DefaultRouteID    string             `json:"default_route_id"`
+	OriginPoolID      string             `json:"origin_pool_id"`
+	DNSRecordToCreate map[string]string  `json:"dns_record_to_create"`
 }
 
 type DomainService struct {

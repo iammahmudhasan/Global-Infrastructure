@@ -17,10 +17,10 @@ const (
 )
 
 var (
-	ErrMissingAuth   = errors.New("missing authorization header or api key")
-	ErrInvalidAuth   = errors.New("invalid or expired credentials")
+	ErrMissingAuth    = errors.New("missing authorization header or api key")
+	ErrInvalidAuth    = errors.New("invalid or expired credentials")
 	ErrTenantMismatch = errors.New("forbidden: tenant ID mismatch")
-	ErrUnauthorized  = errors.New("unauthorized: access denied to requested resource")
+	ErrUnauthorized   = errors.New("unauthorized: access denied to requested resource")
 )
 
 type Role string
@@ -273,4 +273,3 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 		w.Write([]byte(`{"error":"Unauthorized: missing required API key or credentials"}`))
 	})
 }
-

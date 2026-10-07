@@ -144,7 +144,7 @@ func TestAPIWorkflow(t *testing.T) {
 	rateLimitBody, _ := json.Marshal(map[string]interface{}{
 		"rules": []map[string]interface{}{
 			{
-				"path_prefix":          "/api/",
+				"path_prefix":         "/api/",
 				"requests_per_minute": 500,
 				"burst_size":          50,
 			},
@@ -355,9 +355,9 @@ func TestAPIWorkflow(t *testing.T) {
 		t.Fatalf("expected 200 OK from get pool health, got %d", w.Code)
 	}
 	var poolHealthResp struct {
-		PoolID           string                        `json:"pool_id"`
-		TotalEndpoints   int                           `json:"total_endpoints"`
-		HealthyEndpoints int                           `json:"healthy_endpoints"`
+		PoolID           string                       `json:"pool_id"`
+		TotalEndpoints   int                          `json:"total_endpoints"`
+		HealthyEndpoints int                          `json:"healthy_endpoints"`
 		Endpoints        []*model.OriginEndpointState `json:"endpoints"`
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &poolHealthResp)
@@ -917,4 +917,3 @@ func TestControlPlane_CORSFailClosed(t *testing.T) {
 		t.Errorf("expected fail-closed for non-matching origin when allowlist configured, got %q", origin)
 	}
 }
-

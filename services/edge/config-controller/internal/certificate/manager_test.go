@@ -1,8 +1,8 @@
 package certificate_test
 
 import (
-	"encoding/pem"
 	"crypto/x509"
+	"encoding/pem"
 	"testing"
 	"time"
 

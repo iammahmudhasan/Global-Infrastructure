@@ -3,7 +3,7 @@ package scheduler
 import (
 	"errors"
 	"fmt"
-	"math"
+	"sort"
 	"sync"
 	"time"
 
@@ -22,7 +22,7 @@ type cachedDecision struct {
 }
 
 type Evaluator struct {
-	mu          sync.RWMutex
+	mu          sync.Mutex
 	reg         *registry.Registry
 	idempotency map[string]*cachedDecision
 }
@@ -35,9 +35,21 @@ func NewEvaluator(reg *registry.Registry) *Evaluator {
 }
 
 // Evaluate answers: "Where should this application, AI inference request, and compute workload run right now?"
+// Critical section is serialized to ensure atomic idempotency checks and capacity reservations (Findings 6, 7).
 func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	if policy.WorkloadID == "" || policy.TenantID == "" {
 		return nil, ErrInvalidPolicy
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// 0. Periodic Cleanup of Expired Idempotency Entries
+	now := time.Now()
+	for k, v := range e.idempotency {
+		if now.After(v.expiresAt) {
+			delete(e.idempotency, k)
+		}
 	}
 
 	// 1. Tenant & Project-Scoped Idempotency Check (Rules 16, 54, 55, Finding 21)
@@ -48,14 +60,11 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 			projectScope = "default"
 		}
 		idempotencyKey = fmt.Sprintf("%s:%s:%s", policy.TenantID, projectScope, policy.IdempotencyKey)
-		e.mu.RLock()
 		if cached, found := e.idempotency[idempotencyKey]; found {
-			if time.Now().Before(cached.expiresAt) {
-				e.mu.RUnlock()
+			if now.Before(cached.expiresAt) {
 				return cached.decision, nil
 			}
 		}
-		e.mu.RUnlock()
 	}
 
 	gpusReq := policy.GPUsRequested
@@ -126,7 +135,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		// Otherwise, attempt fallback to best available healthy node with capacity
 		for _, b := range candidates {
 			if b.Healthy && (b.Breaker == nil || b.Breaker.State() != circuitbreaker.StateOpen) && b.AvailableGPUs >= gpusReq {
-				if err := e.reg.ReserveGPU(b.ID, gpusReq); err == nil {
+				if err := e.reg.Reserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
 					decision := &DispatchDecision{
 						WorkloadID:      policy.WorkloadID,
 						TenantID:        policy.TenantID,
@@ -140,7 +149,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 						FallbackUsed:    true,
 						CalculatedAt:    time.Now().UTC(),
 					}
-					e.recordIdempotency(idempotencyKey, decision)
+					e.recordIdempotencyLocked(idempotencyKey, decision)
 					return decision, nil
 				}
 			}
@@ -150,7 +159,6 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	}
 
 	// 4. Multi-Objective Placement Optimization Function
-	// Score weights calibrated by optimization objective
 	var wLat, wCost, wCarb float64
 	switch policy.Objective {
 	case ObjectiveLatency:
@@ -163,10 +171,13 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		wLat, wCost, wCarb = 1.5, 25.0, 0.5
 	}
 
-	var bestBackend *registry.ComputeBackend
-	bestScore := math.MaxFloat64
+	type scoredBackend struct {
+		backend *registry.ComputeBackend
+		score   float64
+	}
+
+	scored := make([]scoredBackend, 0, len(eligible))
 	var alternatives []string
-	var reasonCodes []string
 
 	for _, b := range eligible {
 		alternatives = append(alternatives, b.ID)
@@ -182,18 +193,35 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 			score -= 50.0 // Sovereign local data anchor bonus
 		}
 
-		if score < bestScore {
-			bestScore = score
-			bestBackend = b
+		scored = append(scored, scoredBackend{
+			backend: b,
+			score:   score,
+		})
+	}
+
+	// Sort eligible candidates by score: lowest penalty score first (Finding 6)
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score < scored[j].score
+	})
+
+	// 5. Reserve Capacity with Fallback to Next Best Candidate (Finding 6, 7)
+	var bestBackend *registry.ComputeBackend
+	var bestScore float64
+
+	for _, item := range scored {
+		if err := e.reg.Reserve(policy.WorkloadID, item.backend.ID, gpusReq); err == nil {
+			bestBackend = item.backend
+			bestScore = item.score
+			break
 		}
 	}
 
-	// 5. Reserve Capacity Atomically (Finding 20)
-	if err := e.reg.ReserveGPU(bestBackend.ID, gpusReq); err != nil {
-		return nil, fmt.Errorf("failed to reserve GPU capacity on %s: %w", bestBackend.ID, err)
+	if bestBackend == nil {
+		return nil, fmt.Errorf("%w: candidate capacity exhausted during reservation race", ErrNoEligibleBackends)
 	}
 
 	// 6. Synthesize Explainable Decision Codes (Rule 112)
+	var reasonCodes []string
 	reasonCodes = append(reasonCodes, fmt.Sprintf("OPTIMAL_SCORE_%.2f", bestScore))
 	if bestBackend.Jurisdiction == registry.ResidencyBangladesh {
 		reasonCodes = append(reasonCodes, "SOVEREIGN_JURISDICTION_BD_MATCH")
@@ -224,16 +252,14 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		CalculatedAt:    time.Now().UTC(),
 	}
 
-	e.recordIdempotency(idempotencyKey, decision)
+	e.recordIdempotencyLocked(idempotencyKey, decision)
 	return decision, nil
 }
 
-func (e *Evaluator) recordIdempotency(key string, decision *DispatchDecision) {
+func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecision) {
 	if key == "" {
 		return
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.idempotency[key] = &cachedDecision{
 		decision:  decision,
 		expiresAt: time.Now().Add(24 * time.Hour),

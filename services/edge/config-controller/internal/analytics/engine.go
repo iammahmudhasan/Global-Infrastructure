@@ -96,6 +96,12 @@ func (s *ReservoirSampler) Percentiles() model.LatencyPercentiles {
 	}
 }
 
+type MonthlyUsageCounter struct {
+	TotalRequests int64
+	BytesSent     int64
+	BytesReceived int64
+}
+
 type DomainAggregator struct {
 	mu              sync.RWMutex
 	domainID        string
@@ -111,6 +117,7 @@ type DomainAggregator struct {
 	securityBlocked int64
 	sampler         *ReservoirSampler
 	timeSeriesMap   map[int64]*model.TimeSeriesPoint // Unix minute timestamp -> aggregate
+	monthlyUsage    map[string]*MonthlyUsageCounter  // YYYY-MM -> monthly usage counter
 	lastUpdated     time.Time
 }
 
@@ -119,6 +126,7 @@ func NewDomainAggregator(domainID string) *DomainAggregator {
 		domainID:      domainID,
 		sampler:       NewReservoirSampler(defaultReservoirCapacity),
 		timeSeriesMap: make(map[int64]*model.TimeSeriesPoint),
+		monthlyUsage:  make(map[string]*MonthlyUsageCounter),
 		lastUpdated:   time.Now().UTC(),
 	}
 }
@@ -131,6 +139,20 @@ func (da *DomainAggregator) Record(event model.TelemetryEvent) {
 	da.bytesSent += event.BytesSent
 	da.bytesReceived += event.BytesReceived
 	da.lastUpdated = time.Now().UTC()
+
+	eventTime := event.Timestamp
+	if eventTime.IsZero() {
+		eventTime = time.Now().UTC()
+	}
+	monthKey := eventTime.Format("2006-01")
+	monthCounter, exists := da.monthlyUsage[monthKey]
+	if !exists {
+		monthCounter = &MonthlyUsageCounter{}
+		da.monthlyUsage[monthKey] = monthCounter
+	}
+	monthCounter.TotalRequests++
+	monthCounter.BytesSent += event.BytesSent
+	monthCounter.BytesReceived += event.BytesReceived
 
 	// Status code distribution
 	switch {
@@ -163,10 +185,6 @@ func (da *DomainAggregator) Record(event model.TelemetryEvent) {
 	}
 
 	// Time-series rollups: bucket into 1-minute window
-	eventTime := event.Timestamp
-	if eventTime.IsZero() {
-		eventTime = time.Now().UTC()
-	}
 	minuteKey := eventTime.Truncate(time.Minute).Unix()
 
 	point, exists := da.timeSeriesMap[minuteKey]
@@ -252,17 +270,27 @@ func (da *DomainAggregator) BillingUsage(period string) model.BillingUsage {
 		period = time.Now().UTC().Format("2006-01")
 	}
 
-	egressGB := roundDecimals(float64(da.bytesSent)/bytesPerGigabyte, 4)
-	ingressGB := roundDecimals(float64(da.bytesReceived)/bytesPerGigabyte, 4)
+	var reqCount int64
+	var bytesSent int64
+	var bytesReceived int64
+
+	if counter, exists := da.monthlyUsage[period]; exists {
+		reqCount = counter.TotalRequests
+		bytesSent = counter.BytesSent
+		bytesReceived = counter.BytesReceived
+	}
+
+	egressGB := roundDecimals(float64(bytesSent)/bytesPerGigabyte, 4)
+	ingressGB := roundDecimals(float64(bytesReceived)/bytesPerGigabyte, 4)
 
 	bandwidthCost := roundDecimals(egressGB*pricePerEgressGBUSD, 2)
-	requestCost := roundDecimals((float64(da.totalRequests)/1000000.0)*pricePerMillionReqUSD, 4)
+	requestCost := roundDecimals((float64(reqCount)/1000000.0)*pricePerMillionReqUSD, 4)
 	totalCost := roundDecimals(baseDomainMonthlyFeeUSD+bandwidthCost+requestCost, 2)
 
 	return model.BillingUsage{
 		DomainID:         da.domainID,
 		BillingPeriod:    period,
-		TotalRequests:    da.totalRequests,
+		TotalRequests:    reqCount,
 		EgressGB:         egressGB,
 		IngressGB:        ingressGB,
 		BaseFeeUSD:       baseDomainMonthlyFeeUSD,

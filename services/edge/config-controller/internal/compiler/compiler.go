@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
@@ -85,10 +87,10 @@ type RouteMatch struct {
 }
 
 type RouteAction struct {
-	Cluster        string       `json:"cluster"`
-	Timeout        string       `json:"timeout"`
-	RetryPolicy    *RetryPolicy `json:"retry_policy,omitempty"`
-	HostRewriteLiteral string  `json:"host_rewrite_literal,omitempty"`
+	Cluster            string       `json:"cluster"`
+	Timeout            string       `json:"timeout"`
+	RetryPolicy        *RetryPolicy `json:"retry_policy,omitempty"`
+	HostRewriteLiteral string       `json:"host_rewrite_literal,omitempty"`
 }
 
 type RedirectAction struct {
@@ -101,13 +103,14 @@ type RetryPolicy struct {
 }
 
 type Cluster struct {
-	Name            string                   `json:"name"`
-	ConnectTimeout  string                   `json:"connect_timeout"`
-	Type            string                   `json:"type"`
-	LbPolicy        string                   `json:"lb_policy"`
-	LoadAssignment  LoadAssignment           `json:"load_assignment"`
-	HealthChecks    []map[string]interface{} `json:"health_checks,omitempty"`
-	TransportSocket *TransportSocket         `json:"transport_socket,omitempty"`
+	Name                 string                   `json:"name"`
+	ConnectTimeout       string                   `json:"connect_timeout"`
+	Type                 string                   `json:"type"`
+	LbPolicy             string                   `json:"lb_policy"`
+	LoadAssignment       LoadAssignment           `json:"load_assignment"`
+	Http2ProtocolOptions *map[string]interface{}  `json:"http2_protocol_options,omitempty"`
+	HealthChecks         []map[string]interface{} `json:"health_checks,omitempty"`
+	TransportSocket      *TransportSocket         `json:"transport_socket,omitempty"`
 }
 
 type TransportSocket struct {
@@ -116,7 +119,7 @@ type TransportSocket struct {
 }
 
 type LoadAssignment struct {
-	ClusterName string        `json:"cluster_name"`
+	ClusterName string              `json:"cluster_name"`
 	Endpoints   []LocalityEndpoints `json:"endpoints"`
 }
 
@@ -138,6 +141,8 @@ type Compiler struct {
 	adminPort   int
 	httpPort    int
 	httpsPort   int
+	acmeHost    string
+	acmePort    int
 	edgeVersion string
 }
 
@@ -151,10 +156,24 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 	if httpsPort == 0 {
 		httpsPort = 443
 	}
+
+	acmeHost := os.Getenv("NEXUSEDGE_ACME_HOST")
+	if acmeHost == "" {
+		acmeHost = "127.0.0.1"
+	}
+	acmePort := 9091
+	if portStr := os.Getenv("NEXUSEDGE_ACME_PORT"); portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			acmePort = p
+		}
+	}
+
 	return &Compiler{
 		adminPort:   adminPort,
 		httpPort:    httpPort,
 		httpsPort:   httpsPort,
+		acmeHost:    acmeHost,
+		acmePort:    acmePort,
 		edgeVersion: "v1.0.0",
 	}
 }
@@ -752,10 +771,14 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 }
 
 func (c *Compiler) buildACMECluster() Cluster {
+	clusterType := "STATIC"
+	if net.ParseIP(c.acmeHost) == nil {
+		clusterType = "STRICT_DNS"
+	}
 	return Cluster{
 		Name:           "acme_challenge_service",
 		ConnectTimeout: "2s",
-		Type:           "STATIC",
+		Type:           clusterType,
 		LbPolicy:       "ROUND_ROBIN",
 		LoadAssignment: LoadAssignment{
 			ClusterName: "acme_challenge_service",
@@ -766,8 +789,8 @@ func (c *Compiler) buildACMECluster() Cluster {
 							Endpoint: Endpoint{
 								Address: Address{
 									SocketAddress: SocketAddress{
-										Address:   "127.0.0.1",
-										PortValue: 9091,
+										Address:   c.acmeHost,
+										PortValue: c.acmePort,
 									},
 								},
 							},
@@ -779,12 +802,17 @@ func (c *Compiler) buildACMECluster() Cluster {
 	}
 }
 
+// buildSDSCluster produces the gRPC cluster definition for DownstreamTlsContext SDS secret discovery.
+// Architectural Note: In V0 prototype, this endpoint (127.0.0.1:18000) provides declarative Envoy xDS validation.
+// A live production SDS secret distribution server is scheduled for V1.
 func (c *Compiler) buildSDSCluster() Cluster {
+	http2Options := map[string]interface{}{}
 	return Cluster{
-		Name:           "sds-grpc-cluster",
-		ConnectTimeout: "2s",
-		Type:           "STATIC",
-		LbPolicy:       "ROUND_ROBIN",
+		Name:                 "sds-grpc-cluster",
+		ConnectTimeout:       "2s",
+		Type:                 "STATIC",
+		LbPolicy:             "ROUND_ROBIN",
+		Http2ProtocolOptions: &http2Options,
 		LoadAssignment: LoadAssignment{
 			ClusterName: "sds-grpc-cluster",
 			Endpoints: []LocalityEndpoints{

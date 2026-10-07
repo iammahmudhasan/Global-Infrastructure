@@ -91,7 +91,10 @@ pub async fn handle_request(
     if let Some(cl) = req_headers.get("content-length") {
         if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
             if len > MAX_REQUEST_BODY_BYTES {
-                warn!(len = len, "Request rejected: Content-Length exceeds maximum 10 MB limit");
+                warn!(
+                    len = len,
+                    "Request rejected: Content-Length exceeds maximum 10 MB limit"
+                );
                 let resp = Response::builder()
                     .status(StatusCode::PAYLOAD_TOO_LARGE)
                     .header("Content-Type", "application/json")
@@ -130,7 +133,10 @@ pub async fn handle_request(
     };
 
     // 4. WAF Inspection
-    match state.waf.inspect(&uri_string, user_agent.as_deref(), body_sample) {
+    match state
+        .waf
+        .inspect(&uri_string, user_agent.as_deref(), body_sample)
+    {
         WafResult::Blocked { rule, pattern } => {
             warn!(
                 ip = %client_ip,
@@ -158,11 +164,12 @@ pub async fn handle_request(
 
     // 5. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111)
     let scheme = "http";
-    let accept_encoding = req_headers
+    let raw_ae = req_headers
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let cache_key = format!("{}://{}{}#ae={}", scheme, host, uri_string, accept_encoding);
+    let norm_ae = normalize_accept_encoding(raw_ae);
+    let cache_key = format!("{}://{}{}#ae={}", scheme, host, uri_string, norm_ae);
 
     if method == Method::GET && !req_cc.contains("no-cache") && !req_cc.contains("no-store") {
         if let Some(cached) = state.cache.get(&cache_key) {
@@ -288,21 +295,34 @@ pub async fn handle_request(
             //   - Origin Cache-Control: no-store or private
             //   - Origin Set-Cookie present
             //   - Body exceeds MAX_CACHEABLE_RESPONSE_BYTES
+            let is_vary_star = headers_to_cache
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim() == "*")
+                .unwrap_or(false);
+
             let can_cache = method == Method::GET
                 && status == StatusCode::OK
                 && !req_cc.contains("no-store")
-                && (!auth_header_present || resp_cc.contains("public") || resp_cc.contains("s-maxage"))
+                && (!auth_header_present
+                    || resp_cc.contains("public")
+                    || resp_cc.contains("s-maxage"))
                 && !resp_cc.contains("no-store")
                 && !resp_cc.contains("private")
                 && !has_set_cookie
+                && !is_vary_star
                 && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
 
             if can_cache {
                 // Parse s-maxage or max-age for custom TTL if specified
                 let custom_ttl = parse_max_age(&resp_cc).map(Duration::from_secs);
-                state
-                    .cache
-                    .put(cache_key, status, headers_to_cache, resp_bytes.clone(), custom_ttl);
+                state.cache.put(
+                    cache_key,
+                    status,
+                    headers_to_cache,
+                    resp_bytes.clone(),
+                    custom_ttl,
+                );
             }
 
             let latency_ms = start_time.elapsed().as_millis();
@@ -336,6 +356,16 @@ pub async fn handle_request(
     }
 }
 
+pub fn normalize_accept_encoding(value: &str) -> String {
+    let mut encs: Vec<String> = value
+        .split(',')
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+    encs.sort();
+    encs.join(",")
+}
+
 fn parse_max_age(cc: &str) -> Option<u64> {
     for directive in ["s-maxage=", "max-age="] {
         if let Some(idx) = cc.find(directive) {
@@ -347,4 +377,21 @@ fn parse_max_age(cc: &str) -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_accept_encoding() {
+        assert_eq!(normalize_accept_encoding("gzip, br"), "br,gzip");
+        assert_eq!(normalize_accept_encoding("br, gzip"), "br,gzip");
+        assert_eq!(normalize_accept_encoding("GZIP"), "gzip");
+        assert_eq!(
+            normalize_accept_encoding(" gzip , deflate , br "),
+            "br,deflate,gzip"
+        );
+        assert_eq!(normalize_accept_encoding(""), "");
+    }
 }
