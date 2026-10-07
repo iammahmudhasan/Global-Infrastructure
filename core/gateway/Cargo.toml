@@ -1,0 +1,22 @@
+[package]
+name = "nexusedge-gateway"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mahmud Hasan <iammahmudhasanofficial@gmail.com>"]
+description = "NexusEdge Next-Gen L7 Edge Proxy, WAF, and DDoS Mitigation Gateway"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+regex = "1.10"
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

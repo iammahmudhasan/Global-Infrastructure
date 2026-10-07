@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  nexusedge-gateway:
+    build:
+      context: ../core/gateway
+      dockerfile: Dockerfile
+    container_name: nexusedge-pop-01
+    ports:
+      - "8080:8080"
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ../core/gateway/gateway.yaml:/app/gateway.yaml:ro
+    restart: unless-stopped
+
+  mock-origin:
+    image: kennethreitz/httpbin
+    container_name: mock-origin-app
+    ports:
+      - "8081:80"
+    restart: unless-stopped

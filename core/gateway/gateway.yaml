@@ -1,0 +1,26 @@
+server:
+  listen_addr: "0.0.0.0:8080"
+  node_id: "pop-sin-01"
+  region: "ap-southeast-1"
+
+upstream:
+  targets:
+    - "https://httpbin.org"
+  health_check_path: "/status/200"
+  timeout_ms: 5000
+
+rate_limit:
+  enabled: true
+  requests_per_second: 100
+  burst_capacity: 200
+
+waf:
+  enabled: true
+  block_sqli: true
+  block_xss: true
+  block_path_traversal: true
+
+cache:
+  enabled: true
+  default_ttl_seconds: 60
+  max_entries: 10000
