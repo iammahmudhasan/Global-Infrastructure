@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/iammahmudhasan/nexusedge-control-plane/controller"
 )
 
 // Node represents an active global edge Point of Presence (PoP)
@@ -22,20 +24,22 @@ type Node struct {
 
 // GlobalConfig represents the declarative cluster rules synchronized to all Rust Data Planes
 type GlobalConfig struct {
-	Version   int      `json:"version"`
-	UpdatedAt string   `json:"updated_at"`
+	Version    int      `json:"version"`
+	UpdatedAt  string   `json:"updated_at"`
 	BlockedIPs []string `json:"blocked_ips"`
-	WAFRules  []string `json:"waf_rules"`
+	WAFRules   []string `json:"waf_rules"`
 }
 
 type ControlPlaneState struct {
-	mu     sync.RWMutex
-	nodes  map[string]Node
-	config GlobalConfig
+	mu         sync.RWMutex
+	nodes      map[string]Node
+	config     GlobalConfig
+	controller *controller.WorkloadController
 }
 
 func NewControlPlaneState() *ControlPlaneState {
 	return &ControlPlaneState{
+		controller: controller.NewWorkloadController(),
 		nodes: map[string]Node{
 			"pop-sin-01": {
 				ID:        "pop-sin-01",
@@ -128,42 +132,54 @@ func main() {
 		json.NewEncoder(w).Encode(state.config)
 	})
 
-	// 4. Update Rule Ingestion
-	mux.HandleFunc("/api/v1/rules/block-ip", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		var payload struct {
-			IP string `json:"ip"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.IP == "" {
-			http.Error(w, "Invalid IP payload", http.StatusBadRequest)
-			return
-		}
-
-		state.mu.Lock()
-		state.config.BlockedIPs = append(state.config.BlockedIPs, payload.IP)
-		state.config.Version++
-		state.config.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-		state.mu.Unlock()
-
-		log.Printf("[CONTROL-PLANE] Dynamically blocked IP %s globally (Config v%d)", payload.IP, state.config.Version)
-		w.WriteHeader(http.StatusCreated)
+	// 4. Multi-Cloud & AI Compute Backends Registry
+	mux.HandleFunc("/api/v1/backends", func(w http.ResponseWriter, r *http.Request) {
+		backends := state.controller.ListBackends()
+		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"message": "IP added to global blocklist",
-			"version": state.config.Version,
+			"count":    len(backends),
+			"backends": backends,
 		})
+	})
+
+	// 5. Phase 0 Core Engine: Real-Time Workload Dispatcher API
+	// Answers: "Where should every application & compute workload run right now?"
+	mux.HandleFunc("/api/v1/workload/dispatch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed. Use POST.", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var policy controller.Policy
+		if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+			http.Error(w, fmt.Sprintf("Invalid policy JSON payload: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		decision, err := state.controller.EvaluateWorkload(policy)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":   err.Error(),
+				"policy":  policy.Name,
+				"status":  "NO_SUITABLE_BACKEND",
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(decision)
 	})
 
 	port := 9090
 	serverAddr := fmt.Sprintf(":%d", port)
-	log.Printf("======================================================")
-	log.Printf(" NexusEdge Global Control Plane Orchestrator (Go)")
+	log.Printf("=================================================================")
+	log.Printf(" NexusEdge Global AI & Compute Traffic Controller (Go)")
 	log.Printf(" Listening on %s", serverAddr)
-	log.Printf(" Registered Initial PoPs: Dhaka, Singapore, Frankfurt, Virginia")
-	log.Printf("======================================================")
+	log.Printf(" Phase 0 Engine: Multi-Cloud Workload Placement Active")
+	log.Printf(" Sovereign Jurisdictions: Bangladesh (BDIX/SMW6), EU, US, SG")
+	log.Printf("=================================================================")
 
 	if err := http.ListenAndServe(serverAddr, mux); err != nil {
 		log.Fatalf("Control plane fatal error: %v", err)
