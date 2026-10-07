@@ -1,0 +1,9 @@
+# Root Bazel build file for NexusEdge Polyglot Monorepo
+load("@rules_pkg//:pkg.bzl", "pkg_tar")
+
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "all_docs",
+    srcs = glob(["docs/**/*.md", "rfcs/**/*.md", "adr/**/*.md"]),
+)

@@ -1,0 +1,24 @@
+# NexusEdge Global Monorepo Codeowners
+
+# Global Owners
+*       @iammahmudhasan
+
+# Data Plane (Rust & C/eBPF)
+/dataplane/         @iammahmudhasan
+
+# Control Plane (Go)
+/services/          @iammahmudhasan
+
+# Intelligence Plane (Python)
+/intelligence/      @iammahmudhasan
+
+# Customer Facing Products (TypeScript / Next.js)
+/apps/              @iammahmudhasan
+
+# API Contracts & Governance
+/proto/             @iammahmudhasan
+/schemas/           @iammahmudhasan
+
+# Infrastructure & Deployment
+/infra/             @iammahmudhasan
+/deploy/            @iammahmudhasan

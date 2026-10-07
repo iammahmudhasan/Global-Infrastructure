@@ -1,0 +1,20 @@
+[project]
+name = "nexusedge-intelligence"
+version = "0.1.0"
+description = "NexusEdge Intelligence Plane & Global Workload Placement Optimizer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.9.0",
+    "numpy>=1.26.0",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

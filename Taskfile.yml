@@ -1,0 +1,27 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: check
+
+  check:
+    desc: Run compiler and lint checks across all planes
+    cmds:
+      - cmd: cd dataplane/edge/gateway && cargo check
+      - cmd: python intelligence/scheduling/workload-scheduler/optimizer.py
+
+  build:
+    desc: Build core binaries
+    cmds:
+      - cmd: cd dataplane/edge/gateway && cargo build --release
+
+  gateway:
+    desc: Launch local Edge Data Plane gateway
+    cmds:
+      - cmd: cd dataplane/edge/gateway && cargo run
+
+  router:
+    desc: Launch local Global Router service
+    cmds:
+      - cmd: cd services/network/global-router && go run cmd/global-router/main.go

@@ -1,0 +1,17 @@
+{
+  "name": "nexusedge-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NexusEdge Global Infrastructure Platform Monorepo",
+  "scripts": {
+    "dev:dashboard": "pnpm --filter @nexusedge/dashboard dev",
+    "build:dashboard": "pnpm --filter @nexusedge/dashboard build",
+    "lint": "pnpm -r lint",
+    "test": "pnpm -r test"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "prettier": "^3.3.3"
+  }
+}
