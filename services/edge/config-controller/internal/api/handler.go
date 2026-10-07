@@ -72,6 +72,10 @@ func (h *APIHandler) SetAuthenticator(a *auth.Authenticator) {
 }
 
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Global 1 MiB body size cap prevents unbounded memory exhaustion across all control plane JSON endpoints
+	const maxControlPlaneBody = 1 << 20 // 1 MiB
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlPlaneBody)
+
 	origin := r.Header.Get("Origin")
 	allowedOrigin := h.resolveAllowedOrigin(origin)
 	if allowedOrigin != "" {
@@ -1629,7 +1633,38 @@ func (h *APIHandler) handleRoutingRoute(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusBadRequest, "invalid steer payload: "+err.Error())
 			return
 		}
-		decision, err := h.popManager.CalculateSteering(req.ClientPoP, req.DomainID, req.Origins)
+		if req.DomainID == "" {
+			writeError(w, http.StatusBadRequest, "domain_id is required")
+			return
+		}
+
+		domain, err := h.store.GetDomain(req.DomainID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "domain not found: "+req.DomainID)
+			return
+		}
+
+		// Enforce project-level tenant authorization boundary (Rules 54, 55 - IDOR Defense)
+		if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
+			writeError(w, http.StatusForbidden, "forbidden: caller not authorized for domain "+req.DomainID)
+			return
+		}
+
+		origins := req.Origins
+		if len(origins) == 0 {
+			routes := h.store.GetRoutes(domain.ID)
+			for _, r := range routes {
+				if pool, err := h.store.GetOriginPool(r.PoolID); err == nil {
+					origins = append(origins, pool.Origins...)
+				}
+			}
+		}
+		if len(origins) == 0 {
+			writeError(w, http.StatusBadRequest, "no origins configured for domain: "+req.DomainID)
+			return
+		}
+
+		decision, err := h.popManager.CalculateSteering(req.ClientPoP, req.DomainID, origins)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return

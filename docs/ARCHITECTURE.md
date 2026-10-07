@@ -66,7 +66,7 @@ graph TD
 - **Performance Budget:** Under **150 microseconds (μs)** inspection overhead per request.
 
 ### D. Edge Caching Engine
-- **Storage Hierarchy:** In-memory LRU cache with TTL expiration.
+- **Storage Hierarchy:** In-memory bounded earliest-expiry eviction cache with TTL expiration.
 - **Cache-Control Adherence:** Strict adherence to `public`, `max-age`, `s-maxage`, `stale-while-revalidate`.
 - **Cache Keys:** Normalized URL paths, query parameters, and custom header variants (`Vary`).
 
@@ -126,7 +126,7 @@ Where:
 │   │   │   ├── proxy.rs         # L7 reverse proxy connection pool & dispatcher
 │   │   │   ├── rate_limit.rs    # Token-bucket sliding window rate limiter
 │   │   │   ├── waf.rs           # Web Application Firewall pattern matcher
-│   │   │   ├── cache.rs         # High-speed in-memory LRU cache
+│   │   │   ├── cache.rs         # High-speed in-memory bounded expiry-aware cache with RFC 9111 Vary support
 │   │   │   └── router.rs        # Upstream selection, health checks & metrics
 │   │   └── Cargo.toml           # Rust package dependencies (tokio, hyper, etc.)
 │   └── control-plane/           # Cluster config orchestrator & state sync

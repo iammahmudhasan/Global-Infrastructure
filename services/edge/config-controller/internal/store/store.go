@@ -128,12 +128,23 @@ func cloneSecurityPolicy(sp *model.SecurityPolicy) *model.SecurityPolicy {
 	return &cp
 }
 
+func cloneCacheRule(r model.CacheRule) model.CacheRule {
+	cp := r
+	cp.IgnoredParams = append([]string(nil), r.IgnoredParams...)
+	cp.IncludedParams = append([]string(nil), r.IncludedParams...)
+	cp.CustomHeadersToInclude = append([]string(nil), r.CustomHeadersToInclude...)
+	return cp
+}
+
 func cloneCachePolicy(cp *model.CachePolicy) *model.CachePolicy {
 	if cp == nil {
 		return nil
 	}
 	cpc := *cp
-	cpc.CacheRules = append([]model.CacheRule(nil), cp.CacheRules...)
+	cpc.CacheRules = make([]model.CacheRule, len(cp.CacheRules))
+	for i, rule := range cp.CacheRules {
+		cpc.CacheRules[i] = cloneCacheRule(rule)
+	}
 	return &cpc
 }
 
@@ -446,7 +457,7 @@ func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) 
 func (s *Store) GetRateLimitRules(domainID string) []model.RateLimitRule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.rateLimits[domainID]
+	return append([]model.RateLimitRule(nil), s.rateLimits[domainID]...)
 }
 
 func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) {
@@ -507,7 +518,12 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 func (s *Store) GetCacheRules(domainID string) []model.CacheRule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]model.CacheRule(nil), s.cacheRules[domainID]...)
+	rules := s.cacheRules[domainID]
+	list := make([]model.CacheRule, len(rules))
+	for i, r := range rules {
+		list[i] = cloneCacheRule(r)
+	}
+	return list
 }
 
 func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
@@ -611,9 +627,14 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 			continue // Only compile active, verified domains (Rule 17)
 		}
 
+		routes := make([]*model.Route, 0, len(s.routes[d.ID]))
+		for _, r := range s.routes[d.ID] {
+			routes = append(routes, cloneRoute(r))
+		}
+
 		topo := &DomainTopology{
 			Domain:      cloneDomain(d),
-			Routes:      append([]*model.Route(nil), s.routes[d.ID]...),
+			Routes:      routes,
 			Pools:       make(map[string]*model.OriginPool),
 			Security:    cloneSecurityPolicy(s.security[d.ID]),
 			Cache:       cloneCachePolicy(s.cache[d.ID]),

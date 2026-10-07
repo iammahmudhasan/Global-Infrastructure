@@ -148,3 +148,92 @@ func TestStore_ConcurrentReadWrite(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestStore_TopologyRouteAndCacheDeepClone(t *testing.T) {
+	st := store.NewStore()
+
+	domain := &model.Domain{
+		ID:        "dom-topo-1",
+		ProjectID: "prj-topo",
+		Hostname:  "topo.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	route := &model.Route{
+		ID:         "route-1",
+		DomainID:   "dom-topo-1",
+		PathPrefix: "/api",
+		PoolID:     "pool-1",
+		Priority:   10,
+	}
+	st.SaveRoute(route)
+
+	rule := model.CacheRule{
+		ID:                     "crule-1",
+		DomainID:               "dom-topo-1",
+		PathPattern:            "/static/*",
+		TTLSeconds:             3600,
+		IgnoredParams:          []string{"utm_source", "fbclid"},
+		IncludedParams:         []string{"id"},
+		CustomHeadersToInclude: []string{"X-Custom-Auth"},
+	}
+	_ = st.AddCacheRule("dom-topo-1", rule)
+
+	rlRule := model.RateLimitRule{
+		ID:                "rl-1",
+		DomainID:          "dom-topo-1",
+		PathPrefix:        "/login",
+		RequestsPerMinute: 60,
+		Enabled:           true,
+	}
+	_ = st.SetRateLimitRules("dom-topo-1", []model.RateLimitRule{rlRule})
+
+	// 1. Verify Topology route pointer mutation resistance
+	topos := st.GetActiveTopologies()
+	if len(topos) != 1 || len(topos[0].Routes) != 1 {
+		t.Fatalf("expected 1 topology with 1 route, got %d topos", len(topos))
+	}
+	topos[0].Routes[0].PathPrefix = "/mutated"
+	topos[0].Routes[0].Priority = 999
+
+	freshTopos := st.GetActiveTopologies()
+	if freshTopos[0].Routes[0].PathPrefix != "/api" {
+		t.Errorf("internal route was mutated via topology! expected /api, got %s", freshTopos[0].Routes[0].PathPrefix)
+	}
+	if freshTopos[0].Routes[0].Priority != 10 {
+		t.Errorf("internal route priority was mutated! expected 10, got %d", freshTopos[0].Routes[0].Priority)
+	}
+
+	// 2. Verify nested CacheRule slice mutation resistance
+	cacheRules := st.GetCacheRules("dom-topo-1")
+	if len(cacheRules) != 1 {
+		t.Fatalf("expected 1 cache rule, got %d", len(cacheRules))
+	}
+	cacheRules[0].IgnoredParams[0] = "mutated_param"
+	cacheRules[0].IgnoredParams = append(cacheRules[0].IgnoredParams, "injected_param")
+
+	freshCacheRules := st.GetCacheRules("dom-topo-1")
+	if freshCacheRules[0].IgnoredParams[0] != "utm_source" {
+		t.Errorf("internal cache rule IgnoredParams was mutated! expected utm_source, got %s", freshCacheRules[0].IgnoredParams[0])
+	}
+	if len(freshCacheRules[0].IgnoredParams) != 2 {
+		t.Errorf("internal cache rule IgnoredParams length mutated! expected 2, got %d", len(freshCacheRules[0].IgnoredParams))
+	}
+
+	// 3. Verify RateLimitRule slice mutation resistance
+	rlRules := st.GetRateLimitRules("dom-topo-1")
+	if len(rlRules) != 1 {
+		t.Fatalf("expected 1 rate limit rule, got %d", len(rlRules))
+	}
+	rlRules[0].RequestsPerMinute = 9999
+	rlRules = append(rlRules, model.RateLimitRule{ID: "injected-rl"})
+
+	freshRL := st.GetRateLimitRules("dom-topo-1")
+	if freshRL[0].RequestsPerMinute != 60 {
+		t.Errorf("internal rate limit RPM was mutated! expected 60, got %d", freshRL[0].RequestsPerMinute)
+	}
+	if len(freshRL) != 1 {
+		t.Errorf("internal rate limit rules slice was mutated! expected 1, got %d", len(freshRL))
+	}
+}

@@ -993,3 +993,85 @@ func TestCertificatesRoute_NeverLeaksPrivateKey(t *testing.T) {
 	}
 	assertNoPrivateKey(t, "POST /certificates/renew", w.Body.String())
 }
+
+func TestControlPlane_RoutingSteerTenantAuthorization(t *testing.T) {
+	handler := setupTestServer()
+	authEngine := auth.NewAuthenticator()
+	authEngine.RegisterTenant("key-tenant-alpha", "tenant-alpha", "prj-alpha")
+	authEngine.RegisterTenant("key-tenant-beta", "tenant-beta", "prj-beta")
+	handler.SetAuthenticator(authEngine)
+
+	// Setup domain and origin pool under prj-alpha via API
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "alpha.example.com",
+		"origin_address":  "198.51.100.20",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(body))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to onboard domain: %d - %s", w.Code, w.Body.String())
+	}
+	var domainResp struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &domainResp)
+
+	steerPayload, _ := json.Marshal(map[string]interface{}{
+		"client_pop": "dhaka",
+		"domain_id":  domainResp.DomainID,
+	})
+
+	// 1. Authorized tenant (prj-alpha) -> 200 OK
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/routing/steer", bytes.NewReader(steerPayload))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for authorized tenant, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Unauthorized cross-tenant caller (prj-beta) -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/routing/steer", bytes.NewReader(steerPayload))
+	req.Header.Set("X-API-Key", "key-tenant-beta")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant steer caller, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Non-existent domain -> 404 Not Found
+	unknownPayload, _ := json.Marshal(map[string]interface{}{
+		"client_pop": "dhaka",
+		"domain_id":  "dom-nonexistent",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/routing/steer", bytes.NewReader(unknownPayload))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for missing domain, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestControlPlane_GlobalBodySizeLimit(t *testing.T) {
+	handler := setupTestServer()
+
+	// Create payload exceeding 1 MiB (1.5 MiB of garbage padding)
+	oversized := make([]byte, 1500*1024)
+	for i := range oversized {
+		oversized[i] = 'a'
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(oversized))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// http.MaxBytesReader will cause json decoder to fail or return 400 Bad Request
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected oversized request (> 1MB) to fail with 400 Bad Request, got %d", w.Code)
+	}
+}

@@ -5,20 +5,24 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Cached HTTP response entry conforming to RFC 9111.
 #[derive(Clone, Debug)]
 pub struct CachedResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
     pub expires_at: Instant,
+    /// Set of (lowercase_header_name, request_header_value) required by origin's Vary header
+    pub vary_headers: Vec<(String, String)>,
 }
 
+/// Bounded earliest-expiry eviction cache with RFC 9111 Vary header support.
 #[derive(Clone)]
 pub struct EdgeCache {
     enabled: bool,
     default_ttl: Duration,
     max_entries: usize,
-    store: Arc<RwLock<HashMap<String, CachedResponse>>>,
+    store: Arc<RwLock<HashMap<String, Vec<CachedResponse>>>>,
 }
 
 impl EdgeCache {
@@ -31,20 +35,39 @@ impl EdgeCache {
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<CachedResponse> {
+    /// Retrieve cached response matching primary key and incoming request headers for Vary verification
+    pub fn get(&self, key: &str, req_headers: Option<&HeaderMap>) -> Option<CachedResponse> {
         if !self.enabled {
             return None;
         }
 
         let store = self.store.read().unwrap();
-        if let Some(entry) = store.get(key) {
-            if Instant::now() < entry.expires_at {
-                return Some(entry.clone());
+        if let Some(variants) = store.get(key) {
+            let now = Instant::now();
+            for entry in variants {
+                if now < entry.expires_at {
+                    // Verify that all Vary-nominated request headers match (RFC 9111 Section 4.1)
+                    let mut matches = true;
+                    for (vary_name, expected_val) in &entry.vary_headers {
+                        let actual_val = req_headers
+                            .and_then(|h| h.get(vary_name))
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("");
+                        if actual_val != expected_val {
+                            matches = false;
+                            break;
+                        }
+                    }
+                    if matches {
+                        return Some(entry.clone());
+                    }
+                }
             }
         }
         None
     }
 
+    /// Store a response with RFC 9111 Vary extraction and bounded capacity enforcement
     pub fn put(
         &self,
         key: String,
@@ -52,9 +75,34 @@ impl EdgeCache {
         headers: HeaderMap,
         body: Bytes,
         custom_ttl: Option<Duration>,
+        req_headers: Option<&HeaderMap>,
     ) {
         if !self.enabled || self.max_entries == 0 || !status.is_success() {
             return;
+        }
+
+        // RFC 9111 Section 4.1: Reject Vary: * responses from being cached
+        if let Some(vary_val) = headers.get("vary").and_then(|v| v.to_str().ok()) {
+            if vary_val.split(',').any(|part| part.trim() == "*") {
+                return;
+            }
+        }
+
+        // Extract Vary nominated headers from origin response
+        let mut vary_headers = Vec::new();
+        if let Some(vary_val) = headers.get("vary").and_then(|v| v.to_str().ok()) {
+            for part in vary_val.split(',') {
+                let name = part.trim().to_lowercase();
+                if name.is_empty() {
+                    continue;
+                }
+                let val = req_headers
+                    .and_then(|h| h.get(&name))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                vary_headers.push((name, val));
+            }
         }
 
         let ttl = custom_ttl.unwrap_or(self.default_ttl);
@@ -63,28 +111,66 @@ impl EdgeCache {
             headers,
             body,
             expires_at: Instant::now() + ttl,
+            vary_headers,
         };
 
         let mut store = self.store.write().unwrap();
-        if store.len() >= self.max_entries {
+
+        // Count total active variants across all keys
+        let mut total_entries: usize = store.values().map(|v| v.len()).sum();
+
+        if total_entries >= self.max_entries {
             // 1. Evict expired entries
             let now = Instant::now();
-            store.retain(|_, v| v.expires_at > now);
+            for variants in store.values_mut() {
+                variants.retain(|v| v.expires_at > now);
+            }
+            store.retain(|_, v| !v.is_empty());
 
-            // 2. Hard capacity guarantee (Finding 11): If still at capacity, evict earliest expiring entry
-            if store.len() >= self.max_entries {
-                let victim = store
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.expires_at)
-                    .map(|(key, _)| key.clone());
+            // Recalculate count
+            total_entries = store.values().map(|v| v.len()).sum();
 
-                if let Some(victim_key) = victim {
-                    store.remove(&victim_key);
+            // 2. Hard capacity guarantee: Evict earliest expiring entry
+            if total_entries >= self.max_entries {
+                let mut earliest_expiry: Option<(String, usize, Instant)> = None;
+
+                for (k, variants) in store.iter() {
+                    for (idx, v) in variants.iter().enumerate() {
+                        match earliest_expiry {
+                            None => earliest_expiry = Some((k.clone(), idx, v.expires_at)),
+                            Some((_, _, min_exp)) if v.expires_at < min_exp => {
+                                earliest_expiry = Some((k.clone(), idx, v.expires_at));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if let Some((victim_key, victim_idx, _)) = earliest_expiry {
+                    if let Some(variants) = store.get_mut(&victim_key) {
+                        if victim_idx < variants.len() {
+                            variants.remove(victim_idx);
+                        }
+                    }
+                    if let Some(variants) = store.get(&victim_key) {
+                        if variants.is_empty() {
+                            store.remove(&victim_key);
+                        }
+                    }
                 }
             }
         }
 
-        store.insert(key, entry);
+        let variants = store.entry(key).or_default();
+        // Replace existing variant if matching same vary headers
+        if let Some(existing) = variants
+            .iter_mut()
+            .find(|v| v.vary_headers == entry.vary_headers)
+        {
+            *existing = entry;
+        } else {
+            variants.push(entry);
+        }
     }
 
     #[allow(dead_code)]
@@ -95,13 +181,14 @@ impl EdgeCache {
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.store.read().unwrap().len()
+        self.store.read().unwrap().values().map(|v| v.len()).sum()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyper::header::HeaderValue;
 
     #[test]
     fn test_zero_max_entries_guard() {
@@ -115,9 +202,10 @@ mod tests {
             headers,
             body,
             Some(Duration::from_secs(10)),
+            None,
         );
         assert_eq!(cache.len(), 0, "max_entries == 0 must never insert entries");
-        assert!(cache.get("k1").is_none());
+        assert!(cache.get("k1", None).is_none());
     }
 
     #[test]
@@ -132,6 +220,7 @@ mod tests {
             headers.clone(),
             body.clone(),
             Some(Duration::from_secs(10)),
+            None,
         );
         cache.put(
             "k2".to_string(),
@@ -139,6 +228,7 @@ mod tests {
             headers.clone(),
             body.clone(),
             Some(Duration::from_secs(30)),
+            None,
         );
         assert_eq!(cache.len(), 2);
 
@@ -149,10 +239,94 @@ mod tests {
             headers,
             body,
             Some(Duration::from_secs(20)),
+            None,
         );
         assert_eq!(cache.len(), 2);
-        assert!(cache.get("k1").is_none(), "k1 should have been evicted");
-        assert!(cache.get("k2").is_some(), "k2 should be retained");
-        assert!(cache.get("k3").is_some(), "k3 should be present");
+        assert!(
+            cache.get("k1", None).is_none(),
+            "k1 should have been evicted"
+        );
+        assert!(cache.get("k2", None).is_some(), "k2 should be retained");
+        assert!(cache.get("k3", None).is_some(), "k3 should be present");
+    }
+
+    #[test]
+    fn test_vary_header_isolation() {
+        let cache = EdgeCache::new(true, 3600, 10);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("vary", HeaderValue::from_static("Origin, Accept-Language"));
+
+        let mut req_headers_a = HeaderMap::new();
+        req_headers_a.insert("origin", HeaderValue::from_static("https://tenant-a.com"));
+        req_headers_a.insert("accept-language", HeaderValue::from_static("en-US"));
+
+        let mut req_headers_b = HeaderMap::new();
+        req_headers_b.insert("origin", HeaderValue::from_static("https://tenant-b.com"));
+        req_headers_b.insert("accept-language", HeaderValue::from_static("en-US"));
+
+        let body_a = Bytes::from("body-for-tenant-a");
+        let body_b = Bytes::from("body-for-tenant-b");
+
+        // Cache response for Tenant A
+        cache.put(
+            "http://example.com/api".to_string(),
+            StatusCode::OK,
+            resp_headers.clone(),
+            body_a.clone(),
+            Some(Duration::from_secs(60)),
+            Some(&req_headers_a),
+        );
+
+        // Request from Tenant A should HIT
+        let hit_a = cache.get("http://example.com/api", Some(&req_headers_a));
+        assert!(hit_a.is_some());
+        assert_eq!(hit_a.unwrap().body, body_a);
+
+        // Request from Tenant B should MISS due to Vary mismatch
+        let miss_b = cache.get("http://example.com/api", Some(&req_headers_b));
+        assert!(
+            miss_b.is_none(),
+            "Tenant B must not receive Tenant A's cached response"
+        );
+
+        // Now cache response for Tenant B as variant
+        cache.put(
+            "http://example.com/api".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            body_b.clone(),
+            Some(Duration::from_secs(60)),
+            Some(&req_headers_b),
+        );
+
+        assert_eq!(cache.len(), 2, "Both variants should be stored");
+
+        // Both now HIT their respective variants
+        let hit_b = cache.get("http://example.com/api", Some(&req_headers_b));
+        assert!(hit_b.is_some());
+        assert_eq!(hit_b.unwrap().body, body_b);
+
+        let hit_a_again = cache.get("http://example.com/api", Some(&req_headers_a));
+        assert!(hit_a_again.is_some());
+        assert_eq!(hit_a_again.unwrap().body, body_a);
+    }
+
+    #[test]
+    fn test_vary_star_rejected() {
+        let cache = EdgeCache::new(true, 3600, 10);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("vary", HeaderValue::from_static("*"));
+
+        cache.put(
+            "http://example.com/dynamic".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from("dynamic-data"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        assert_eq!(cache.len(), 0, "Vary: * must never be cached");
+        assert!(cache.get("http://example.com/dynamic", None).is_none());
     }
 }

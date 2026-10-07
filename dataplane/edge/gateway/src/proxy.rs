@@ -26,6 +26,13 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "host",
 ];
 
+const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "forwarded",
+];
+
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 
@@ -172,7 +179,7 @@ pub async fn handle_request(
     let cache_key = format!("{}://{}{}#ae={}", scheme, host, uri_string, norm_ae);
 
     if method == Method::GET && !req_cc.contains("no-cache") && !req_cc.contains("no-store") {
-        if let Some(cached) = state.cache.get(&cache_key) {
+        if let Some(cached) = state.cache.get(&cache_key, Some(&req_headers)) {
             let latency_us = start_time.elapsed().as_micros();
             info!(uri = %uri_string, host = %host, latency_us = latency_us, cache = "HIT", "Serving from Edge Cache");
 
@@ -223,10 +230,12 @@ pub async fn handle_request(
     );
 
     // Forward all client application headers (Authorization, Cookie, Content-Type, Accept, etc.)
-    // Stripping only hop-by-hop headers
+    // Stripping hop-by-hop headers and untrusted client forwarding headers to prevent spoofing
     for (name, value) in req_headers.iter() {
         let name_str = name.as_str().to_lowercase();
-        if HOP_BY_HOP_HEADERS.contains(&name_str.as_str()) {
+        if HOP_BY_HOP_HEADERS.contains(&name_str.as_str())
+            || STRIPPED_FORWARDING_HEADERS.contains(&name_str.as_str())
+        {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -322,6 +331,7 @@ pub async fn handle_request(
                     headers_to_cache,
                     resp_bytes.clone(),
                     custom_ttl,
+                    Some(&req_headers),
                 );
             }
 

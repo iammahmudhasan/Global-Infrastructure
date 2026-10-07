@@ -96,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let http_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
+        .redirect(reqwest::redirect::Policy::none()) // Prevent upstream redirect-following SSRF attacks (RFC 9110)
         .pool_max_idle_per_host(256)
         .tcp_nodelay(true)
         .build()?;
