@@ -5,18 +5,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
-func setupTestServer() http.Handler {
+func setupTestServer() *api.APIHandler {
 	st := store.NewStore()
 	svc := onboarding.NewDomainService(st)
 	comp := compiler.NewCompiler(9901, 80, 443)
@@ -738,3 +740,168 @@ func TestAPIWorkflow(t *testing.T) {
 		t.Fatalf("expected local Dhaka origin affinity, got %+v", steerDecision)
 	}
 }
+
+func TestControlPlane_AuthenticationAndTenantIsolation(t *testing.T) {
+	handler := setupTestServer()
+	authEngine := auth.NewAuthenticator()
+	authEngine.RegisterTenant("key-alpha-secret", "tenant-alpha", "proj-alpha")
+	authEngine.RegisterTenant("key-beta-secret", "tenant-beta", "proj-beta")
+	handler.SetAuthenticator(authEngine)
+
+	// 1. Tenant Alpha successfully onboards domain under proj-alpha
+	onboardPayload, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "portal.tenant-alpha.com",
+		"origin_address":  "origin.tenant-alpha.internal",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-alpha/domains", bytes.NewReader(onboardPayload))
+	req.Header.Set("X-API-Key", "key-alpha-secret")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created for authenticated tenant-alpha onboarding, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var alphaDomain struct {
+		DomainID     string `json:"domain_id"`
+		OriginPoolID string `json:"origin_pool_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &alphaDomain)
+	if alphaDomain.DomainID == "" || alphaDomain.OriginPoolID == "" {
+		t.Fatalf("expected valid domain ID and pool ID, got %+v", alphaDomain)
+	}
+
+	// 2. Tenant Alpha reads their own domain -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+alphaDomain.DomainID, nil)
+	req.Header.Set("X-API-Key", "key-alpha-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for tenant-alpha accessing their own domain, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. IDOR Defense: Tenant Beta attempts to access Tenant Alpha's domain -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+alphaDomain.DomainID, nil)
+	req.Header.Set("X-API-Key", "key-beta-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when tenant-beta accesses tenant-alpha domain, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. IDOR Defense: Tenant Beta attempts to add origin to Tenant Alpha's domain -> 403 Forbidden
+	addOriginBody, _ := json.Marshal(map[string]interface{}{
+		"address": "evil-origin.beta.internal",
+		"port":    443,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+alphaDomain.DomainID+"/origins", bytes.NewReader(addOriginBody))
+	req.Header.Set("X-API-Key", "key-beta-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when tenant-beta tries to add origin to tenant-alpha domain, got %d", w.Code)
+	}
+
+	// 5. Tenant Beta attempts to create domain in Tenant Alpha's project -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodPost, "/v1/projects/proj-alpha/domains", bytes.NewReader(onboardPayload))
+	req.Header.Set("X-API-Key", "key-beta-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when tenant-beta tries to onboard into proj-alpha, got %d", w.Code)
+	}
+
+	// 6. Tenant Beta attempts to list Tenant Alpha's domains -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/proj-alpha/domains", nil)
+	req.Header.Set("X-API-Key", "key-beta-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when tenant-beta lists proj-alpha domains, got %d", w.Code)
+	}
+
+	// 7. Tenant Beta attempts to access Tenant Alpha's origin pool -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/pools/"+alphaDomain.OriginPoolID, nil)
+	req.Header.Set("X-API-Key", "key-beta-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when tenant-beta accesses tenant-alpha pool, got %d", w.Code)
+	}
+
+	// 8. Tenant Spoofing Defense: Key belongs to Alpha, but header claims Tenant Beta -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+alphaDomain.DomainID, nil)
+	req.Header.Set("X-API-Key", "key-alpha-secret")
+	req.Header.Set("X-Tenant-ID", "tenant-beta")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on tenant ID mismatch, got %d", w.Code)
+	}
+
+	// 9. Asserting X-Tenant-ID without credentials -> 401 Unauthorized
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+alphaDomain.DomainID, nil)
+	req.Header.Set("X-Tenant-ID", "tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when asserting tenant ID without key, got %d", w.Code)
+	}
+
+	// 10. Strict Auth Mode: NEXUSEDGE_ENFORCE_AUTH=true -> 401 Unauthorized on unauthenticated request
+	os.Setenv("NEXUSEDGE_ENFORCE_AUTH", "true")
+	defer os.Unsetenv("NEXUSEDGE_ENFORCE_AUTH")
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+alphaDomain.DomainID, nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized when NEXUSEDGE_ENFORCE_AUTH=true, got %d", w.Code)
+	}
+}
+
+func TestControlPlane_CORSFailClosed(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Empty Origin: No CORS headers should be returned
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if origin := w.Header().Get("Access-Control-Allow-Origin"); origin != "" {
+		t.Errorf("expected empty CORS origin for requests with no Origin header, got %q", origin)
+	}
+
+	// 2. Unknown External Origin: In production or without allowlist, must fail closed (no wildcard)
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://unauthorized-external-site.com")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if origin := w.Header().Get("Access-Control-Allow-Origin"); origin == "*" || origin == "https://unauthorized-external-site.com" {
+		t.Errorf("expected fail-closed CORS for unknown origin, got %q", origin)
+	}
+
+	// 3. Configured Allowed Origin: Matches exact origin
+	os.Setenv("NEXUSEDGE_ALLOWED_ORIGINS", "https://console.nexusedge.net,https://api.nexusedge.net")
+	defer os.Unsetenv("NEXUSEDGE_ALLOWED_ORIGINS")
+
+	// 3a. Matching allowed origin
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://console.nexusedge.net")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if origin := w.Header().Get("Access-Control-Allow-Origin"); origin != "https://console.nexusedge.net" {
+		t.Errorf("expected allowed origin reflection, got %q", origin)
+	}
+
+	// 3b. Non-matching origin fails closed
+	req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Origin", "https://attacker.evil.com")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if origin := w.Header().Get("Access-Control-Allow-Origin"); origin != "" {
+		t.Errorf("expected fail-closed for non-matching origin when allowlist configured, got %q", origin)
+	}
+}
+

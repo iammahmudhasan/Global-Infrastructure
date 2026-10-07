@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/analytics"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
@@ -38,10 +38,14 @@ type APIHandler struct {
 	certManager     *certificate.Manager
 	analyticsEngine *analytics.Engine
 	popManager      *pop.Manager
+	authenticator   *auth.Authenticator
+	handlerChain    http.Handler
 	mux             *http.ServeMux
 }
 
 func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
+	authenticator := auth.NewAuthenticator()
+	mux := http.NewServeMux()
 	h := &APIHandler{
 		store:           s,
 		service:         svc,
@@ -53,10 +57,18 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		certManager:     certificate.NewManager(s),
 		analyticsEngine: analytics.NewEngine(),
 		popManager:      pop.NewManager(),
-		mux:             http.NewServeMux(),
+		authenticator:   authenticator,
+		mux:             mux,
+		handlerChain:    authenticator.Middleware(mux),
 	}
 	h.registerRoutes()
 	return h
+}
+
+// SetAuthenticator allows overriding or updating the authenticator (e.g. for testing)
+func (h *APIHandler) SetAuthenticator(a *auth.Authenticator) {
+	h.authenticator = a
+	h.handlerChain = a.Middleware(h.mux)
 }
 
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +77,7 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if allowedOrigin != "" {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, X-Tenant-ID")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, X-Tenant-ID, X-API-Key")
 		w.Header().Set("Vary", "Origin")
 	}
 
@@ -74,12 +86,14 @@ func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.mux.ServeHTTP(w, r)
+	h.handlerChain.ServeHTTP(w, r)
 }
 
+// resolveAllowedOrigin implements strict fail-closed CORS defaults (P1 Security).
+// Never returns a blanket wildcard "*" unless explicitly configured in allowed origins.
 func (h *APIHandler) resolveAllowedOrigin(origin string) string {
 	if origin == "" {
-		return "*"
+		return ""
 	}
 	allowedList := os.Getenv("NEXUSEDGE_ALLOWED_ORIGINS")
 	if allowedList != "" {
@@ -90,33 +104,20 @@ func (h *APIHandler) resolveAllowedOrigin(origin string) string {
 		}
 		return ""
 	}
-	// In local development / prototype testbed mode, reflect localhost/127.0.0.1 or fallback to origin
-	if strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://127.0.0.1") {
-		return origin
-	}
-	return "*"
-}
-
-// authenticateTenant verifies request identity and extracts tenant context (Rules 17, 54, 55).
-// When NEXUSEDGE_ENFORCE_AUTH=true, requests missing authorization credentials fail closed (Rule 88).
-func (h *APIHandler) authenticateTenant(r *http.Request) (string, error) {
-	tenantID := r.Header.Get("X-Tenant-ID")
-	if os.Getenv("NEXUSEDGE_ENFORCE_AUTH") == "true" {
-		apiKey := r.Header.Get("X-API-Key")
-		if apiKey == "" {
-			authHeader := r.Header.Get("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				apiKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-		if apiKey == "" && tenantID == "" {
-			return "", errors.New("unauthorized: missing API key or tenant credentials")
+	// In development / prototype mode, permit localhost origins only. Fail closed for external origins.
+	if os.Getenv("NEXUSEDGE_ENV") != "production" && os.Getenv("ENV") != "production" {
+		if strings.HasPrefix(origin, "http://localhost:") ||
+			strings.HasPrefix(origin, "https://localhost:") ||
+			strings.HasPrefix(origin, "http://127.0.0.1:") ||
+			strings.HasPrefix(origin, "https://127.0.0.1:") ||
+			origin == "http://localhost" ||
+			origin == "https://localhost" ||
+			origin == "http://127.0.0.1" ||
+			origin == "https://127.0.0.1" {
+			return origin
 		}
 	}
-	if tenantID == "" {
-		tenantID = "default-tenant"
-	}
-	return tenantID, nil
+	return ""
 }
 
 func (h *APIHandler) registerRoutes() {
@@ -160,6 +161,12 @@ func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request)
 	projectID := parts[0]
 	if projectID == "" {
 		writeError(w, http.StatusBadRequest, "project_id is required")
+		return
+	}
+
+	// Verify authenticated tenant has access to this project (Rules 54, 55)
+	if !h.authenticator.AuthorizeProject(r.Context(), projectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+projectID)
 		return
 	}
 
@@ -213,10 +220,22 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 
 	domainID := parts[0]
 
+	// Enforce IDOR protection: lookup domain and verify project ownership against authenticated tenant (Rules 54, 55)
+	domain, err := h.store.GetDomain(domainID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+
+	if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for domain "+domainID)
+		return
+	}
+
 	if len(parts) == 1 {
 		// /v1/domains/{domain_id}
 		if r.Method == http.MethodGet {
-			h.handleGetDomain(w, r, domainID)
+			writeJSON(w, http.StatusOK, domain)
 			return
 		}
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -486,6 +505,12 @@ func (h *APIHandler) handlePoolsRoute(w http.ResponseWriter, r *http.Request) {
 	pool, err := h.store.GetOriginPool(poolID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "origin pool not found")
+		return
+	}
+
+	// Verify project ownership of pool against authenticated tenant (Rules 54, 55 - IDOR Defense)
+	if !h.authenticator.AuthorizeProject(r.Context(), pool.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for pool "+poolID)
 		return
 	}
 
@@ -994,6 +1019,11 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for domain "+req.DomainID)
+		return
+	}
+
 	policy := h.store.GetCachePolicy(req.DomainID)
 	if policy == nil {
 		writeError(w, http.StatusNotFound, "cache policy not found")
@@ -1098,6 +1128,17 @@ func (h *APIHandler) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 
 	if req.DomainID == "" {
 		writeError(w, http.StatusBadRequest, "domain_id is required")
+		return
+	}
+
+	domain, err := h.store.GetDomain(req.DomainID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "domain not found")
+		return
+	}
+
+	if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for domain "+req.DomainID)
 		return
 	}
 

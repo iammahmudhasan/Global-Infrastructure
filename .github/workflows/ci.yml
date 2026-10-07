@@ -1,0 +1,82 @@
+name: NexusEdge CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-control-plane:
+    name: Go Verification (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - services/edge/config-controller
+          - services/network/global-router
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: ${{ matrix.service }}/go.sum
+
+      - name: Run Go Vet
+        run: |
+          cd ${{ matrix.service }}
+          go vet ./...
+
+      - name: Run Go Tests
+        run: |
+          cd ${{ matrix.service }}
+          go test -v -race ./...
+
+  rust-data-plane:
+    name: Rust Data Plane Gateway
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Check
+        run: cargo check --manifest-path dataplane/edge/gateway/Cargo.toml
+
+      - name: Rust Test
+        run: cargo test --manifest-path dataplane/edge/gateway/Cargo.toml
+
+  python-intelligence:
+    name: Python Intelligence Schedulers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify Workload Optimizer
+        run: python intelligence/scheduling/workload-scheduler/optimizer.py
+
+  deploy-manifest-check:
+    name: Docker Compose Manifest Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Validate Compose Config
+        run: docker compose -f deploy/docker-compose.yml config

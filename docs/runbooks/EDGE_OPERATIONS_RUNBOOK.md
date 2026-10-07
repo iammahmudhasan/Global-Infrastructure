@@ -89,7 +89,7 @@ The NexusEdge Global Edge Network + Security Gateway operates across three decou
 
 ---
 
-### SOP-02: Zero-Day WAF Rule Patching & OWASP CRS Sensitivity Tuning
+### SOP-02: Zero-Day WAF Rule Patching & CRS-Aligned WAF Tuning
 
 **Objective:** Deploy immediate virtual patches for critical zero-day vulnerabilities (e.g., Log4Shell, Spring4Shell, SQLi) across all edge PoPs within 60 seconds without restarting Envoy proxies.
 
@@ -286,7 +286,7 @@ The NexusEdge Global Edge Network + Security Gateway operates across three decou
 |---|---|---|---|
 | **SEV-1 (CRITICAL)** | Global PoP Anycast withdrawal across >= 2 regions | Traffic reroutes to remaining online PoPs via BGP | Execute SOP-04, inspect transit upstream BGP session state, initiate emergency bridge |
 | **SEV-1 (CRITICAL)** | Complete origin pool outage (`ErrNoHealthyOrigins`) | Edge serves stale cache (`stale-if-error`) if available | Contact customer NOC, verify origin firewall/upstream provider |
-| **SEV-2 (HIGH)** | WAF False Positive Spike (>5% request block rate) | WAF Engine logs anomalous rule IDs | Identify triggered rule via logs, lower OWASP CRS sensitivity level, apply bypass exception |
+| **SEV-2 (HIGH)** | WAF False Positive Spike (>5% request block rate) | WAF Engine logs anomalous rule IDs | Identify triggered rule via logs, lower CRS-aligned rule sensitivity level, apply bypass exception |
 | **SEV-2 (HIGH)** | Certificate Expiring in < 7 days | ACME Auto-Renew loop triggers retry | Inspect DNS challenge resolution, run manual renewal via SOP-05 |
 | **SEV-3 (MEDIUM)** | Cache Hit Ratio drops below 40% | Cache key normalization logs missing query params | Verify customer cache headers (`Cache-Control: private/no-store`), adjust Query Parameter Allow-list |
 
@@ -296,9 +296,9 @@ The NexusEdge Global Edge Network + Security Gateway operates across three decou
 
 The NexusEdge Edge Engine has been empirically stress-tested and benchmarked on commodity hardware (Intel Core i5-8365U @ 1.60GHz, 8 Threads):
 
-- **OWASP CRS WAF Inspection:** `4,658 ns/op` (~4.6 microseconds per deep regex payload inspection).
+- **OWASP-Aligned WAF Inspection:** `4,658 ns/op` (~4.6 microseconds per deep regex payload inspection).
 - **RFC 9111 Cache Key Normalization:** `2,110 ns/op` (~2.1 microseconds per URI path, query sorting, header normalization).
 - **EWMA Smart Origin Routing:** `1,121 ns/op` (~1.1 microseconds per multi-origin latency calculation).
 - **Reservoir Latency Sampling (Vitter Algorithm R):** `148.2 ns/op`, `0 B/op`, `0 allocs/op` (Zero GC footprint).
 - **High-Concurrency Pipeline Throughput:** `149,572.41 ops/sec` under 50-worker parallel saturation with bounded memory.
-- **Availability Target:** Guaranteed 99.99% Edge Availability SLA backed by automated BGP Anycast and EWMA multi-origin failover.
+- **Availability Target:** 99.99% Edge Availability design target backed by simulated Anycast and EWMA multi-origin failover.

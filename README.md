@@ -46,7 +46,7 @@
 > *"Do not build yesterday's Cloudflare. Do not build an undifferentiated AI Gateway or a capital-burning GPU cloud. Build the Infrastructure-Neutral Global Fabric whose core intellectual question is:*  
 > **'Where should every application, AI inference request, and compute workload run right now?'"**
 
-NexusEdge is an infrastructure-native, high-performance global network designed from first principles. It combines sub-millisecond line-rate edge routing, OWASP CRS WAF inspection, distributed RFC 9111 caching, EWMA latency-adaptive origin steering, and multi-region BGP Anycast topology synchronization with automated ACME TLS lifecycle management.
+NexusEdge is an infrastructure-native, high-performance global network designed from first principles. It combines sub-millisecond line-rate edge routing, OWASP-inspired / CRS-aligned detection engine prototype, distributed RFC 9111 caching, EWMA latency-adaptive origin steering, and multi-region simulated Anycast topology synchronization with automated local development TLS lifecycle management.
 
 ### Platform Comparison Matrix
 
@@ -56,7 +56,7 @@ NexusEdge is an infrastructure-native, high-performance global network designed 
 | **Compute Placement** | Fixed edge worker v8 isolates | Multi-AZ load balancers with cold starts | Multi-Objective Optimization (Latency, Cost, Carbon) |
 | **Failover Routing** | DNS TTL-based rerouting (30s–300s delay) | Health check ping intervals (10s–30s) | Sub-millisecond EWMA ($\alpha = 0.2$) real-time steering |
 | **WAF Evaluation** | Interpreted ruleset engines | Centralized inspection middleboxes | In-process zero-allocation deterministic regex |
-| **State Propagation** | Eventual consistency (minutes globally) | Regional propagation delays | Raft / NATS JetStream sub-100ms global sync |
+| **State Propagation** | Eventual consistency (minutes globally) | Regional propagation delays | Raft / NATS JetStream declarative state replication |
 | **Data Sovereignty** | General geographic regions | Single country availability zones | Cryptographic NDMA 2026 & GDPR hard boundaries |
 
 ---
@@ -97,7 +97,7 @@ graph TD
         PoPFRA["pop-frankfurt (Frankfurt Simulated DE-CIX <115ms)"]
         PoPIAD["pop-virginia (Virginia Simulated Ashburn <175ms)"]
         RustGateway["Rust Hyper/Tokio Edge Gateway Prototype"]
-        FastPathEngine["OWASP WAF + RFC 9111 CDN Cache + EWMA Smart Router"]
+        FastPathEngine["CRS-Aligned WAF + RFC 9111 CDN Cache + EWMA Smart Router"]
         
         AnycastBGP --> PoPDhaka
         AnycastBGP --> PoPSG
@@ -111,7 +111,7 @@ graph TD
     end
 
     IntelligencePlane -->|Calculated Placement Graphs & Latency Intent| ControlPlane
-    ControlPlane -->|Sub-100ms Dynamic xDS & SDS Push| DataPlane
+    ControlPlane -->|Compiled Envoy v3 xDS & SDS Configuration| DataPlane
 ```
 
 ### Decoupled Plane Invariants
@@ -121,7 +121,7 @@ graph TD
    - Fast-path execution must **never** block on control plane or database round-trips.
 2. **Control Plane (Go 1.23 / gRPC / NATS JetStream):**
    - Idempotent declarative reconciliation loops.
-   - Pushes compiled xDS configuration in sub-100ms globally.
+   - Generates compiled Envoy v3 xDS/SDS configuration (live gRPC xDS stream in development for V1).
 3. **Intelligence Plane (Python 3.14 / PyTorch / ClickHouse):**
    - Mathematical placement optimization governed by deterministic fallback bounds.
    - Evaluates multi-objective trade-offs across latency, transit cost, and grid power.
@@ -181,7 +181,7 @@ PASS
 ```
 Operation                         Latency (ns/op)   Memory (B/op)   Allocations
 --------------------------------------------------------------------------------
-OWASP CRS WAF Inspection         4,658 ns (4.6 µs)     205 B/op      9 allocs
+OWASP-Aligned WAF Inspection     4,658 ns (4.6 µs)     205 B/op      9 allocs
 RFC 9111 Cache Key Normalization 2,110 ns (2.1 µs)     301 B/op     15 allocs
 EWMA Smart Origin Routing        1,121 ns (1.1 µs)     704 B/op      4 allocs
 Reservoir Latency Sampling         148 ns (0.1 µs)       0 B/op      0 allocs (Zero-GC)
@@ -254,33 +254,33 @@ Every subsystem in the repository is strictly tracked against our 6-stage lifecy
 ```bash
 cd services/edge/config-controller
 go run cmd/config-controller/main.go
-# Controller listening on http://127.0.0.1:8080
+# Controller listening on http://127.0.0.1:9091
 ```
 
-### 2. Onboard a Production Domain
+### 2. Onboard a Test/Development Domain
 ```bash
-curl -s -X POST http://127.0.0.1:8080/api/v1/domains \
+curl -s -X POST http://127.0.0.1:9091/v1/projects/prj-enterprise-01/domains \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-fixture-key-01" \
   -d '{
-    "project_id": "prj-enterprise-01",
-    "hostname": "api.production.internal"
+    "hostname": "api.dev.internal",
+    "origin_address": "198.51.100.10",
+    "origin_port": 443,
+    "origin_protocol": "HTTPS"
   }'
 ```
-*Response includes assigned CNAME target (`api.production.internal.edge.nexusedge.io`) and verification token.*
+*Response includes assigned CNAME target (`dom-xxxx.edge.nexusedge.net`) and verification token.*
 
-### 3. Attach OWASP WAF & Token Bucket Rate Limiter
+### 3. Attach CRS-Aligned WAF Rule & Configure Edge Protection
 ```bash
-curl -s -X PUT http://127.0.0.1:8080/api/v1/security-policies/{policy_id} \
+curl -s -X POST http://127.0.0.1:9091/v1/domains/{domain_id}/waf/rules \
   -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-fixture-key-01" \
   -d '{
-    "waf_enabled": true,
-    "owasp_crs_level": 2,
-    "action": "BLOCK",
-    "rate_limiting": {
-      "enabled": true,
-      "requests_per_second": 500,
-      "burst": 1000
-    }
+    "name": "block-admin-path",
+    "match_type": "PATH_PREFIX",
+    "pattern": "/admin",
+    "action": "BLOCK"
   }'
 ```
 
@@ -328,12 +328,12 @@ NexusEdge's business model targets high-margin, recurring infrastructure revenue
 Comprehensive Standard Operating Procedures (SOPs) and disaster triage protocols are documented in:
 - [**Master Edge Operations Runbook**](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
   - `SOP-01`: Customer Domain Onboarding & CNAME Delegation
-  - `SOP-02`: Zero-Day WAF Rule Patching & OWASP CRS Tuning (Sub-60s push without restart)
+  - `SOP-02`: Zero-Day WAF Rule Patching & CRS-Aligned WAF Tuning (Sub-60s push without restart)
   - `SOP-03`: Origin Health Probing & Instant EWMA Failover
   - `SOP-04`: Emergency Anycast BGP Route Withdrawal & PoP Draining
   - `SOP-05`: Automated ACME TLS Rotation & Envoy Zero-Reload SDS Lifecycle
   - `SOP-06`: High-Frequency Telemetry Aggregation & Usage Billing Reconciliation
-  - `SOP-07`: Incident Triage Matrix & 99.99% Availability SLA Guarantees
+  - `SOP-07`: Incident Triage Matrix & High Availability Target Design
 
 ---
 
