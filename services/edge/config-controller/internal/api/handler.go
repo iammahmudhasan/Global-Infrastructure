@@ -351,6 +351,41 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
+type CertificateResponse struct {
+	ID                string                  `json:"id"`
+	DomainID          string                  `json:"domain_id"`
+	Domains           []string                `json:"domains"`
+	Status            model.CertificateStatus `json:"status"`
+	KeyType           model.KeyType           `json:"key_type"`
+	CertPEM           string                  `json:"cert_pem"`
+	Issuer            string                  `json:"issuer"`
+	IssuedAt          time.Time               `json:"issued_at"`
+	ExpiresAt         time.Time               `json:"expires_at"`
+	AutoRenew         bool                    `json:"auto_renew"`
+	FingerprintSHA256 string                  `json:"fingerprint_sha256"`
+	SerialNumber      string                  `json:"serial_number"`
+}
+
+func publicCertificate(cert *model.Certificate) *CertificateResponse {
+	if cert == nil {
+		return nil
+	}
+	return &CertificateResponse{
+		ID:                cert.ID,
+		DomainID:          cert.DomainID,
+		Domains:           cert.Domains,
+		Status:            cert.Status,
+		KeyType:           cert.KeyType,
+		CertPEM:           cert.CertPEM,
+		Issuer:            cert.Issuer,
+		IssuedAt:          cert.IssuedAt,
+		ExpiresAt:         cert.ExpiresAt,
+		AutoRenew:         cert.AutoRenew,
+		FingerprintSHA256: cert.FingerprintSHA256,
+		SerialNumber:      cert.SerialNumber,
+	}
+}
+
 func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Request, domainID string, parts []string) {
 	if len(parts) == 2 {
 		if r.Method == http.MethodGet {
@@ -359,7 +394,7 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 				writeError(w, http.StatusNotFound, "no certificate found for domain")
 				return
 			}
-			writeJSON(w, http.StatusOK, cert)
+			writeJSON(w, http.StatusOK, publicCertificate(cert))
 			return
 		}
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -379,7 +414,7 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
-			"certificate": cert,
+			"certificate": publicCertificate(cert),
 			"challenge":   challenge,
 		})
 
@@ -398,7 +433,7 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 			daysRemaining = int(time.Until(cert.ExpiresAt).Hours() / 24)
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"certificate":           cert,
+			"certificate":           publicCertificate(cert),
 			"is_expiring_soon":      h.certManager.IsExpiringSoon(cert),
 			"days_until_expiration": daysRemaining,
 		})
@@ -413,7 +448,7 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusBadRequest, "failed to renew certificate: "+err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, renewedCert)
+		writeJSON(w, http.StatusOK, publicCertificate(renewedCert))
 
 	default:
 		writeError(w, http.StatusNotFound, "unknown certificate action: "+action)

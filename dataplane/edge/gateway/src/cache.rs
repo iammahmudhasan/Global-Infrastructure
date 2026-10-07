@@ -53,7 +53,7 @@ impl EdgeCache {
         body: Bytes,
         custom_ttl: Option<Duration>,
     ) {
-        if !self.enabled || !status.is_success() {
+        if !self.enabled || self.max_entries == 0 || !status.is_success() {
             return;
         }
 
@@ -102,6 +102,23 @@ impl EdgeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_zero_max_entries_guard() {
+        let cache = EdgeCache::new(true, 3600, 0);
+        let headers = HeaderMap::new();
+        let body = Bytes::from("payload");
+
+        cache.put(
+            "k1".to_string(),
+            StatusCode::OK,
+            headers,
+            body,
+            Some(Duration::from_secs(10)),
+        );
+        assert_eq!(cache.len(), 0, "max_entries == 0 must never insert entries");
+        assert!(cache.get("k1").is_none());
+    }
 
     #[test]
     fn test_hard_max_entries_eviction() {

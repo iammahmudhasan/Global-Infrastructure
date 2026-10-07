@@ -41,30 +41,48 @@ impl Router {
     }
 
     /// Selects lowest latency healthy upstream node using smoothed EWMA
+    /// Fast-path invariant: Zero heap allocations and O(N) scan with round-robin tie-breaking.
     pub fn select_upstream(&self) -> Option<String> {
         let nodes = self.nodes.read().unwrap();
-        let mut healthy_nodes: Vec<&UpstreamNode> = nodes.iter().filter(|n| n.healthy).collect();
 
-        if healthy_nodes.is_empty() {
+        // Pass 1: Find minimum EWMA latency among healthy nodes
+        let mut min_latency = f64::MAX;
+        for node in nodes.iter() {
+            if node.healthy && node.ewma_latency_ms < min_latency {
+                min_latency = node.ewma_latency_ms;
+            }
+        }
+
+        if min_latency == f64::MAX {
             // Invariant (Audit Finding 13): Never forward traffic to known unhealthy backends
             return None;
         }
 
-        // Sort by smoothed EWMA latency (lowest latency preferred)
-        healthy_nodes.sort_by(|a, b| {
-            a.ewma_latency_ms
-                .partial_cmp(&b.ewma_latency_ms)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Pass 2: Count tied lowest-latency healthy nodes (within 1e-6 epsilon)
+        let mut tied_count = 0;
+        for node in nodes.iter() {
+            if node.healthy && (node.ewma_latency_ms - min_latency).abs() < 1e-6 {
+                tied_count += 1;
+            }
+        }
 
-        let min_latency = healthy_nodes[0].ewma_latency_ms;
-        let tied_best_nodes: Vec<&&UpstreamNode> = healthy_nodes
-            .iter()
-            .filter(|n| (n.ewma_latency_ms - min_latency).abs() < 1e-6)
-            .collect();
+        if tied_count == 0 {
+            return None;
+        }
 
-        let idx = self.index.fetch_add(1, Ordering::Relaxed) % tied_best_nodes.len();
-        Some(tied_best_nodes[idx].url.clone())
+        // Pass 3: Pick deterministic tied node using atomic round-robin counter
+        let pick_index = self.index.fetch_add(1, Ordering::Relaxed) % tied_count;
+        let mut current_idx = 0;
+        for node in nodes.iter() {
+            if node.healthy && (node.ewma_latency_ms - min_latency).abs() < 1e-6 {
+                if current_idx == pick_index {
+                    return Some(node.url.clone());
+                }
+                current_idx += 1;
+            }
+        }
+
+        None
     }
 
     #[allow(dead_code)]

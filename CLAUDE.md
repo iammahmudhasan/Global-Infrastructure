@@ -65,7 +65,7 @@ cd apps/cli
 go run cmd/main.go status
 ```
 
-### 3. Intelligence Plane (Python 3.14)
+### 3. Intelligence Plane (Python 3.12+)
 ```bash
 # Execute mathematical placement optimizer
 python intelligence/scheduling/workload-scheduler/optimizer.py
@@ -88,7 +88,7 @@ buf breaking --against ".git#branch=main"
 |---|---|---|
 | **Data Plane** | **Rust + C/eBPF** (`dataplane/`) | Latency matters. Line-rate packet processing, zero GC pauses, memory safety. Never calls control plane for ordinary forwarding (Rule 5). |
 | **Control Plane**| **Go + gRPC** (`services/`) | Correctness matters. Raft consensus, K8s operators, NATS JetStream, Postgres 18. Domain owns its data (Rule 8). |
-| **Intelligence** | **Python 3.14** (`intelligence/`) | Optimization matters. PyTorch, vLLM, ClickHouse telemetry, placement math. Bounded by deterministic fallbacks (Rules 28–30). |
+| **Intelligence** | **Python 3.12+** (`intelligence/`) | Optimization matters. PyTorch, vLLM, ClickHouse telemetry, placement math. Bounded by deterministic fallbacks (Rules 28–30). |
 | **Product / UI** | **TypeScript / Next.js** (`apps/`) | Developer experience. Tailwind, shadcn/ui, real-time 3D telemetry. |
 
 ---

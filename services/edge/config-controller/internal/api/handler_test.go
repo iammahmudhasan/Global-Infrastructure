@@ -917,3 +917,80 @@ func TestControlPlane_CORSFailClosed(t *testing.T) {
 		t.Errorf("expected fail-closed for non-matching origin when allowlist configured, got %q", origin)
 	}
 }
+
+func TestCertificatesRoute_NeverLeaksPrivateKey(t *testing.T) {
+	handler := setupTestServer()
+
+	// 1. Onboard Domain
+	body, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "secure.dev.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to onboard domain: %d - %s", w.Code, w.Body.String())
+	}
+
+	var onboardResp struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &onboardResp)
+	domainID := onboardResp.DomainID
+
+	// Verify domain so it's active
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/verify", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Helper to check for private key material
+	assertNoPrivateKey := func(t *testing.T, endpoint string, bodyStr string) {
+		t.Helper()
+		if strings.Contains(bodyStr, "EC PRIVATE KEY") {
+			t.Fatalf("[%s] certificate API leaked private key material: found EC PRIVATE KEY in %s", endpoint, bodyStr)
+		}
+		if strings.Contains(bodyStr, "PRIVATE KEY") {
+			t.Fatalf("[%s] certificate API leaked private key material: found PRIVATE KEY in %s", endpoint, bodyStr)
+		}
+	}
+
+	// 2. Order Certificate (POST /v1/domains/{domain_id}/certificates/order)
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/certificates/order", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("failed to order certificate: %d - %s", w.Code, w.Body.String())
+	}
+	assertNoPrivateKey(t, "POST /certificates/order", w.Body.String())
+
+	// 3. Get Certificate (GET /v1/domains/{domain_id}/certificates)
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+domainID+"/certificates", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to get certificate: %d - %s", w.Code, w.Body.String())
+	}
+	assertNoPrivateKey(t, "GET /certificates", w.Body.String())
+
+	// 4. Current Certificate (GET /v1/domains/{domain_id}/certificates/current)
+	req = httptest.NewRequest(http.MethodGet, "/v1/domains/"+domainID+"/certificates/current", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to get current certificate: %d - %s", w.Code, w.Body.String())
+	}
+	assertNoPrivateKey(t, "GET /certificates/current", w.Body.String())
+
+	// 5. Renew Certificate (POST /v1/domains/{domain_id}/certificates/renew)
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/certificates/renew", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("failed to renew certificate: %d - %s", w.Code, w.Body.String())
+	}
+	assertNoPrivateKey(t, "POST /certificates/renew", w.Body.String())
+}
+

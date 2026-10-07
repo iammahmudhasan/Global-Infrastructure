@@ -228,3 +228,106 @@ func TestCompiler(t *testing.T) {
 		t.Errorf("expected pop config to contain x-nexusedge-pop: dhaka header")
 	}
 }
+
+func TestCompiler_ExactRateLimitAndClusterTLS(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+
+	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj_test",
+		Hostname:       "ratelimit.example.com",
+		OriginAddress:  "origin.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard error: %v", err)
+	}
+
+	_, err = svc.VerifyDomain(res.DomainID)
+	if err != nil {
+		t.Fatalf("verify error: %v", err)
+	}
+
+	// Set Rate Limit to 1200 RPM
+	secPolicy := &model.SecurityPolicy{
+		DomainID:         res.DomainID,
+		RateLimitEnabled: true,
+		RateLimitRPM:     1200,
+	}
+	st.SaveSecurityPolicy(secPolicy)
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	cfgJSON, _ := cfg.ToJSON()
+	cfgStr := string(cfgJSON)
+
+	// Verify exact RPM math: max_tokens: 1200, tokens_per_fill: 1200, fill_interval: 60s
+	if !strings.Contains(cfgStr, `"fill_interval": "60s"`) {
+		t.Errorf("expected rate limit fill_interval to be exact '60s'")
+	}
+	if !strings.Contains(cfgStr, `"tokens_per_fill": 1200`) {
+		t.Errorf("expected tokens_per_fill to be exactly 1200")
+	}
+	if !strings.Contains(cfgStr, `"max_tokens": 1200`) {
+		t.Errorf("expected max_tokens to be exactly 1200")
+	}
+
+	// 2. Add an origin pool with mixed HTTP and HTTPS to verify cluster does NOT attach TransportSocket
+	mixedPool := &model.OriginPool{
+		ID:          "pool_mixed",
+		ProjectID:   "prj_test",
+		Name:        "mixed-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig_http",
+				PoolID:   "pool_mixed",
+				Address:  "192.0.2.1",
+				Port:     80,
+				Protocol: model.ProtocolHTTP,
+				Healthy:  true,
+			},
+			{
+				ID:       "orig_https",
+				PoolID:   "pool_mixed",
+				Address:  "192.0.2.2",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Healthy:  true,
+			},
+		},
+	}
+
+	// Verify that store rejects saving mixed origin pool via standard SaveOriginPool
+	if err := st.SaveOriginPool(mixedPool); err != store.ErrMixedOriginProtocols {
+		t.Errorf("expected ErrMixedOriginProtocols when saving mixed pool, got: %v", err)
+	}
+
+	// Save via test fixture bypass to test compiler fallback defense
+	st.SaveOriginPoolBypass(mixedPool)
+
+	topologies := st.GetActiveTopologies()
+	if len(topologies) > 0 && len(topologies[0].Routes) > 0 {
+		topologies[0].Pools[mixedPool.ID] = mixedPool
+		topologies[0].Routes[0].PoolID = mixedPool.ID
+	}
+	cfgMixed, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("compilation with mixed pool failed: %v", err)
+	}
+	for _, cl := range cfgMixed.StaticResources.Clusters {
+		if cl.Name == "cluster_pool_mixed" {
+			if cl.TransportSocket != nil {
+				t.Fatalf("mixed HTTP/HTTPS pool must NOT attach cluster-level TransportSocket!")
+			}
+		}
+	}
+}
+
+

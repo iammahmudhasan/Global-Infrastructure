@@ -49,7 +49,8 @@ All components and capabilities transition strictly through the following six ve
 | **Intelligence: Workload Scheduler** | `LOCALLY_VERIFIED` | `optimizer.py`, `scheduler_test.go` | V0 / V4 | Multi-objective placement optimization prototype in Python/Go. |
 | **Intelligence: Capacity Forecaster**| `SIMULATED` | `fixtures/simulation/capacity/` | V4 | Mathematical models run on simulated provider inventories. |
 | **Tenant Isolation & Auth Middleware** | `LOCALLY_VERIFIED` | `auth_test.go`, `TestControlPlane_AuthenticationAndTenantIsolation` | V0 / V1 | Control plane middleware, tenant spoofing rejection, and IDOR resource-level authorization verified. |
-| **Automated CI/CD Pipeline** | `LOCALLY_VERIFIED` | `.github/workflows/ci.yml` | V0 / V1 | GitHub Actions workflow configured for Go tests/vet, Rust check/test, Python optimizer, and Compose validation. |
+| **Automated CI/CD Pipeline** | `CONFIGURED` | `.github/workflows/ci.yml` | V0 / V1 | GitHub Actions workflow configured for Go tests/vet, Rust check/test, Python optimizer, and Compose validation. |
+| **Customer-Origin Runtime DNS Rebinding Protection** | `NOT_IMPLEMENTED` | - | V1 | Envoy STRICT_DNS resolves customer hostnames directly without egress validation; public-IP allowlisting or egress proxy scheduled for V1. |
 | **99.99% Guaranteed Availability** | `NOT_IMPLEMENTED` | - | V2 / V3 | Target design SLO. Real SLA requires multi-PoP live production traffic. |
 
 ---

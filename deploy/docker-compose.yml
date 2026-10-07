@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     container_name: nexusedge-config-controller
     ports:
-      - "9091:9091"
+      - "127.0.0.1:9091:9091"
     environment:
       - PORT=9091
       - NEXUSEDGE_DEV_MODE=true

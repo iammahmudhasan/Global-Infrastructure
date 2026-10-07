@@ -8,8 +8,9 @@ import (
 )
 
 var (
-	ErrNotFound      = errors.New("entity not found")
-	ErrAlreadyExists = errors.New("entity already exists")
+	ErrNotFound             = errors.New("entity not found")
+	ErrAlreadyExists        = errors.New("entity already exists")
+	ErrMixedOriginProtocols = errors.New("all origins in an origin pool must share the same protocol")
 )
 
 type Store struct {
@@ -208,7 +209,21 @@ func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 	return nil
 }
 
-func (s *Store) SaveOriginPool(p *model.OriginPool) {
+func (s *Store) SaveOriginPool(p *model.OriginPool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := 1; i < len(p.Origins); i++ {
+		if p.Origins[i].Protocol != p.Origins[0].Protocol {
+			return ErrMixedOriginProtocols
+		}
+	}
+	s.pools[p.ID] = p
+	return nil
+}
+
+// SaveOriginPoolBypass saves an origin pool directly without validation (used in test fixtures)
+func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pools[p.ID] = p
@@ -221,6 +236,12 @@ func (s *Store) AddOrigin(o *model.Origin) error {
 	pool, exists := s.pools[o.PoolID]
 	if !exists {
 		return ErrNotFound
+	}
+
+	for _, existing := range pool.Origins {
+		if existing.Protocol != o.Protocol {
+			return ErrMixedOriginProtocols
+		}
 	}
 
 	s.origins[o.ID] = o

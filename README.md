@@ -23,7 +23,7 @@
 
 [![Data Plane: Rust Gateway Prototype](https://img.shields.io/badge/Data%20Plane-Rust%20Gateway%20%2B%20Envoy%20Compiler-FF6D00?style=flat-square&logo=rust&logoColor=white)](docs/TECH_STACK.md)
 [![Control Plane: Go 1.23](https://img.shields.io/badge/Control%20Plane-Go%201.23%20%2B%20Config%20Engine-00ADD8?style=flat-square&logo=go&logoColor=white)](docs/TECH_STACK.md)
-[![Intelligence Plane: Python 3.14](https://img.shields.io/badge/Intelligence-Python%203.14%20%2B%20Optimizer-3776AB?style=flat-square&logo=python&logoColor=white)](docs/TECH_STACK.md)
+[![Intelligence Plane: Python 3.12+](https://img.shields.io/badge/Intelligence-Python%203.12%2B%20%2B%20Optimizer-3776AB?style=flat-square&logo=python&logoColor=white)](docs/TECH_STACK.md)
 [![Compliance Target: NDMA 2026 & GDPR](https://img.shields.io/badge/Compliance%20Target-NDMA%202026%20%7C%20GDPR-43A047?style=flat-square&logo=shield&logoColor=white)](docs/runbooks/EDGE_OPERATIONS_RUNBOOK.md)
 
 <br/>
@@ -122,14 +122,14 @@ graph TD
 2. **Control Plane (Go 1.23 / gRPC / NATS JetStream):**
    - Idempotent declarative reconciliation loops.
    - Generates compiled Envoy v3 xDS/SDS configuration (live gRPC xDS stream in development for V1).
-3. **Intelligence Plane (Python 3.14 / PyTorch / ClickHouse):**
+3. **Intelligence Plane (Python 3.12+ / PyTorch / ClickHouse):**
    - Mathematical placement optimization governed by deterministic fallback bounds.
    - Evaluates multi-objective trade-offs across latency, transit cost, and grid power.
 
 > [!NOTE]
-> **Data Plane Integration Architecture Notice:**  
-> The codebase currently features a **Go Control Plane & Envoy Configuration Compiler prototype** (`services/edge/config-controller`) alongside an **independent high-performance Rust L7 Edge Proxy prototype** (`dataplane/edge/gateway`).  
-> In this prototype milestone, the Rust gateway operates with a local configuration fixture (`gateway.yaml`), while the Go control plane compiles declarative Envoy v3 LDS/CDS/SDS JSON configurations (`/v1/edge/envoy-config`). Live dynamic integration via an Envoy xDS server and synchronized Rust config ingestion is scheduled for the V1 release.
+> **Data Plane Integration & Security Boundary Notices:**  
+> - **Proxy Integration:** The codebase currently features a **Go Control Plane & Envoy Configuration Compiler prototype** (`services/edge/config-controller`) alongside an **independent high-performance Rust L7 Edge Proxy prototype** (`dataplane/edge/gateway`). In this prototype milestone, the Rust gateway operates with a local configuration fixture (`gateway.yaml`), while the Go control plane compiles declarative Envoy v3 LDS/CDS/SDS JSON configurations (`/v1/edge/envoy-config`). Live dynamic integration via an Envoy xDS server and synchronized Rust config ingestion is scheduled for the V1 release.
+> - **Origin DNS Rebinding:** In the V0 prototype, customer origin domain names use Envoy `STRICT_DNS` directly. While onboarding validates resolved public IPs, full runtime DNS rebinding mitigation (via an Egress Proxy with link-local/private IP rejection or IP-pinned EDS) is `NOT_IMPLEMENTED` in V0 and scheduled for V1.
 
 ---
 

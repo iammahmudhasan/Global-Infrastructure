@@ -219,21 +219,17 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			},
 		}
 
-		// Per-Domain VirtualHost Rate Limit Isolation (Finding 9, 14)
+		// Per-Domain VirtualHost Rate Limit Isolation (Finding 9, 14, P1 RPM Audit)
 		if topo.Security != nil && topo.Security.RateLimitEnabled && topo.Security.RateLimitRPM > 0 {
 			rpm := topo.Security.RateLimitRPM
-			tokensPerFill := rpm / 60
-			if tokensPerFill <= 0 {
-				tokensPerFill = 1
-			}
 			vh.TypedPerFilterConfig = map[string]interface{}{
 				"envoy.filters.http.local_ratelimit": map[string]interface{}{
 					"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
 					"stat_prefix": fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
 					"token_bucket": map[string]interface{}{
 						"max_tokens":      rpm,
-						"tokens_per_fill": tokensPerFill,
-						"fill_interval":   "1s",
+						"tokens_per_fill": rpm,
+						"fill_interval":   "60s",
 					},
 					"filter_enabled": map[string]interface{}{
 						"runtime_key": "local_rate_limit_enabled",
@@ -657,11 +653,16 @@ func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate) map[string
 	}
 }
 
+// Runtime DNS Rebinding Security Boundary:
+// In V0, customer origins with hostnames use STRICT_DNS directly.
+// While onboarding validates resolved IPs, runtime DNS rebinding protection (Egress Proxy /
+// IP-pinned EDS allowlists) is scheduled for V1.
 func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Cluster {
 	// Determine cluster discovery type: STRICT_DNS for domain origins, STATIC for raw IPs
 	clusterType := "STRICT_DNS"
 	isAllIPs := true
 	hasHTTPS := false
+	hasHTTP := false
 
 	lbEndpoints := make([]LbEndpoint, 0)
 	for _, o := range pool.Origins {
@@ -674,6 +675,8 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 		}
 		if o.Protocol == model.ProtocolHTTPS {
 			hasHTTPS = true
+		} else {
+			hasHTTP = true
 		}
 
 		weight := o.Weight
@@ -755,8 +758,8 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 		}
 	}
 
-	// If origin protocol is HTTPS, attach Upstream TLS context with SNI
-	if hasHTTPS && len(pool.Origins) > 0 {
+	// If origin protocol is HTTPS and homogenous (no mixed plain HTTP), attach Upstream TLS context with SNI
+	if hasHTTPS && !hasHTTP && len(pool.Origins) > 0 {
 		sniHost := pool.Origins[0].Address
 		cluster.TransportSocket = &TransportSocket{
 			Name: "envoy.transport_sockets.tls",

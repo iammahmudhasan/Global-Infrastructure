@@ -40,7 +40,7 @@ All AI coding agents operating on this codebase MUST follow these non-negotiable
 ```
                   ┌────────────────────────────────────────────────────────┐
                   │      1. INTELLIGENCE PLANE (Optimization Matters)      │
-                  │      Python 3.14 + PyTorch / vLLM + ClickHouse         │
+                  │      Python 3.12+ + PyTorch / vLLM + ClickHouse        │
                   │      Multi-objective scheduling: Latency, Cost, Carbon │
                   └──────────────────────────┬─────────────────────────────┘
                                              │ (Calculated Placement Graphs & Intent)
