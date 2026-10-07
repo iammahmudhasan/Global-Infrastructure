@@ -67,35 +67,24 @@ We explicitly **do not** rewrite mature open-source infrastructure (Postgres, K8
 
 ---
 
-## 📁 Repository Monorepo Structure
+## 📁 Monorepo Directory Contract (The 14 Pillars)
 
-```text
-.
-├── proto/                           # Protocol Buffers with Buf API governance
-│   ├── buf.yaml                     # Buf linting and breaking change detection
-│   └── nexusedge/v1/
-│       └── workload.proto           # Universal Workload abstraction & RPCs
-├── core/
-│   ├── gateway/                     # Data Plane: High-throughput Rust proxy & WAF
-│   │   ├── src/                     # Tokio, Hyper, in-memory cache, token-bucket
-│   │   └── Cargo.toml
-│   ├── control-plane/               # Control Plane: Go cluster orchestrator & API
-│   │   ├── controller/              # Workload placement & policy engine
-│   │   └── main.go                  # REST & gRPC server on :9090
-│   └── ebpf/                        # Kernel Path: C / XDP L4 DDoS filter
-│       └── xdp_drop.c
-├── intelligence/                    # Intelligence Plane: Mathematical optimization
-│   └── scheduler/
-│       └── optimizer.py             # Multi-objective GPU, carbon, latency solver
-├── deploy/                          # Infrastructure deployment templates
-│   ├── envoy/envoy.yaml             # Envoy edge proxy configuration
-│   └── docker-compose.yml           # Multi-node local testbed
-├── docs/
-│   ├── MASTER_ARCHITECTURE.md       # Complete 3-Plane System Architecture
-│   ├── TECH_STACK.md                # North-Star Technology Stack Matrix
-│   └── THESIS.md                    # 10-15 Year Strategic Vision & Falsification
-└── README.md
-```
+| Directory | Plane / Function | Stack & Role |
+|---|---|---|
+| **`apps/`** | Customer-Facing Products | Next.js Dashboard, `nexusedge` Go CLI, Docs, Status, Console |
+| **`services/`** | Control Plane | Go domain services (Global Router, IAM, DNS, Compute, Storage, Billing) |
+| **`dataplane/`** | Data Plane (Hot Path) | Rust + C/eBPF (L7 Edge Proxy, WAF, XDP filter, L4 LB, Wasm) |
+| **`intelligence/`**| Intelligence Plane | Python 3.14 (Mathematical Workload Placement, Capacity Forecast) |
+| **`proto/`** | API Contracts | Protocol Buffers + Buf Governance (`proto/compute/v1/workload.proto`) |
+| **`schemas/`** | Data Contracts | NATS JetStream Event Schemas, Telemetry, and Analytics Contracts |
+| **`infra/`** | Physical & Cloud Substrate| Regions (Dhaka, Singapore, Frankfurt, Virginia), BGP, Hardware |
+| **`deploy/`** | Deployment Manifests | Envoy configs, Kubernetes manifests, Helm, Argo CD, Firecracker |
+| **`tests/`** | Multi-Tier Verification | Integration, e2e, network emulation, security, chaos tests |
+| **`benchmarks/`**| Performance Benchmarks | Packet rate (Mpps), L7 proxy latency, DNS throughput, GPU saturation |
+| **`rfcs/`** | Architecture Proposals | Formal proposals before major decisions (`rfcs/0001-...`) |
+| **`adr/`** | Architecture Decisions | Permanent architectural decision records (`adr/0001-...`) |
+| **`security/`** | Security Foundations | Threat models, compliance, SBOM, cryptographic signing policies |
+| **`docs/`** | Documentation & Runbooks | Master system architecture, network runbooks, operator guides |
 
 ---
 
@@ -103,20 +92,25 @@ We explicitly **do not** rewrite mature open-source infrastructure (Postgres, K8
 
 ### 1. Data Plane (Rust Gateway)
 ```bash
-cd core/gateway
+cd dataplane/edge/gateway
 cargo run
 ```
 
-### 2. Control Plane (Go Orchestrator)
+### 2. Control Plane (Go Global Router & Workload Dispatcher)
 ```bash
-cd core/control-plane
-go run main.go
+cd services/network/global-router
+go run cmd/global-router/main.go
 ```
 
 ### 3. Intelligence Plane (Python Optimizer)
 ```bash
-cd intelligence/scheduler
-python optimizer.py
+python intelligence/scheduling/workload-scheduler/optimizer.py
+```
+
+### 4. Official CLI
+```bash
+cd apps/cli
+go run cmd/main.go status
 ```
 
 ---
