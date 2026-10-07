@@ -20,6 +20,18 @@ All AI coding agents operating on this codebase MUST follow these non-negotiable
    **Never write unverified code.** Every feature, route, or scheduler algorithm MUST be executed and verified immediately in the shell (`cargo check`, `cargo test`, `go test ./...`, `python optimizer.py`). Never assume code works without execution proof.
 4. **Continuous Cryptographic Git Push (Rule 3, 96):**  
    Every completed task, bugfix, or architectural addition MUST be committed cleanly and pushed immediately to `origin/main` with verified commits.
+5. **Architectural Graph Anchor Mandate (Rule 124):**  
+   Before generating, modifying, or deleting code for any milestone or subsystem, the agent MUST construct and output a complete architectural relationship graph (Mermaid diagram). The graph must explicitly illustrate component boundaries, data-plane vs. control-plane paths, data stores, external dependencies, and failure transitions. This visually anchors the system topology and prevents architectural drift or blind patching.
+6. **The 4-Question Code Justification Mandate (Rule 125):**  
+   Before writing OR deleting any code, the agent MUST explicitly define and document:
+   - **WHERE:** The exact file path, package, and layer (Data Plane / Control Plane / Intelligence).
+   - **WHY:** The concrete technical and business requirement driving this addition/deletion.
+   - **IMPACT:** What happens when this code is written (operational behavior, state transitions, outputs).
+   - **RISK OF OMISSION:** What breaks, what fails, or what security/reliability hole opens up if this code is NOT written.
+7. **Cleanliness & Industrial Discipline Mandate (Rule 126):**  
+   - **Zero Unused Code:** No dead functions, unused struct fields, orphaned files, or dangling imports.
+   - **Zero Zombie Comments:** No commented-out dead code blocks.
+   - **No Gratuitous Emojis:** Keep production code, type definitions, log messages, and comments strictly industrial, professional, and free of emoji clutter.
 
 ---
 
@@ -122,9 +134,15 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 - Hide errors or return fake success responses.
 - Claim completion without real validation.
 - Rewrite mature infrastructure without a strong reason.
+- Write or delete code without explicitly answering Where, Why, Impact, and Risk of Omission.
+- Leave unused functions, orphaned files, or commented-out zombie code in the repository.
+- Clutter source code or internal logs with gratuitous emojis.
+- Write code without first anchoring the full system graph.
 
 ### ALWAYS:
 - Preserve architecture and 14-pillar directory boundaries.
+- Construct a complete visual architecture graph (Mermaid) before writing code.
+- Explicitly define Where, Why, What happens, and What breaks before adding or removing code.
 - Validate all external input.
 - Enforce least privilege and defense in depth.
 - Add OpenTelemetry metrics, traces, and structured logs.
@@ -136,6 +154,7 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 - Measure performance via actual benchmarks rather than guessing.
 - Bound AI decisions by deterministic policy fallbacks.
 - Optimize for correctness and long-term maintainability.
+- Ensure 100% dead-code elimination, zero orphaned files, and clean industrial code.
 
 ---
 
@@ -144,6 +163,8 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 Before considering ANY engineering task complete, verify:
 
 ```text
+[ ] Architectural graph anchored before coding?
+[ ] 4-Question justification answered (Where, Why, Impact, Risk)?
 [ ] Correct domain?
 [ ] Correct architectural boundary?
 [ ] Existing code inspected?
@@ -159,6 +180,9 @@ Before considering ANY engineering task complete, verify:
 [ ] Observability added?
 [ ] Tests added/updated?
 [ ] Performance measured when relevant?
+[ ] Zero unused code or orphaned files remaining?
+[ ] Zero commented-out zombie code?
+[ ] Clean industrial code without emoji clutter?
 [ ] No secrets added?
 [ ] No unnecessary dependencies?
 [ ] No unrelated refactor?

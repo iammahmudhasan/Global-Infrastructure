@@ -23,6 +23,18 @@ This document provides definitive guidance for all AI assistants, engineers, and
    - Run `cargo check`, `cargo test`, `go test ./...`, or execute Python placement models. Never commit unverified code.
 3. **Continuous Cryptographic Git Push (Rules 3, 96):**
    - Commit with descriptive commit messages and push to `origin/main` after completing tasks.
+4. **Visual Architecture Graph Anchor Mandate (Rule 124):**
+   - Before writing or deleting code for any milestone or subsystem, construct a complete Mermaid architecture/relationship graph. Visually anchor component boundaries, line-rate data plane paths, control plane state loops, and failure transitions.
+5. **The 4-Question Code Justification Mandate (Rule 125):**
+   - Before adding or removing ANY code, explicitly answer:
+     1. **WHERE:** Exact file path, package, and plane.
+     2. **WHY:** Technical and business requirement driving the change.
+     3. **IMPACT:** Operational behavior and state transitions when written.
+     4. **RISK OF OMISSION:** What breaks, what fails, or what security/reliability hole opens up if omitted.
+6. **Cleanliness & Industrial Discipline Mandate (Rule 126):**
+   - Zero unused code (no dead functions, unused structs, orphaned files, or dangling imports).
+   - Zero zombie comments (no commented-out dead code).
+   - No gratuitous emoji clutter in production code, comments, or error messages. Clean, industrial-grade engineering only.
 
 ---
 
@@ -133,9 +145,15 @@ docs/         → Master architecture, network runbooks, operator guides.
 * Hide errors or return fake success responses.
 * Claim completion without actual shell validation.
 * Rewrite mature infrastructure without a strong reason.
+* Write or delete code without answering Where, Why, Impact, and Risk of Omission.
+* Leave unused functions, orphaned files, or commented-out zombie code in the repository.
+* Clutter source code or logs with excessive emojis.
+* Write code without first constructing a complete architectural graph.
 
 ### ALWAYS:
 * Follow the 14-pillar directory structure.
+* Construct a complete visual architecture graph (Mermaid) before writing code.
+* Explicitly define Where, Why, What happens, and What breaks before adding or removing code.
 * Validate all external input.
 * Use least privilege.
 * Expose OpenTelemetry metrics, structured logs, and distributed traces.
@@ -143,12 +161,15 @@ docs/         → Master architecture, network runbooks, operator guides.
 * Plan for failure modes (partitions, node crashes, hardware degradation).
 * Keep infrastructure state reconciled via declarative controllers.
 * Measure performance via actual benchmarks rather than guessing.
+* Ensure 100% dead-code elimination, zero orphaned files, and clean industrial code.
 
 ---
 
 ## 📋 7. Rule 121: Final Completion Checklist
 
 ```text
+[ ] Architectural graph anchored before coding?
+[ ] 4-Question justification answered (Where, Why, Impact, Risk)?
 [ ] Correct domain?
 [ ] Correct architectural boundary?
 [ ] Existing code inspected?
@@ -164,6 +185,9 @@ docs/         → Master architecture, network runbooks, operator guides.
 [ ] Observability added?
 [ ] Tests added/updated?
 [ ] Performance measured when relevant?
+[ ] Zero unused code or orphaned files remaining?
+[ ] Zero commented-out zombie code?
+[ ] Clean industrial code without emoji clutter?
 [ ] No secrets added?
 [ ] No unnecessary dependencies?
 [ ] No unrelated refactor?
