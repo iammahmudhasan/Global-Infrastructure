@@ -407,10 +407,23 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 					continue
 				}
 				if rule.MatchType == model.WAFMatchPathPrefix {
+					// Tenant Isolation (Finding 14): Scope RBAC rule to match :authority (domain hostname) AND :path
 					rbacDenyPrincipals = append(rbacDenyPrincipals, map[string]interface{}{
-						"header": map[string]interface{}{
-							"name":         ":path",
-							"string_match": map[string]interface{}{"prefix": rule.Pattern},
+						"and_ids": map[string]interface{}{
+							"ids": []map[string]interface{}{
+								{
+									"header": map[string]interface{}{
+										"name":         ":authority",
+										"string_match": map[string]interface{}{"exact": topo.Domain.Hostname},
+									},
+								},
+								{
+									"header": map[string]interface{}{
+										"name":         ":path",
+										"string_match": map[string]interface{}{"prefix": rule.Pattern},
+									},
+								},
+							},
 						},
 					})
 				}
@@ -525,21 +538,32 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 }
 
 func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate) map[string]interface{} {
-	if cert == nil || cert.CertPEM == "" || cert.PrivateKeyPEM == "" {
+	if cert == nil || cert.CertPEM == "" {
 		return nil
 	}
+	// Production Envoy v3 SDS Secret Architecture (Rule 18 Zero Secrets in Config/Logs).
+	// Downstream TLS delegates private key discovery to SDS and never inlines plaintext private keys.
 	return map[string]interface{}{
 		"name": "envoy.transport_sockets.tls",
 		"typed_config": map[string]interface{}{
 			"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext",
 			"common_tls_context": map[string]interface{}{
-				"tls_certificates": []map[string]interface{}{
+				"tls_certificate_sds_secret_configs": []map[string]interface{}{
 					{
-						"certificate_chain": map[string]interface{}{
-							"inline_string": cert.CertPEM,
-						},
-						"private_key": map[string]interface{}{
-							"inline_string": cert.PrivateKeyPEM,
+						"name": fmt.Sprintf("sds-cert-%s", cert.DomainID),
+						"sds_config": map[string]interface{}{
+							"resource_api_version": "V3",
+							"api_config_source": map[string]interface{}{
+								"api_type":              "GRPC",
+								"transport_api_version": "V3",
+								"grpc_services": []map[string]interface{}{
+									{
+										"envoy_grpc": map[string]interface{}{
+											"cluster_name": "sds-grpc-cluster",
+										},
+									},
+								},
+							},
 						},
 					},
 				},

@@ -33,7 +33,7 @@ func TestCompiler(t *testing.T) {
 	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj-test-01",
 		Hostname:       "api.customer.com",
-		OriginAddress:  "origin.customer.internal",
+		OriginAddress:  "origin.customer.com",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -75,8 +75,8 @@ func TestCompiler(t *testing.T) {
 	if !strings.Contains(jsonStr, "api.customer.com") {
 		t.Errorf("expected JSON config to contain customer domain api.customer.com")
 	}
-	if !strings.Contains(jsonStr, "origin.customer.internal") {
-		t.Errorf("expected JSON config to contain origin address origin.customer.internal")
+	if !strings.Contains(jsonStr, "origin.customer.com") {
+		t.Errorf("expected JSON config to contain origin address origin.customer.com")
 	}
 	if !strings.Contains(jsonStr, "envoy.filters.http.local_ratelimit") {
 		t.Errorf("expected JSON config to contain local_ratelimit HTTP filter")
@@ -88,7 +88,7 @@ func TestCompiler(t *testing.T) {
 		t.Errorf("expected JSON config to contain structured access log configuration")
 	}
 
-	// 4. Add a custom WAF block rule and verify Envoy RBAC filter is generated
+	// 4. Add a custom WAF block rule and verify Envoy RBAC filter is generated with tenant isolation
 	_ = st.AddWAFRule(res.DomainID, model.WAFRule{
 		ID:        "rule-admin-block",
 		DomainID:  res.DomainID,
@@ -103,8 +103,12 @@ func TestCompiler(t *testing.T) {
 		t.Fatalf("failed to compile topology with WAF rule: %v", err)
 	}
 	wafJsonBytes, _ := cfgWithWAF.ToJSON()
-	if !strings.Contains(string(wafJsonBytes), "envoy.filters.http.rbac") {
+	wafStr := string(wafJsonBytes)
+	if !strings.Contains(wafStr, "envoy.filters.http.rbac") {
 		t.Errorf("expected JSON config to contain envoy.filters.http.rbac filter when WAF block rule is active")
+	}
+	if !strings.Contains(wafStr, ":authority") || !strings.Contains(wafStr, "api.customer.com") {
+		t.Errorf("expected RBAC filter to be tenant-scoped to :authority api.customer.com")
 	}
 
 	// 5. Add HealthMonitor to origin pool and verify Envoy health_checks block
@@ -159,6 +163,12 @@ func TestCompiler(t *testing.T) {
 	tlsStr := string(tlsJSON)
 	if !strings.Contains(tlsStr, "DownstreamTlsContext") {
 		t.Errorf("expected JSON to contain DownstreamTlsContext")
+	}
+	if strings.Contains(tlsStr, "dummy-key") {
+		t.Fatalf("CRITICAL SECURITY FLAW: Private key leaked in compiled Envoy configuration!")
+	}
+	if !strings.Contains(tlsStr, "tls_certificate_sds_secret_configs") {
+		t.Errorf("expected SDS configuration in DownstreamTlsContext")
 	}
 	if !strings.Contains(tlsStr, "api.customer.com") {
 		t.Errorf("expected JSON to contain SNI server_names for api.customer.com")

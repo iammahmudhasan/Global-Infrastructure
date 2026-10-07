@@ -141,8 +141,9 @@ func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
 	if !exists {
 		return nil, ErrNotFound
 	}
-	p.HealthMonitor = s.monitors[poolID]
-	return p, nil
+	cp := *p
+	cp.HealthMonitor = s.monitors[poolID]
+	return &cp, nil
 }
 
 func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
@@ -239,7 +240,7 @@ func (s *Store) SaveRoute(r *model.Route) {
 func (s *Store) GetRoutes(domainID string) []*model.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.routes[domainID]
+	return append([]*model.Route(nil), s.routes[domainID]...)
 }
 
 func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
@@ -271,7 +272,7 @@ func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
 func (s *Store) GetWAFRules(domainID string) []model.WAFRule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.wafRules[domainID]
+	return append([]model.WAFRule(nil), s.wafRules[domainID]...)
 }
 
 func (s *Store) DeleteWAFRule(domainID string, ruleID string) error {
@@ -382,7 +383,7 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 func (s *Store) GetCacheRules(domainID string) []model.CacheRule {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cacheRules[domainID]
+	return append([]model.CacheRule(nil), s.cacheRules[domainID]...)
 }
 
 func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
@@ -486,21 +487,24 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 			continue // Only compile active, verified domains (Rule 17)
 		}
 
-		secPolicy := s.security[d.ID]
-		if secPolicy != nil {
-			// Ensure rules are attached
-			secPolicy.WAFRules = s.wafRules[d.ID]
-			secPolicy.RateLimitRules = s.rateLimits[d.ID]
+		var secPolicy *model.SecurityPolicy
+		if sp := s.security[d.ID]; sp != nil {
+			cp := *sp
+			cp.WAFRules = append([]model.WAFRule(nil), s.wafRules[d.ID]...)
+			cp.RateLimitRules = append([]model.RateLimitRule(nil), s.rateLimits[d.ID]...)
+			secPolicy = &cp
 		}
 
-		cachePolicy := s.cache[d.ID]
-		if cachePolicy != nil {
-			cachePolicy.CacheRules = s.cacheRules[d.ID]
+		var cachePolicy *model.CachePolicy
+		if cp := s.cache[d.ID]; cp != nil {
+			cpc := *cp
+			cpc.CacheRules = append([]model.CacheRule(nil), s.cacheRules[d.ID]...)
+			cachePolicy = &cpc
 		}
 
 		topo := &DomainTopology{
 			Domain:      d,
-			Routes:      s.routes[d.ID],
+			Routes:      append([]*model.Route(nil), s.routes[d.ID]...),
 			Pools:       make(map[string]*model.OriginPool),
 			Security:    secPolicy,
 			Cache:       cachePolicy,
@@ -510,8 +514,9 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 
 		for _, r := range topo.Routes {
 			if pool, exists := s.pools[r.PoolID]; exists {
-				pool.HealthMonitor = s.monitors[pool.ID]
-				topo.Pools[r.PoolID] = pool
+				poolCopy := *pool
+				poolCopy.HealthMonitor = s.monitors[pool.ID]
+				topo.Pools[r.PoolID] = &poolCopy
 			}
 		}
 

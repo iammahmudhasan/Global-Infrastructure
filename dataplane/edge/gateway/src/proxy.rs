@@ -4,15 +4,30 @@ use crate::rate_limit::RateLimiter;
 use crate::router::Router;
 use crate::waf::{WafEngine, WafResult};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use reqwest::Client as HttpClient;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+];
+
+const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
+const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -52,21 +67,57 @@ pub async fn handle_request(
         return Ok(resp);
     }
 
-    // 2. Extract User-Agent header (clone into owned String before moving req)
-    let user_agent = req
-        .headers()
+    // 2. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
+    let req_headers = req.headers().clone();
+    let host = req_headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost")
+        .to_string();
+
+    let user_agent = req_headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // 3. Read Body (or small initial chunk for WAF inspection)
-    let body_bytes = match req.into_body().collect().await {
+    let auth_header_present = req_headers.contains_key("authorization");
+    let req_cc = req_headers
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    // Fast-path payload size check from Content-Length header
+    if let Some(cl) = req_headers.get("content-length") {
+        if let Ok(len) = cl.to_str().unwrap_or("0").parse::<usize>() {
+            if len > MAX_REQUEST_BODY_BYTES {
+                warn!(len = len, "Request rejected: Content-Length exceeds maximum 10 MB limit");
+                let resp = Response::builder()
+                    .status(StatusCode::PAYLOAD_TOO_LARGE)
+                    .header("Content-Type", "application/json")
+                    .header("Server", "NexusEdge/0.1.0")
+                    .body(Full::new(Bytes::from(
+                        r#"{"error":"Payload Too Large: maximum allowed body size is 10 MB"}"#,
+                    )))
+                    .unwrap();
+                return Ok(resp);
+            }
+        }
+    }
+
+    // 3. Read Body bounded to MAX_REQUEST_BODY_BYTES (Finding 4)
+    let limited_body = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
+    let body_bytes = match limited_body.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) => {
-            warn!("Failed to read request body: {:?}", e);
+            warn!("Failed to read bounded request body: {:?}", e);
             let resp = Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Full::new(Bytes::from("Malformed request body")))
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(
+                    r#"{"error":"Payload Too Large: request body exceeds 10 MB limit or is malformed"}"#,
+                )))
                 .unwrap();
             return Ok(resp);
         }
@@ -105,12 +156,14 @@ pub async fn handle_request(
         WafResult::Allowed => {}
     }
 
-    // 5. Edge Cache Check (for idempotent GET requests)
-    let cache_key = format!("{}:{}", method, uri_string);
-    if method == Method::GET {
+    // 5. Tenant-Isolated Edge Cache Check (Finding 5, RFC 9111)
+    let scheme = "http";
+    let cache_key = format!("{}://{}{}", scheme, host, uri_string);
+
+    if method == Method::GET && !req_cc.contains("no-cache") && !req_cc.contains("no-store") {
         if let Some(cached) = state.cache.get(&cache_key) {
             let latency_us = start_time.elapsed().as_micros();
-            info!(uri = %uri_string, latency_us = latency_us, cache = "HIT", "Serving from Edge Cache");
+            info!(uri = %uri_string, host = %host, latency_us = latency_us, cache = "HIT", "Serving from Edge Cache");
 
             let mut builder = Response::builder()
                 .status(cached.status)
@@ -143,16 +196,31 @@ pub async fn handle_request(
 
     let forward_url = format!("{}{}", upstream_base.trim_end_matches('/'), uri_string);
 
-    // 7. Proxy Forwarding via Reqwest Client
+    // 7. Proxy Forwarding with Strict Header Forwarding (Finding 3)
     let mut client_req = state.http_client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         &forward_url,
     );
 
-    // Forward headers (excluding hop-by-hop)
-    // Note: We avoid forwarding host directly to let client determine host or pass original
+    // Forward all client application headers (Authorization, Cookie, Content-Type, Accept, etc.)
+    // Stripping only hop-by-hop headers
+    for (name, value) in req_headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+        if HOP_BY_HOP_HEADERS.contains(&name_str.as_str()) {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            client_req = client_req.header(hn, hv);
+        }
+    }
+
+    // Attach standard reverse proxy forwarding headers
     client_req = client_req.header("X-Forwarded-For", client_ip.to_string());
-    client_req = client_req.header("X-Forwarded-Proto", "http");
+    client_req = client_req.header("X-Forwarded-Proto", scheme);
+    client_req = client_req.header("X-Forwarded-Host", &host);
     client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
 
     if !body_bytes.is_empty() {
@@ -172,6 +240,14 @@ pub async fn handle_request(
                 .header("X-Edge-Node", &state.config.server.node_id)
                 .header("X-Edge-Region", &state.config.server.region);
 
+            let resp_cc = upstream_resp
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
+
             for (k, v) in upstream_resp.headers().iter() {
                 if let (Ok(hn), Ok(hv)) = (
                     HeaderName::from_bytes(k.as_str().as_bytes()),
@@ -190,11 +266,30 @@ pub async fn handle_request(
                 }
             };
 
-            // Store in cache if 200 OK and GET
-            if method == Method::GET && status == StatusCode::OK {
+            // 8. RFC 9111 Shared Cache Evaluation (Finding 6)
+            // Never cache if:
+            //   - Not GET
+            //   - Not 200 OK
+            //   - Request Cache-Control: no-store
+            //   - Authorization header present without explicit public / s-maxage directive
+            //   - Origin Cache-Control: no-store or private
+            //   - Origin Set-Cookie present
+            //   - Body exceeds MAX_CACHEABLE_RESPONSE_BYTES
+            let can_cache = method == Method::GET
+                && status == StatusCode::OK
+                && !req_cc.contains("no-store")
+                && (!auth_header_present || resp_cc.contains("public") || resp_cc.contains("s-maxage"))
+                && !resp_cc.contains("no-store")
+                && !resp_cc.contains("private")
+                && !has_set_cookie
+                && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
+
+            if can_cache {
+                // Parse s-maxage or max-age for custom TTL if specified
+                let custom_ttl = parse_max_age(&resp_cc).map(Duration::from_secs);
                 state
                     .cache
-                    .put(cache_key, status, headers_to_cache, resp_bytes.clone(), None);
+                    .put(cache_key, status, headers_to_cache, resp_bytes.clone(), custom_ttl);
             }
 
             let latency_ms = start_time.elapsed().as_millis();
@@ -226,4 +321,17 @@ pub async fn handle_request(
             Ok(resp)
         }
     }
+}
+
+fn parse_max_age(cc: &str) -> Option<u64> {
+    for directive in ["s-maxage=", "max-age="] {
+        if let Some(idx) = cc.find(directive) {
+            let sub = &cc[idx + directive.len()..];
+            let end = sub.find([',', ' ', ';']).unwrap_or(sub.len());
+            if let Ok(secs) = sub[..end].trim().parse::<u64>() {
+                return Some(secs);
+            }
+        }
+    }
+    None
 }

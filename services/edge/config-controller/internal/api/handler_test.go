@@ -19,6 +19,7 @@ import (
 )
 
 func setupTestServer() *api.APIHandler {
+	os.Setenv("NEXUSEDGE_DEV_MODE", "true")
 	st := store.NewStore()
 	svc := onboarding.NewDomainService(st)
 	comp := compiler.NewCompiler(9901, 80, 443)
@@ -39,7 +40,7 @@ func TestAPIWorkflow(t *testing.T) {
 	// 2. Onboard Domain
 	body, _ := json.Marshal(map[string]interface{}{
 		"hostname":        "api.customer.com",
-		"origin_address":  "origin.customer.internal",
+		"origin_address":  "origin.customer.com",
 		"origin_port":     443,
 		"origin_protocol": "HTTPS",
 	})
@@ -83,7 +84,7 @@ func TestAPIWorkflow(t *testing.T) {
 
 	// 5. Add a secondary origin to the pool
 	addOriginBody, _ := json.Marshal(map[string]interface{}{
-		"address":  "secondary-origin.customer.internal",
+		"address":  "secondary-origin.customer.com",
 		"port":     443,
 		"protocol": "HTTPS",
 		"weight":   50,
@@ -751,7 +752,7 @@ func TestControlPlane_AuthenticationAndTenantIsolation(t *testing.T) {
 	// 1. Tenant Alpha successfully onboards domain under proj-alpha
 	onboardPayload, _ := json.Marshal(map[string]interface{}{
 		"hostname":        "portal.tenant-alpha.com",
-		"origin_address":  "origin.tenant-alpha.internal",
+		"origin_address":  "origin.tenant-alpha.com",
 		"origin_port":     443,
 		"origin_protocol": "HTTPS",
 	})

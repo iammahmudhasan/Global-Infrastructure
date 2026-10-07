@@ -695,6 +695,7 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req AddOriginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -703,6 +704,10 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 
 	if req.Address == "" {
 		writeError(w, http.StatusBadRequest, "origin address is required")
+		return
+	}
+	if err := onboarding.ValidateOriginAddress(req.Address); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if req.Port == 0 {
@@ -715,7 +720,7 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 		req.Weight = 100
 	}
 
-	originID := "orig-" + domainID[:min(len(domainID), 6)] + "-" + strings.ReplaceAll(req.Address, ".", "")[:min(len(req.Address), 6)]
+	originID := "orig-" + generateHex(4)
 	origin := &model.Origin{
 		ID:       originID,
 		PoolID:   routes[0].PoolID,
@@ -965,14 +970,16 @@ func (h *APIHandler) handlePurgeCache(w http.ResponseWriter, r *http.Request, do
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
+	domain, _ := h.store.GetDomain(domainID)
 	target := body.Target
 	if target == "" {
-		domain, _ := h.store.GetDomain(domainID)
 		if domain != nil {
 			target = domain.Hostname
 		} else {
 			target = domainID
 		}
+	} else if domain != nil && target != "*" && !strings.Contains(target, "://") && !strings.HasPrefix(target, domain.Hostname) {
+		target = domain.Hostname + "/" + strings.TrimPrefix(target, "/")
 	}
 
 	purged := h.cacheEngine.Purge(target)
@@ -1077,7 +1084,17 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 			if matchingRule != nil && matchingRule.TTLSeconds > 0 {
 				ttl = matchingRule.TTLSeconds
 			}
-			newEntry := h.cacheEngine.Store(cacheKey, req.OriginResponse.StatusCode, req.OriginResponse.Headers, []byte(req.OriginResponse.Body), ttl)
+
+			// Finding 7: When StripCookies is enabled, strip Set-Cookie header before storing into edge cache
+			headersToStore := make(map[string]string)
+			for k, v := range req.OriginResponse.Headers {
+				if policy != nil && policy.StripCookies && strings.EqualFold(k, "Set-Cookie") {
+					continue
+				}
+				headersToStore[k] = v
+			}
+
+			newEntry := h.cacheEngine.Store(cacheKey, req.OriginResponse.StatusCode, headersToStore, []byte(req.OriginResponse.Body), ttl)
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"cache_status": cache.CacheStatusMiss,
 				"cache_stored": true,
@@ -1207,6 +1224,12 @@ func (h *APIHandler) handleEnvoyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// RBAC Boundary (Finding 9): Only Platform Operators or Edge Nodes can inspect global compiled Envoy configuration
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+
 	topologies := h.store.GetActiveTopologies()
 	cfg, err := h.compiler.Compile(topologies)
 	if err != nil {
@@ -1224,6 +1247,12 @@ func (h *APIHandler) handleTopologies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// RBAC Boundary (Finding 9): Only Platform Operators or Edge Nodes can view global edge topologies
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+
 	topologies := h.store.GetActiveTopologies()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"active_topologies_count": len(topologies),
@@ -1238,9 +1267,17 @@ func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// RBAC Boundary (Finding 9): Only Edge Nodes or Platform Operators can submit edge telemetry
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+
+	// Request Body Limit (Finding 19): Bounded to 1 MiB to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "failed to read request body")
+		writeError(w, http.StatusBadRequest, "failed to read request body (max 1 MiB)")
 		return
 	}
 
@@ -1398,6 +1435,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 	action := parts[1]
 	switch action {
 	case "nodes":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+			return
+		}
 		if len(parts) == 2 {
 			if r.Method == http.MethodGet {
 				nodes := h.popManager.ListNodes(popID)
@@ -1409,6 +1450,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if r.Method == http.MethodPost {
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 				var node model.EdgeNode
 				if err := json.NewDecoder(r.Body).Decode(&node); err != nil {
 					writeError(w, http.StatusBadRequest, "invalid node payload: "+err.Error())
@@ -1433,6 +1475,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			nodeID := parts[2]
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			var payload struct {
 				CPUUsagePercent   float64 `json:"cpu_usage_percent"`
 				MemoryUsageMB     int64   `json:"memory_usage_mb"`
@@ -1453,6 +1496,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown node route")
 
 	case "bgp":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			writeError(w, http.StatusForbidden, "forbidden: platform operator role required for BGP control")
+			return
+		}
 		if len(parts) == 3 {
 			bgpAction := parts[2]
 			if r.Method != http.MethodPost {
@@ -1479,6 +1526,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown bgp route")
 
 	case "config":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return

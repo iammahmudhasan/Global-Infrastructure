@@ -23,10 +23,19 @@ var (
 	ErrUnauthorized  = errors.New("unauthorized: access denied to requested resource")
 )
 
+type Role string
+
+const (
+	RoleTenant           Role = "TENANT"
+	RolePlatformOperator Role = "PLATFORM_OPERATOR"
+	RoleEdgeNode         Role = "EDGE_NODE"
+)
+
 // TenantRecord represents an authenticated organizational identity
 type TenantRecord struct {
 	TenantID        string
 	ProjectID       string
+	Role            Role
 	APIKey          string
 	AllowedProjects map[string]bool
 	Active          bool
@@ -36,6 +45,7 @@ type TenantRecord struct {
 type TenantContext struct {
 	TenantID        string
 	ProjectID       string
+	Role            Role
 	AllowedProjects map[string]bool
 	IsDevBypass     bool
 }
@@ -60,11 +70,23 @@ func (a *Authenticator) loadFromEnv() {
 		for _, entry := range strings.Split(rawKeys, ",") {
 			parts := strings.Split(strings.TrimSpace(entry), ":")
 			if len(parts) >= 3 {
+				role := RoleTenant
 				extra := []string{}
 				if len(parts) > 3 {
-					extra = parts[3:]
+					// Format: key:tenant:proj:role:extraProj1...
+					switch strings.ToUpper(parts[3]) {
+					case "PLATFORM_OPERATOR", "OPERATOR", "ADMIN":
+						role = RolePlatformOperator
+					case "EDGE_NODE", "NODE":
+						role = RoleEdgeNode
+					default:
+						extra = append(extra, parts[3])
+					}
+					if len(parts) > 4 {
+						extra = append(extra, parts[4:]...)
+					}
 				}
-				a.RegisterTenant(parts[0], parts[1], parts[2], extra...)
+				a.RegisterTenantWithRole(parts[0], parts[1], parts[2], role, extra...)
 			}
 		}
 		return
@@ -72,12 +94,17 @@ func (a *Authenticator) loadFromEnv() {
 
 	// In explicit local development mode, register synthetic mock fixtures
 	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
-		a.RegisterTenant("dev-fixture-key-01", "tenant-system", "proj-core", "prj-enterprise-01")
-		a.RegisterTenant("dev-fixture-key-banking", "tenant-cbr-banking", "proj-fintech-prod")
+		a.RegisterTenantWithRole("dev-fixture-key-01", "tenant-system", "proj-core", RolePlatformOperator, "prj-enterprise-01")
+		a.RegisterTenantWithRole("dev-fixture-key-banking", "tenant-cbr-banking", "proj-fintech-prod", RoleTenant)
+		a.RegisterTenantWithRole("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", RoleEdgeNode)
 	}
 }
 
 func (a *Authenticator) RegisterTenant(apiKey, tenantID, projectID string, extraProjects ...string) {
+	a.RegisterTenantWithRole(apiKey, tenantID, projectID, RoleTenant, extraProjects...)
+}
+
+func (a *Authenticator) RegisterTenantWithRole(apiKey, tenantID, projectID string, role Role, extraProjects ...string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -92,6 +119,7 @@ func (a *Authenticator) RegisterTenant(apiKey, tenantID, projectID string, extra
 	a.tenants[apiKey] = &TenantRecord{
 		TenantID:        tenantID,
 		ProjectID:       projectID,
+		Role:            role,
 		APIKey:          apiKey,
 		AllowedProjects: allowed,
 		Active:          true,
@@ -132,6 +160,23 @@ func (a *Authenticator) AuthorizeProject(ctx context.Context, projectID string) 
 		return true
 	}
 	return tc.AllowedProjects[projectID]
+}
+
+// AuthorizeRole verifies that the authenticated caller has one of the required roles (P0 RBAC boundary)
+func (a *Authenticator) AuthorizeRole(ctx context.Context, requiredRoles ...Role) bool {
+	tc, ok := ctx.Value(TenantContextKey).(*TenantContext)
+	if !ok || tc == nil {
+		return false
+	}
+	if tc.IsDevBypass {
+		return true
+	}
+	for _, r := range requiredRoles {
+		if tc.Role == r {
+			return true
+		}
+	}
+	return false
 }
 
 // FromContext extracts the TenantContext from request context
@@ -180,6 +225,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			tc := &TenantContext{
 				TenantID:        record.TenantID,
 				ProjectID:       record.ProjectID,
+				Role:            record.Role,
 				AllowedProjects: record.AllowedProjects,
 				IsDevBypass:     false,
 			}
@@ -188,19 +234,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 3. Handle unauthenticated requests
-		isEnforced := os.Getenv("NEXUSEDGE_ENFORCE_AUTH") == "true" ||
-			os.Getenv("NEXUSEDGE_ENV") == "production" ||
-			os.Getenv("ENV") == "production"
-
-		if isEnforced {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"error":"Unauthorized: missing required API key or credentials"}`))
-			return
-		}
-
-		// 4. Reject unverified tenant header assertion without credentials
+		// 3. Reject unverified tenant header assertion without credentials
 		claimedTenant := r.Header.Get("X-Tenant-ID")
 		if claimedTenant != "" && claimedTenant != "dev-tenant" {
 			w.Header().Set("Content-Type", "application/json")
@@ -209,14 +243,34 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// 5. Default prototype testbed fallback (allows local development and unauthenticated test suites)
-		tc := &TenantContext{
-			TenantID:        "dev-tenant",
-			ProjectID:       "proj-default",
-			AllowedProjects: map[string]bool{"*": true},
-			IsDevBypass:     true,
+		// 4. Reject unauthenticated requests if auth is explicitly enforced or in production
+		if os.Getenv("NEXUSEDGE_ENFORCE_AUTH") == "true" ||
+			os.Getenv("NEXUSEDGE_ENV") == "production" ||
+			os.Getenv("ENV") == "production" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error":"Unauthorized: missing required API key or credentials"}`))
+			return
 		}
-		ctx := context.WithValue(r.Context(), TenantContextKey, tc)
-		next.ServeHTTP(w, r.WithContext(ctx))
+
+		// 5. Strict Dev Bypass Gate (Finding 18): Only permitted when NEXUSEDGE_DEV_MODE=true
+		if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+			tc := &TenantContext{
+				TenantID:        "dev-tenant",
+				ProjectID:       "proj-default",
+				Role:            RolePlatformOperator, // Permits testbed execution in local dev mode
+				AllowedProjects: map[string]bool{"*": true},
+				IsDevBypass:     true,
+			}
+			ctx := context.WithValue(r.Context(), TenantContextKey, tc)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+
+		// 6. Fail closed in all other environments (staging, preview, CI)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":"Unauthorized: missing required API key or credentials"}`))
 	})
 }
+

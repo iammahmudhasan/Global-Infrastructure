@@ -126,6 +126,11 @@ graph TD
    - Mathematical placement optimization governed by deterministic fallback bounds.
    - Evaluates multi-objective trade-offs across latency, transit cost, and grid power.
 
+> [!NOTE]
+> **Data Plane Integration Architecture Notice:**  
+> The codebase currently features a **Go Control Plane & Envoy Configuration Compiler prototype** (`services/edge/config-controller`) alongside an **independent high-performance Rust L7 Edge Proxy prototype** (`dataplane/edge/gateway`).  
+> In this prototype milestone, the Rust gateway operates with a local configuration fixture (`gateway.yaml`), while the Go control plane compiles declarative Envoy v3 LDS/CDS/SDS JSON configurations (`/v1/edge/envoy-config`). Live dynamic integration via an Envoy xDS server and synchronized Rust config ingestion is scheduled for the V1 release.
+
 ---
 
 ## The 8 Commercial Subsystems

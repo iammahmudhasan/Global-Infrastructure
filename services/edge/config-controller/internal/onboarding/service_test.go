@@ -47,7 +47,7 @@ func TestOnboardAndVerifyDomain(t *testing.T) {
 	req := onboarding.OnboardRequest{
 		ProjectID:      "prj-test-001",
 		Hostname:       "api.customer.com",
-		OriginAddress:  "origin.customer.internal",
+		OriginAddress:  "origin.customer.com",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	}
@@ -85,3 +85,40 @@ func TestOnboardAndVerifyDomain(t *testing.T) {
 		t.Errorf("expected status ACTIVE after verification, got %s", verifiedDomain.Status)
 	}
 }
+
+func TestValidateOriginAddress_SSRFProtection(t *testing.T) {
+	blockedOrigins := []string{
+		"127.0.0.1",
+		"127.0.0.1:8080",
+		"10.0.0.1",
+		"172.16.0.5",
+		"192.168.1.1",
+		"169.254.169.254", // Cloud metadata
+		"100.64.0.1",     // CGNAT
+		"localhost",
+		"backend.internal",
+		"app.local",
+		"::1",
+		"",
+	}
+
+	for _, origin := range blockedOrigins {
+		if err := onboarding.ValidateOriginAddress(origin); err == nil {
+			t.Errorf("expected origin %q to be blocked by SSRF protection, but was allowed", origin)
+		}
+	}
+
+	validOrigins := []string{
+		"origin.customer.com",
+		"203.0.113.15",
+		"198.51.100.20",
+		"api.upstream-partner.io",
+	}
+
+	for _, origin := range validOrigins {
+		if err := onboarding.ValidateOriginAddress(origin); err != nil {
+			t.Errorf("expected origin %q to be valid, got error: %v", origin, err)
+		}
+	}
+}
+

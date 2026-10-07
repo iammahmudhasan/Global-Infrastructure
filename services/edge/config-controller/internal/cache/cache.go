@@ -308,9 +308,17 @@ func (e *CacheEngine) Store(key string, statusCode int, headers map[string]strin
 	defer e.mu.Unlock()
 
 	if len(e.storage) >= e.maxKeys {
-		// Evict an expired or arbitrary key
+		evicted := false
 		for k, v := range e.storage {
 			if time.Now().After(v.ExpiresAt) {
+				delete(e.storage, k)
+				evicted = true
+				break
+			}
+		}
+		if !evicted {
+			// Enforce hard bound: evict arbitrary key if none are expired (Finding 20)
+			for k := range e.storage {
 				delete(e.storage, k)
 				break
 			}
@@ -336,7 +344,7 @@ func (e *CacheEngine) Store(key string, statusCode int, headers map[string]strin
 	return cached
 }
 
-// Purge invalidates cached entries matching a specific URL or prefix pattern
+// Purge invalidates cached entries matching a specific URL or prefix pattern (Finding 20)
 func (e *CacheEngine) Purge(target string) int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -345,7 +353,8 @@ func (e *CacheEngine) Purge(target string) int {
 	target = strings.TrimSpace(target)
 
 	for k := range e.storage {
-		if target == "*" || strings.Contains(k, target) || strings.HasPrefix(k, target) {
+		if target == "*" || k == target || strings.HasPrefix(k, target) ||
+			strings.HasPrefix(k, "https://"+target) || strings.HasPrefix(k, "http://"+target) {
 			delete(e.storage, k)
 			purged++
 		}

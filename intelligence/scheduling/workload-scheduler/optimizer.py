@@ -38,18 +38,28 @@ class WorkloadRequirement:
     strict_sovereignty: bool
     max_latency_p95_ms: int
     max_cost_per_hour: float
+    gpus_requested: int = 1
     prioritize_green_energy: bool = False
+    tenant_id: str = "tenant-default"
+    project_id: str = "proj-default"
 
 class GlobalScheduler:
     def __init__(self, nodes: List[ComputeNode]):
         self.nodes = nodes
+        self.active_workloads: Dict[str, str] = {} # workload_id -> node_id
+        self.idempotency_cache: Dict[str, Dict] = {} # tenant:proj:key -> decision
 
     def find_optimal_placement(self, req: WorkloadRequirement) -> Dict:
+        # 0. Scoped Idempotency Check (Finding 16)
+        idempotency_key = f"{req.tenant_id}:{req.project_id}:{req.workload_id}"
+        if idempotency_key in self.idempotency_cache:
+            return self.idempotency_cache[idempotency_key]
+
         candidates = []
 
         for node in self.nodes:
-            # 1. Capacity check
-            if node.available_gpus < 1:
+            # 1. Capacity check with requested GPUs (Finding 16)
+            if node.available_gpus < req.gpus_requested:
                 continue
 
             # 2. Strict Sovereignty Constraint (Hard Legal Boundary)
@@ -60,10 +70,7 @@ class GlobalScheduler:
             # 3. Latency Upper Bound Check
             rtt = getattr(node, f"rtt_ms_from_{req.client_origin}", 100)
             if req.max_latency_p95_ms > 0 and rtt > req.max_latency_p95_ms:
-                # If strict latency breached, reject unless no alternatives
-                if req.strict_sovereignty:
-                    pass
-                else:
+                if not req.strict_sovereignty:
                     continue
 
             # 4. Budget Constraint Check
@@ -74,13 +81,12 @@ class GlobalScheduler:
 
         if not candidates:
             return {
-                "error": "No available node satisfies constraints",
+                "error": "No available node satisfies constraints or capacity exhausted",
                 "workload_id": req.workload_id,
                 "status": "UNSCHEDULABLE"
             }
 
         # Multi-Objective Optimization Scoring Function (Lower Score is Better)
-        # Score = w_lat * RTT + w_cost * Cost + w_carbon * Carbon - w_kv * KV_Warmth
         best_node = None
         best_score = float("inf")
         best_rtt = 0
@@ -102,7 +108,13 @@ class GlobalScheduler:
                 best_node = node
                 best_rtt = rtt
 
-        return {
+        # Real Capacity Accounting: decrement available GPUs upon placement (Finding 16)
+        best_node.available_gpus -= req.gpus_requested
+        self.active_workloads[req.workload_id] = best_node.node_id
+
+        carbon_label = "LOW_CARBON_RENEWABLE_POWER" if best_node.carbon_intensity < 50.0 else "STANDARD_GRID"
+
+        decision = {
             "workload_id": req.workload_id,
             "status": "SCHEDULED",
             "assigned_node": best_node.node_id,
@@ -112,9 +124,14 @@ class GlobalScheduler:
             "measured_rtt_ms": best_rtt,
             "hourly_cost": best_node.cost_per_gpu_hour,
             "carbon_gco2_kwh": best_node.carbon_intensity,
+            "carbon_classification": carbon_label,
+            "remaining_node_gpus": best_node.available_gpus,
             "optimization_score": round(best_score, 2),
-            "reason": f"Optimized via Intelligence Plane (RTT: {best_rtt}ms, Cost: ${best_node.cost_per_gpu_hour}/h, Sovereignty: {best_node.jurisdiction})"
+            "reason": f"Optimized via Intelligence Plane (RTT: {best_rtt}ms, Cost: ${best_node.cost_per_gpu_hour}/h, Sovereignty: {best_node.jurisdiction}, Power: {carbon_label})"
         }
+
+        self.idempotency_cache[idempotency_key] = decision
+        return decision
 
 if __name__ == "__main__":
     # Testbed topology

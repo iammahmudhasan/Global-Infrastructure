@@ -25,16 +25,16 @@ const (
 	ProtocolHTTPS Protocol = "HTTPS"
 )
 
-// Domain represents a customer application endpoint fronted by NexusEdge
 type Domain struct {
-	ID             string       `json:"id"`
-	ProjectID      string       `json:"project_id"`
-	Hostname       string       `json:"hostname"`
-	Status         DomainStatus `json:"status"`
-	OnboardingType string       `json:"onboarding_type"` // "CNAME" or "NAMESERVER"
-	CNAMETarget    string       `json:"cname_target"`    // e.g. "cname-d101.edge.nexusedge.net"
-	CreatedAt      time.Time    `json:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at"`
+	ID                string       `json:"id"`
+	ProjectID         string       `json:"project_id"`
+	Hostname          string       `json:"hostname"`
+	Status            DomainStatus `json:"status"`
+	OnboardingType    string       `json:"onboarding_type"` // "CNAME" or "NAMESERVER"
+	CNAMETarget       string       `json:"cname_target"`    // e.g. "cname-d101.edge.nexusedge.net"
+	VerificationToken string       `json:"verification_token,omitempty"`
+	CreatedAt         time.Time    `json:"created_at"`
+	UpdatedAt         time.Time    `json:"updated_at"`
 }
 
 type DomainVerification struct {
@@ -246,7 +246,7 @@ type Certificate struct {
 	Status            CertificateStatus `json:"status"`
 	KeyType           KeyType           `json:"key_type"`
 	CertPEM           string            `json:"cert_pem"`
-	PrivateKeyPEM     string            `json:"private_key_pem,omitempty"`
+	PrivateKeyPEM     string            `json:"-"`
 	FingerprintSHA256 string            `json:"fingerprint_sha256"`
 	SerialNumber      string            `json:"serial_number"`
 	Issuer            string            `json:"issuer"`

@@ -35,10 +35,12 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		return nil, ErrInvalidPolicy
 	}
 
-	// 1. Idempotency Check (Rule 16)
+	// 1. Tenant-Scoped Idempotency Check (Rule 16, Finding 16)
+	idempotencyKey := ""
 	if policy.IdempotencyKey != "" {
+		idempotencyKey = policy.TenantID + ":" + policy.IdempotencyKey
 		e.mu.RLock()
-		if existing, found := e.idempotency[policy.IdempotencyKey]; found {
+		if existing, found := e.idempotency[idempotencyKey]; found {
 			e.mu.RUnlock()
 			return existing, nil
 		}
@@ -163,13 +165,13 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	// 5. Synthesize Explainable Decision Codes (Rule 112)
 	reasonCodes = append(reasonCodes, fmt.Sprintf("OPTIMAL_SCORE_%.2f", bestScore))
 	if bestBackend.Jurisdiction == registry.ResidencyBangladesh {
-		reasonCodes = append(reasonCodes, "SOVEREIGN_BD_NDMA_2026_COMPLIANT")
+		reasonCodes = append(reasonCodes, "SOVEREIGN_JURISDICTION_BD_MATCH")
 	}
 	if bestBackend.LatencyP95Ms <= 10 {
 		reasonCodes = append(reasonCodes, "ULTRA_LOW_LATENCY_SUB_10MS")
 	}
 	if bestBackend.CarbonIntensity < 50.0 {
-		reasonCodes = append(reasonCodes, "ZERO_CARBON_GEOTHERMAL_GRID")
+		reasonCodes = append(reasonCodes, "LOW_CARBON_RENEWABLE_POWER")
 	}
 
 	reason := fmt.Sprintf("Placed on %s (%s, %s): RTT %dms, Cost $%.2f/hr, Carbon %.1fgCO2/kWh [Objective: %s]",
@@ -189,7 +191,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		CalculatedAt:    time.Now().UTC(),
 	}
 
-	e.recordIdempotency(policy.IdempotencyKey, decision)
+	e.recordIdempotency(idempotencyKey, decision)
 	return decision, nil
 }
 
