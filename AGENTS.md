@@ -1,85 +1,87 @@
 # AGENTS.md — NexusEdge Autonomous Agent Operating Manual
 
-> **Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
+> **Platform Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
 > **Core Intellectual Question:** *"Where should every application, AI inference request, and compute workload run right now?"*  
-> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) (123 Mandatory Platform Rules)
+> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) (123 Mandatory Platform Rules)  
+> **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/.agents/rules/ai-engineering-rules.md)
 
 ---
 
-## ⚡ The First-Principles Development Protocol
+## ⚡ 1. The First-Principles Development Protocol
 
-All AI coding assistants and autonomous engineering agents operating on this codebase MUST follow these **non-negotiable first principles**:
+All AI coding agents operating on this codebase MUST follow these non-negotiable first principles:
 
-1. **Constitutional Hierarchy:**
-   **Correctness > Security > Reliability > Maintainability > Performance > Development Speed**
-   Never reverse this order merely to ship faster. All 123 rules in [docs/AI_ENGINEERING_RULES.md](file:///c:/Users/mah54/Desktop/Infrastructure%20Business/docs/AI_ENGINEERING_RULES.md) apply repository-wide.
-2. **First-Principles Thinking Over Analogies:**
-   - Never copy legacy architectures blindly (e.g. Cloudflare is 15 years old, designed for static web caching).
-   - Reason upward from physical truths: subsea fiber latency (speed of light in glass ~200 km/ms), transformer power density (100–200 kW/rack), and GPU memory bandwidth.
-3. **Mandatory Real-World Verification:**
-   - **Never write unverified code.** When a feature, proxy route, or scheduler algorithm is implemented, it MUST be executed and tested immediately in the shell.
-   - Run `cargo check`, `cargo test`, `go test ./...`, or execute Python placement models. Never assume code works without execution proof.
-4. **Continuous Cryptographic Git Push:**
-   - Every completed task, bugfix, or architectural addition MUST be committed cleanly and pushed immediately to `origin/main` with verified commits.
+1. **Constitutional Priority Hierarchy (Rule 1):**  
+   $$\mathbf{Correctness} > \mathbf{Security} > \mathbf{Reliability} > \mathbf{Maintainability} > \mathbf{Performance} > \mathbf{Speed}$$  
+   *Never reverse this order merely to ship faster.*
+2. **First-Principles Over Analogies (Rule 2):**  
+   Do not copy legacy architectures blindly (e.g. Cloudflare is 15 years old, designed for static web caching). Reason upward from physical truths: speed of light in fiber (~200 km/ms), rack power density (100–200 kW/rack), and GPU memory bandwidth.
+3. **Mandatory Real-World Verification (Rules 2, 81):**  
+   **Never write unverified code.** Every feature, route, or scheduler algorithm MUST be executed and verified immediately in the shell (`cargo check`, `cargo test`, `go test ./...`, `python optimizer.py`). Never assume code works without execution proof.
+4. **Continuous Cryptographic Git Push (Rule 3, 96):**  
+   Every completed task, bugfix, or architectural addition MUST be committed cleanly and pushed immediately to `origin/main` with verified commits.
 
 ---
 
-## 🏛️ The 3-Plane Master Architecture
+## 🏛️ 2. The 3-Plane Master Architecture
 
 ```
-                  ┌──────────────────────────────────────────────┐
-                  │ 1. INTELLIGENCE PLANE (Optimization Matters) │
-                  │ Python 3.14 + PyTorch / vLLM + ClickHouse    │
-                  └──────────────────────┬───────────────────────┘
-                                         │ (Calculated Placement & Routing Graphs)
-                                         ▼
-                  ┌──────────────────────────────────────────────┐
-                  │   2. CONTROL PLANE (Correctness Matters)     │
-                  │   Go + gRPC (Buf) + NATS JetStream + Postgres│
-                  └──────────────────────┬───────────────────────┘
-                                         │ (Sub-100ms Declarative Reconciliation)
-                                         ▼
-                  ┌──────────────────────────────────────────────┐
-                  │      3. DATA PLANE (Latency Matters)         │
-                  │   Rust Fast-Path + Envoy L7 + Linux C/eBPF   │
-                  └──────────────────────────────────────────────┘
+                  ┌────────────────────────────────────────────────────────┐
+                  │      1. INTELLIGENCE PLANE (Optimization Matters)      │
+                  │      Python 3.14 + PyTorch / vLLM + ClickHouse         │
+                  │      Multi-objective scheduling: Latency, Cost, Carbon │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │ (Calculated Placement Graphs & Intent)
+                                             ▼
+                  ┌────────────────────────────────────────────────────────┐
+                  │        2. CONTROL PLANE (Correctness Matters)          │
+                  │        Go + gRPC (Buf) + NATS JetStream + Postgres 18  │
+                  │        Sub-100ms declarative reconciliation loops       │
+                  └──────────────────────────┬─────────────────────────────┘
+                                             │ (Pushed Local State & Fast-Path Policy)
+                                             ▼
+                  ┌────────────────────────────────────────────────────────┐
+                  │           3. DATA PLANE (Latency Matters)              │
+                  │        Rust Fast-Path + Envoy L7 + Linux C/eBPF / XDP  │
+                  │        Line-rate packet path, zero GC, lock-free       │
+                  └────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📁 The 14 Monorepo Pillars & Strict Invariants
+## 📁 3. The 14 Monorepo Pillars & Strict Invariants (Rules 4–8)
 
 The monorepo is strictly structured into 14 domain directories. **Never place files outside their designated pillar:**
 
 | Pillar | Operational Plane | Strict Invariants & Responsibilities |
 |---|---|---|
-| **`apps/`** | Customer Products | Next.js Dashboard, Go CLI (`nexusedge`), Docs, Status, Console. No core daemons. |
+| **`apps/`** | Product / Customer | Next.js Dashboard, Go CLI (`nexusedge`), Docs, Status, Console. No core daemons. |
 | **`services/`** | Control Plane (Go) | Business domains: `api-gateway`, `network/global-router`, `compute`, `storage`, `billing`. |
 | **`dataplane/`** | Data Plane (Rust/C) | Line-rate packet path: `edge/gateway`, `network/ebpf/programs/xdp`, `runtime/wasm`. |
-| **`intelligence/`** | Intelligence Plane (Python)| Multi-objective schedulers, capacity predictors, PyTorch models, GPU optimizers. |
+| **`intelligence/`** | Intelligence (Python)| Multi-objective schedulers, capacity predictors, PyTorch models, GPU optimizers. |
 | **`proto/`** | API Contracts | Protocol Buffers governed by `buf.yaml`. Source of truth for all gRPC communication. |
 | **`schemas/`** | Event / Data Contracts | NATS JetStream event schemas (Avro/JSON), Telemetry, Analytics schemas. |
-| **`infra/`** | Physical / Cloud Substrate| Datacenter topology, regions (`dhaka`, `singapore`, `frankfurt`, `virginia`), BGP, SONiC. |
+| **`infra/`** | Physical Substrate | Datacenter topology, regions (`dhaka`, `singapore`, `frankfurt`, `virginia`), BGP, SONiC. |
 | **`deploy/`** | Deployment Manifests | Envoy configs, Kubernetes base & overlays (dev/prod), Helm charts, Argo CD. |
 | **`tests/`** | Multi-Tier Verification| Integration, e2e, network emulation, security fuzzing, chaos injection. |
 | **`benchmarks/`** | Performance Benchmarks | Line-rate Mpps, L7 proxy latency (p99), DNS throughput, GPU memory saturation. |
-| **`rfcs/`** | Architectural Proposals | Proposed architecture changes before code is written (`rfcs/0001-...`). |
-| **`adr/`** | Architecture Decisions | Permanent architectural decision records (`adr/0001-...`). |
+| **`rfcs/`** | Architectural Proposals| Proposed architecture changes before code is written (`rfcs/0001-...`). |
+| **`adr/`** | Architectural Decisions| Permanent architectural decision records (`adr/0001-...`). |
 | **`security/`** | Security Foundations | Threat models, compliance rules, SBOM, signing keys, zero-trust policies. |
-| **`docs/`** | Documentation & Runbooks | Master system architecture, operational runbooks, disaster recovery procedures. |
+| **`docs/`** | Master Documentation | System architecture, network runbooks, operational disaster recovery procedures. |
 
 ### 5 Non-Negotiable Invariants:
-1. **Data Plane ≠ Control Plane:** Performance-critical code is Rust/C; control/reconciliation is Go. Packets never depend on slow control-plane round trips.
-2. **Private Internal Packages:** `services/<A>` must NEVER import `services/<B>/internal`. Communicate strictly via gRPC/events.
-3. **No God Services:** Do not create `services/core` or `libs/utils`. Keep packages domain-specific.
-4. **Domain Owns Its Data:** No monolithic database. Network service owns network tables; Billing owns billing tables.
-5. **Adopt Commodity, Build Moat:** Adopt Postgres, K8s, Envoy, PowerDNS, Ceph, NATS. Build our 5 IP engines.
+1. **Data Plane ≠ Control Plane (Rule 5):** High-performance packet processing lives in Rust/C. Packets must NEVER wait on slow control plane or DB round trips.
+2. **Private Service Boundaries (Rule 7):** `services/<A>` must NEVER import `services/<B>/internal`. Communicate strictly via gRPC/events.
+3. **No God Services (Rule 59):** Do not create `services/core` or `libs/utils`. Keep libraries domain-specific (`libs/go/telemetry`).
+4. **Domain Owns Its Data (Rule 8):** Network service owns network tables; Billing owns billing tables. Never execute cross-domain SQL queries.
+5. **Adopt Commodity, Build Moat (Rules 33, 34):** Adopt Postgres, K8s, Envoy, PowerDNS, Ceph, NATS. Focus proprietary IP on our 5 engines.
 
 ---
 
-## 🎯 The 5 Proprietary IP Engines (Our Moat)
+## 🎯 4. The 5 Proprietary IP Engines (Our Moat)
 
-1. **Global Traffic Director (`dataplane/`, `services/network`):** Routes users to nearest PoP via Anycast & live RTT probes.
+1. **Global Traffic Director (`dataplane/`, `services/network`):** Routes requests to optimal PoPs via Anycast & live RTT telemetry.
 2. **Universal Workload Scheduler (`intelligence/`, `services/orchestration`):** Places jobs based on Latency, Cost, Power, and Sovereignty.
 3. **Capacity Engine (`services/compute`, `intelligence/capacity`):** Tracks live GPU VRAM, grid power, and transit capacity.
 4. **Policy Engine (`services/network`, OPA):** Sub-millisecond data residency enforcement (Bangladesh NDMA 2026, EU GDPR).
@@ -87,7 +89,24 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 
 ---
 
-## 🛡️ Rule 122: Absolute Non-Negotiable Invariants
+## ⚙️ 5. Operationalizing Key Rules for AI Agents
+
+- **Rule 2 (Understand Before Editing):** Inspect existing domain code, tests, and nearest README before modifying anything.
+- **Rule 9–11 (API & Event Contracts):** `proto/` and `schemas/` are sacred contracts. Never make breaking changes silently; use semantic versioning (`v1`, `v2`). Run `buf lint`.
+- **Rule 12 (Desired State Architecture):** Implement idempotent declarative reconciliation loops over imperative scripts.
+- **Rule 14–16 (Failure & Idempotency):** Assume networks partition, nodes fail, and requests duplicate. Design all mutating APIs with `request_id` / `idempotency_key`.
+- **Rule 18–19 (Zero Secrets in Code/Logs):** Never commit API keys, private keys, or passwords. Redact authorization headers and tokens in logs.
+- **Rule 23 (Untrusted Input):** Validate lengths, types, ranges, IPs, headers, and protobuf payloads. Fail closed.
+- **Rule 24 (Unsafe Rust):** Rust `unsafe` is forbidden unless strictly necessary with an explicit `// SAFETY:` invariant block.
+- **Rule 28–30 (AI / Intelligence Bounds):** ML predictions must NEVER bypass deterministic safety checks. Always provide a deterministic fallback when models are offline.
+- **Rule 35–37 (Error Handling & Timeouts):** No swallowed errors (`_ = ...`). Every external network call MUST have explicit timeouts and bounded backoff.
+- **Rule 42–43 (Observability):** Expose OpenTelemetry traces, structured metrics, and pass `request_id` / `trace_id` across service hops.
+- **Rule 54–55 (Tenant Isolation):** Multi-tenancy is mandatory. Never trust an entity ID (`GET /instances/{id}`) without organizational authorization.
+- **Rule 83–84 (No Fabricated Metrics):** Never fabricate latency, throughput, benchmark claims, or test passes. Measurements must be empirically verified.
+
+---
+
+## 🛡️ 6. Rule 122: Absolute Non-Negotiables
 
 ### NEVER:
 - Commit secrets (API keys, private keys, tokens, production certificates).
@@ -115,14 +134,14 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 - Keep APIs versioned and backward compatible.
 - Document major architecture decisions in RFCs and ADRs.
 - Measure performance via actual benchmarks rather than guessing.
-- Bounded AI decisions by deterministic policy fallbacks.
+- Bound AI decisions by deterministic policy fallbacks.
 - Optimize for correctness and long-term maintainability.
 
 ---
 
-## 📋 Rule 121: Final Completion Checklist
+## 📋 7. Rule 121: Final Completion Checklist
 
-Before considering any engineering task complete, verify:
+Before considering ANY engineering task complete, verify:
 
 ```text
 [ ] Correct domain?
@@ -152,7 +171,7 @@ Before considering any engineering task complete, verify:
 
 ---
 
-## 🛠️ CLI & Build Verification Cheatsheet
+## 🛠️ 8. Execution & Verification Cheatsheet
 
 ```bash
 # 1. Rust Data Plane (Gateway)
@@ -178,18 +197,18 @@ buf breaking --against ".git#branch=main"
 
 ---
 
-## 🇧🇩 Strategic Geo-Anchor (Bangladesh Advantage)
+## 🇧🇩 9. Strategic Geo-Anchor (Bangladesh Advantage)
+
 - **BDIX Peering:** 167 members, 2.27 Tbps cumulative port capacity.
 - **SMW6 Submarine Cable:** 30,000 Gbps planned capacity (Cox's Bazar to Singapore/Mumbai/France).
 - **National Data Management Act 2026:** Mandates synchronized real-time copy within Bangladesh for Critical Information Infrastructure (CII). NexusEdge provides **Global-Grade Infrastructure + Local Cryptographic Sovereignty**.
 
 ---
 
-## 🧠 Rule 123: Engineering Philosophy
+## 🧠 10. Rule 123: Engineering Philosophy
 
-The goal is not to produce the most code.  
-The goal is to produce the smallest amount of correct, secure, observable, maintainable code that can become part of a globally distributed infrastructure system.
-
-Every implementation must ask:  
+> **"The goal is not to produce the most code. The goal is to produce the smallest amount of correct, secure, observable, maintainable code that can become part of a globally distributed infrastructure system."**  
+>  
+> *Every implementation must ask:*  
 > **"Will this still make sense when this system operates across hundreds of PoPs, thousands of nodes, millions of workloads, multiple continents, and thousands of engineers?"**  
-If the answer is no, redesign it before merging.
+> *If the answer is no, redesign it before merging.*
