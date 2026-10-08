@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
@@ -106,14 +107,21 @@ type RetryPolicy struct {
 }
 
 type Cluster struct {
-	Name                 string                   `json:"name"`
-	ConnectTimeout       string                   `json:"connect_timeout"`
-	Type                 string                   `json:"type"`
-	LbPolicy             string                   `json:"lb_policy"`
-	LoadAssignment       LoadAssignment           `json:"load_assignment"`
-	Http2ProtocolOptions *map[string]interface{}  `json:"http2_protocol_options,omitempty"`
-	HealthChecks         []map[string]interface{} `json:"health_checks,omitempty"`
-	TransportSocket      *TransportSocket         `json:"transport_socket,omitempty"`
+	Name                   string                   `json:"name"`
+	ConnectTimeout         string                   `json:"connect_timeout"`
+	Type                   string                   `json:"type"`
+	LbPolicy               string                   `json:"lb_policy"`
+	LoadAssignment         LoadAssignment           `json:"load_assignment"`
+	Http2ProtocolOptions   *map[string]interface{}  `json:"http2_protocol_options,omitempty"`
+	HealthChecks           []map[string]interface{} `json:"health_checks,omitempty"`
+	TransportSocket        *TransportSocket         `json:"transport_socket,omitempty"`
+	TransportSocketMatches []TransportSocketMatch   `json:"transport_socket_matches,omitempty"`
+}
+
+type TransportSocketMatch struct {
+	Name            string                 `json:"name"`
+	Match           map[string]interface{} `json:"match"`
+	TransportSocket *TransportSocket       `json:"transport_socket"`
 }
 
 type TransportSocket struct {
@@ -131,8 +139,9 @@ type LocalityEndpoints struct {
 }
 
 type LbEndpoint struct {
-	Endpoint            Endpoint `json:"endpoint"`
-	LoadBalancingWeight int      `json:"load_balancing_weight,omitempty"`
+	Endpoint            Endpoint               `json:"endpoint"`
+	LoadBalancingWeight int                    `json:"load_balancing_weight,omitempty"`
+	Metadata            map[string]interface{} `json:"metadata,omitempty"`
 }
 
 type Endpoint struct {
@@ -175,6 +184,12 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 		}
 	}
 
+	defaultResolver := func(ctx context.Context, host string) ([]net.IP, error) {
+		resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		return net.DefaultResolver.LookupIP(resolveCtx, "ip", host)
+	}
+
 	return &Compiler{
 		adminPort:   adminPort,
 		httpPort:    httpPort,
@@ -182,6 +197,7 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 		acmeHost:    acmeHost,
 		acmePort:    acmePort,
 		edgeVersion: "v1.0.0",
+		resolver:    defaultResolver,
 	}
 }
 
@@ -774,9 +790,8 @@ func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate, settings *
 // and pins them as STATIC cluster endpoints with preserved SNI, completely shielding Envoy
 // from runtime DNS rebinding to loopback, RFC1918, or cloud metadata ranges (P1 Finding).
 func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Cluster {
-	// Determine cluster discovery type: STRICT_DNS for domain origins, STATIC for raw IPs
-	clusterType := "STRICT_DNS"
-	isAllIPs := true
+	// Pinned STATIC endpoints shield Envoy from runtime DNS rebinding SSRF (Rule 23, Finding 1)
+	clusterType := "STATIC"
 	hasHTTPS := false
 	hasHTTP := false
 
@@ -797,6 +812,17 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 			hasHTTP = true
 		}
 
+		var endpointMeta map[string]interface{}
+		if o.Protocol == model.ProtocolHTTPS {
+			endpointMeta = map[string]interface{}{
+				"filter_metadata": map[string]interface{}{
+					"envoy.transport_socket_match": map[string]interface{}{
+						"sni_host": o.Address,
+					},
+				},
+			}
+		}
+
 		parsedIP := net.ParseIP(o.Address)
 		if parsedIP != nil {
 			// Direct IP destination: validate against SSRF private/reserved ranges
@@ -813,66 +839,54 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 					},
 				},
 				LoadBalancingWeight: weight,
+				Metadata:            endpointMeta,
 			})
 		} else {
-			// Origin is an FQDN:
-			if c.resolver != nil {
-				resolvedIPs, err := c.resolver(context.Background(), o.Address)
-				if err != nil {
-					// Unresolvable origin: fail-closed to prevent routing to unverified destinations
-					continue
-				}
+			// Origin is an FQDN: Fail-closed without resolver or if resolution fails/unsafe (P1 Finding 1)
+			if c.resolver == nil {
+				continue
+			}
 
-				// Validate every resolved IP against private / loopback / metadata ranges (anti-rebinding)
-				hasUnsafeIP := false
-				var safeIPs []net.IP
-				for _, ip := range resolvedIPs {
-					if onboarding.IsPrivateOrReservedIP(ip) {
-						hasUnsafeIP = true
-						break
-					}
-					safeIPs = append(safeIPs, ip)
-				}
+			resolveCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			resolvedIPs, err := c.resolver(resolveCtx, o.Address)
+			cancel()
+			if err != nil {
+				// Unresolvable origin: fail-closed to prevent routing to unverified destinations
+				continue
+			}
 
-				if hasUnsafeIP || len(safeIPs) == 0 {
-					// SSRF / DNS Rebinding detected! Reject completely - never install private destinations in config!
-					continue
+			// Validate every resolved IP against private / loopback / metadata ranges (anti-rebinding)
+			hasUnsafeIP := false
+			var safeIPs []net.IP
+			for _, ip := range resolvedIPs {
+				if onboarding.IsPrivateOrReservedIP(ip) {
+					hasUnsafeIP = true
+					break
 				}
+				safeIPs = append(safeIPs, ip)
+			}
 
-				// Pin validated public IPs as STATIC endpoints
-				for _, ip := range safeIPs {
-					lbEndpoints = append(lbEndpoints, LbEndpoint{
-						Endpoint: Endpoint{
-							Address: Address{
-								SocketAddress: SocketAddress{
-									Address:   ip.String(),
-									PortValue: o.Port,
-								},
-							},
-						},
-						LoadBalancingWeight: weight,
-					})
-				}
-			} else {
-				// No resolver injected (backward-compatible fallback): retain STRICT_DNS
-				isAllIPs = false
+			if hasUnsafeIP || len(safeIPs) == 0 {
+				// SSRF / DNS Rebinding detected! Reject completely - never install private destinations in config!
+				continue
+			}
+
+			// Pin validated public IPs as STATIC endpoints
+			for _, ip := range safeIPs {
 				lbEndpoints = append(lbEndpoints, LbEndpoint{
 					Endpoint: Endpoint{
 						Address: Address{
 							SocketAddress: SocketAddress{
-								Address:   o.Address,
+								Address:   ip.String(),
 								PortValue: o.Port,
 							},
 						},
 					},
 					LoadBalancingWeight: weight,
+					Metadata:            endpointMeta,
 				})
 			}
 		}
-	}
-
-	if isAllIPs && len(lbEndpoints) > 0 {
-		clusterType = "STATIC"
 	}
 
 	lbPolicy := "ROUND_ROBIN"
@@ -934,13 +948,51 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 
 	// If origin protocol is HTTPS and homogenous (no mixed plain HTTP), attach Upstream TLS context with SNI
 	if hasHTTPS && !hasHTTP && len(pool.Origins) > 0 {
-		sniHost := pool.Origins[0].Address
-		cluster.TransportSocket = &TransportSocket{
-			Name: "envoy.transport_sockets.tls",
-			TypedConfig: map[string]interface{}{
-				"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-				"sni":   sniHost,
-			},
+		uniqueHosts := make([]string, 0)
+		hostSeen := make(map[string]bool)
+		for _, orig := range pool.Origins {
+			if orig.Protocol == model.ProtocolHTTPS {
+				lower := strings.ToLower(orig.Address)
+				if !hostSeen[lower] {
+					hostSeen[lower] = true
+					uniqueHosts = append(uniqueHosts, orig.Address)
+				}
+			}
+		}
+
+		if len(uniqueHosts) == 1 {
+			cluster.TransportSocket = &TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				TypedConfig: map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+					"sni":   uniqueHosts[0],
+				},
+			}
+		} else if len(uniqueHosts) > 1 {
+			// Per-origin endpoint TLS matching: prevents SNI mismatches when origins have distinct hostnames (Finding 3)
+			for _, host := range uniqueHosts {
+				cluster.TransportSocketMatches = append(cluster.TransportSocketMatches, TransportSocketMatch{
+					Name: fmt.Sprintf("tls_match_%s", sanitizeName(host)),
+					Match: map[string]interface{}{
+						"sni_host": host,
+					},
+					TransportSocket: &TransportSocket{
+						Name: "envoy.transport_sockets.tls",
+						TypedConfig: map[string]interface{}{
+							"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+							"sni":   host,
+						},
+					},
+				})
+			}
+			// Cluster-level fallback TransportSocket
+			cluster.TransportSocket = &TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				TypedConfig: map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+					"sni":   uniqueHosts[0],
+				},
+			}
 		}
 	}
 

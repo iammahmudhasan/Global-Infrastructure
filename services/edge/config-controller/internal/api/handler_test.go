@@ -1364,13 +1364,19 @@ func TestPoPAndRoutingAccessControl(t *testing.T) {
 			t.Errorf("expected 200 OK for operator on %s, got %d: %s", ep, w.Code, w.Body.String())
 		}
 
-		// 3. Edge node -> 200 OK
+		// 3. Edge node access
 		req = httptest.NewRequest(http.MethodGet, ep, nil)
 		req.Header.Set("X-API-Key", "key-node-user")
 		w = httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Errorf("expected 200 OK for edge node on %s, got %d: %s", ep, w.Code, w.Body.String())
+		if ep == "/v1/edge/routing/matrix" {
+			if w.Code != http.StatusForbidden {
+				t.Errorf("expected 403 Forbidden for edge node on %s, got %d: %s", ep, w.Code, w.Body.String())
+			}
+		} else {
+			if w.Code != http.StatusOK {
+				t.Errorf("expected 200 OK for edge node on %s, got %d: %s", ep, w.Code, w.Body.String())
+			}
 		}
 	}
 }
@@ -1414,6 +1420,81 @@ func TestNodeRegistration_OperatorOnly(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("expected 201 Created for operator node registration, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEdgeNode_PoPAndTopologyIsolation(t *testing.T) {
+	// P2 Finding 6 Verification: EdgeNode visibility bounded to its assigned PoP
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterTenantWithRole("key-operator", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
+	authInst.RegisterNodeWithPoP("key-node-dhaka", "tenant-infra", "proj-infra", "edge-node-01", "dhaka")
+
+	// 1. Operator listing PoPs receives all global PoPs (4 default PoPs)
+	reqOp := httptest.NewRequest(http.MethodGet, "/v1/edge/pops", nil)
+	reqOp.Header.Set("X-API-Key", "key-operator")
+	wOp := httptest.NewRecorder()
+	handler.ServeHTTP(wOp, reqOp)
+	if wOp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator, got %d: %s", wOp.Code, wOp.Body.String())
+	}
+	var opResp struct {
+		TotalPoPs int             `json:"total_pops"`
+		PoPs      []model.EdgePoP `json:"pops"`
+	}
+	if err := json.Unmarshal(wOp.Body.Bytes(), &opResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if opResp.TotalPoPs != 4 {
+		t.Fatalf("expected 4 global PoPs for operator, got %d", opResp.TotalPoPs)
+	}
+
+	// 2. Edge node assigned to 'dhaka' receives ONLY dhaka in /v1/edge/pops
+	reqNode := httptest.NewRequest(http.MethodGet, "/v1/edge/pops", nil)
+	reqNode.Header.Set("X-API-Key", "key-node-dhaka")
+	wNode := httptest.NewRecorder()
+	handler.ServeHTTP(wNode, reqNode)
+	if wNode.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for edge node, got %d: %s", wNode.Code, wNode.Body.String())
+	}
+	var nodeResp struct {
+		TotalPoPs int             `json:"total_pops"`
+		PoPs      []model.EdgePoP `json:"pops"`
+	}
+	if err := json.Unmarshal(wNode.Body.Bytes(), &nodeResp); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if nodeResp.TotalPoPs != 1 || len(nodeResp.PoPs) != 1 || strings.ToLower(nodeResp.PoPs[0].ID) != "dhaka" {
+		t.Fatalf("expected edge node to receive only its assigned 'dhaka' PoP, got %d PoPs: %+v",
+			nodeResp.TotalPoPs, nodeResp.PoPs)
+	}
+
+	// 3. Edge node requesting global /v1/edge/topologies -> 403 Forbidden
+	reqTopo := httptest.NewRequest(http.MethodGet, "/v1/edge/topologies", nil)
+	reqTopo.Header.Set("X-API-Key", "key-node-dhaka")
+	wTopo := httptest.NewRecorder()
+	handler.ServeHTTP(wTopo, reqTopo)
+	if wTopo.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for edge node on /v1/edge/topologies, got %d", wTopo.Code)
+	}
+
+	// 4. Operator requesting /v1/edge/topologies -> 200 OK
+	reqTopoOp := httptest.NewRequest(http.MethodGet, "/v1/edge/topologies", nil)
+	reqTopoOp.Header.Set("X-API-Key", "key-operator")
+	wTopoOp := httptest.NewRecorder()
+	handler.ServeHTTP(wTopoOp, reqTopoOp)
+	if wTopoOp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator on /v1/edge/topologies, got %d", wTopoOp.Code)
+	}
+
+	// 5. Edge node requesting /v1/edge/routing/matrix -> 403 Forbidden
+	reqMatrix := httptest.NewRequest(http.MethodGet, "/v1/edge/routing/matrix", nil)
+	reqMatrix.Header.Set("X-API-Key", "key-node-dhaka")
+	wMatrix := httptest.NewRecorder()
+	handler.ServeHTTP(wMatrix, reqMatrix)
+	if wMatrix.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for edge node on /v1/edge/routing/matrix, got %d", wMatrix.Code)
 	}
 }
 

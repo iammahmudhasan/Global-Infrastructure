@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,9 +32,10 @@ type BackendSummary struct {
 }
 
 type Server struct {
-	auth      *auth.Authenticator
-	registry  *registry.Registry
-	evaluator *scheduler.Evaluator
+	auth        *auth.Authenticator
+	registry    *registry.Registry
+	evaluator   *scheduler.Evaluator
+	stopSweeper chan struct{}
 }
 
 func NewServer() *Server {
@@ -44,10 +47,36 @@ func NewServer() *Server {
 		log.Println("[INFO] Zero preconfigured API keys loaded. Configure NEXUSEDGE_API_KEYS or set NEXUSEDGE_DEV_MODE=true.")
 	}
 
-	return &Server{
-		auth:      authenticator,
-		registry:  reg,
-		evaluator: eval,
+	s := &Server{
+		auth:        authenticator,
+		registry:    reg,
+		evaluator:   eval,
+		stopSweeper: make(chan struct{}),
+	}
+	s.StartSweeper(1*time.Minute, 15*time.Minute)
+	return s
+}
+
+func (s *Server) StartSweeper(interval, ttl time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.registry.SweepExpiredReservations(ttl)
+			case <-s.stopSweeper:
+				return
+			}
+		}
+	}()
+}
+
+func (s *Server) Close() {
+	select {
+	case <-s.stopSweeper:
+	default:
+		close(s.stopSweeper)
 	}
 }
 
@@ -201,6 +230,89 @@ func (s *Server) routes() http.Handler {
 		json.NewEncoder(w).Encode(publicDispatchDecision(decision, isOperator))
 	})
 
+	// 5. Workload Completion Lifecycle API (Finding 2)
+	mux.HandleFunc("/api/v1/workload/complete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			WorkloadID string `json:"workload_id"`
+			Status     string `json:"status"` // "COMPLETED" or "FAILED"
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid complete request body"})
+			return
+		}
+		if req.WorkloadID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "workload_id is required"})
+			return
+		}
+
+		success := !strings.EqualFold(req.Status, "FAILED")
+		if err := s.registry.CompleteWorkload(req.WorkloadID, success); err != nil {
+			if errors.Is(err, registry.ErrReservationNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]string{"error": "workload reservation not found"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      "RELEASED",
+			"workload_id": req.WorkloadID,
+			"outcome":     req.Status,
+		})
+	})
+
+	// 6. Workload Release API
+	mux.HandleFunc("/api/v1/workload/release", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			WorkloadID string `json:"workload_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid release request body"})
+			return
+		}
+		if req.WorkloadID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "workload_id is required"})
+			return
+		}
+
+		if err := s.registry.Release(req.WorkloadID); err != nil {
+			if errors.Is(err, registry.ErrReservationNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]string{"error": "workload reservation not found"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      "RELEASED",
+			"workload_id": req.WorkloadID,
+		})
+	})
+
 	// Wrap in middleware chain: Correlation -> BodySizeLimit -> Auth (Rule 6: Dependency Direction)
 	handler := s.auth.Middleware(mux)
 	handler = bodySizeLimitMiddleware(handler)
@@ -242,6 +354,7 @@ func bodySizeLimitMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	server := NewServer()
+	defer server.Close()
 
 	port := 9090
 	serverAddr := fmt.Sprintf(":%d", port)

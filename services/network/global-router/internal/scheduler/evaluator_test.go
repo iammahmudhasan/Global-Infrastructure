@@ -488,3 +488,55 @@ func TestIdempotency_BoundedMemoryCapacity(t *testing.T) {
 		t.Fatalf("idempotency cache exceeded maximum bounds! got: %d, max: %d", count, scheduler.MaxIdempotencyEntries)
 	}
 }
+
+func TestIdempotency_TrueLRUEviction(t *testing.T) {
+	// P2 Finding 8 Verification: True LRU eviction evicts the least recently accessed item, NOT FIFO
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	dummyDecision := &scheduler.DispatchDecision{
+		WorkloadID: "wl-lru",
+		TenantID:   "tenant-test",
+		ProjectID:  "proj-test",
+		Status:     "SCHEDULED",
+	}
+
+	// 1. Populate cache to capacity (10,000 entries)
+	for i := 0; i < scheduler.MaxIdempotencyEntries; i++ {
+		key := fmt.Sprintf("tenant-test:proj-test:key-%06d", i)
+		eval.RecordIdempotencyForTesting(key, dummyDecision)
+	}
+
+	// key-0 was the first item inserted (oldest insertion time).
+	key0 := "tenant-test:proj-test:key-000000"
+	key1 := "tenant-test:proj-test:key-000001"
+
+	// 2. Explicitly set key1 as least recently accessed (1 hour ago)
+	eval.SetLastAccessedForTesting(key1, time.Now().Add(-1*time.Hour))
+
+	// 3. Access key-0 via Evaluate to refresh its lastAccessed timestamp to now
+	policy0 := scheduler.DispatchPolicy{
+		WorkloadID:     "wl-lru-access",
+		TenantID:       "tenant-test",
+		ProjectID:      "proj-test",
+		IdempotencyKey: "key-000000",
+		Objective:      scheduler.ObjectiveLatency,
+	}
+	cachedDec, err := eval.Evaluate(policy0)
+	if err != nil || cachedDec == nil {
+		t.Fatalf("expected cache hit on key0: %v", err)
+	}
+
+	// 4. Insert a new entry key-10000 to trigger eviction
+	keyNew := fmt.Sprintf("tenant-test:proj-test:key-%06d", scheduler.MaxIdempotencyEntries)
+	eval.RecordIdempotencyForTesting(keyNew, dummyDecision)
+
+	// Under FIFO/insertion-time eviction, key-0 would be evicted because it was inserted first.
+	// Under True LRU eviction, key-0 SURVIVES because it was recently accessed, and key-1 is evicted!
+	if !eval.HasIdempotencyKey(key0) {
+		t.Fatalf("expected key-0 to survive in cache due to recent access (True LRU), but it was evicted!")
+	}
+	if eval.HasIdempotencyKey(key1) {
+		t.Fatalf("expected key-1 (least recently accessed) to be evicted, but it still exists!")
+	}
+}

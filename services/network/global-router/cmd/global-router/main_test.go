@@ -255,3 +255,117 @@ func TestWorkloadDispatch_EndpointRedaction(t *testing.T) {
 		t.Fatalf("operator should receive actual endpoint, got: %s", opDecision.AssignedBackend.Endpoint)
 	}
 }
+
+func TestWorkload_CompleteAndReleaseLifecycle(t *testing.T) {
+	// P1 Finding 2 Verification: Workload completion and release restore capacity
+	srv := NewServer()
+	defer srv.Close()
+
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-alpha", "proj-alpha", auth.RoleTenant)
+	handler := srv.routes()
+
+	backend := &registry.ComputeBackend{
+		ID:            "backend-dgx-h100-life",
+		Provider:      "baremetal",
+		Region:        "ap-south-2",
+		Endpoint:      "https://dgx-life.internal/v1",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.00,
+		LatencyP95Ms:  5,
+		Healthy:       true,
+	}
+	srv.registry.Register(backend)
+
+	// 1. Dispatch 2 GPUs
+	dispatchPayload := map[string]interface{}{
+		"workload_id":     "wl-lifecycle-01",
+		"tenant_id":       "tenant-alpha",
+		"name":            "Lifecycle Test",
+		"required_gpu":    "H100",
+		"gpus_requested":  2,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-life-01",
+	}
+	body, _ := json.Marshal(dispatchPayload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch failed: %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	b, _ := srv.registry.Get("backend-dgx-h100-life")
+	if b.AvailableGPUs != 6 {
+		t.Fatalf("expected 6 available GPUs after dispatch, got %d", b.AvailableGPUs)
+	}
+
+	// 2. Complete workload -> Capacity restored to 8
+	completeBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id": "wl-lifecycle-01",
+		"status":      "COMPLETED",
+	})
+	reqComp := httptest.NewRequest(http.MethodPost, "/api/v1/workload/complete", bytes.NewReader(completeBody))
+	reqComp.Header.Set("Authorization", "Bearer key-tenant")
+	recComp := httptest.NewRecorder()
+	handler.ServeHTTP(recComp, reqComp)
+	if recComp.Code != http.StatusOK {
+		t.Fatalf("complete failed: %d, body: %s", recComp.Code, recComp.Body.String())
+	}
+
+	b, _ = srv.registry.Get("backend-dgx-h100-life")
+	if b.AvailableGPUs != 8 {
+		t.Fatalf("expected 8 available GPUs after completion, got %d", b.AvailableGPUs)
+	}
+
+	// 3. Dispatch workload 2 for 3 GPUs
+	dispatchPayload2 := map[string]interface{}{
+		"workload_id":     "wl-lifecycle-02",
+		"tenant_id":       "tenant-alpha",
+		"name":            "Lifecycle Test 2",
+		"required_gpu":    "H100",
+		"gpus_requested":  3,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-life-02",
+	}
+	body2, _ := json.Marshal(dispatchPayload2)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body2))
+	req2.Header.Set("Authorization", "Bearer key-tenant")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("dispatch 2 failed: %d", rec2.Code)
+	}
+
+	b, _ = srv.registry.Get("backend-dgx-h100-life")
+	if b.AvailableGPUs != 5 {
+		t.Fatalf("expected 5 available GPUs after dispatch 2, got %d", b.AvailableGPUs)
+	}
+
+	// 4. Release workload 2 -> Capacity restored to 8
+	releaseBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id": "wl-lifecycle-02",
+	})
+	reqRel := httptest.NewRequest(http.MethodPost, "/api/v1/workload/release", bytes.NewReader(releaseBody))
+	reqRel.Header.Set("Authorization", "Bearer key-tenant")
+	recRel := httptest.NewRecorder()
+	handler.ServeHTTP(recRel, reqRel)
+	if recRel.Code != http.StatusOK {
+		t.Fatalf("release failed: %d, body: %s", recRel.Code, recRel.Body.String())
+	}
+
+	b, _ = srv.registry.Get("backend-dgx-h100-life")
+	if b.AvailableGPUs != 8 {
+		t.Fatalf("expected 8 available GPUs after release, got %d", b.AvailableGPUs)
+	}
+
+	// 5. Calling release again on released workload returns 404
+	reqRelAgain := httptest.NewRequest(http.MethodPost, "/api/v1/workload/release", bytes.NewReader(releaseBody))
+	reqRelAgain.Header.Set("Authorization", "Bearer key-tenant")
+	recRelAgain := httptest.NewRecorder()
+	handler.ServeHTTP(recRelAgain, reqRelAgain)
+	if recRelAgain.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on duplicate release, got %d", recRelAgain.Code)
+	}
+}

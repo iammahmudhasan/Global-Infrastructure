@@ -840,3 +840,152 @@ func TestCompiler_RuntimeDNSRebindingSSRF(t *testing.T) {
 		}
 	}
 }
+
+func TestCompiler_DefaultResolverWiresInProduction(t *testing.T) {
+	// P1 Finding 1 Verification: NewCompiler MUST have default resolver wired without manual SetDNSResolver
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	pool := &model.OriginPool{
+		ID:          "pool_prod_dns",
+		ProjectID:   "prj_test",
+		Name:        "prod-dns-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig_fqdn_invalid",
+				PoolID:   "pool_prod_dns",
+				Address:  "unresolvable-domain-xyz-never-exists.invalid",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Healthy:  true,
+			},
+		},
+	}
+
+	topo := &store.DomainTopology{
+		Domain: &model.Domain{
+			ID:        "dom_dns",
+			Hostname:  "test-dns.example.com",
+			ProjectID: "prj_test",
+			Status:    model.DomainStatusActive,
+		},
+		Routes: []*model.Route{
+			{
+				ID:         "r_dns",
+				DomainID:   "dom_dns",
+				PoolID:     pool.ID,
+				PathPrefix: "/",
+				Priority:   1,
+			},
+		},
+		Pools: map[string]*model.OriginPool{
+			pool.ID: pool,
+		},
+	}
+
+	cfg, err := comp.Compile([]*store.DomainTopology{topo})
+	if err != nil {
+		t.Fatalf("failed to compile: %v", err)
+	}
+
+	for _, cl := range cfg.StaticResources.Clusters {
+		if cl.Name == "cluster_pool_prod_dns" {
+			// Cluster must NOT fall back to STRICT_DNS when resolution fails or is unconfigured
+			if cl.Type == "STRICT_DNS" {
+				t.Fatalf("CRITICAL SECURITY VULNERABILITY: FQDN origin without resolution fell back to STRICT_DNS!")
+			}
+			// Cluster should fail-closed with 0 active endpoints
+			if len(cl.LoadAssignment.Endpoints[0].LbEndpoints) != 0 {
+				t.Fatalf("expected 0 endpoints for unresolvable FQDN origin, got %d", len(cl.LoadAssignment.Endpoints[0].LbEndpoints))
+			}
+		}
+	}
+}
+
+func TestCompiler_MultiOriginHTTPSPerEndpointSNI(t *testing.T) {
+	// P1/P2 Finding 3 Verification: Multi-origin HTTPS pool generates per-endpoint SNI matches
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	pool := &model.OriginPool{
+		ID:          "pool_multi_sni",
+		ProjectID:   "prj_test",
+		Name:        "multi-sni-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig_1",
+				PoolID:   "pool_multi_sni",
+				Address:  "192.0.2.10",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Healthy:  true,
+			},
+			{
+				ID:       "orig_2",
+				PoolID:   "pool_multi_sni",
+				Address:  "192.0.2.20",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Healthy:  true,
+			},
+		},
+	}
+
+	topo := &store.DomainTopology{
+		Domain: &model.Domain{
+			ID:        "dom_sni",
+			Hostname:  "test-sni.example.com",
+			ProjectID: "prj_test",
+			Status:    model.DomainStatusActive,
+		},
+		Routes: []*model.Route{
+			{
+				ID:         "r_sni",
+				DomainID:   "dom_sni",
+				PoolID:     pool.ID,
+				PathPrefix: "/",
+				Priority:   1,
+			},
+		},
+		Pools: map[string]*model.OriginPool{
+			pool.ID: pool,
+		},
+	}
+
+	cfg, err := comp.Compile([]*store.DomainTopology{topo})
+	if err != nil {
+		t.Fatalf("failed to compile: %v", err)
+	}
+
+	var targetCluster *compiler.Cluster
+	for i := range cfg.StaticResources.Clusters {
+		if cfg.StaticResources.Clusters[i].Name == "cluster_pool_multi_sni" {
+			targetCluster = &cfg.StaticResources.Clusters[i]
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		t.Fatalf("expected cluster_pool_multi_sni to exist")
+	}
+
+	if len(targetCluster.TransportSocketMatches) != 2 {
+		t.Fatalf("expected 2 transport socket matches for 2 distinct origins, got %d", len(targetCluster.TransportSocketMatches))
+	}
+
+	// Verify each lbEndpoint has metadata match corresponding to its origin address
+	for _, ep := range targetCluster.LoadAssignment.Endpoints[0].LbEndpoints {
+		meta, ok := ep.Metadata["filter_metadata"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected filter_metadata on lbEndpoint")
+		}
+		match, ok := meta["envoy.transport_socket_match"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected envoy.transport_socket_match in filter_metadata")
+		}
+		sniHost, ok := match["sni_host"].(string)
+		if !ok || sniHost == "" {
+			t.Fatalf("expected non-empty sni_host in endpoint metadata")
+		}
+	}
+}

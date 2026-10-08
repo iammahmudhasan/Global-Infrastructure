@@ -17,8 +17,9 @@ var (
 )
 
 type cachedDecision struct {
-	decision  *DispatchDecision
-	expiresAt time.Time
+	decision     *DispatchDecision
+	expiresAt    time.Time
+	lastAccessed time.Time
 }
 
 type Evaluator struct {
@@ -62,6 +63,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		idempotencyKey = fmt.Sprintf("%s:%s:%s", policy.TenantID, projectScope, policy.IdempotencyKey)
 		if cached, found := e.idempotency[idempotencyKey]; found {
 			if now.Before(cached.expiresAt) {
+				cached.lastAccessed = now
 				return cloneDecision(cached.decision), nil
 			}
 		}
@@ -309,10 +311,25 @@ func (e *Evaluator) IdempotencyCount() int {
 	return len(e.idempotency)
 }
 
+func (e *Evaluator) HasIdempotencyKey(key string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, found := e.idempotency[key]
+	return found
+}
+
 func (e *Evaluator) RecordIdempotencyForTesting(key string, decision *DispatchDecision) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.recordIdempotencyLocked(key, decision)
+}
+
+func (e *Evaluator) SetLastAccessedForTesting(key string, t time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if entry, ok := e.idempotency[key]; ok {
+		entry.lastAccessed = t
+	}
 }
 
 func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecision) {
@@ -320,18 +337,17 @@ func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecisi
 		return
 	}
 
+	now := time.Now()
 	// Update existing entry if present
-	if _, exists := e.idempotency[key]; exists {
-		e.idempotency[key] = &cachedDecision{
-			decision:  cloneDecision(decision),
-			expiresAt: time.Now().Add(24 * time.Hour),
-		}
+	if cached, exists := e.idempotency[key]; exists {
+		cached.decision = cloneDecision(decision)
+		cached.expiresAt = now.Add(24 * time.Hour)
+		cached.lastAccessed = now
 		return
 	}
 
-	// Enforce bounded memory pool to prevent unbounded cache growth (Finding 4)
+	// Enforce bounded memory pool to prevent unbounded cache growth (True LRU eviction)
 	if len(e.idempotency) >= MaxIdempotencyEntries {
-		now := time.Now()
 		// 1. Purge expired entries
 		for k, v := range e.idempotency {
 			if now.After(v.expiresAt) {
@@ -339,15 +355,15 @@ func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecisi
 			}
 		}
 
-		// 2. If still at or above capacity, evict oldest / earliest expiring entry
+		// 2. If still at or above capacity, evict least recently accessed entry (true LRU)
 		if len(e.idempotency) >= MaxIdempotencyEntries {
 			var oldestKey string
-			var oldestExp time.Time
+			var oldestAccessed time.Time
 			first := true
 			for k, v := range e.idempotency {
-				if first || v.expiresAt.Before(oldestExp) {
+				if first || v.lastAccessed.Before(oldestAccessed) {
 					oldestKey = k
-					oldestExp = v.expiresAt
+					oldestAccessed = v.lastAccessed
 					first = false
 				}
 			}
@@ -358,7 +374,8 @@ func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecisi
 	}
 
 	e.idempotency[key] = &cachedDecision{
-		decision:  cloneDecision(decision),
-		expiresAt: time.Now().Add(24 * time.Hour),
+		decision:     cloneDecision(decision),
+		expiresAt:    now.Add(24 * time.Hour),
+		lastAccessed: now,
 	}
 }

@@ -1427,9 +1427,9 @@ func (h *APIHandler) handleTopologies(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RBAC Boundary (Finding 9): Only Platform Operators or Edge Nodes can view global edge topologies
-	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
-		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+	// RBAC Boundary (Finding 6): Only Platform Operators can view global edge topologies
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+		writeError(w, http.StatusForbidden, "forbidden: operator role required for global edge topologies")
 		return
 	}
 
@@ -1595,6 +1595,18 @@ func (h *APIHandler) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pops := h.popManager.ListPoPs()
+
+	// If caller is an edge node, restrict visibility to its assigned PoP only (Finding 6)
+	if tc, ok := auth.FromContext(r.Context()); ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass && tc.PoPID != "*" && tc.PoPID != "" {
+		filtered := make([]model.EdgePoP, 0)
+		for _, p := range pops {
+			if strings.EqualFold(p.ID, tc.PoPID) {
+				filtered = append(filtered, p)
+			}
+		}
+		pops = filtered
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total_pops": len(pops),
 		"pops":       pops,
@@ -1794,8 +1806,9 @@ func (h *APIHandler) handleRoutingRoute(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
-			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		// RBAC Boundary (Finding 6): Only Platform Operators can view the global latency matrix
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			writeError(w, http.StatusForbidden, "forbidden: operator role required for global latency matrix")
 			return
 		}
 		matrix := h.popManager.GetLatencyMatrix()

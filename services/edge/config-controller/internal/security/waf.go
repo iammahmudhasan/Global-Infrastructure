@@ -207,23 +207,47 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 		if limitRPM <= 0 {
 			limitRPM = 1000
 		}
+		burstSize := limitRPM
+		scope := "default"
+		identity := clientIP
 
-		// Check if a path-specific rate limit rule overrides the default
-		for _, rlRule := range policy.RateLimitRules {
+		// Check if a path-specific rate limit rule overrides the default (match longest prefix)
+		var matchedRule *model.RateLimitRule
+		for i := range policy.RateLimitRules {
+			rlRule := &policy.RateLimitRules[i]
 			if rlRule.Enabled && strings.HasPrefix(path, rlRule.PathPrefix) {
-				limitRPM = rlRule.RequestsPerMinute
-				break
+				if matchedRule == nil || len(rlRule.PathPrefix) > len(matchedRule.PathPrefix) {
+					matchedRule = rlRule
+				}
 			}
 		}
 
-		limiterKey := fmt.Sprintf("%s:%s", policy.DomainID, clientIP)
-		if !e.allowRate(limiterKey, limitRPM) {
+		if matchedRule != nil {
+			limitRPM = matchedRule.RequestsPerMinute
+			burstSize = matchedRule.BurstSize
+			if matchedRule.PathPrefix != "" {
+				scope = matchedRule.PathPrefix
+			}
+			switch matchedRule.KeyType {
+			case "HEADER":
+				if matchedRule.HeaderName != "" && req != nil && req.Header != nil {
+					if hdrVal := req.Header.Get(matchedRule.HeaderName); hdrVal != "" {
+						identity = hdrVal
+					}
+				}
+			case "CLIENT_IP":
+				identity = clientIP
+			}
+		}
+
+		limiterKey := fmt.Sprintf("%s:%s:%s", policy.DomainID, scope, identity)
+		if !e.allowRate(limiterKey, limitRPM, burstSize) {
 			return EvaluationResult{
 				Blocked:       true,
 				StatusCode:    http.StatusTooManyRequests,
 				RuleTriggered: "RATE_LIMIT_EXCEEDED",
 				Action:        model.WAFActionBlock,
-				Reason:        fmt.Sprintf("rate limit of %d requests/min exceeded for client %s", limitRPM, clientIP),
+				Reason:        fmt.Sprintf("rate limit of %d requests/min exceeded for client %s", limitRPM, identity),
 			}
 		}
 	}
@@ -259,7 +283,7 @@ func (e *WAFEngine) RateLimiterCount() int {
 	return len(e.rateLimiters)
 }
 
-func (e *WAFEngine) allowRate(key string, rpm int) bool {
+func (e *WAFEngine) allowRate(key string, rpm int, burst int) bool {
 	e.mu.Lock()
 	tb, exists := e.rateLimiters[key]
 	if !exists {
@@ -297,7 +321,10 @@ func (e *WAFEngine) allowRate(key string, rpm int) bool {
 			}
 		}
 
-		capacity := float64(rpm)
+		capacity := float64(burst)
+		if capacity <= 0 {
+			capacity = float64(rpm)
+		}
 		tb = &TokenBucket{
 			tokens:     capacity,
 			capacity:   capacity,

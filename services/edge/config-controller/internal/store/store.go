@@ -240,6 +240,7 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 			return ErrMixedOriginProtocols
 		}
 	}
+
 	s.pools[p.ID] = cloneOriginPool(p)
 	return nil
 }

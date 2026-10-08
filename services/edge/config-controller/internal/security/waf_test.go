@@ -248,3 +248,100 @@ func TestWAF_PriorityAndAllowSemantics(t *testing.T) {
 			resFlood.Blocked, resFlood.StatusCode)
 	}
 }
+
+func TestRateLimiter_HeaderKeyTypeAndPathScoping(t *testing.T) {
+	// P1/P2 Finding 4 Verification: Header-based rate limiting & path-scoped isolation
+	engine := security.NewWAFEngine()
+	policy := &model.SecurityPolicy{
+		DomainID:         "dom-header-rl",
+		WAFEnabled:       true,
+		RateLimitEnabled: true,
+		RateLimitRPM:     100, // Default broad RPM
+		RateLimitRules: []model.RateLimitRule{
+			{
+				ID:                "rl-login",
+				PathPrefix:        "/login",
+				RequestsPerMinute: 1, // 1 RPM for /login
+				KeyType:           "HEADER",
+				HeaderName:        "X-User-ID",
+				Enabled:           true,
+			},
+			{
+				ID:                "rl-api",
+				PathPrefix:        "/api",
+				RequestsPerMinute: 50, // 50 RPM for /api
+				KeyType:           "CLIENT_IP",
+				Enabled:           true,
+			},
+		},
+	}
+
+	// 1. User Alice requests /login twice -> 1st OK, 2nd blocked (1 RPM)
+	reqAlice1 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
+	reqAlice1.Header.Set("X-User-ID", "alice")
+	resAlice1 := engine.EvaluateRequest(reqAlice1, policy)
+	if resAlice1.Blocked {
+		t.Fatalf("expected Alice 1st login request to be allowed")
+	}
+
+	reqAlice2 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
+	reqAlice2.Header.Set("X-User-ID", "alice")
+	resAlice2 := engine.EvaluateRequest(reqAlice2, policy)
+	if !resAlice2.Blocked || resAlice2.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected Alice 2nd login request to be rate-limited (429), got %d", resAlice2.StatusCode)
+	}
+
+	// 2. User Bob from SAME IP requests /login -> must be ALLOWED (header isolation)
+	reqBob1 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
+	reqBob1.Header.Set("X-User-ID", "bob")
+	resBob1 := engine.EvaluateRequest(reqBob1, policy)
+	if resBob1.Blocked {
+		t.Fatalf("expected Bob 1st login request to be allowed due to header isolation")
+	}
+
+	// 3. User Alice requests /api -> must be ALLOWED because /login scope does not throttle /api scope!
+	reqAliceAPI := newTestRequest("GET", "/api/user/profile", "198.51.100.20", "TestAgent")
+	reqAliceAPI.Header.Set("X-User-ID", "alice")
+	resAliceAPI := engine.EvaluateRequest(reqAliceAPI, policy)
+	if resAliceAPI.Blocked {
+		t.Fatalf("expected /api request to be allowed; /login rate limit must not pollute /api bucket!")
+	}
+}
+
+func TestRateLimiter_BurstCapacity(t *testing.T) {
+	// P2 Finding 5 Verification: BurstSize is functional and expands token bucket capacity
+	engine := security.NewWAFEngine()
+	policy := &model.SecurityPolicy{
+		DomainID:         "dom-burst-rl",
+		WAFEnabled:       true,
+		RateLimitEnabled: true,
+		RateLimitRules: []model.RateLimitRule{
+			{
+				ID:                "rl-burst",
+				PathPrefix:        "/burst",
+				RequestsPerMinute: 60, // 1 per sec
+				BurstSize:         5,  // Allows immediate burst of 5
+				KeyType:           "CLIENT_IP",
+				Enabled:           true,
+			},
+		},
+	}
+
+	clientIP := "198.51.100.77"
+	// 5 requests within burst capacity should all succeed
+	for i := 1; i <= 5; i++ {
+		req := newTestRequest("GET", "/burst/test", clientIP, "BurstAgent")
+		res := engine.EvaluateRequest(req, policy)
+		if res.Blocked {
+			t.Fatalf("expected request %d within burst capacity 5 to be allowed", i)
+		}
+	}
+
+	// 6th request exhausts burst capacity -> 429 Too Many Requests
+	req6 := newTestRequest("GET", "/burst/test", clientIP, "BurstAgent")
+	res6 := engine.EvaluateRequest(req6, policy)
+	if !res6.Blocked || res6.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 6th request exceeding burst capacity to be rate limited (429), got blocked=%v, code=%d",
+			res6.Blocked, res6.StatusCode)
+	}
+}
