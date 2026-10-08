@@ -27,13 +27,22 @@ var (
 	ErrReservationExists    = errors.New("workload reservation already exists")
 	ErrReservationNotFound  = errors.New("workload reservation not found")
 	ErrReservationForbidden = errors.New("forbidden: reservation belongs to another tenant or project")
+	ErrTenantQuotaExceeded  = errors.New("forbidden: tenant resource quota exceeded")
 	ErrInvalidBackend       = errors.New("invalid backend: missing required fields or negative capacity/cost/latency")
 )
 
 const (
-	DefaultLeaseDuration = 15 * time.Minute
-	MaxLeaseDuration     = 2 * time.Hour
+	DefaultLeaseDuration         = 15 * time.Minute
+	MaxLeaseDuration             = 2 * time.Hour
+	DefaultMaxGPUsPerTenant      = 64
+	DefaultMaxWorkloadsPerTenant = 16
 )
+
+// TenantQuota defines resource capacity limits for a specific tenant.
+type TenantQuota struct {
+	MaxGPUs            int `json:"max_gpus"`
+	MaxActiveWorkloads int `json:"max_active_workloads"`
+}
 
 // Reservation tracks capacity ownership by a specific workload, tenant, and lease (Findings 1, 2)
 type Reservation struct {
@@ -70,15 +79,21 @@ type ComputeBackend struct {
 }
 
 type Registry struct {
-	mu           sync.RWMutex
-	backends     map[string]*ComputeBackend
-	reservations map[string]*Reservation
+	mu              sync.RWMutex
+	backends        map[string]*ComputeBackend
+	reservations    map[string]*Reservation
+	tenantQuotas    map[string]TenantQuota
+	tenantGPUs      map[string]int
+	tenantWorkloads map[string]int
 }
 
 func NewRegistry() *Registry {
 	r := &Registry{
-		backends:     make(map[string]*ComputeBackend),
-		reservations: make(map[string]*Reservation),
+		backends:        make(map[string]*ComputeBackend),
+		reservations:    make(map[string]*Reservation),
+		tenantQuotas:    make(map[string]TenantQuota),
+		tenantGPUs:      make(map[string]int),
+		tenantWorkloads: make(map[string]int),
 	}
 	r.bootstrapDefaults()
 	return r
@@ -310,6 +325,22 @@ func (r *Registry) AdmitAndReserve(workloadID, tenantID, projectID, backendID st
 		return ErrInsufficientCapacity
 	}
 
+	if tenantID != "" {
+		quota := r.getTenantQuotaLocked(tenantID)
+		if r.tenantGPUs[tenantID]+count > quota.MaxGPUs {
+			if b.Breaker != nil {
+				b.Breaker.ReleaseTrial()
+			}
+			return ErrTenantQuotaExceeded
+		}
+		if r.tenantWorkloads[tenantID]+1 > quota.MaxActiveWorkloads {
+			if b.Breaker != nil {
+				b.Breaker.ReleaseTrial()
+			}
+			return ErrTenantQuotaExceeded
+		}
+	}
+
 	leaseDuration := DefaultLeaseDuration
 	if len(leaseDurations) > 0 && leaseDurations[0] > 0 {
 		leaseDuration = leaseDurations[0]
@@ -321,6 +352,10 @@ func (r *Registry) AdmitAndReserve(workloadID, tenantID, projectID, backendID st
 	now := time.Now().UTC()
 	b.AvailableGPUs -= count
 	b.ActiveWorkloads++
+	if tenantID != "" {
+		r.tenantGPUs[tenantID] += count
+		r.tenantWorkloads[tenantID]++
+	}
 	r.reservations[workloadID] = &Reservation{
 		WorkloadID:     workloadID,
 		TenantID:       tenantID,
@@ -371,6 +406,7 @@ func (r *Registry) CompleteWorkloadOwned(workloadID, tenantID, projectID string,
 			b.CircuitState = b.Breaker.State()
 		}
 	}
+	r.releaseReservationLocked(res)
 	delete(r.reservations, workloadID)
 	return nil
 }
@@ -409,6 +445,7 @@ func (r *Registry) ReleaseOwned(workloadID, tenantID, projectID string, isOperat
 			b.CircuitState = b.Breaker.State()
 		}
 	}
+	r.releaseReservationLocked(res)
 	delete(r.reservations, workloadID)
 	return nil
 }
@@ -507,9 +544,47 @@ func (r *Registry) SweepExpiredReservations(ttls ...time.Duration) int {
 					b.CircuitState = b.Breaker.State()
 				}
 			}
+			r.releaseReservationLocked(res)
 			delete(r.reservations, wid)
 			swept++
 		}
 	}
 	return swept
+}
+
+func (r *Registry) releaseReservationLocked(res *Reservation) {
+	if res.TenantID != "" {
+		r.tenantGPUs[res.TenantID] -= res.GPUs
+		if r.tenantGPUs[res.TenantID] < 0 {
+			r.tenantGPUs[res.TenantID] = 0
+		}
+		r.tenantWorkloads[res.TenantID]--
+		if r.tenantWorkloads[res.TenantID] < 0 {
+			r.tenantWorkloads[res.TenantID] = 0
+		}
+	}
+}
+
+func (r *Registry) getTenantQuotaLocked(tenantID string) TenantQuota {
+	if q, exists := r.tenantQuotas[tenantID]; exists {
+		return q
+	}
+	return TenantQuota{
+		MaxGPUs:            DefaultMaxGPUsPerTenant,
+		MaxActiveWorkloads: DefaultMaxWorkloadsPerTenant,
+	}
+}
+
+// SetTenantQuota overrides resource capacity ceilings for a specific tenant.
+func (r *Registry) SetTenantQuota(tenantID string, quota TenantQuota) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tenantQuotas[tenantID] = quota
+}
+
+// GetTenantUsage returns current active GPU and workload reservations for a tenant.
+func (r *Registry) GetTenantUsage(tenantID string) (gpus int, workloads int) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.tenantGPUs[tenantID], r.tenantWorkloads[tenantID]
 }

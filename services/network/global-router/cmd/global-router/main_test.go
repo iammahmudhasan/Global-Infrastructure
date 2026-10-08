@@ -582,3 +582,63 @@ func TestWorkload_IdempotencyReservationCoupling(t *testing.T) {
 		t.Fatalf("third dispatch failed: %d", rec3.Code)
 	}
 }
+
+func TestWorkloadDispatch_FieldBoundsValidation(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant)
+	handler := srv.auth.Middleware(srv.routes())
+
+	longKey := strings.Repeat("A", 300) // MaxIdempotencyKey is 256
+	dispatchPayload := map[string]interface{}{
+		"workload_id":     "wl-bounds-01",
+		"residency":       "ANY",
+		"gpus_requested":  1,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": longKey,
+	}
+	body, _ := json.Marshal(dispatchPayload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for oversized idempotency key, got: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "idempotency_key exceeds maximum length") {
+		t.Errorf("expected error message to mention idempotency_key limit, got: %s", rec.Body.String())
+	}
+}
+
+func TestWorkloadDispatch_TenantQuotaEnforcement(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant)
+	handler := srv.auth.Middleware(srv.routes())
+
+	// Limit tenant-user to 2 GPUs
+	srv.registry.SetTenantQuota("tenant-user", registry.TenantQuota{
+		MaxGPUs:            2,
+		MaxActiveWorkloads: 5,
+	})
+
+	dispatchPayload := map[string]interface{}{
+		"workload_id":    "wl-quota-dispatch-01",
+		"residency":      "ANY",
+		"gpus_requested": 4, // Exceeds quota of 2
+		"objective":      "LOW_LATENCY",
+	}
+	body, _ := json.Marshal(dispatchPayload)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for quota exceeded, got: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "tenant resource quota exceeded") {
+		t.Errorf("expected error to mention tenant resource quota exceeded, got: %s", rec.Body.String())
+	}
+}

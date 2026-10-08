@@ -419,3 +419,62 @@ func TestRegistry_ReserveEnforcesCircuitBreaker(t *testing.T) {
 		t.Fatalf("expected Reserve to fail when circuit breaker is OPEN")
 	}
 }
+
+func TestRegistry_TenantQuotaEnforcement(t *testing.T) {
+	reg := registry.NewRegistry()
+	tenantID := "tenant-quota-test"
+	projectID := "proj-quota-test"
+	backendID := "cw-iad-h100-cluster" // Has 64 available GPUs
+
+	// Configure quota of max 8 GPUs, max 2 workloads
+	reg.SetTenantQuota(tenantID, registry.TenantQuota{
+		MaxGPUs:            8,
+		MaxActiveWorkloads: 2,
+	})
+
+	// 1. First reservation of 6 GPUs -> Success
+	err := reg.AdmitAndReserve("wl-quota-01", tenantID, projectID, backendID, 6)
+	if err != nil {
+		t.Fatalf("expected successful admission within quota, got: %v", err)
+	}
+
+	gpus, workloads := reg.GetTenantUsage(tenantID)
+	if gpus != 6 || workloads != 1 {
+		t.Errorf("expected 6 GPUs and 1 workload, got %d gpus and %d workloads", gpus, workloads)
+	}
+
+	// 2. Second reservation requesting 4 GPUs (6 + 4 = 10 > 8) -> ErrTenantQuotaExceeded
+	err = reg.AdmitAndReserve("wl-quota-02", tenantID, projectID, backendID, 4)
+	if err != registry.ErrTenantQuotaExceeded {
+		t.Fatalf("expected ErrTenantQuotaExceeded for GPU limit, got: %v", err)
+	}
+
+	// 3. Second reservation requesting 2 GPUs (6 + 2 = 8 <= 8) -> Success
+	err = reg.AdmitAndReserve("wl-quota-03", tenantID, projectID, backendID, 2)
+	if err != nil {
+		t.Fatalf("expected successful admission at exact quota limit, got: %v", err)
+	}
+
+	// 4. Third reservation requesting 1 GPU (already at 2 workloads limit) -> ErrTenantQuotaExceeded
+	err = reg.AdmitAndReserve("wl-quota-04", tenantID, projectID, backendID, 1)
+	if err != registry.ErrTenantQuotaExceeded {
+		t.Fatalf("expected ErrTenantQuotaExceeded for workload limit, got: %v", err)
+	}
+
+	// 5. Release wl-quota-01 (releasing 6 GPUs) -> quota usage decrements
+	err = reg.ReleaseOwned("wl-quota-01", tenantID, projectID, false)
+	if err != nil {
+		t.Fatalf("release failed: %v", err)
+	}
+
+	gpus, workloads = reg.GetTenantUsage(tenantID)
+	if gpus != 2 || workloads != 1 {
+		t.Errorf("expected 2 GPUs and 1 workload after release, got %d gpus and %d workloads", gpus, workloads)
+	}
+
+	// 6. Now admission of 4 GPUs succeeds
+	err = reg.AdmitAndReserve("wl-quota-05", tenantID, projectID, backendID, 4)
+	if err != nil {
+		t.Fatalf("expected admission to succeed after releasing quota, got: %v", err)
+	}
+}

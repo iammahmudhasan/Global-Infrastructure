@@ -120,3 +120,38 @@ func TestCertificateManager_Errors(t *testing.T) {
 		t.Errorf("expected ErrChallengeNotFound, got %v", err)
 	}
 }
+
+func TestCertificateManager_RateLimits(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+
+	domain := &model.Domain{
+		ID:        "dom-ratelimit-tls",
+		ProjectID: "prj-rl",
+		Hostname:  "ratelimit.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	// Max 5 orders per hour per domain
+	var lastChallenge *model.ACMEChallenge
+	for i := 0; i < 5; i++ {
+		_, ch, err := mgr.OrderCertificate("dom-ratelimit-tls")
+		if err != nil {
+			t.Fatalf("order %d failed unexpectedly: %v", i+1, err)
+		}
+		lastChallenge = ch
+	}
+
+	// 6th order should be rate limited
+	_, _, err := mgr.OrderCertificate("dom-ratelimit-tls")
+	if err != certificate.ErrRateLimitExceeded {
+		t.Fatalf("expected ErrRateLimitExceeded on 6th order, got %v", err)
+	}
+
+	// Validate the last challenge
+	_, err = mgr.ValidateAndIssueCertificate(lastChallenge.Token)
+	if err != nil {
+		t.Fatalf("validation failed unexpectedly: %v", err)
+	}
+}

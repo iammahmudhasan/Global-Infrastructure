@@ -26,17 +26,44 @@ var (
 	ErrChallengeNotFound    = errors.New("acme challenge not found")
 	ErrChallengeAlreadyUsed = errors.New("acme challenge has already been consumed")
 	ErrCertNotFound         = errors.New("certificate not found for domain")
+	ErrRateLimitExceeded    = errors.New("certificate operation rate limit exceeded")
+)
+
+const (
+	MaxOrdersPerHourPerDomain      = 5
+	MaxValidationsPerHourPerDomain = 10
 )
 
 type Manager struct {
-	mu    sync.RWMutex
-	store *store.Store
+	mu           sync.RWMutex
+	store        *store.Store
+	orderHistory map[string][]time.Time
+	valHistory   map[string][]time.Time
 }
 
 func NewManager(s *store.Store) *Manager {
 	return &Manager{
-		store: s,
+		store:        s,
+		orderHistory: make(map[string][]time.Time),
+		valHistory:   make(map[string][]time.Time),
 	}
+}
+
+func checkAndRecordCertRate(history map[string][]time.Time, key string, limit int, window time.Duration, now time.Time) error {
+	cutoff := now.Add(-window)
+	timestamps := history[key]
+	valid := make([]time.Time, 0, len(timestamps))
+	for _, t := range timestamps {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+	if len(valid) >= limit {
+		history[key] = valid
+		return ErrRateLimitExceeded
+	}
+	history[key] = append(valid, now)
+	return nil
 }
 
 // OrderCertificate initiates an automated ACME HTTP-01 challenge order for a domain
@@ -49,6 +76,11 @@ func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.
 		return nil, nil, ErrDomainNotFound
 	}
 
+	now := time.Now().UTC()
+	if err := checkAndRecordCertRate(m.orderHistory, domainID, MaxOrdersPerHourPerDomain, 1*time.Hour, now); err != nil {
+		return nil, nil, err
+	}
+
 	certID := "cert-" + generateHex(6)
 	challengeID := "acme-ch-" + generateHex(6)
 
@@ -56,7 +88,6 @@ func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.
 	thumbprint := generateHex(16)
 	keyAuth := fmt.Sprintf("%s.%s", token, thumbprint)
 
-	now := time.Now().UTC()
 	challenge := &model.ACMEChallenge{
 		ID:               challengeID,
 		CertificateID:    certID,
@@ -98,7 +129,12 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 		return nil, ErrChallengeNotFound
 	}
 
-	if time.Now().UTC().After(challenge.ExpiresAt) {
+	now := time.Now().UTC()
+	if err := checkAndRecordCertRate(m.valHistory, challenge.DomainID, MaxValidationsPerHourPerDomain, 1*time.Hour, now); err != nil {
+		return nil, err
+	}
+
+	if now.After(challenge.ExpiresAt) {
 		m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusFailed)
 		return nil, ErrChallengeExpired
 	}
@@ -135,7 +171,7 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 		return nil, fmt.Errorf("failed to generate serial number: %w", err)
 	}
 
-	now := time.Now().UTC()
+	now = time.Now().UTC()
 	validFor := 90 * 24 * time.Hour // 90 days validity (Let's Encrypt standard)
 	expiresAt := now.Add(validFor)
 

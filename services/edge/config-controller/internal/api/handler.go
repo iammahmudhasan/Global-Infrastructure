@@ -425,6 +425,10 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 		}
 		cert, challenge, err := h.certManager.OrderCertificate(domainID)
 		if err != nil {
+			if errors.Is(err, certificate.ErrRateLimitExceeded) {
+				writeError(w, http.StatusTooManyRequests, err.Error())
+				return
+			}
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -538,6 +542,10 @@ func (h *APIHandler) handleACMEValidate(w http.ResponseWriter, r *http.Request) 
 
 	cert, err := h.certManager.ValidateAndIssueCertificate(req.Token)
 	if err != nil {
+		if errors.Is(err, certificate.ErrRateLimitExceeded) {
+			writeError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -1252,6 +1260,16 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 	rules := h.store.GetCacheRules(req.DomainID)
 	matchingRule := cache.FindMatchingRule(req.Path, rules)
 
+	// Enforce CacheRule.BypassCache: if matching customer rule specifies bypass, bypass immediately
+	if matchingRule != nil && matchingRule.BypassCache {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"cache_status": cache.CacheStatusBypass,
+			"reason":       "cache rule specifies bypass_cache",
+			"cacheable":    false,
+		})
+		return
+	}
+
 	// Construct HTTP request for cacheability verification
 	httpReq, _ := http.NewRequest(req.Method, req.Path, nil)
 	for k, v := range req.Headers {
@@ -1298,12 +1316,8 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 				ttl = matchingRule.TTLSeconds
 			}
 
-			// Finding 7: When StripCookies is enabled, strip Set-Cookie header before storing into edge cache
 			headersToStore := make(map[string]string)
 			for k, v := range req.OriginResponse.Headers {
-				if policy != nil && policy.StripCookies && strings.EqualFold(k, "Set-Cookie") {
-					continue
-				}
 				headersToStore[k] = v
 			}
 
@@ -1407,7 +1421,22 @@ func (h *APIHandler) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		simulatedHTTPReq.Header.Set(k, v)
 	}
 
-	result := h.wafEngine.EvaluateRequest(simulatedHTTPReq, secPolicy)
+	tc, _ := auth.FromContext(r.Context())
+	evalCtx := security.EvaluationContext{
+		ClientIP: req.ClientIP,
+	}
+	// P2 Finding 3: Trust decision is strictly governed by authenticated caller context.
+	// Client-supplied markers (e.g. X-Gateway-Identity-Verified) are ignored.
+	if tc != nil && (tc.Role == auth.RoleEdgeNode || tc.Role == auth.RolePlatformOperator) {
+		evalCtx.IdentityTrusted = true
+		if trustedID, ok := req.Headers["X-Authenticated-User"]; ok && trustedID != "" {
+			evalCtx.TrustedIdentity = trustedID
+		}
+	} else {
+		evalCtx.IdentityTrusted = false
+	}
+
+	result := h.wafEngine.EvaluateRequestWithContext(simulatedHTTPReq, secPolicy, evalCtx)
 
 	// Record security event if blocked
 	if result.Blocked || result.Action == model.WAFActionLog {
@@ -1516,8 +1545,10 @@ func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request)
 		events = []model.TelemetryEvent{single}
 	}
 
-	// Pre-validate all events: ensure domain exists and caller is authorized for the project (P1 finding)
-	for i, ev := range events {
+	// Pre-validate all events: ensure domain exists, caller is authorized for the project, and timestamp is within sanity window (P1/P2)
+	now := time.Now().UTC()
+	for i := range events {
+		ev := &events[i]
 		if ev.DomainID == "" {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("event [%d]: domain_id is required", i))
 			return
@@ -1530,6 +1561,15 @@ func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request)
 		if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
 			writeError(w, http.StatusForbidden, fmt.Sprintf("event [%d]: forbidden, caller not authorized for domain %s", i, ev.DomainID))
 			return
+		}
+		// P2 Finding 8: Validate timestamp against sanity window [now - 24h, now + 5m] to prevent telemetry skew and billing tampering
+		if !ev.Timestamp.IsZero() {
+			if ev.Timestamp.Before(now.Add(-24*time.Hour)) || ev.Timestamp.After(now.Add(5*time.Minute)) {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("event [%d]: telemetry timestamp out of acceptable window", i))
+				return
+			}
+		} else {
+			ev.Timestamp = now
 		}
 	}
 
@@ -1635,15 +1675,21 @@ func (h *APIHandler) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 	}
 	pops := h.popManager.ListPoPs()
 
-	// If caller is an edge node, restrict visibility to its assigned PoP only (Finding 6)
-	if tc, ok := auth.FromContext(r.Context()); ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass && tc.PoPID != "*" && tc.PoPID != "" {
-		filtered := make([]model.EdgePoP, 0)
-		for _, p := range pops {
-			if strings.EqualFold(p.ID, tc.PoPID) {
-				filtered = append(filtered, p)
-			}
+	// If caller is an edge node, restrict visibility to its assigned PoP only (Finding 5)
+	if tc, ok := auth.FromContext(r.Context()); ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
+		if tc.PoPID == "" {
+			writeError(w, http.StatusForbidden, "edge node is not bound to a PoP")
+			return
 		}
-		pops = filtered
+		if tc.PoPID != "*" {
+			filtered := make([]model.EdgePoP, 0)
+			for _, p := range pops {
+				if strings.EqualFold(p.ID, tc.PoPID) {
+					filtered = append(filtered, p)
+				}
+			}
+			pops = filtered
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{

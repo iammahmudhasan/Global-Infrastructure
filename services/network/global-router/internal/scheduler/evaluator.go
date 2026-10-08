@@ -41,6 +41,21 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	if policy.WorkloadID == "" || policy.TenantID == "" {
 		return nil, ErrInvalidPolicy
 	}
+	if len(policy.WorkloadID) > MaxWorkloadID {
+		return nil, fmt.Errorf("%w: workload_id exceeds maximum length of %d", ErrInvalidPolicy, MaxWorkloadID)
+	}
+	if len(policy.IdempotencyKey) > MaxIdempotencyKey {
+		return nil, fmt.Errorf("%w: idempotency_key exceeds maximum length of %d", ErrInvalidPolicy, MaxIdempotencyKey)
+	}
+	if len(policy.Name) > MaxWorkloadName {
+		return nil, fmt.Errorf("%w: name exceeds maximum length of %d", ErrInvalidPolicy, MaxWorkloadName)
+	}
+	if len(policy.PreferredProvider) > MaxPreferredProvider {
+		return nil, fmt.Errorf("%w: preferred_provider exceeds maximum length of %d", ErrInvalidPolicy, MaxPreferredProvider)
+	}
+	if policy.GPUsRequested > MaxRequiredGPU {
+		return nil, fmt.Errorf("%w: gpus_requested exceeds maximum allowable limit of %d", ErrInvalidPolicy, MaxRequiredGPU)
+	}
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -149,8 +164,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	if len(eligible) == 0 {
 		// If strict sovereignty was requested, never violate the law (Rule 28)
 		if policy.StrictSovereignty {
-			return nil, fmt.Errorf("%w: strict sovereignty constraints violated. Filter details: %v",
-				ErrNoEligibleBackends, filterReasons)
+			return nil, ErrNoEligibleBackends
 		}
 
 		// Collect healthy candidate fallback nodes with capacity and score them deterministically
@@ -191,10 +205,12 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 				}
 				e.recordIdempotencyLocked(idempotencyKey, decision)
 				return decision, nil
+			} else if errors.Is(err, registry.ErrTenantQuotaExceeded) {
+				return nil, err
 			}
 		}
 
-		return nil, fmt.Errorf("%w: all nodes unhealthy or filtered. Details: %v", ErrNoEligibleBackends, filterReasons)
+		return nil, ErrNoEligibleBackends
 	}
 
 	// 5. Multi-Objective Placement Optimization Function
@@ -242,17 +258,26 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	var bestBackend *registry.ComputeBackend
 	var bestScore float64
 
+	var lastReserveErr error
 	for _, item := range scored {
 		// Atomically check circuit breaker admission and reserve capacity
 		if err := e.reg.AdmitAndReserve(policy.WorkloadID, policy.TenantID, policy.ProjectID, item.backend.ID, gpusReq, registry.DefaultLeaseDuration); err == nil {
 			bestBackend = item.backend
 			bestScore = item.score
 			break
+		} else {
+			lastReserveErr = err
+			if errors.Is(err, registry.ErrTenantQuotaExceeded) {
+				return nil, err
+			}
 		}
 	}
 
 	if bestBackend == nil {
-		return nil, fmt.Errorf("%w: candidate capacity exhausted during reservation race", ErrNoEligibleBackends)
+		if lastReserveErr != nil && errors.Is(lastReserveErr, registry.ErrTenantQuotaExceeded) {
+			return nil, lastReserveErr
+		}
+		return nil, ErrNoEligibleBackends
 	}
 
 	// 6. Synthesize Explainable Decision Codes (Rule 112)

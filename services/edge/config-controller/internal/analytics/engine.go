@@ -141,11 +141,12 @@ func (da *DomainAggregator) Record(event model.TelemetryEvent) {
 	da.totalRequests++
 	da.bytesSent += event.BytesSent
 	da.bytesReceived += event.BytesReceived
-	da.lastUpdated = time.Now().UTC()
+	now := time.Now().UTC()
+	da.lastUpdated = now
 
 	eventTime := event.Timestamp
 	if eventTime.IsZero() {
-		eventTime = time.Now().UTC()
+		eventTime = now
 	}
 	monthKey := eventTime.Format("2006-01")
 	monthCounter, exists := da.monthlyUsage[monthKey]

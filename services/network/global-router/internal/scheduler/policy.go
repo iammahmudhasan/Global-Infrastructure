@@ -15,6 +15,14 @@ const (
 	ObjectiveCarbon   OptimizationObjective = "ZERO_CARBON"
 )
 
+const (
+	MaxWorkloadID        = 128
+	MaxIdempotencyKey    = 256
+	MaxWorkloadName      = 512
+	MaxPreferredProvider = 128
+	MaxRequiredGPU       = 64
+)
+
 // DispatchPolicy encapsulates client workload constraints and optimization targets (Rule 23)
 type DispatchPolicy struct {
 	WorkloadID        string                 `json:"workload_id"`

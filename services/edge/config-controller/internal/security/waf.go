@@ -57,23 +57,26 @@ type WAFEngine struct {
 	rateLimiters map[string]*TokenBucket
 }
 
-// Trusted identity headers injected by authenticating edge reverse proxies / gateways (Finding 8)
-var defaultTrustedIdentityHeaders = map[string]bool{
-	"x-authenticated-user": true,
-	"x-consumer-id":        true,
-	"x-jwt-subject":        true,
-	"x-client-dn":          true,
-	"x-nexusedge-identity": true,
-}
-
 func NewWAFEngine() *WAFEngine {
 	return &WAFEngine{
 		rateLimiters: make(map[string]*TokenBucket),
 	}
 }
 
+// EvaluationContext provides verified operational context passed by trusted infrastructure (Finding 3).
+type EvaluationContext struct {
+	ClientIP        string
+	TrustedIdentity string
+	IdentityTrusted bool
+}
+
 // EvaluateRequest checks an incoming request against domain policy, OWASP CRS, and customer rules
 func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPolicy) EvaluationResult {
+	return e.EvaluateRequestWithContext(req, policy, EvaluationContext{})
+}
+
+// EvaluateRequestWithContext evaluates request with verified infrastructure context
+func (e *WAFEngine) EvaluateRequestWithContext(req *http.Request, policy *model.SecurityPolicy, evalCtx EvaluationContext) EvaluationResult {
 	if policy == nil || !policy.WAFEnabled {
 		return EvaluationResult{Blocked: false, Action: model.WAFActionAllow}
 	}
@@ -241,16 +244,18 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 			switch matchedRule.KeyType {
 			case "HEADER":
 				if matchedRule.HeaderName != "" && req != nil && req.Header != nil {
-					hdrLower := strings.ToLower(strings.TrimSpace(matchedRule.HeaderName))
-					isTrusted := defaultTrustedIdentityHeaders[hdrLower] ||
-						req.Header.Get("X-Gateway-Identity-Verified") == "true" ||
-						req.Header.Get("X-Auth-Verified") == "true"
-
-					if hdrVal := req.Header.Get(matchedRule.HeaderName); hdrVal != "" && isTrusted {
-						identity = hdrVal
+					// P2 Finding 3: Trust decision is strictly governed by internal EvaluationContext.
+					// Client-supplied markers (X-Gateway-Identity-Verified, X-Auth-Verified) are completely ignored.
+					if evalCtx.IdentityTrusted {
+						if evalCtx.TrustedIdentity != "" {
+							identity = evalCtx.TrustedIdentity
+						} else if hdrVal := req.Header.Get(matchedRule.HeaderName); hdrVal != "" {
+							identity = hdrVal
+						} else {
+							identity = clientIP
+						}
 					} else {
-						// Finding 8: Client-controlled untrusted headers cannot fabricate arbitrary identities.
-						// Fall back to client IP to prevent rate limiting bypass.
+						// Untrusted caller context cannot fabricate identities via headers; fall back to client IP.
 						identity = clientIP
 					}
 				}

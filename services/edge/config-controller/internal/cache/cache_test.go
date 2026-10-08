@@ -128,17 +128,39 @@ func TestResponseCacheability(t *testing.T) {
 		t.Errorf("expected Cache-Control: no-store to NOT be cached")
 	}
 
-	// 4. Set-Cookie header must NOT be cached (Security risk)
+	// 4. Set-Cookie header must NOT be cached (Security risk) even with StripCookies=true
 	hCookie := http.Header{"Set-Cookie": []string{"session_id=secret; Path=/; Secure"}}
 	ok, _, _ = cache.IsResponseCacheable(200, hCookie, policy)
 	if ok {
 		t.Errorf("expected Set-Cookie response to NOT be cached")
 	}
 
+	policyStrip := &model.CachePolicy{
+		CacheEnabled: true,
+		StripCookies: true,
+	}
+	ok, _, _ = cache.IsResponseCacheable(200, hCookie, policyStrip)
+	if ok {
+		t.Errorf("expected Set-Cookie response to NOT be cached even with StripCookies=true")
+	}
+
 	// 5. 500 Internal Server Error must NOT be cached
 	ok, _, _ = cache.IsResponseCacheable(500, http.Header{}, policy)
 	if ok {
 		t.Errorf("expected 500 error to NOT be cached")
+	}
+}
+
+func TestRequestCacheability_CookieRejected(t *testing.T) {
+	policy := &model.CachePolicy{CacheEnabled: true}
+	reqCookie, _ := http.NewRequest(http.MethodGet, "https://api.example.com/dashboard", nil)
+	reqCookie.Header.Set("Cookie", "session=user-A")
+	ok, reason := cache.IsRequestCacheable(reqCookie, policy)
+	if ok {
+		t.Fatalf("expected Cookie-bearing request to be non-cacheable")
+	}
+	if reason != "request contains Cookie header" {
+		t.Errorf("unexpected rejection reason: %s", reason)
 	}
 }
 

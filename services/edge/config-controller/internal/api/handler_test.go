@@ -1643,6 +1643,32 @@ func TestEdgeTelemetry_DomainValidationAndAuthorization(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for authorized telemetry, got %d: %s", w.Code, w.Body.String())
 	}
+
+	// 4. Future timestamp (> 5m) -> 400 Bad Request (P2 Finding 8)
+	futureEvent := []model.TelemetryEvent{
+		{DomainID: resA.DomainID, StatusCode: 200, BytesSent: 100, Timestamp: now.Add(10 * time.Minute)},
+	}
+	bodyFuture, _ := json.Marshal(futureEvent)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(bodyFuture))
+	req.Header.Set("X-API-Key", "key-node-scoped")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "timestamp out of acceptable window") {
+		t.Fatalf("expected 400 Bad Request for future timestamp, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. Far past timestamp (> 24h) -> 400 Bad Request (P2 Finding 8)
+	pastEvent := []model.TelemetryEvent{
+		{DomainID: resA.DomainID, StatusCode: 200, BytesSent: 100, Timestamp: now.Add(-48 * time.Hour)},
+	}
+	bodyPast, _ := json.Marshal(pastEvent)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(bodyPast))
+	req.Header.Set("X-API-Key", "key-node-scoped")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "timestamp out of acceptable window") {
+		t.Fatalf("expected 400 Bad Request for far-past timestamp, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestEdgeNode_PoPScopingAndCrossPoPIsolation(t *testing.T) {
@@ -1687,6 +1713,16 @@ func TestEdgeNode_PoPScopingAndCrossPoPIsolation(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for operator on global envoy-config, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. Unbound edge node (PoPID == "") attempting to list PoPs -> 403 Forbidden (P2 Finding 5)
+	authInst.RegisterNodeWithPoP("key-node-unbound", "tenant-infra", "proj-infra", "edge-node-unbound", "")
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops", nil)
+	req.Header.Set("X-API-Key", "key-node-unbound")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "edge node is not bound to a PoP") {
+		t.Fatalf("expected 403 Forbidden for unbound edge node listing pops, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

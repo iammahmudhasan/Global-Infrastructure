@@ -276,17 +276,19 @@ func TestRateLimiter_HeaderKeyTypeAndPathScoping(t *testing.T) {
 		},
 	}
 
+	trustedCtx := security.EvaluationContext{IdentityTrusted: true}
+
 	// 1. User Alice requests /login twice -> 1st OK, 2nd blocked (1 RPM)
 	reqAlice1 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
 	reqAlice1.Header.Set("X-Authenticated-User", "alice")
-	resAlice1 := engine.EvaluateRequest(reqAlice1, policy)
+	resAlice1 := engine.EvaluateRequestWithContext(reqAlice1, policy, trustedCtx)
 	if resAlice1.Blocked {
 		t.Fatalf("expected Alice 1st login request to be allowed")
 	}
 
 	reqAlice2 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
 	reqAlice2.Header.Set("X-Authenticated-User", "alice")
-	resAlice2 := engine.EvaluateRequest(reqAlice2, policy)
+	resAlice2 := engine.EvaluateRequestWithContext(reqAlice2, policy, trustedCtx)
 	if !resAlice2.Blocked || resAlice2.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("expected Alice 2nd login request to be rate-limited (429), got %d", resAlice2.StatusCode)
 	}
@@ -294,7 +296,7 @@ func TestRateLimiter_HeaderKeyTypeAndPathScoping(t *testing.T) {
 	// 2. User Bob from SAME IP requests /login -> must be ALLOWED (trusted header isolation)
 	reqBob1 := newTestRequest("POST", "/login", "198.51.100.20", "TestAgent")
 	reqBob1.Header.Set("X-Authenticated-User", "bob")
-	resBob1 := engine.EvaluateRequest(reqBob1, policy)
+	resBob1 := engine.EvaluateRequestWithContext(reqBob1, policy, trustedCtx)
 	if resBob1.Blocked {
 		t.Fatalf("expected Bob 1st login request to be allowed due to header isolation")
 	}
@@ -302,14 +304,14 @@ func TestRateLimiter_HeaderKeyTypeAndPathScoping(t *testing.T) {
 	// 3. User Alice requests /api -> must be ALLOWED because /login scope does not throttle /api scope!
 	reqAliceAPI := newTestRequest("GET", "/api/user/profile", "198.51.100.20", "TestAgent")
 	reqAliceAPI.Header.Set("X-Authenticated-User", "alice")
-	resAliceAPI := engine.EvaluateRequest(reqAliceAPI, policy)
+	resAliceAPI := engine.EvaluateRequestWithContext(reqAliceAPI, policy, trustedCtx)
 	if resAliceAPI.Blocked {
 		t.Fatalf("expected /api request to be allowed; /login rate limit must not pollute /api bucket!")
 	}
 }
 
 func TestRateLimiter_UntrustedClientHeaderSpoofingProtection(t *testing.T) {
-	// Finding 8 Verification: Client cannot bypass rate limit by rotating arbitrary untrusted headers
+	// P2 Finding 3 Verification: Client cannot spoof trusted identity or bypass rate limits by rotating headers or supplying forged markers
 	engine := security.NewWAFEngine()
 	policy := &model.SecurityPolicy{
 		DomainID:         "dom-spoof-rl",
@@ -339,10 +341,13 @@ func TestRateLimiter_UntrustedClientHeaderSpoofingProtection(t *testing.T) {
 	}
 
 	// 2. Same client attempts to bypass rate limiting by changing header to X-User-ID: bob
-	// Because X-User-ID is untrusted and lacks gateway verification, it falls back to clientIP anchor.
+	// AND injects spoofed verification markers (X-Gateway-Identity-Verified, X-Auth-Verified).
+	// Because EvaluationContext.IdentityTrusted is false, client-supplied markers are completely ignored.
 	// Therefore, the second request MUST be blocked (429)!
 	reqBob := newTestRequest("POST", "/login", clientIP, "TestAgent")
 	reqBob.Header.Set("X-User-ID", "bob")
+	reqBob.Header.Set("X-Gateway-Identity-Verified", "true")
+	reqBob.Header.Set("X-Auth-Verified", "true")
 	resBob := engine.EvaluateRequest(reqBob, policy)
 	if !resBob.Blocked || resBob.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("untrusted client header bypass vulnerability! Expected 429 Too Many Requests, got blocked=%v, code=%d",

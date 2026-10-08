@@ -190,7 +190,15 @@ pub async fn handle_request(
     let norm_ae = normalize_accept_encoding(raw_ae);
     let cache_key = format!("{}://{}{}#ae={}", scheme, host, uri_string, norm_ae);
 
-    if method == Method::GET && !req_cc.contains("no-cache") && !req_cc.contains("no-store") {
+    let has_cookie = req_headers.contains_key("cookie");
+    let has_auth = req_headers.contains_key("authorization");
+
+    if method == Method::GET
+        && !has_cookie
+        && !has_auth
+        && !req_cc.contains("no-cache")
+        && !req_cc.contains("no-store")
+    {
         if let Some(cached) = state.cache.get(&cache_key, Some(&req_headers)) {
             let latency_us = start_time.elapsed().as_micros();
             info!(uri = %uri_string, host = %host, latency_us = latency_us, cache = "HIT", "Serving from Edge Cache");
@@ -335,6 +343,8 @@ pub async fn handle_request(
 
             let can_cache = method == Method::GET
                 && status == StatusCode::OK
+                && !has_cookie
+                && !has_auth
                 && !req_cc.contains("no-store")
                 && (!auth_header_present
                     || resp_cc.contains("public")

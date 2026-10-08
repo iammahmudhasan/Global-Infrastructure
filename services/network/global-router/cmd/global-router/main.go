@@ -208,12 +208,19 @@ func (s *Server) routes() http.Handler {
 
 		if err != nil {
 			telemetry.GlobalMetrics.RecordDispatch(string(policy.Residency), "none", duration, false)
+			log.Printf("[DISPATCH_REJECTED] workload=%s tenant=%s project=%s error=%v", policy.WorkloadID, policy.TenantID, policy.ProjectID, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnprocessableEntity)
+			clientErr := "no eligible compute backend available"
+			if errors.Is(err, registry.ErrTenantQuotaExceeded) {
+				clientErr = "tenant resource quota exceeded"
+			} else if errors.Is(err, scheduler.ErrInvalidPolicy) {
+				clientErr = err.Error()
+			}
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"status":      "DISPATCH_REJECTED",
 				"workload_id": policy.WorkloadID,
-				"error":       err.Error(),
+				"error":       clientErr,
 			})
 			return
 		}

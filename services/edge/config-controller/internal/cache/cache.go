@@ -190,9 +190,12 @@ func IsRequestCacheable(req *http.Request, policy *model.CachePolicy) (bool, str
 		return false, fmt.Sprintf("HTTP method %s is not cacheable", req.Method)
 	}
 
-	// 2. Authorization-bearing request: never blindly shared (Section 15)
+	// 2. Authorization-bearing or Cookie-bearing request: never blindly shared (RFC 9111 Section 15)
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		return false, "request contains Authorization header"
+	}
+	if cookie := req.Header.Get("Cookie"); cookie != "" {
+		return false, "request contains Cookie header"
 	}
 
 	// 3. Request Cache-Control: no-store
@@ -218,8 +221,9 @@ func IsResponseCacheable(statusCode int, respHeaders http.Header, policy *model.
 		return false, 0, fmt.Sprintf("HTTP status code %d is not cacheable", statusCode)
 	}
 
-	// 2. Cookie Check: responses setting cookies must not be cached (Section 15)
-	if setCookie := respHeaders.Get("Set-Cookie"); setCookie != "" && !policy.StripCookies {
+	// 2. Cookie Check: responses setting cookies must never be stored in a shared cache (Section 15)
+	// Stripping Set-Cookie does not de-personalize the body, so Set-Cookie responses must never be cached.
+	if setCookie := respHeaders.Get("Set-Cookie"); setCookie != "" {
 		return false, 0, "response contains Set-Cookie header"
 	}
 
