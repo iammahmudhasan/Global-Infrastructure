@@ -126,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS,
     ));
     let aggregate_buffered_bytes = Arc::new(AtomicUsize::new(0));
+    let aggregate_buffered_request_bytes = Arc::new(AtomicUsize::new(0));
 
     let state = Arc::new(ProxyState {
         config: config.clone(),
@@ -136,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         http_client: http_client.clone(),
         inflight_buffer_semaphore,
         aggregate_buffered_bytes,
+        aggregate_buffered_request_bytes,
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
@@ -183,15 +185,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config (P1 Integrity & SSRF Hardening)
                 if cp_cfg.enabled {
-                    let is_secure_endpoint = cp_cfg.endpoint.starts_with("https://")
-                        || cp_cfg.endpoint.starts_with("http://127.0.0.1")
-                        || cp_cfg.endpoint.starts_with("http://localhost")
-                        || cp_cfg.endpoint.starts_with("http://config-controller")
-                        || cp_cfg.auth_token.is_empty();
-                    if !is_secure_endpoint {
-                        tracing::warn!(
+                    if let Err(err_msg) =
+                        validate_control_plane_endpoint(&cp_cfg.endpoint, &cp_cfg.auth_token)
+                    {
+                        tracing::error!(
                             endpoint = %cp_cfg.endpoint,
-                            "Insecure Control Plane endpoint: Bearer token transport over non-loopback HTTP is forbidden"
+                            error = %err_msg,
+                            "Control Plane endpoint rejected; skipping sync cycle"
                         );
                         continue;
                     }
@@ -212,23 +212,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 .headers()
                                 .get("x-snapshot-checksum")
                                 .and_then(|v| v.to_str().ok())
-                                .map(|s| s.to_string());
+                                .map(|s| s.trim().to_string());
+
+                            let Some(expected_checksum) = header_checksum else {
+                                tracing::error!("Missing mandatory X-Snapshot-Checksum header from Control Plane response; rejecting unauthenticated snapshot update");
+                                continue;
+                            };
+
+                            if expected_checksum.is_empty() {
+                                tracing::error!("Empty X-Snapshot-Checksum header from Control Plane response; rejecting snapshot update");
+                                continue;
+                            }
 
                             if let Ok(body_str) = resp.text().await {
-                                // Validate SHA-256 integrity if checksum is present
-                                if let Some(ref expected_checksum) = header_checksum {
-                                    let computed_hash =
-                                        format!("{:x}", sha2::Sha256::digest(body_str.as_bytes()));
-                                    if !expected_checksum.is_empty()
-                                        && !expected_checksum.eq_ignore_ascii_case(&computed_hash)
-                                    {
-                                        tracing::error!(
-                                            expected = %expected_checksum,
-                                            computed = %computed_hash,
-                                            "Snapshot SHA-256 checksum mismatch, rejecting corrupted or tampered route update"
-                                        );
-                                        continue;
-                                    }
+                                let computed_hash =
+                                    format!("{:x}", sha2::Sha256::digest(body_str.as_bytes()));
+                                if !expected_checksum.eq_ignore_ascii_case(&computed_hash) {
+                                    tracing::error!(
+                                        expected = %expected_checksum,
+                                        computed = %computed_hash,
+                                        "Snapshot SHA-256 checksum mismatch, rejecting corrupted or tampered route update"
+                                    );
+                                    continue;
                                 }
 
                                 match router::parse_pop_config_routes(&body_str) {
@@ -340,5 +345,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::debug!("Connection terminated: {:?}", err);
             }
         });
+    }
+}
+
+/// Validates Control Plane sync endpoint for transport security and credential safety.
+/// Requires HTTPS for all remote endpoints and mandates authentication token for remote transports.
+pub fn validate_control_plane_endpoint(
+    endpoint: &str,
+    auth_token: &str,
+) -> Result<reqwest::Url, String> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err("Control Plane endpoint cannot be empty".to_string());
+    }
+
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|e| format!("Malformed Control Plane endpoint URL: {}", e))?;
+
+    let scheme = parsed.scheme();
+    let host_str = match parsed.host_str() {
+        Some(h) if !h.is_empty() => h.trim().to_ascii_lowercase(),
+        _ => return Err("Control Plane endpoint must include a valid host".to_string()),
+    };
+
+    let unbracketed_host = host_str.trim_start_matches('[').trim_end_matches(']');
+    let is_trusted_internal = unbracketed_host == "127.0.0.1"
+        || unbracketed_host == "localhost"
+        || unbracketed_host == "::1"
+        || unbracketed_host == "config-controller";
+
+    match scheme {
+        "http" => {
+            if !is_trusted_internal {
+                return Err(format!(
+                    "Insecure HTTP forbidden for remote Control Plane endpoint '{}'; HTTPS is strictly required",
+                    endpoint
+                ));
+            }
+        }
+        "https" => {
+            if !is_trusted_internal && auth_token.trim().is_empty() {
+                return Err(format!(
+                    "Remote Control Plane endpoint '{}' requires non-empty authentication token",
+                    endpoint
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Invalid scheme '{}' for Control Plane endpoint; must be http or https",
+                scheme
+            ));
+        }
+    }
+
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_control_plane_endpoint_security() {
+        // Trusted internal / loopback HTTP endpoints allowed
+        assert!(validate_control_plane_endpoint("http://127.0.0.1:9091", "").is_ok());
+        assert!(validate_control_plane_endpoint("http://localhost:9091", "").is_ok());
+        assert!(validate_control_plane_endpoint("http://[::1]:9091", "").is_ok());
+        assert!(validate_control_plane_endpoint("http://config-controller:9091", "").is_ok());
+
+        // Subdomain / prefix attack vectors on trusted hosts rejected
+        let err =
+            validate_control_plane_endpoint("http://127.0.0.1.attacker.example:9091", "token")
+                .unwrap_err();
+        assert!(err.contains("HTTPS is strictly required"));
+
+        let err = validate_control_plane_endpoint("http://config-controller.attacker.com", "token")
+            .unwrap_err();
+        assert!(err.contains("HTTPS is strictly required"));
+
+        // Remote plain HTTP forbidden even if auth_token is present or empty
+        let err = validate_control_plane_endpoint("http://cp.remote.infra:9091", "secret-token")
+            .unwrap_err();
+        assert!(err.contains("HTTPS is strictly required"));
+
+        // Remote HTTPS requires non-empty auth token
+        let err =
+            validate_control_plane_endpoint("https://cp.remote.infra:9091", "   ").unwrap_err();
+        assert!(err.contains("requires non-empty authentication token"));
+
+        assert!(
+            validate_control_plane_endpoint("https://cp.remote.infra:9091", "valid-token").is_ok()
+        );
+
+        // Invalid scheme rejected
+        let err = validate_control_plane_endpoint("ftp://cp.remote.infra", "token").unwrap_err();
+        assert!(err.contains("must be http or https"));
     }
 }

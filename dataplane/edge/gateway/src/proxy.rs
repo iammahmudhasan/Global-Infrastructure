@@ -37,6 +37,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB hard limit for origin responses
 pub const MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB aggregate limit (P1 Finding 5)
+pub const MAX_AGGREGATE_BUFFERED_REQUEST_BYTES: usize = 128 * 1024 * 1024; // 128 MiB aggregate limit for request bodies
 const MAX_CUSTOM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days (Finding 2)
 
 pub const DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS: usize = 256;
@@ -57,14 +58,24 @@ impl BufferBudgetGuard {
     }
 
     pub fn try_allocate(&mut self, bytes: usize) -> Result<(), ()> {
-        let current = self.tracker.load(std::sync::atomic::Ordering::Relaxed);
-        if current + bytes > self.limit {
-            return Err(());
+        let mut current = self.tracker.load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            if current.saturating_add(bytes) > self.limit {
+                return Err(());
+            }
+            match self.tracker.compare_exchange_weak(
+                current,
+                current + bytes,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.allocated += bytes;
+                    return Ok(());
+                }
+                Err(actual) => current = actual,
+            }
         }
-        self.tracker
-            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
-        self.allocated += bytes;
-        Ok(())
     }
 }
 
@@ -72,7 +83,7 @@ impl Drop for BufferBudgetGuard {
     fn drop(&mut self) {
         if self.allocated > 0 {
             self.tracker
-                .fetch_sub(self.allocated, std::sync::atomic::Ordering::Relaxed);
+                .fetch_sub(self.allocated, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -87,6 +98,7 @@ pub struct ProxyState {
     pub http_client: HttpClient,
     pub inflight_buffer_semaphore: Arc<tokio::sync::Semaphore>,
     pub aggregate_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub aggregate_buffered_request_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub async fn handle_request(
@@ -250,17 +262,39 @@ pub async fn handle_request(
         }
     };
 
-    let body_sample = if !body_bytes.is_empty() {
-        std::str::from_utf8(&body_bytes[..body_bytes.len().min(4096)]).ok()
+    let mut req_body_guard = BufferBudgetGuard::new(
+        Arc::clone(&state.aggregate_buffered_request_bytes),
+        MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
+    );
+    if !body_bytes.is_empty() && req_body_guard.try_allocate(body_bytes.len()).is_err() {
+        warn!(
+            bytes = body_bytes.len(),
+            limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
+            "Gateway aggregate request body buffer limit saturated"
+        );
+        let resp = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge/0.1.0")
+            .header("Retry-After", "1")
+            .body(Full::new(Bytes::from(
+                r#"{"error":"Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure","status":503}"#,
+            )))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    let body_lossy = if !body_bytes.is_empty() {
+        Some(String::from_utf8_lossy(&body_bytes))
     } else {
         None
     };
 
-    // 6. Tenant & Global WAF Inspection (Finding 7)
+    // 6. Tenant & Global WAF Inspection (Finding 7 & P1 Finding 3)
     match state.waf.inspect_with_tenant_policy(
         &uri_string,
         user_agent.as_deref(),
-        body_sample,
+        body_lossy.as_deref(),
         domain_sec_policy.as_ref(),
     ) {
         WafResult::Blocked { rule, pattern } => {
@@ -977,5 +1011,42 @@ mod tests {
 
         // On drop, guard must decrement allocated bytes
         assert_eq!(tracker.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_buffer_budget_guard_concurrent_cas_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let limit = 10_000;
+        let mut handles = vec![];
+
+        // 10 concurrent threads allocating 1500 bytes each
+        // Since limit is 10,000, exactly 6 threads can succeed (6 * 1500 = 9000 <= 10000),
+        // and remaining 4 threads MUST fail without exceeding limit!
+        for _ in 0..10 {
+            let t = Arc::clone(&tracker);
+            handles.push(std::thread::spawn(move || {
+                let mut guard = BufferBudgetGuard::new(t, limit);
+                let ok = guard.try_allocate(1500).is_ok();
+                (ok, guard)
+            }));
+        }
+
+        let mut successes = 0;
+        let mut guards = vec![];
+        for h in handles {
+            let (ok, guard) = h.join().unwrap();
+            if ok {
+                successes += 1;
+                guards.push(guard);
+            }
+        }
+
+        assert_eq!(successes, 6);
+        assert_eq!(tracker.load(Ordering::Acquire), 9000);
+
+        drop(guards);
+        assert_eq!(tracker.load(Ordering::Acquire), 0);
     }
 }

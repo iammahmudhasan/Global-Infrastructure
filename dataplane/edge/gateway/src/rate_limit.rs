@@ -37,6 +37,18 @@ impl TokenBucket {
             false
         }
     }
+
+    fn update_limits(&mut self, new_capacity: f64, new_refill_rate: f64) {
+        if (self.capacity - new_capacity).abs() > f64::EPSILON {
+            self.capacity = new_capacity;
+            if self.tokens > new_capacity {
+                self.tokens = new_capacity;
+            }
+        }
+        if (self.refill_rate_per_sec - new_refill_rate).abs() > f64::EPSILON {
+            self.refill_rate_per_sec = new_refill_rate;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -110,10 +122,16 @@ impl RateLimiter {
             .filter(|&r| r > 0)
             .map(|r| r as f64)
             .unwrap_or(self.refill_rate);
-        let bucket = store
-            .buckets
-            .entry(key.to_string())
-            .or_insert_with(|| TokenBucket::new(capacity, refill_rate));
+        let bucket = match store.buckets.entry(key.to_string()) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let b = entry.into_mut();
+                b.update_limits(capacity, refill_rate);
+                b
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(TokenBucket::new(capacity, refill_rate))
+            }
+        };
 
         let allowed = bucket.try_consume(1.0);
         let update_time = bucket.last_update;
@@ -227,5 +245,21 @@ mod tests {
         // instead of setting capacity=0 and blocking every request
         assert!(limiter.check_key("tenant.example.com:1.2.3.4", Some(0), Some(0)));
         assert!(limiter.check_key("tenant.example.com:1.2.3.4", Some(0), Some(0)));
+    }
+
+    #[test]
+    fn test_live_policy_rate_limit_update() {
+        let limiter = RateLimiter::new(true, 100, 100);
+        let key = "tenant.example.com:192.0.2.1";
+
+        // Initial policy allows high burst
+        assert!(limiter.check_key(key, Some(10), Some(10)));
+
+        // Live policy change: capacity reduced to 1 and RPS to 1
+        // Consume the only 1 allowed token
+        assert!(limiter.check_key(key, Some(1), Some(1)));
+
+        // Subsequent immediate request must be blocked (burst limit clamped to 1)
+        assert!(!limiter.check_key(key, Some(1), Some(1)));
     }
 }

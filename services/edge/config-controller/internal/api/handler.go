@@ -2271,7 +2271,7 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 						SNI:      o.Address,
 						Weight:   o.Weight,
 					})
-					targets = append(targets, fmt.Sprintf("%s://%s:%d", strings.ToLower(proto), ip.String(), o.Port))
+					targets = append(targets, fmt.Sprintf("%s://%s", strings.ToLower(proto), net.JoinHostPort(ip.String(), strconv.Itoa(o.Port))))
 				}
 			}
 		}

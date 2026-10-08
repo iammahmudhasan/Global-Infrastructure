@@ -257,4 +257,54 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn test_waf_body_inspection_beyond_4k_and_lossy_utf8() {
+        let waf = test_waf();
+        let active_policy = DomainSecurityPolicy {
+            waf_enabled: true,
+            block_sqli: true,
+            block_xss: true,
+            block_path_traversal: true,
+            blocked_paths: vec![],
+            rate_limit_enabled: false,
+            requests_per_second: 0,
+            burst_capacity: 0,
+        };
+
+        // 1. Malicious SQLi payload positioned beyond 4096 bytes (e.g. at offset 5000)
+        let mut padding = "a".repeat(5000);
+        padding.push_str(" UNION SELECT username, password FROM users --");
+        let res_deep = waf.inspect_with_tenant_policy(
+            "/api/submit",
+            Some("curl/7.68.0"),
+            Some(&padding),
+            Some(&active_policy),
+        );
+        assert!(matches!(
+            res_deep,
+            WafResult::Blocked {
+                rule: "SQLI_IN_BODY",
+                ..
+            }
+        ));
+
+        // 2. Binary / invalid UTF-8 prefix converted via from_utf8_lossy must not bypass inspection
+        let mut raw_bytes = vec![0xFF, 0xFE, 0xFD, 0x80];
+        raw_bytes.extend_from_slice(b"'; DROP TABLE accounts; --");
+        let lossy_str = String::from_utf8_lossy(&raw_bytes);
+        let res_lossy = waf.inspect_with_tenant_policy(
+            "/api/binary-upload",
+            Some("curl/7.68.0"),
+            Some(&lossy_str),
+            Some(&active_policy),
+        );
+        assert!(matches!(
+            res_lossy,
+            WafResult::Blocked {
+                rule: "SQLI_IN_BODY",
+                ..
+            }
+        ));
+    }
 }

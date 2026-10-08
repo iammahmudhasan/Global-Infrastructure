@@ -450,7 +450,7 @@ impl Router {
                 let mut matching: Vec<&PathRoute> = domain_route
                     .path_routes
                     .iter()
-                    .filter(|pr| path.starts_with(&pr.path_prefix))
+                    .filter(|pr| path_matches_prefix(path, &pr.path_prefix))
                     .collect();
 
                 matching.sort_by(|a, b| {
@@ -685,6 +685,22 @@ pub fn normalize_host(host: &str) -> String {
     }
 
     trimmed.to_ascii_lowercase()
+}
+
+/// Path-segment boundary-aware prefix matching.
+/// Matches exact prefix or directory hierarchy boundary (e.g., '/admin' matches '/admin' and '/admin/users' but not '/administrator').
+pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    if prefix == "/" {
+        return path.starts_with('/');
+    }
+    if path == prefix {
+        return true;
+    }
+    if prefix.ends_with('/') {
+        path.starts_with(prefix)
+    } else {
+        path.starts_with(prefix) && path[prefix.len()..].starts_with('/')
+    }
 }
 
 /// Identifies private RFC 1918, loopback, link-local, carrier-grade NAT, multicast,
@@ -923,17 +939,29 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
         let proto = o.protocol.to_lowercase();
         let is_https = proto == "https";
         let sni_trimmed = o.sni.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
-        let dest_addr = format!("{}:{}", o.address, o.port)
-            .parse::<std::net::SocketAddr>()
-            .ok();
+        let clean_addr = o
+            .address
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let dest_addr = clean_addr
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .map(|ip| std::net::SocketAddr::new(ip, o.port));
+
+        let host_for_url = if clean_addr.contains(':') && !clean_addr.starts_with('[') {
+            format!("[{}]", clean_addr)
+        } else {
+            clean_addr.to_string()
+        };
 
         let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
-            (true, Some(sni_host)) if sni_host != o.address => {
+            (true, Some(sni_host)) if sni_host != clean_addr => {
                 let target_url = format!("https://{}:{}", sni_host, o.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
             _ => {
-                let target_url = format!("{}://{}:{}", proto, o.address, o.port);
+                let target_url = format!("{}://{}:{}", proto, host_for_url, o.port);
                 (target_url, None, dest_addr)
             }
         };
@@ -1500,5 +1528,66 @@ mod tests {
             router.select_upstream_for_host("tenant-1.com").unwrap_err(),
             RoutingError::UnknownHost("tenant-1.com".to_string())
         );
+    }
+
+    #[test]
+    fn test_ipv6_pinned_dns_resolution() {
+        // P1 Finding 2: IPv6 address without brackets from Control Plane parses into SocketAddr
+        // and is correctly mapped in PinnedDnsResolver to defeat DNS-rebinding attacks.
+        let pop_json = r#"{
+            "pop_id": "singapore",
+            "config_version": "v1.2.0-ipv6",
+            "routes": [
+                {
+                    "host": "ipv6-app.customer.com",
+                    "origins": [
+                        {
+                            "address": "2001:4860:4860::8888",
+                            "port": 443,
+                            "protocol": "HTTPS",
+                            "sni": "origin-v6.customer.com"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let parsed_routes = parse_pop_config_routes(pop_json).unwrap();
+        assert_eq!(parsed_routes.len(), 1);
+        let node = &parsed_routes[0].origins[0];
+        assert_eq!(node.url, "https://origin-v6.customer.com:443");
+        assert_eq!(node.sni, Some("origin-v6.customer.com".to_string()));
+
+        let expected_addr: std::net::SocketAddr = "[2001:4860:4860::8888]:443".parse().unwrap();
+        assert_eq!(node.destination_addr, Some(expected_addr));
+
+        let router = Router::new_multi_tenant(parsed_routes, vec![], 5000).unwrap();
+        let mappings = router.dns_mappings();
+        assert_eq!(
+            mappings.get("origin-v6.customer.com"),
+            Some(&vec![expected_addr])
+        );
+
+        let resolver = crate::dns::PinnedDnsResolver::new();
+        router.sync_dns_resolver(&resolver);
+    }
+
+    #[test]
+    fn test_path_routing_boundary_aware_matching() {
+        // P2 Finding 6: Prefix matching must respect path segment boundaries
+        assert!(path_matches_prefix("/admin", "/admin"));
+        assert!(path_matches_prefix("/admin/dashboard", "/admin"));
+        assert!(path_matches_prefix("/admin/settings/keys", "/admin"));
+        assert!(path_matches_prefix("/admin/", "/admin/"));
+        assert!(path_matches_prefix("/admin/users", "/admin/"));
+
+        // Must NOT match prefixes that are sub-words without path delimiters
+        assert!(!path_matches_prefix("/administrator", "/admin"));
+        assert!(!path_matches_prefix("/admin_tools", "/admin"));
+        assert!(!path_matches_prefix("/admin-panel", "/admin"));
+
+        // Root prefix matches everything starting with /
+        assert!(path_matches_prefix("/", "/"));
+        assert!(path_matches_prefix("/api/v1", "/"));
     }
 }
