@@ -2948,3 +2948,27 @@ Every file, module, and commit must adhere to strict industrial discipline:
 * **Zero Zombie Comments:** No commented-out dead code blocks.
 * **No Gratuitous Emojis:** Keep production code, type definitions, log messages, and comments strictly industrial, professional, and free of emoji clutter.
 * **Honest Subsystem Status:** Never label simulated or prototype capabilities as production-ready. Clearly distinguish `SIMULATED` vs `PRODUCTION`.
+
+---
+
+# 127. Pre-Push CI Parity Mandate (Zero CI Failure Protocol)
+
+No commit or push shall ever be made to `origin/main` without first executing and passing the complete local CI parity verification suite matching `.github/workflows/ci.yml`.
+
+Functional compilation alone is strictly insufficient. All formatting, linting, and compiler gates MUST be verified clean locally before pushing:
+
+1. **Go Format Gate:** `gofmt -l .` must return zero unformatted files across all Go services (`services/edge/config-controller`, `services/network/global-router`, etc.).
+2. **Go Vet Gate:** `go vet ./...` must exit 0 across all services.
+3. **Go Test Gate:** `go test -v ./...` must exit 0 across all services.
+4. **Rust Format Gate:** `cargo fmt --manifest-path dataplane/edge/gateway/Cargo.toml --all -- --check` must exit 0.
+5. **Rust Clippy Gate:** `cargo clippy --manifest-path dataplane/edge/gateway/Cargo.toml --all-targets --all-features -- -D warnings` must exit 0 with zero warnings.
+6. **Rust Check & Test Gate:** `cargo check` and `cargo test` must exit 0.
+7. **Python Intelligence Gate:** `python intelligence/scheduling/workload-scheduler/optimizer.py` must exit 0.
+
+Verification can be executed in one step via:
+* Windows: `powershell -ExecutionPolicy Bypass -File tools/ci/verify-ci.ps1`
+* Linux / macOS: `bash tools/ci/verify-ci.sh`
+* Makefile: `make verify-ci`
+
+Pushing code that subsequently fails remote GitHub Actions CI due to skipped local formatting, linting, or test checks is a direct constitutional breach.
+

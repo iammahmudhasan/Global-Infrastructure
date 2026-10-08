@@ -2,7 +2,7 @@
 
 > **Platform Mission:** Build the world's most intelligent global infrastructure network for applications and AI.  
 > **Core Intellectual Question:** *"Where should every application, AI inference request, and compute workload run right now?"*  
-> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](docs/AI_ENGINEERING_RULES.md) (126 Mandatory Platform Rules)  
+> **Constitutional Rulebook:** [docs/AI_ENGINEERING_RULES.md](docs/AI_ENGINEERING_RULES.md) (127 Mandatory Platform Rules)  
 > **Workspace Rule:** [.agents/rules/ai-engineering-rules.md](.agents/rules/ai-engineering-rules.md)
 
 ---
@@ -32,6 +32,9 @@ All AI coding agents operating on this codebase MUST follow these non-negotiable
    - **Zero Unused Code:** No dead functions, unused struct fields, orphaned files, or dangling imports.
    - **Zero Zombie Comments:** No commented-out dead code blocks.
    - **No Gratuitous Emojis:** Keep production code, type definitions, log messages, and comments strictly industrial, professional, and free of emoji clutter.
+8. **Pre-Push CI Parity Mandate (Rule 127):**  
+   **Zero Remote CI Failures.** Never commit or push to `origin/main` without first executing and passing the complete local CI parity verification suite mirroring `.github/workflows/ci.yml`. Functional compilation alone is strictly insufficient; all formatting gates (`gofmt -l`, `cargo fmt --check`), linting gates (`cargo clippy -D warnings`), and test suites must be verified 100% clean locally before push.
+
 
 ---
 
@@ -138,6 +141,7 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 - Leave unused functions, orphaned files, or commented-out zombie code in the repository.
 - Clutter source code or internal logs with gratuitous emojis.
 - Write code without first anchoring the full system graph.
+- Push to remote origin without running and passing the full local Pre-Push CI Parity verification suite (Rule 127).
 
 ### ALWAYS:
 - Preserve architecture and 14-pillar directory boundaries.
@@ -155,6 +159,7 @@ The monorepo is strictly structured into 14 domain directories. **Never place fi
 - Bound AI decisions by deterministic policy fallbacks.
 - Optimize for correctness and long-term maintainability.
 - Ensure 100% dead-code elimination, zero orphaned files, and clean industrial code.
+- Run the 100% Pre-Push CI Parity suite (`tools/ci/verify-ci.ps1`, `tools/ci/verify-ci.sh`, or `make verify-ci`) before any `git push`.
 
 ---
 
@@ -191,6 +196,7 @@ Before considering ANY engineering task complete, verify:
 [ ] Rollback considered?
 [ ] Actual validation performed?
 [ ] No fabricated test/benchmark claims?
+[ ] 100% Pre-Push CI Parity verified (gofmt, cargo fmt --check, cargo clippy -D warnings, go vet, all test suites)?
 ```
 
 ---
@@ -198,23 +204,33 @@ Before considering ANY engineering task complete, verify:
 ## 🛠️ 8. Execution & Verification Cheatsheet
 
 ```bash
+# 0. One-Shot Pre-Push CI Parity Suite (MANDATORY BEFORE EVERY GIT PUSH)
+powershell -ExecutionPolicy Bypass -File tools/ci/verify-ci.ps1   # Windows
+bash tools/ci/verify-ci.sh                                        # Linux / macOS / CI
+make verify-ci                                                    # Makefile
+
 # 1. Rust Data Plane (Gateway)
 cd dataplane/edge/gateway
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
 cargo check
 cargo test
 
-# 2. Go Control Plane (Global Router)
-cd services/network/global-router
-go run cmd/global-router/main.go
+# 2. Go Control Plane (Format, Vet, and Test)
+cd services/edge/config-controller && gofmt -l . && go vet ./... && go test ./...
+cd services/network/global-router && gofmt -l . && go vet ./... && go test ./...
 
 # 3. Intelligence Plane (Optimizer)
 python intelligence/scheduling/workload-scheduler/optimizer.py
 
-# 4. Official CLI
+# 4. Monorepo Formatting (Automated Fix)
+make fmt-all
+
+# 5. Official CLI
 cd apps/cli
 go run cmd/main.go status
 
-# 5. Protobuf Governance
+# 6. Protobuf Governance
 buf lint
 buf breaking --against ".git#branch=main"
 ```

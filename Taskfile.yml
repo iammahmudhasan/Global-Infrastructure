@@ -5,6 +5,18 @@ tasks:
     cmds:
       - task: check
 
+  fmt:
+    desc: Auto-format all Go and Rust source code
+    cmds:
+      - cmd: cd services/edge/config-controller && gofmt -w .
+      - cmd: cd services/network/global-router && gofmt -w .
+      - cmd: cargo fmt --manifest-path dataplane/edge/gateway/Cargo.toml --all
+
+  verify-ci:
+    desc: Execute 100% Pre-Push CI Parity Suite matching GitHub Actions
+    cmds:
+      - cmd: powershell -ExecutionPolicy Bypass -File tools/ci/verify-ci.ps1
+
   check:
     desc: Run compiler and lint checks across all planes
     cmds:
