@@ -196,13 +196,20 @@ impl EdgeCache {
                 }
             }
         }
-
-        let ttl = custom_ttl.unwrap_or(self.default_ttl);
+        // P2 Finding 2: Enforce hard ceiling on cache TTL and prevent Instant::now() + ttl panic on arithmetic overflow
+        const MAX_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
+        let ttl = custom_ttl
+            .unwrap_or(self.default_ttl)
+            .min(MAX_CACHE_TTL);
+        let expires_at = match Instant::now().checked_add(ttl) {
+            Some(at) => at,
+            None => return, // Defensively drop unrepresentable Instant expiries
+        };
         let entry = CachedResponse {
             status,
             headers,
             body,
-            expires_at: Instant::now() + ttl,
+            expires_at,
             vary_headers,
         };
 
@@ -601,5 +608,24 @@ mod tests {
         assert!(cache.get("key1", None).is_none());
         assert!(cache.get("key2", None).is_some());
         assert!(cache.current_bytes() <= max_bytes);
+    }
+
+    #[test]
+    fn test_cache_ttl_u64_max_does_not_panic() {
+        // P2 Finding 2: Malicious or misconfigured upstream max-age=u64::MAX
+        let cache = EdgeCache::new(true, 60, 10, 1024 * 1024);
+        cache.put(
+            "key-huge-ttl".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(b"data"),
+            Some(Duration::from_secs(u64::MAX)),
+            None,
+        );
+        // Must safely insert without panicking and clamped to MAX_CACHE_TTL
+        assert_eq!(cache.len(), 1);
+        let hit = cache.get("key-huge-ttl", None);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().body, Bytes::from_static(b"data"));
     }
 }

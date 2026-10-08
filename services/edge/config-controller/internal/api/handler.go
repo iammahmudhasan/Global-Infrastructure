@@ -62,7 +62,7 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		analyticsEngine: analytics.NewEngine(),
 		popManager:      pop.NewManager(),
 		authenticator:   authenticator,
-		limiter:         NewControlPlaneLimiter(100.0, 100, 50),
+		limiter:         NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
 	}
@@ -94,7 +94,8 @@ func (h *APIHandler) resolveClientKey(r *http.Request) string {
 		}
 	}
 	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
-		return "apikey:" + apiKey
+		hash := sha256.Sum256([]byte(apiKey))
+		return "apikey:" + hex.EncodeToString(hash[:16])
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err == nil && host != "" {
@@ -245,6 +246,11 @@ func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	req.ProjectID = projectID
+
+	if err := store.ValidateAllowedPoPs(req.AllowedPoPs); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	res, err := h.service.OnboardDomain(req)
 	if err != nil {

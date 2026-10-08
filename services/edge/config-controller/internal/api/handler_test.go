@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -2553,5 +2554,203 @@ func TestHandler_ControlPlaneRateLimiter(t *testing.T) {
 	}
 	if w3.Header().Get("Retry-After") != "1" {
 		t.Errorf("expected Retry-After: 1 header on 429 response, got %s", w3.Header().Get("Retry-After"))
+	}
+}
+
+func TestStore_ValidateAllowedPoPs(t *testing.T) {
+	// P2 Finding 3: AllowedPoPs bounds enforcement
+
+	// 1. Valid list
+	valid := []string{"dhaka", "singapore", "frankfurt"}
+	if err := store.ValidateAllowedPoPs(valid); err != nil {
+		t.Fatalf("expected valid PoP list to succeed, got %v", err)
+	}
+
+	// 2. Empty list (global)
+	if err := store.ValidateAllowedPoPs(nil); err != nil {
+		t.Fatalf("expected nil list to succeed, got %v", err)
+	}
+
+	// 3. Exceeds MaxAllowedPoPsPerResource (16)
+	tooMany := make([]string, 17)
+	for i := 0; i < 17; i++ {
+		tooMany[i] = fmt.Sprintf("pop-%d", i)
+	}
+	if err := store.ValidateAllowedPoPs(tooMany); !errors.Is(err, store.ErrRuleSizeExceeded) {
+		t.Fatalf("expected ErrRuleSizeExceeded for 17 PoPs, got %v", err)
+	}
+
+	// 4. Token exceeds MaxPoPIDLength (64)
+	tooLong := []string{strings.Repeat("a", 65)}
+	if err := store.ValidateAllowedPoPs(tooLong); !errors.Is(err, store.ErrRuleSizeExceeded) {
+		t.Fatalf("expected ErrRuleSizeExceeded for token > 64 chars, got %v", err)
+	}
+
+	// 5. Empty token
+	hasEmpty := []string{"dhaka", "  "}
+	if err := store.ValidateAllowedPoPs(hasEmpty); !errors.Is(err, store.ErrRuleSizeExceeded) {
+		t.Fatalf("expected ErrRuleSizeExceeded for empty token, got %v", err)
+	}
+
+	// 6. Duplicate tokens (case-insensitive)
+	dups := []string{"Dhaka", "dhaka"}
+	if err := store.ValidateAllowedPoPs(dups); !errors.Is(err, store.ErrRuleSizeExceeded) {
+		t.Fatalf("expected ErrRuleSizeExceeded for duplicate tokens, got %v", err)
+	}
+}
+
+func TestHandler_ControlPlanePerClientConcurrencyFairness(t *testing.T) {
+	// P2 Finding 4: Per-client concurrency isolation prevents tenant starvation
+	limiter := api.NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 20, 2)
+
+	// Client A acquires 2 in-flight permits (reaches clientMaxConcurrent: 2)
+	relA1, err := limiter.Acquire("client-a")
+	if err != nil {
+		t.Fatalf("expected permit 1 for client-a, got %v", err)
+	}
+	defer relA1()
+
+	relA2, err := limiter.Acquire("client-a")
+	if err != nil {
+		t.Fatalf("expected permit 2 for client-a, got %v", err)
+	}
+	defer relA2()
+
+	// Client A attempts 3rd permit -> must be rejected with ErrClientConcurrencyLimitExceeded
+	_, err = limiter.Acquire("client-a")
+	if !errors.Is(err, api.ErrClientConcurrencyLimitExceeded) {
+		t.Fatalf("expected ErrClientConcurrencyLimitExceeded for client-a 3rd permit, got %v", err)
+	}
+
+	// Client B requests permit -> must SUCCEED (not starved by client-a!)
+	relB1, err := limiter.Acquire("client-b")
+	if err != nil {
+		t.Fatalf("client-b should NOT be starved by client-a, got error %v", err)
+	}
+	relB1()
+}
+
+func TestPoP_EmptyOriginOmissionPreventsBlackhole(t *testing.T) {
+	// P2 Finding 8: A domain matching PoP but with 0 usable origins at that PoP must be omitted
+	st := store.NewStore()
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	domainID := "dom-dhaka-only"
+	_ = st.SaveDomain(&model.Domain{
+		ID:          domainID,
+		ProjectID:   "prj-dhaka",
+		Hostname:    "dhaka.example.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"dhaka"}, // Domain allows Dhaka
+	})
+
+	poolID := "pool-singapore-only"
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          poolID,
+		ProjectID:   "prj-dhaka",
+		AllowedPoPs: []string{"singapore"}, // Pool restricted to Singapore!
+		Origins: []model.Origin{
+			{
+				ID:          "orig-sin",
+				PoolID:      poolID,
+				Address:     "203.0.113.15",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				AllowedPoPs: []string{"singapore"},
+			},
+		},
+	})
+
+	st.SaveRoute(&model.Route{
+		ID:       "rt-dhaka",
+		DomainID: domainID,
+		PoolID:   poolID,
+		PathPrefix: "/",
+	})
+
+	// For Dhaka: Domain has routes, but 0 usable origins in Dhaka -> must be omitted from Dhaka PoP config!
+	dhakaTopologies := st.GetActiveTopologiesForPoP("dhaka")
+	if len(dhakaTopologies) != 0 {
+		t.Fatalf("expected 0 topologies for Dhaka due to 0 usable origins, got %d", len(dhakaTopologies))
+	}
+
+	envoyCfg, err := comp.CompileForPoP("dhaka", dhakaTopologies)
+	if err != nil {
+		t.Fatalf("failed to compile for dhaka: %v", err)
+	}
+	// Verify no virtual hosts created for dhaka.example.com
+	for _, l := range envoyCfg.StaticResources.Listeners {
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				if rc, ok := f.TypedConfig["route_config"].(map[string]interface{}); ok {
+					if vhs, ok := rc["virtual_hosts"].([]compiler.VirtualHost); ok {
+						for _, vh := range vhs {
+							for _, domainName := range vh.Domains {
+								if domainName == "dhaka.example.com" {
+									t.Fatalf("dhaka.example.com should NOT appear in virtual hosts for Dhaka PoP when 0 origins are usable")
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestStore_PoPTopologySnapshotCaching(t *testing.T) {
+	// P2 Finding 7: Snapshot caching prevents repeated lock contention
+	st := store.NewStore()
+
+	domainID := "dom-cached-pop"
+	_ = st.SaveDomain(&model.Domain{
+		ID:          domainID,
+		ProjectID:   "prj-cache",
+		Hostname:    "cached.example.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"dhaka"},
+	})
+	poolID := "pool-cached"
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          poolID,
+		ProjectID:   "prj-cache",
+		AllowedPoPs: []string{"dhaka"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-1",
+				PoolID:      poolID,
+				Address:     "198.51.100.22",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				AllowedPoPs: []string{"dhaka"},
+			},
+		},
+	})
+	st.SaveRoute(&model.Route{
+		ID:       "rt-1",
+		DomainID: domainID,
+		PoolID:   poolID,
+		PathPrefix: "/",
+	})
+
+	// Pass 1: compiles and populates cache
+	t1 := st.GetActiveTopologiesForPoP("dhaka")
+	if len(t1) != 1 {
+		t.Fatalf("expected 1 topology, got %d", len(t1))
+	}
+
+	// Pass 2: should return cached slice
+	t2 := st.GetActiveTopologiesForPoP("dhaka")
+	if len(t2) != 1 {
+		t.Fatalf("expected 1 cached topology, got %d", len(t2))
+	}
+
+	// Mutation: update domain status to Pending -> invalidates cache
+	_ = st.UpdateDomainStatus(domainID, model.DomainStatusPendingVerification)
+	t3 := st.GetActiveTopologiesForPoP("dhaka")
+	if len(t3) != 0 {
+		t.Fatalf("expected 0 topologies after cache invalidation and status change, got %d", len(t3))
 	}
 }

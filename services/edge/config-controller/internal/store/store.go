@@ -37,6 +37,10 @@ const (
 	// Cache TTL Limits (P2 Finding 3)
 	MaxCacheTTLSeconds = 7 * 24 * 60 * 60 // 7 days (604,800 seconds)
 
+	// AllowedPoPs Bounds (P2 Finding 3)
+	MaxAllowedPoPsPerResource = 16
+	MaxPoPIDLength            = 64
+
 	// Security Event Bounds (Finding 1)
 	MaxSecurityEventsPerDomain          = 1000
 	MaxSecurityEventByteBudgetPerDomain = 4 * 1024 * 1024 // 4 MiB cap per domain
@@ -56,30 +60,58 @@ type ProjectQuota struct {
 	MaxDomains int
 }
 
+// ValidateAllowedPoPs validates and normalizes allowed PoP lists (P2 Finding 3)
+// Enforces max 16 PoPs per resource, max 64 chars per token, no empty tokens, and case-insensitive deduplication.
+func ValidateAllowedPoPs(pops []string) error {
+	if len(pops) > MaxAllowedPoPsPerResource {
+		return ErrRuleSizeExceeded
+	}
+
+	seen := make(map[string]struct{}, len(pops))
+	for _, pop := range pops {
+		pop = strings.TrimSpace(pop)
+		if pop == "" || len(pop) > MaxPoPIDLength {
+			return ErrRuleSizeExceeded
+		}
+
+		key := strings.ToLower(pop)
+		if _, exists := seen[key]; exists {
+			return ErrRuleSizeExceeded
+		}
+		seen[key] = struct{}{}
+	}
+
+	return nil
+}
+
 type Store struct {
-	mu                 sync.RWMutex
-	domains            map[string]*model.Domain
-	hostIndex          map[string]string // hostname -> domain ID
-	projectQuotas      map[string]ProjectQuota
-	projectDomainCount map[string]int
-	pools              map[string]*model.OriginPool
-	origins            map[string]*model.Origin
-	routes             map[string][]*model.Route             // domain ID -> routes
-	security           map[string]*model.SecurityPolicy      // domain ID -> policy
-	wafRules           map[string][]model.WAFRule            // domain ID -> WAF rules
-	rateLimits         map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
-	events             map[string][]model.SecurityEvent      // domain ID -> Security events
-	cache              map[string]*model.CachePolicy         // domain ID -> policy
-	cacheRules         map[string][]model.CacheRule          // domain ID -> Cache rules
-	monitors           map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
-	healthStates       map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
-	certificates       map[string]*model.Certificate         // domain ID -> certificate
-	challenges         map[string]*model.ACMEChallenge       // token -> ACMEChallenge
-	tlsSettings        map[string]*model.TLSSettings         // domain ID -> TLSSettings
+	mu                  sync.RWMutex
+	version             uint64
+	popTopologyCache    map[string][]*DomainTopology
+	activeTopologyCache []*DomainTopology
+	domains             map[string]*model.Domain
+	hostIndex           map[string]string // hostname -> domain ID
+	projectQuotas       map[string]ProjectQuota
+	projectDomainCount  map[string]int
+	pools               map[string]*model.OriginPool
+	origins             map[string]*model.Origin
+	routes              map[string][]*model.Route             // domain ID -> routes
+	security            map[string]*model.SecurityPolicy      // domain ID -> policy
+	wafRules            map[string][]model.WAFRule            // domain ID -> WAF rules
+	rateLimits          map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
+	events              map[string][]model.SecurityEvent      // domain ID -> Security events
+	cache               map[string]*model.CachePolicy         // domain ID -> policy
+	cacheRules          map[string][]model.CacheRule          // domain ID -> Cache rules
+	monitors            map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
+	healthStates        map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
+	certificates        map[string]*model.Certificate         // domain ID -> certificate
+	challenges          map[string]*model.ACMEChallenge       // token -> ACMEChallenge
+	tlsSettings         map[string]*model.TLSSettings         // domain ID -> TLSSettings
 }
 
 func NewStore() *Store {
 	return &Store{
+		popTopologyCache:   make(map[string][]*DomainTopology),
 		domains:            make(map[string]*model.Domain),
 		hostIndex:          make(map[string]string),
 		projectQuotas:      make(map[string]ProjectQuota),
@@ -101,10 +133,17 @@ func NewStore() *Store {
 	}
 }
 
+func (s *Store) invalidateCachesLocked() {
+	s.version++
+	s.popTopologyCache = make(map[string][]*DomainTopology)
+	s.activeTopologyCache = nil
+}
+
 func (s *Store) SetProjectQuota(projectID string, quota ProjectQuota) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.projectQuotas[projectID] = quota
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetProjectQuota(projectID string) ProjectQuota {
@@ -117,6 +156,10 @@ func (s *Store) GetProjectQuota(projectID string) ProjectQuota {
 }
 
 func (s *Store) SaveDomain(d *model.Domain) error {
+	if err := ValidateAllowedPoPs(d.AllowedPoPs); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -142,6 +185,7 @@ func (s *Store) SaveDomain(d *model.Domain) error {
 	if isNew && d.ProjectID != "" {
 		s.projectDomainCount[d.ProjectID]++
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -301,6 +345,17 @@ func (s *Store) ListDomainsByProject(projectID string) []*model.Domain {
 	return list
 }
 
+func (s *Store) ListDomains() []*model.Domain {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var list []*model.Domain
+	for _, d := range s.domains {
+		list = append(list, cloneDomain(d))
+	}
+	return list
+}
+
 func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -310,6 +365,7 @@ func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 		return ErrNotFound
 	}
 	d.Status = status
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -353,6 +409,7 @@ func (s *Store) deleteDomainLocked(domainID string) error {
 	delete(s.certificates, domainID)
 	delete(s.tlsSettings, domainID)
 
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -382,6 +439,15 @@ func (s *Store) SweepExpiredPendingDomains(maxAge time.Duration) int {
 }
 
 func (s *Store) SaveOriginPool(p *model.OriginPool) error {
+	if err := ValidateAllowedPoPs(p.AllowedPoPs); err != nil {
+		return err
+	}
+	for _, o := range p.Origins {
+		if err := ValidateAllowedPoPs(o.AllowedPoPs); err != nil {
+			return err
+		}
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -392,6 +458,7 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 	}
 
 	s.pools[p.ID] = cloneOriginPool(p)
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -400,9 +467,14 @@ func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pools[p.ID] = cloneOriginPool(p)
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) AddOrigin(o *model.Origin) error {
+	if err := ValidateAllowedPoPs(o.AllowedPoPs); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -424,6 +496,7 @@ func (s *Store) AddOrigin(o *model.Origin) error {
 	cloned := cloneOrigin(o)
 	s.origins[o.ID] = cloned
 	pool.Origins = append(pool.Origins, *cloned)
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -450,6 +523,7 @@ func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
 	if pool, exists := s.pools[cloned.PoolID]; exists {
 		pool.HealthMonitor = cloneHealthMonitor(cloned)
 	}
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
@@ -475,6 +549,7 @@ func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
 			}
 		}
 	}
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetOriginHealthState(originID string) *model.OriginEndpointState {
@@ -527,12 +602,14 @@ func (s *Store) UpdateOriginHealthy(originID string, healthy bool) {
 	if st, exists := s.healthStates[originID]; exists {
 		st.Healthy = healthy
 	}
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) SaveRoute(r *model.Route) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.routes[r.DomainID] = append(s.routes[r.DomainID], cloneRoute(r))
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetRoutes(domainID string) []*model.Route {
@@ -551,6 +628,7 @@ func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.security[sp.DomainID] = cloneSecurityPolicy(sp)
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
@@ -576,6 +654,7 @@ func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
 	if s.security[domainID] != nil {
 		s.security[domainID].WAFRules = s.wafRules[domainID]
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -612,6 +691,7 @@ func (s *Store) DeleteWAFRule(domainID string, ruleID string) error {
 	if s.security[domainID] != nil {
 		s.security[domainID].WAFRules = filtered
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -635,6 +715,7 @@ func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) 
 	if s.security[domainID] != nil {
 		s.security[domainID].RateLimitRules = append([]model.RateLimitRule(nil), rules...)
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -711,6 +792,7 @@ func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 		}
 	}
 	s.cache[cp.DomainID] = cloned
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
@@ -761,6 +843,7 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 	if s.cache[domainID] != nil {
 		s.cache[domainID].CacheRules = s.cacheRules[domainID]
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -802,6 +885,7 @@ func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
 	if s.cache[domainID] != nil {
 		s.cache[domainID].CacheRules = filtered
 	}
+	s.invalidateCachesLocked()
 	return nil
 }
 
@@ -809,6 +893,7 @@ func (s *Store) SaveCertificate(cert *model.Certificate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.certificates[cert.DomainID] = cloneCertificate(cert)
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetCertificate(domainID string) *model.Certificate {
@@ -821,6 +906,7 @@ func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.challenges[ch.Token] = cloneACMEChallenge(ch)
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
@@ -835,12 +921,14 @@ func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeSt
 	if ch, exists := s.challenges[token]; exists {
 		ch.Status = status
 	}
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) SaveTLSSettings(domainID string, settings *model.TLSSettings) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tlsSettings[domainID] = cloneTLSSettings(settings)
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {
@@ -865,11 +953,7 @@ type DomainTopology struct {
 	TLSSettings *model.TLSSettings
 }
 
-// GetActiveTopologies extracts all verified and active domains for Envoy compilation
-func (s *Store) GetActiveTopologies() []*DomainTopology {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+func (s *Store) buildActiveTopologiesLocked() []*DomainTopology {
 	var topologies []*DomainTopology
 	for _, d := range s.domains {
 		if d.Status != model.DomainStatusActive {
@@ -921,6 +1005,60 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 	return topologies
 }
 
+func cloneDomainTopology(dt *DomainTopology) *DomainTopology {
+	if dt == nil {
+		return nil
+	}
+	routes := make([]*model.Route, len(dt.Routes))
+	for i, r := range dt.Routes {
+		routes[i] = cloneRoute(r)
+	}
+	pools := make(map[string]*model.OriginPool, len(dt.Pools))
+	for k, p := range dt.Pools {
+		pools[k] = cloneOriginPool(p)
+	}
+	return &DomainTopology{
+		Domain:      cloneDomain(dt.Domain),
+		Routes:      routes,
+		Pools:       pools,
+		Security:    cloneSecurityPolicy(dt.Security),
+		Cache:       cloneCachePolicy(dt.Cache),
+		Certificate: cloneCertificate(dt.Certificate),
+		TLSSettings: cloneTLSSettings(dt.TLSSettings),
+	}
+}
+
+func cloneTopologies(topos []*DomainTopology) []*DomainTopology {
+	result := make([]*DomainTopology, len(topos))
+	for i, t := range topos {
+		result[i] = cloneDomainTopology(t)
+	}
+	return result
+}
+
+// GetActiveTopologies extracts all verified and active domains for Envoy compilation using snapshot caching (P2 Finding 7)
+func (s *Store) GetActiveTopologies() []*DomainTopology {
+	s.mu.RLock()
+	if s.activeTopologyCache != nil {
+		result := cloneTopologies(s.activeTopologyCache)
+		s.mu.RUnlock()
+		return result
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.activeTopologyCache != nil {
+		return cloneTopologies(s.activeTopologyCache)
+	}
+
+	topos := s.buildActiveTopologiesLocked()
+	s.activeTopologyCache = topos
+
+	return cloneTopologies(topos)
+}
+
 func containsPoP(allowedPoPs []string, targetPoP string) bool {
 	if len(allowedPoPs) == 0 {
 		return true // Unrestricted / Global
@@ -934,12 +1072,7 @@ func containsPoP(allowedPoPs []string, targetPoP string) bool {
 	return false
 }
 
-// GetActiveTopologiesForPoP extracts active domains and origin topologies allowed for a specific PoP (P1 PoP Scoping)
-func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	targetPoP := strings.ToLower(strings.TrimSpace(popID))
+func (s *Store) buildTopologiesForPoPLocked(targetPoP string) []*DomainTopology {
 	var topologies []*DomainTopology
 
 	for _, d := range s.domains {
@@ -967,6 +1100,7 @@ func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
 			TLSSettings: cloneTLSSettings(s.tlsSettings[d.ID]),
 		}
 
+		totalUsableOrigins := 0
 		for _, r := range topo.Routes {
 			if pool, exists := s.pools[r.PoolID]; exists {
 				// Filter origin pools restricted to other PoPs
@@ -982,9 +1116,29 @@ func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
 						filteredOrigins = append(filteredOrigins, o)
 					}
 				}
-				clonedPool.Origins = filteredOrigins
-				topo.Pools[r.PoolID] = clonedPool
+				if len(filteredOrigins) > 0 {
+					clonedPool.Origins = filteredOrigins
+					topo.Pools[r.PoolID] = clonedPool
+					totalUsableOrigins += len(filteredOrigins)
+				}
 			}
+		}
+
+		// P2 Finding 8: If domain has configured routes, check that at least one route has usable origins at this PoP.
+		// If 0 usable origins exist at this PoP, omit domain to prevent empty VirtualHost and routing blackholes.
+		if len(topo.Routes) > 0 && totalUsableOrigins == 0 {
+			continue
+		}
+
+		// Filter routes to only those pointing to usable pools
+		if len(topo.Routes) > 0 {
+			usableRoutes := make([]*model.Route, 0, len(topo.Routes))
+			for _, r := range topo.Routes {
+				if _, ok := topo.Pools[r.PoolID]; ok {
+					usableRoutes = append(usableRoutes, r)
+				}
+			}
+			topo.Routes = usableRoutes
 		}
 
 		topologies = append(topologies, topo)
@@ -1009,4 +1163,29 @@ func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
 	})
 
 	return topologies
+}
+
+// GetActiveTopologiesForPoP extracts active domains and origin topologies allowed for a specific PoP using snapshot caching (P2 Finding 7)
+func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
+	targetPoP := strings.ToLower(strings.TrimSpace(popID))
+
+	s.mu.RLock()
+	if cached, ok := s.popTopologyCache[targetPoP]; ok {
+		result := cloneTopologies(cached)
+		s.mu.RUnlock()
+		return result
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if cached, ok := s.popTopologyCache[targetPoP]; ok {
+		return cloneTopologies(cached)
+	}
+
+	topos := s.buildTopologiesForPoPLocked(targetPoP)
+	s.popTopologyCache[targetPoP] = topos
+
+	return cloneTopologies(topos)
 }

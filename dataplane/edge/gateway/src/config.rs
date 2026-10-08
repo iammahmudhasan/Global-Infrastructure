@@ -19,8 +19,17 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpstreamConfig {
+pub struct DomainRouteConfig {
+    pub host: String,
     pub targets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamConfig {
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub routes: Vec<DomainRouteConfig>,
     pub health_check_path: String,
     pub timeout_ms: u64,
 }
@@ -63,6 +72,7 @@ impl Default for GatewayConfig {
             },
             upstream: UpstreamConfig {
                 targets: vec!["http://127.0.0.1:3000".to_string()],
+                routes: vec![],
                 health_check_path: "/healthz".to_string(),
                 timeout_ms: 5000,
             },

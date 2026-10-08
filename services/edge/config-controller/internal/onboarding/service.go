@@ -171,6 +171,9 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 	if err := ValidateOriginAddress(req.OriginAddress); err != nil {
 		return nil, err
 	}
+	if err := store.ValidateAllowedPoPs(req.AllowedPoPs); err != nil {
+		return nil, err
+	}
 
 	// Validate origin port (Finding 18)
 	if req.OriginPort == 0 {

@@ -523,7 +523,26 @@ func (c *Compiler) CompileForPoP(popID string, topologies []*store.DomainTopolog
 			}
 		}
 
+		// P2 Finding 8: If domain has configured routes, verify there is at least one usable pool with valid origins for this PoP.
+		// If 0 usable origins exist at this PoP, omit domain to prevent empty VirtualHost and routing blackholes.
+		if len(topo.Routes) > 0 && len(filteredPools) == 0 {
+			continue
+		}
+
+		hasUsableRoute := false
+		usableRoutes := make([]*model.Route, 0, len(topo.Routes))
+		for _, r := range topo.Routes {
+			if pool, ok := filteredPools[r.PoolID]; ok && len(pool.Origins) > 0 {
+				hasUsableRoute = true
+				usableRoutes = append(usableRoutes, r)
+			}
+		}
+		if len(topo.Routes) > 0 && !hasUsableRoute {
+			continue
+		}
+
 		topoCopy := *topo
+		topoCopy.Routes = usableRoutes
 		topoCopy.Pools = filteredPools
 		filteredTopologies = append(filteredTopologies, &topoCopy)
 	}

@@ -35,6 +35,7 @@ const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
+const MAX_CUSTOM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days (Finding 2)
 
 pub const DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS: usize = 256;
 
@@ -234,13 +235,29 @@ pub async fn handle_request(
         }
     }
 
-    // 6. Upstream Selection (Finding 13: 503 Service Unavailable when no healthy nodes exist)
-    let upstream_base = match state.router.select_upstream() {
-        Some(target) => target,
-        None => {
-            warn!(uri = %uri_string, "No healthy upstream nodes available in pool");
+    // 6. Multi-Tenant Upstream Selection by Host (Finding 1)
+    let upstream_base = match state.router.select_upstream_for_host(&host) {
+        Ok(target) => target,
+        Err(crate::router::RoutingError::UnknownHost(h)) => {
+            warn!(host = %h, uri = %uri_string, "Unknown host: no tenant domain route configured");
             let body = serde_json::json!({
-                "error": "Service Unavailable: No healthy upstream origin nodes available in pool",
+                "error": "Misdirected Request: No tenant domain route configured for host",
+                "host": h,
+                "status": 421,
+            });
+            let resp = Response::builder()
+                .status(StatusCode::MISDIRECTED_REQUEST)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+        Err(crate::router::RoutingError::NoHealthyUpstreams(h)) => {
+            warn!(host = %h, uri = %uri_string, "No healthy upstream origin nodes available for tenant host");
+            let body = serde_json::json!({
+                "error": "Service Unavailable: No healthy upstream origin nodes available for tenant host",
+                "host": h,
                 "status": 503,
             });
             let resp = Response::builder()
@@ -366,8 +383,10 @@ pub async fn handle_request(
                 && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
 
             if can_cache {
-                // Parse s-maxage or max-age for custom TTL if specified
-                let custom_ttl = parse_max_age(&resp_cc).map(Duration::from_secs);
+                // Parse s-maxage or max-age for custom TTL if specified, bounded to 7 days
+                let custom_ttl = parse_max_age(&resp_cc)
+                    .map(Duration::from_secs)
+                    .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
                 state.cache.put(
                     cache_key,
                     status,
@@ -487,6 +506,20 @@ fn parse_max_age(cc: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_max_age_overflow_and_bounds() {
+        assert_eq!(parse_max_age("max-age=3600"), Some(3600));
+        assert_eq!(
+            parse_max_age("public, s-maxage=86400, max-age=3600"),
+            Some(86400)
+        );
+        assert_eq!(
+            parse_max_age("max-age=18446744073709551615"),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_max_age("no-cache"), None);
+    }
 
     #[test]
     fn test_normalize_accept_encoding() {

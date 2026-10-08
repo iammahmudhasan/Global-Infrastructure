@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.cache.max_entries,
         config.cache.max_bytes,
     );
-    let router = Router::new(config.upstream.targets.clone(), config.upstream.timeout_ms);
+    let router = Router::from_upstream_config(&config.upstream);
 
     let http_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tcp_nodelay(true)
         .build()?;
     let health_path = config.upstream.health_check_path.clone();
-    let targets = config.upstream.targets.clone();
+    let targets = router.all_targets();
 
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
