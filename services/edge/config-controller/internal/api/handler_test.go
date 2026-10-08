@@ -2111,4 +2111,3 @@ func TestHandler_RuleCardinalityLimits(t *testing.T) {
 		t.Errorf("unexpected Cache rule limit error message: %s", cacheRec.Body.String())
 	}
 }
-

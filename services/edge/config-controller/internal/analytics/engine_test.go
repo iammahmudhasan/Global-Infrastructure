@@ -373,7 +373,7 @@ func TestEngine_TimeSeriesRetentionPruning(t *testing.T) {
 
 	now := time.Now().UTC()
 	oldTime := now.Add(-35 * 24 * time.Hour) // 35 days ago (should be pruned)
-	recentTime := now.Add(-10 * time.Minute)  // 10 minutes ago (should be kept)
+	recentTime := now.Add(-10 * time.Minute) // 10 minutes ago (should be kept)
 
 	// Ingest event 35 days ago
 	_ = engine.Ingest(model.TelemetryEvent{
@@ -406,4 +406,3 @@ func TestEngine_TimeSeriesRetentionPruning(t *testing.T) {
 		t.Errorf("expected exactly 1 recent point, got %d", len(points))
 	}
 }
-

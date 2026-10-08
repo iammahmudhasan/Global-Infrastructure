@@ -419,4 +419,3 @@ func TestRegistry_ReserveEnforcesCircuitBreaker(t *testing.T) {
 		t.Fatalf("expected Reserve to fail when circuit breaker is OPEN")
 	}
 }
-
