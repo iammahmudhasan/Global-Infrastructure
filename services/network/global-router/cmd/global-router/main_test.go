@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
 )
 
 func TestBackendsAPI_AccessControl(t *testing.T) {
@@ -95,5 +97,85 @@ func TestBackendsAPI_AccessControl(t *testing.T) {
 	}
 	if !foundUnredacted {
 		t.Errorf("operator should see original unredacted endpoint for registered backend")
+	}
+}
+
+func TestWorkloadDispatch_ProjectIDSpoofingProtection(t *testing.T) {
+	srv := NewServer()
+	// Register authenticated tenant with ProjectID "proj-finance-secure"
+	srv.auth.RegisterTenantWithRole("key-tenant-auth", "tenant-cbr-banking", "proj-finance-secure", auth.RoleTenant)
+	handler := srv.routes()
+
+	// 1. Register backend so dispatch can be admitted
+	srv.registry.Register(&registry.ComputeBackend{
+		ID:            "backend-dgx-h100",
+		Provider:      "baremetal",
+		Region:        "ap-south-2",
+		Endpoint:      "https://dgx01.internal/v1",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.00,
+		LatencyP95Ms:  5,
+		Healthy:       true,
+	})
+
+	// 2. Caller sends body attempting to spoof ProjectID as "proj-victim-foreign"
+	dispatchReqBody := map[string]interface{}{
+		"workload_id":     "wl-dispatch-spoof-01",
+		"tenant_id":       "tenant-cbr-banking",
+		"project_id":      "proj-victim-foreign", // Attempted spoof!
+		"name":            "High Security Banking Model",
+		"required_gpu":    "H100",
+		"gpus_requested":  1,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-spoof-test-01",
+	}
+	body, _ := json.Marshal(dispatchReqBody)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant-auth")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for dispatch, got: %d (%s)", rec.Code, rec.Body.String())
+	}
+
+	var decision scheduler.DispatchDecision
+	if err := json.Unmarshal(rec.Body.Bytes(), &decision); err != nil {
+		t.Fatalf("failed to decode dispatch decision: %v", err)
+	}
+
+	// 3. Verify ProjectID is overridden with the authenticated project from context
+	if decision.ProjectID != "proj-finance-secure" {
+		t.Errorf("ProjectID spoofing vulnerability! Expected authoritative proj-finance-secure, got: %s", decision.ProjectID)
+	}
+	if decision.TenantID != "tenant-cbr-banking" {
+		t.Errorf("TenantID mismatch! Expected tenant-cbr-banking, got: %s", decision.TenantID)
+	}
+}
+
+func TestGlobalRouter_BodySizeLimit(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant-auth", "tenant-cbr-banking", "proj-finance-secure", auth.RoleTenant)
+	handler := srv.routes()
+
+	// Create body larger than 1 MiB (1.5 MiB)
+	largePayload := make([]byte, 1500*1024)
+	for i := range largePayload {
+		largePayload[i] = 'A'
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(largePayload))
+	req.Header.Set("Authorization", "Bearer key-tenant-auth")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	// MaxBytesReader should cause decoder to fail with BadRequest (or RequestEntityTooLarge)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for oversized payload exceeding 1 MiB, got: %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "too large") && !strings.Contains(rec.Body.String(), "Invalid policy JSON") {
+		t.Errorf("expected body to indicate payload error, got: %s", rec.Body.String())
 	}
 }

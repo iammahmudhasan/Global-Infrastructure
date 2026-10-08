@@ -136,10 +136,14 @@ func (s *Server) routes() http.Handler {
 			return
 		}
 
-		// Inject authenticated tenant from context if not provided (Rules 54, 55)
+		// Inject authenticated tenant and project from context as authoritative source of truth (Rules 54, 55)
 		tenantID, _ := r.Context().Value(auth.TenantContextKey).(string)
+		projectID, _ := r.Context().Value(auth.ProjectContextKey).(string)
 		if tenantID != "" {
 			policy.TenantID = tenantID
+		}
+		if projectID != "" {
+			policy.ProjectID = projectID
 		}
 
 		start := time.Now()
@@ -169,9 +173,21 @@ func (s *Server) routes() http.Handler {
 		json.NewEncoder(w).Encode(decision)
 	})
 
-	// Wrap in middleware chain: Correlation -> Auth (Rule 6: Dependency Direction)
+	// Wrap in middleware chain: Correlation -> BodySizeLimit -> Auth (Rule 6: Dependency Direction)
 	handler := s.auth.Middleware(mux)
+	handler = bodySizeLimitMiddleware(handler)
 	return telemetry.RequestCorrelationMiddleware(handler)
+}
+
+const maxRequestBody = 1 << 20 // 1 MiB
+
+func bodySizeLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func main() {

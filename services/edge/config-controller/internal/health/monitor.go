@@ -29,6 +29,14 @@ type Monitor struct {
 	httpClient *http.Client
 }
 
+func isExplicitDevEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "development" || env == "test"
+}
+
 func safeDialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
@@ -45,8 +53,8 @@ func safeDialContext(ctx context.Context, network, address string) (net.Conn, er
 
 	for _, ip := range ips {
 		if isPrivateOrReservedIP(ip.IP) {
-			if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && ip.IP.IsLoopback() {
-				// Permitted for local testbed harnesses (httptest.NewServer) only under explicit dev mode
+			if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() && ip.IP.IsLoopback() {
+				// Permitted for local testbed harnesses (httptest.NewServer) only under explicit dev/test mode
 				continue
 			}
 			return nil, fmt.Errorf("blocked private/reserved destination: %s (SSRF protection)", ip.IP)

@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 func TestMonitor_ProbeSuccessAndThreshold(t *testing.T) {
 	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
 	// Mock healthy server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" {
@@ -83,6 +85,7 @@ func TestMonitor_ProbeSuccessAndThreshold(t *testing.T) {
 
 func TestMonitor_ProbeFailureAndFailoverThreshold(t *testing.T) {
 	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
 	// Mock failing server (returns 503)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
@@ -303,5 +306,73 @@ func TestMonitor_IPv6ProbeFormatting(t *testing.T) {
 	// Because 2001:db8::1 is unreachable/testnet, it fails to connect, but must NOT fail due to malformed URL parsing
 	if st.ConsecutiveFailures != 1 {
 		t.Errorf("expected failure registered for probe to unreachable IPv6 address, got %d", st.ConsecutiveFailures)
+	}
+}
+
+func TestMonitor_DevLoopbackEnvironmentBinding(t *testing.T) {
+	// Spin up a local mock server on 127.0.0.1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	origin := &model.Origin{
+		ID:       "orig-loopback",
+		PoolID:   "pool-1",
+		Address:  u.Hostname(), // 127.0.0.1
+		Port:     port,
+		Protocol: model.ProtocolHTTP,
+		Healthy:  true,
+	}
+
+	monitorConfig := &model.HealthMonitor{
+		ID:                  "hm-loopback",
+		PoolID:              "pool-1",
+		Protocol:            model.HealthCheckProtocolHTTP,
+		Path:                "/",
+		Port:                port,
+		TimeoutSeconds:      1,
+		HealthyThreshold:    1,
+		UnhealthyThreshold:  1,
+		ExpectedStatusCodes: []int{200},
+	}
+
+	m := health.NewMonitor()
+	ctx := context.Background()
+
+	// 1. DEV_MODE=true + ENV=development -> loopback allowed for local tests
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "development")
+	st1 := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	if !st1.Healthy || st1.LastStatusCode != http.StatusOK {
+		t.Errorf("expected loopback to be allowed under DEV_MODE=true + ENV=development, got: %s", st1.LastError)
+	}
+
+	// 2. DEV_MODE=true + ENV=production -> loopback BLOCKED by SSRF protection
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "production")
+	st2 := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	if st2.Healthy || !strings.Contains(st2.LastError, "SSRF protection") {
+		t.Errorf("expected loopback to be blocked in production, got healthy=%v err=%s", st2.Healthy, st2.LastError)
+	}
+
+	// 3. DEV_MODE=true + ENV="" -> loopback BLOCKED
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "")
+	t.Setenv("ENV", "")
+	st3 := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	if st3.Healthy || !strings.Contains(st3.LastError, "SSRF protection") {
+		t.Errorf("expected loopback to be blocked with empty ENV, got healthy=%v err=%s", st3.Healthy, st3.LastError)
+	}
+
+	// 4. DEV_MODE=false + ENV=development -> loopback BLOCKED
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	t.Setenv("NEXUSEDGE_ENV", "development")
+	st4 := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	if st4.Healthy || !strings.Contains(st4.LastError, "SSRF protection") {
+		t.Errorf("expected loopback to be blocked when DEV_MODE=false, got healthy=%v err=%s", st4.Healthy, st4.LastError)
 	}
 }
