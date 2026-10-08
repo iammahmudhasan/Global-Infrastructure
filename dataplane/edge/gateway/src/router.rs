@@ -138,14 +138,14 @@ impl Router {
                     .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
 
                 select_from_nodes(nodes, &counter)
-                    .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host))
+                    .ok_or(RoutingError::NoHealthyUpstreams(norm_host))
             } else {
                 Err(RoutingError::UnknownHost(norm_host))
             }
         } else {
             let default_nodes = self.default_nodes.read().unwrap();
             select_from_nodes(&default_nodes, &self.default_index)
-                .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host))
+                .ok_or(RoutingError::NoHealthyUpstreams(norm_host))
         }
     }
 
@@ -157,7 +157,7 @@ impl Router {
             select_from_nodes(&default_nodes, &self.default_index)
         } else {
             let routes = self.routes.read().unwrap();
-            for (_host, nodes) in routes.iter() {
+            for nodes in routes.values() {
                 if let Some(target) = select_from_nodes(nodes, &self.default_index) {
                     return Some(target);
                 }

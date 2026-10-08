@@ -2663,9 +2663,9 @@ func TestPoP_EmptyOriginOmissionPreventsBlackhole(t *testing.T) {
 	})
 
 	st.SaveRoute(&model.Route{
-		ID:       "rt-dhaka",
-		DomainID: domainID,
-		PoolID:   poolID,
+		ID:         "rt-dhaka",
+		DomainID:   domainID,
+		PoolID:     poolID,
 		PathPrefix: "/",
 	})
 
@@ -2729,9 +2729,9 @@ func TestStore_PoPTopologySnapshotCaching(t *testing.T) {
 		},
 	})
 	st.SaveRoute(&model.Route{
-		ID:       "rt-1",
-		DomainID: domainID,
-		PoolID:   poolID,
+		ID:         "rt-1",
+		DomainID:   domainID,
+		PoolID:     poolID,
 		PathPrefix: "/",
 	})
 

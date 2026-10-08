@@ -198,9 +198,7 @@ impl EdgeCache {
         }
         // P2 Finding 2: Enforce hard ceiling on cache TTL and prevent Instant::now() + ttl panic on arithmetic overflow
         const MAX_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
-        let ttl = custom_ttl
-            .unwrap_or(self.default_ttl)
-            .min(MAX_CACHE_TTL);
+        let ttl = custom_ttl.unwrap_or(self.default_ttl).min(MAX_CACHE_TTL);
         let expires_at = match Instant::now().checked_add(ttl) {
             Some(at) => at,
             None => return, // Defensively drop unrepresentable Instant expiries
