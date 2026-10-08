@@ -41,12 +41,12 @@ impl TokenBucket {
 
 #[derive(Default)]
 struct BucketStore {
-    buckets: HashMap<IpAddr, TokenBucket>,
-    access_queue: VecDeque<(IpAddr, Instant)>,
+    buckets: HashMap<String, TokenBucket>,
+    access_queue: VecDeque<(String, Instant)>,
 }
 
 impl Deref for BucketStore {
-    type Target = HashMap<IpAddr, TokenBucket>;
+    type Target = HashMap<String, TokenBucket>;
 
     fn deref(&self) -> &Self::Target {
         &self.buckets
@@ -79,34 +79,39 @@ impl RateLimiter {
         }
     }
 
+    #[allow(dead_code)]
     pub fn check(&self, client_ip: IpAddr) -> bool {
+        self.check_key(&client_ip.to_string(), None, None)
+    }
+
+    pub fn check_key(&self, key: &str, custom_rps: Option<u32>, custom_burst: Option<u32>) -> bool {
         if !self.enabled {
             return true;
         }
 
         let mut store = self.buckets.write().unwrap();
-        if !store.buckets.contains_key(&client_ip) && store.buckets.len() >= self.max_buckets {
+        if !store.buckets.contains_key(key) && store.buckets.len() >= self.max_buckets {
             // Amortized O(1) eviction via lazy LRU access queue (Finding 5)
-            while let Some((candidate_ip, candidate_ts)) = store.access_queue.pop_front() {
-                if let Some(bucket) = store.buckets.get(&candidate_ip) {
+            while let Some((candidate_key, candidate_ts)) = store.access_queue.pop_front() {
+                if let Some(bucket) = store.buckets.get(&candidate_key) {
                     if bucket.last_update == candidate_ts {
-                        store.buckets.remove(&candidate_ip);
+                        store.buckets.remove(&candidate_key);
                         break;
                     }
                 }
             }
         }
 
-        let capacity = self.capacity;
-        let refill_rate = self.refill_rate;
+        let capacity = custom_burst.map(|c| c as f64).unwrap_or(self.capacity);
+        let refill_rate = custom_rps.map(|r| r as f64).unwrap_or(self.refill_rate);
         let bucket = store
             .buckets
-            .entry(client_ip)
+            .entry(key.to_string())
             .or_insert_with(|| TokenBucket::new(capacity, refill_rate));
 
         let allowed = bucket.try_consume(1.0);
         let update_time = bucket.last_update;
-        store.access_queue.push_back((client_ip, update_time));
+        store.access_queue.push_back((key.to_string(), update_time));
 
         // Periodic hygiene: trim dead items from access_queue if it grows significantly larger than capacity
         if store.access_queue.len() > self.max_buckets * 3 {
@@ -114,7 +119,7 @@ impl RateLimiter {
                 buckets,
                 access_queue,
             } = &mut *store;
-            access_queue.retain(|(ip, ts)| buckets.get(ip).is_some_and(|b| b.last_update == *ts));
+            access_queue.retain(|(k, ts)| buckets.get(k).is_some_and(|b| b.last_update == *ts));
         }
 
         allowed
@@ -168,9 +173,12 @@ mod tests {
         assert_eq!(limiter.bucket_count(), 2);
 
         let buckets = limiter.buckets.read().unwrap();
-        assert!(!buckets.contains_key(&ip1), "ip1 should have been evicted");
-        assert!(buckets.contains_key(&ip2));
-        assert!(buckets.contains_key(&ip3));
+        assert!(
+            !buckets.contains_key(&ip1.to_string()),
+            "ip1 should have been evicted"
+        );
+        assert!(buckets.contains_key(&ip2.to_string()));
+        assert!(buckets.contains_key(&ip3.to_string()));
     }
 
     #[test]
@@ -193,13 +201,16 @@ mod tests {
 
         let buckets = limiter.buckets.read().unwrap();
         assert!(
-            buckets.contains_key(&ip1),
+            buckets.contains_key(&ip1.to_string()),
             "ip1 was refreshed so it must remain"
         );
         assert!(
-            !buckets.contains_key(&ip2),
+            !buckets.contains_key(&ip2.to_string()),
             "ip2 was LRU so it must be evicted"
         );
-        assert!(buckets.contains_key(&ip3), "ip3 must be present");
+        assert!(
+            buckets.contains_key(&ip3.to_string()),
+            "ip3 must be present"
+        );
     }
 }

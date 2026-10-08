@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -2070,37 +2071,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		hash := sha256.Sum256(cfgJSON)
 		checksum := hex.EncodeToString(hash[:])
 
-		gatewayRoutes := make([]model.GatewayRouteSync, 0, len(topologies))
-		for _, topo := range topologies {
-			if topo == nil || topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
-				continue
-			}
-			var targets []string
-			for _, pool := range topo.Pools {
-				if pool == nil {
-					continue
-				}
-				for _, o := range pool.Origins {
-					proto := strings.ToLower(string(o.Protocol))
-					if proto == "" {
-						proto = "http"
-					}
-					targetURL := fmt.Sprintf("%s://%s:%d", proto, o.Address, o.Port)
-					targets = append(targets, targetURL)
-				}
-			}
-			if len(targets) > 0 {
-				gatewayRoutes = append(gatewayRoutes, model.GatewayRouteSync{
-					Host:    strings.ToLower(topo.Domain.Hostname),
-					Targets: targets,
-				})
-			}
-		}
+		gatewayRoutes := h.buildGatewayRoutesForPoP(topologies)
+
+		canonicalBytes, _ := json.Marshal(gatewayRoutes)
+		canonicalSum := sha256.Sum256(canonicalBytes)
+		canonicalHash := hex.EncodeToString(canonicalSum[:])
+		w.Header().Set("X-Snapshot-Checksum", canonicalHash)
 
 		syncResult := model.PoPConfigSync{
 			PoPID:           pop.ID,
 			ConfigVersion:   "v1.0.0-" + checksum[:8],
 			ChecksumSHA256:  checksum,
+			CanonicalSHA256: canonicalHash,
 			CompiledAt:      time.Now().UTC(),
 			TopologiesCount: len(topologies),
 			EnvoyConfig:     envoyCfg,
@@ -2216,4 +2198,162 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology) []model.GatewayRouteSync {
+	resolver := h.compiler.GetDNSResolver()
+	pinOriginsForPool := func(pool *model.OriginPool) ([]model.GatewayOriginSync, []string) {
+		if pool == nil {
+			return nil, nil
+		}
+		var origins []model.GatewayOriginSync
+		var targets []string
+
+		for _, o := range pool.Origins {
+			proto := strings.ToUpper(string(o.Protocol))
+			if proto == "" {
+				proto = "HTTP"
+			}
+			parsedIP := net.ParseIP(o.Address)
+			if parsedIP != nil {
+				if onboarding.IsPrivateOrReservedIP(parsedIP) {
+					continue
+				}
+				origins = append(origins, model.GatewayOriginSync{
+					Address:  parsedIP.String(),
+					Port:     o.Port,
+					Protocol: proto,
+					SNI:      o.Address,
+					Weight:   o.Weight,
+				})
+				targets = append(targets, fmt.Sprintf("%s://%s:%d", strings.ToLower(proto), parsedIP.String(), o.Port))
+			} else {
+				if resolver == nil {
+					continue
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				resolvedIPs, err := resolver(ctx, o.Address)
+				cancel()
+				if err != nil || len(resolvedIPs) == 0 {
+					continue
+				}
+				hasUnsafeIP := false
+				var safeIPs []net.IP
+				for _, ip := range resolvedIPs {
+					if onboarding.IsPrivateOrReservedIP(ip) {
+						hasUnsafeIP = true
+						break
+					}
+					safeIPs = append(safeIPs, ip)
+				}
+				if hasUnsafeIP || len(safeIPs) == 0 {
+					continue
+				}
+				for _, ip := range safeIPs {
+					origins = append(origins, model.GatewayOriginSync{
+						Address:  ip.String(),
+						Port:     o.Port,
+						Protocol: proto,
+						SNI:      o.Address,
+						Weight:   o.Weight,
+					})
+					targets = append(targets, fmt.Sprintf("%s://%s:%d", strings.ToLower(proto), ip.String(), o.Port))
+				}
+			}
+		}
+		return origins, targets
+	}
+
+	gatewayRoutes := make([]model.GatewayRouteSync, 0, len(topologies))
+	for _, topo := range topologies {
+		if topo == nil || topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
+			continue
+		}
+
+		var pathRoutes []model.GatewayPathRouteSync
+		var allTargets []string
+		seenTargets := make(map[string]bool)
+
+		for _, r := range topo.Routes {
+			pool := topo.Pools[r.PoolID]
+			pinnedOrigins, tgts := pinOriginsForPool(pool)
+			if len(pinnedOrigins) > 0 {
+				pathRoutes = append(pathRoutes, model.GatewayPathRouteSync{
+					PathPrefix: r.PathPrefix,
+					Priority:   r.Priority,
+					Origins:    pinnedOrigins,
+					Targets:    tgts,
+				})
+				for _, t := range tgts {
+					if !seenTargets[t] {
+						seenTargets[t] = true
+						allTargets = append(allTargets, t)
+					}
+				}
+			}
+		}
+
+		if len(pathRoutes) == 0 {
+			var fallbackOrigins []model.GatewayOriginSync
+			for _, pool := range topo.Pools {
+				pinned, tgts := pinOriginsForPool(pool)
+				fallbackOrigins = append(fallbackOrigins, pinned...)
+				for _, t := range tgts {
+					if !seenTargets[t] {
+						seenTargets[t] = true
+						allTargets = append(allTargets, t)
+					}
+				}
+			}
+			if len(fallbackOrigins) > 0 {
+				pathRoutes = append(pathRoutes, model.GatewayPathRouteSync{
+					PathPrefix: "/",
+					Priority:   0,
+					Origins:    fallbackOrigins,
+					Targets:    allTargets,
+				})
+			}
+		}
+
+		if len(pathRoutes) == 0 && len(allTargets) == 0 {
+			continue
+		}
+
+		var secSync *model.GatewaySecuritySync
+		if topo.Security != nil {
+			secSync = &model.GatewaySecuritySync{
+				WAFEnabled:         topo.Security.WAFEnabled,
+				BlockSQLi:          topo.Security.WAFEnabled && (topo.Security.OWASPProtection || topo.Security.WAFMode == "BLOCK"),
+				BlockXSS:           topo.Security.WAFEnabled && (topo.Security.OWASPProtection || topo.Security.WAFMode == "BLOCK"),
+				BlockPathTraversal: topo.Security.WAFEnabled && (topo.Security.OWASPProtection || topo.Security.WAFMode == "BLOCK"),
+				RateLimitEnabled:   topo.Security.RateLimitEnabled,
+			}
+			if topo.Security.RateLimitRPM > 0 {
+				secSync.RequestsPerSecond = uint32((topo.Security.RateLimitRPM + 59) / 60)
+				secSync.BurstCapacity = secSync.RequestsPerSecond * 2
+			}
+			for _, wr := range topo.Security.WAFRules {
+				if wr.Enabled && wr.Action == model.WAFActionBlock && wr.MatchType == model.WAFMatchPathPrefix {
+					secSync.BlockedPaths = append(secSync.BlockedPaths, wr.Pattern)
+				}
+			}
+		}
+
+		var cacheSync *model.GatewayCacheSync
+		if topo.Cache != nil {
+			cacheSync = &model.GatewayCacheSync{
+				Enabled:           topo.Cache.CacheEnabled,
+				DefaultTTLSeconds: uint64(topo.Cache.DefaultTTLSeconds),
+			}
+		}
+
+		gatewayRoutes = append(gatewayRoutes, model.GatewayRouteSync{
+			Host:       strings.ToLower(topo.Domain.Hostname),
+			PathRoutes: pathRoutes,
+			Targets:    allTargets,
+			Security:   secSync,
+			Cache:      cacheSync,
+		})
+	}
+	return gatewayRoutes
 }

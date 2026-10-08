@@ -13,7 +13,7 @@ if (-not $RepoRoot) {
 }
 
 # 1. Go Format Gate
-Write-Host "[1/6] Running Go format check (gofmt -l)..." -ForegroundColor Yellow
+Write-Host "[1/7] Running Go format check (gofmt -l)..." -ForegroundColor Yellow
 $GoServices = @(
     "services/edge/config-controller",
     "services/network/global-router"
@@ -39,7 +39,7 @@ foreach ($svc in $GoServices) {
 Write-Host " -> Go format check passed." -ForegroundColor Green
 
 # 2. Go Vet and Tests Gate
-Write-Host "[2/6] Running Go vet and unit tests..." -ForegroundColor Yellow
+Write-Host "[2/7] Running Go vet and unit tests..." -ForegroundColor Yellow
 foreach ($svc in $GoServices) {
     $svcPath = Join-Path $RepoRoot $svc
     if (Test-Path $svcPath) {
@@ -64,7 +64,7 @@ foreach ($svc in $GoServices) {
 Write-Host " -> Go vet and tests passed." -ForegroundColor Green
 
 # 3. Rust Format Gate
-Write-Host "[3/6] Running Rust format check (cargo fmt --check)..." -ForegroundColor Yellow
+Write-Host "[3/7] Running Rust format check (cargo fmt --check)..." -ForegroundColor Yellow
 $GatewayCargo = Join-Path $RepoRoot "dataplane/edge/gateway/Cargo.toml"
 & cargo fmt --manifest-path $GatewayCargo --all -- --check
 if ($LASTEXITCODE -ne 0) {
@@ -75,7 +75,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host " -> Rust format check passed." -ForegroundColor Green
 
 # 4. Rust Clippy Gate (-D warnings)
-Write-Host "[4/6] Running Rust Clippy linter (cargo clippy -D warnings)..." -ForegroundColor Yellow
+Write-Host "[4/7] Running Rust Clippy linter (cargo clippy -D warnings)..." -ForegroundColor Yellow
 & cargo clippy --manifest-path $GatewayCargo --all-targets --all-features -- -D warnings
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Rust clippy reported warnings or errors." -ForegroundColor Red
@@ -84,7 +84,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host " -> Rust clippy passed with zero warnings." -ForegroundColor Green
 
 # 5. Rust Compiler Check
-Write-Host "[5/6] Running Rust check (cargo check)..." -ForegroundColor Yellow
+Write-Host "[5/7] Running Rust check (cargo check)..." -ForegroundColor Yellow
 & cargo check --manifest-path $GatewayCargo
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: 'cargo check' failed." -ForegroundColor Red
@@ -93,7 +93,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host " -> Rust check passed." -ForegroundColor Green
 
 # 6. Python Intelligence Optimizer Gate
-Write-Host "[6/6] Verifying Python Intelligence scheduler..." -ForegroundColor Yellow
+Write-Host "[6/7] Verifying Python Intelligence scheduler..." -ForegroundColor Yellow
 $OptimizerScript = Join-Path $RepoRoot "intelligence/scheduling/workload-scheduler/optimizer.py"
 & python $OptimizerScript
 if ($LASTEXITCODE -ne 0) {
@@ -101,6 +101,20 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host " -> Python optimizer passed." -ForegroundColor Green
+
+# 7. Docker Compose Manifest Validation Gate
+Write-Host "[7/7] Validating Docker Compose configuration..." -ForegroundColor Yellow
+$ComposeFile = Join-Path $RepoRoot "deploy/docker-compose.yml"
+if (Get-Command docker -ErrorAction SilentlyContinue) {
+    & docker compose -f $ComposeFile config
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Docker Compose configuration validation failed." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host " -> Docker Compose validation passed." -ForegroundColor Green
+} else {
+    Write-Host " -> Docker CLI not found, skipping local compose check." -ForegroundColor Gray
+}
 
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host " SUCCESS: All CI Parity Gates Passed. Safe to commit and push!" -ForegroundColor Green

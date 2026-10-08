@@ -21,9 +21,25 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathRouteConfig {
+    #[serde(default = "default_path_prefix")]
+    pub path_prefix: String,
+    #[serde(default)]
+    pub priority: u32,
+    pub targets: Vec<String>,
+}
+
+fn default_path_prefix() -> String {
+    "/".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainRouteConfig {
     pub host: String,
+    #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub path_routes: Vec<PathRouteConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +93,7 @@ pub struct ControlPlaneConfig {
 }
 
 fn default_control_plane_endpoint() -> String {
-    "http://127.0.0.1:8081".to_string()
+    "http://127.0.0.1:9091".to_string()
 }
 
 fn default_pop_id() -> String {

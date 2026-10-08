@@ -16,6 +16,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use reqwest::Client as HttpClient;
+use sha2::Digest;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,8 +158,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
 
-                // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config
+                // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config (P1 Integrity & SSRF Hardening)
                 if cp_cfg.enabled {
+                    let is_secure_endpoint = cp_cfg.endpoint.starts_with("https://")
+                        || cp_cfg.endpoint.starts_with("http://127.0.0.1")
+                        || cp_cfg.endpoint.starts_with("http://localhost");
+                    if !is_secure_endpoint {
+                        tracing::warn!(
+                            endpoint = %cp_cfg.endpoint,
+                            "Insecure Control Plane endpoint: Bearer token transport over non-loopback HTTP is forbidden"
+                        );
+                        continue;
+                    }
+
                     let url = format!(
                         "{}/v1/edge/pops/{}/config",
                         cp_cfg.endpoint.trim_end_matches('/'),
@@ -171,7 +183,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     match req_builder.send().await {
                         Ok(resp) if resp.status().is_success() => {
+                            let header_checksum = resp
+                                .headers()
+                                .get("x-snapshot-checksum")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|s| s.to_string());
+
                             if let Ok(body_str) = resp.text().await {
+                                // Validate SHA-256 integrity if checksum is present
+                                if let Some(ref expected_checksum) = header_checksum {
+                                    let computed_hash =
+                                        format!("{:x}", sha2::Sha256::digest(body_str.as_bytes()));
+                                    if !expected_checksum.is_empty()
+                                        && !expected_checksum.eq_ignore_ascii_case(&computed_hash)
+                                    {
+                                        tracing::error!(
+                                            expected = %expected_checksum,
+                                            computed = %computed_hash,
+                                            "Snapshot SHA-256 checksum mismatch, rejecting corrupted or tampered route update"
+                                        );
+                                        continue;
+                                    }
+                                }
+
                                 match router::parse_pop_config_routes(&body_str) {
                                     Ok(new_routes) => {
                                         if let Err(e) =
@@ -206,7 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // 5. Autonomous Upstream Health Probing Loop (Findings 8, 9, 14)
+    // 5. Autonomous Upstream Health Probing Loop (Findings 8, 9, 14, P1 Finding 2)
     let health_router = router.clone();
     let health_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
@@ -215,15 +249,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tcp_nodelay(true)
         .build()?;
     let health_path = config.upstream.health_check_path.clone();
-    let targets = router.all_targets();
 
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
+            let current_targets = health_router.all_targets();
             let mut join_set = tokio::task::JoinSet::new();
-            for target in targets.clone() {
+            for target in current_targets {
                 let client = health_client.clone();
                 let path = health_path.clone();
                 let permit = semaphore.clone();

@@ -205,6 +205,10 @@ func (c *Compiler) SetDNSResolver(r DNSResolver) {
 	c.resolver = r
 }
 
+func (c *Compiler) GetDNSResolver() DNSResolver {
+	return c.resolver
+}
+
 // Compile compiles active domain topologies into an Envoy v3 configuration
 func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, error) {
 	config := &EnvoyConfig{

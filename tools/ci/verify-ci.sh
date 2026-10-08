@@ -40,33 +40,42 @@ for svc in "${GO_SERVICES[@]}"; do
     pushd "${REPO_ROOT}/${svc}" > /dev/null
     echo "   Testing ${svc}..."
     go vet ./...
-    go test -v ./...
+    go test -v -race ./...
     popd > /dev/null
   fi
 done
 echo " -> Go vet and tests passed."
 
 # 3. Rust Format Gate
-echo "[3/6] Running Rust format check (cargo fmt --check)..."
+echo "[3/7] Running Rust format check (cargo fmt --check)..."
 GATEWAY_CARGO="${REPO_ROOT}/dataplane/edge/gateway/Cargo.toml"
 cargo fmt --manifest-path "${GATEWAY_CARGO}" --all -- --check
 echo " -> Rust format check passed."
 
 # 4. Rust Clippy Gate (-D warnings)
-echo "[4/6] Running Rust Clippy linter (cargo clippy -D warnings)..."
+echo "[4/7] Running Rust Clippy linter (cargo clippy -D warnings)..."
 cargo clippy --manifest-path "${GATEWAY_CARGO}" --all-targets --all-features -- -D warnings
 echo " -> Rust clippy passed with zero warnings."
 
 # 5. Rust Compiler Check
-echo "[5/6] Running Rust check (cargo check)..."
+echo "[5/7] Running Rust check (cargo check)..."
 cargo check --manifest-path "${GATEWAY_CARGO}"
 cargo test --manifest-path "${GATEWAY_CARGO}"
 echo " -> Rust check and tests passed."
 
 # 6. Python Intelligence Optimizer Gate
-echo "[6/6] Verifying Python Intelligence scheduler..."
+echo "[6/7] Verifying Python Intelligence scheduler..."
 python "${REPO_ROOT}/intelligence/scheduling/workload-scheduler/optimizer.py"
 echo " -> Python optimizer passed."
+
+# 7. Docker Compose Manifest Gate
+echo "[7/7] Validating Docker Compose configuration..."
+if command -v docker >/dev/null 2>&1; then
+  docker compose -f "${REPO_ROOT}/deploy/docker-compose.yml" config
+  echo " -> Docker Compose validation passed."
+else
+  echo " -> Docker CLI not found, skipping local compose check."
+fi
 
 echo "================================================================"
 echo " SUCCESS: All CI Parity Gates Passed. Safe to commit and push!"

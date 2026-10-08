@@ -81,16 +81,93 @@ impl std::fmt::Display for RouterError {
 impl std::error::Error for RouterError {}
 
 #[derive(Clone, Debug)]
+pub struct OriginHealthState {
+    pub healthy: bool,
+    pub latency_ms: u64,
+    pub ewma_latency_ms: f64,
+    pub consecutive_passes: u32,
+    pub consecutive_failures: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PathRoute {
+    pub path_prefix: String,
+    pub priority: u32,
+    pub origins: Vec<UpstreamNode>,
+    pub round_robin_index: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct DomainSecurityPolicy {
+    pub waf_enabled: bool,
+    pub block_sqli: bool,
+    pub block_xss: bool,
+    pub block_path_traversal: bool,
+    pub blocked_paths: Vec<String>,
+    pub rate_limit_enabled: bool,
+    pub requests_per_second: u32,
+    pub burst_capacity: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct DomainCachePolicy {
+    pub enabled: bool,
+    pub default_ttl_seconds: u64,
+    pub bypass_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct DomainRoute {
     pub host: String,
     pub origins: Vec<UpstreamNode>,
+    pub path_routes: Vec<PathRoute>,
+    pub security: Option<DomainSecurityPolicy>,
+    pub cache: Option<DomainCachePolicy>,
+}
+
+impl DomainRoute {
+    pub fn new(host: String, origins: Vec<UpstreamNode>) -> Self {
+        let path_routes = vec![PathRoute {
+            path_prefix: "/".to_string(),
+            priority: 0,
+            origins: origins.clone(),
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
+        }];
+        Self {
+            host,
+            origins,
+            path_routes,
+            security: None,
+            cache: None,
+        }
+    }
+
+    pub fn with_paths(
+        host: String,
+        path_routes: Vec<PathRoute>,
+        security: Option<DomainSecurityPolicy>,
+        cache: Option<DomainCachePolicy>,
+    ) -> Self {
+        let mut origins = Vec::new();
+        for pr in &path_routes {
+            origins.extend(pr.origins.clone());
+        }
+        Self {
+            host,
+            origins,
+            path_routes,
+            security,
+            cache,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Router {
     default_nodes: Arc<RwLock<Vec<UpstreamNode>>>,
-    routes: Arc<RwLock<HashMap<String, Vec<UpstreamNode>>>>,
-    route_indices: Arc<RwLock<HashMap<String, Arc<AtomicUsize>>>>,
+    routes: Arc<RwLock<HashMap<String, DomainRoute>>>,
+    health_states: Arc<RwLock<HashMap<String, OriginHealthState>>>,
     default_index: Arc<AtomicUsize>,
     #[allow(dead_code)]
     timeout: Duration,
@@ -111,13 +188,31 @@ impl Router {
         }
     }
 
+    pub fn create_node_with_health(
+        url: String,
+        health_states: &HashMap<String, OriginHealthState>,
+    ) -> UpstreamNode {
+        if let Some(h) = health_states.get(&url) {
+            UpstreamNode {
+                url,
+                healthy: h.healthy,
+                latency_ms: h.latency_ms,
+                ewma_latency_ms: h.ewma_latency_ms,
+                consecutive_passes: h.consecutive_passes,
+                consecutive_failures: h.consecutive_failures,
+            }
+        } else {
+            Self::create_node(url)
+        }
+    }
+
     /// Creates a single-tenant router with default targets (V0 backwards compatibility)
     pub fn new(targets: Vec<String>, timeout_ms: u64) -> Self {
         let nodes = targets.into_iter().map(Self::create_node).collect();
         Self {
             default_nodes: Arc::new(RwLock::new(nodes)),
             routes: Arc::new(RwLock::new(HashMap::new())),
-            route_indices: Arc::new(RwLock::new(HashMap::new())),
+            health_states: Arc::new(RwLock::new(HashMap::new())),
             default_index: Arc::new(AtomicUsize::new(0)),
             timeout: Duration::from_millis(timeout_ms),
             is_multi_tenant: Arc::new(AtomicBool::new(false)),
@@ -132,7 +227,6 @@ impl Router {
         timeout_ms: u64,
     ) -> Result<Self, RouterError> {
         let mut routes_map = HashMap::new();
-        let mut indices_map = HashMap::new();
 
         for route in routes_input {
             let norm_host = normalize_host(&route.host);
@@ -142,14 +236,18 @@ impl Router {
             if routes_map.contains_key(&norm_host) {
                 return Err(RouterError::DuplicateHost(norm_host));
             }
-            if route.origins.is_empty() {
+            if route.origins.is_empty() && route.path_routes.is_empty() {
                 return Err(RouterError::EmptyTargets(norm_host));
             }
             for node in &route.origins {
                 validate_target_url(&norm_host, &node.url)?;
             }
-            routes_map.insert(norm_host.clone(), route.origins);
-            indices_map.insert(norm_host, Arc::new(AtomicUsize::new(0)));
+            for pr in &route.path_routes {
+                for node in &pr.origins {
+                    validate_target_url(&norm_host, &node.url)?;
+                }
+            }
+            routes_map.insert(norm_host, route);
         }
 
         for target in &default_targets {
@@ -160,7 +258,7 @@ impl Router {
         Ok(Self {
             default_nodes: Arc::new(RwLock::new(default_nodes)),
             routes: Arc::new(RwLock::new(routes_map)),
-            route_indices: Arc::new(RwLock::new(indices_map)),
+            health_states: Arc::new(RwLock::new(HashMap::new())),
             default_index: Arc::new(AtomicUsize::new(0)),
             timeout: Duration::from_millis(timeout_ms),
             is_multi_tenant: Arc::new(AtomicBool::new(true)),
@@ -171,14 +269,32 @@ impl Router {
     /// Returns a validation error if routes contain duplicate hosts, empty targets, or invalid URLs.
     pub fn from_upstream_config(cfg: &crate::config::UpstreamConfig) -> Result<Self, RouterError> {
         if !cfg.routes.is_empty() {
-            let domain_routes = cfg
-                .routes
-                .iter()
-                .map(|r| DomainRoute {
-                    host: r.host.clone(),
-                    origins: r.targets.iter().cloned().map(Self::create_node).collect(),
-                })
-                .collect();
+            let mut domain_routes = Vec::new();
+            for r in &cfg.routes {
+                if !r.path_routes.is_empty() {
+                    let path_routes = r
+                        .path_routes
+                        .iter()
+                        .map(|pr| PathRoute {
+                            path_prefix: pr.path_prefix.clone(),
+                            priority: pr.priority,
+                            origins: pr.targets.iter().cloned().map(Self::create_node).collect(),
+                            round_robin_index: Arc::new(AtomicUsize::new(0)),
+                        })
+                        .collect();
+                    domain_routes.push(DomainRoute::with_paths(
+                        r.host.clone(),
+                        path_routes,
+                        None,
+                        None,
+                    ));
+                } else {
+                    domain_routes.push(DomainRoute::new(
+                        r.host.clone(),
+                        r.targets.iter().cloned().map(Self::create_node).collect(),
+                    ));
+                }
+            }
             Self::new_multi_tenant(domain_routes, cfg.targets.clone(), cfg.timeout_ms)
         } else {
             for target in &cfg.targets {
@@ -189,15 +305,16 @@ impl Router {
     }
 
     /// Atomically updates routing tables from new domain routes (Control Plane dynamic reconfiguration)
+    /// Preserves existing node health states across route updates (P1 Finding 2)
     pub fn update_routes(
         &self,
-        new_routes: Vec<DomainRoute>,
+        mut new_routes: Vec<DomainRoute>,
         new_defaults: Vec<String>,
     ) -> Result<(), RouterError> {
         let mut routes_map = HashMap::new();
-        let mut indices_map = HashMap::new();
 
-        for route in new_routes {
+        // 1. Validate routes
+        for route in &new_routes {
             let norm_host = normalize_host(&route.host);
             if norm_host.is_empty() {
                 return Err(RouterError::EmptyHost);
@@ -205,30 +322,66 @@ impl Router {
             if routes_map.contains_key(&norm_host) {
                 return Err(RouterError::DuplicateHost(norm_host));
             }
-            if route.origins.is_empty() {
+            if route.origins.is_empty() && route.path_routes.is_empty() {
                 return Err(RouterError::EmptyTargets(norm_host));
             }
             for node in &route.origins {
                 validate_target_url(&norm_host, &node.url)?;
             }
-            routes_map.insert(norm_host.clone(), route.origins);
-            indices_map.insert(norm_host, Arc::new(AtomicUsize::new(0)));
+            for pr in &route.path_routes {
+                for node in &pr.origins {
+                    validate_target_url(&norm_host, &node.url)?;
+                }
+            }
+            routes_map.insert(norm_host, ());
         }
 
         for target in &new_defaults {
             validate_target_url("default", target)?;
         }
-        let default_nodes: Vec<UpstreamNode> =
-            new_defaults.into_iter().map(Self::create_node).collect();
 
-        // Atomically swap routes in memory
+        // 2. Refresh health states into new nodes to preserve health hysteresis across updates (P1 Finding 2)
+        let health_states = self.health_states.read().unwrap();
+        for route in &mut new_routes {
+            for node in &mut route.origins {
+                if let Some(h) = health_states.get(&node.url) {
+                    node.healthy = h.healthy;
+                    node.latency_ms = h.latency_ms;
+                    node.ewma_latency_ms = h.ewma_latency_ms;
+                    node.consecutive_passes = h.consecutive_passes;
+                    node.consecutive_failures = h.consecutive_failures;
+                }
+            }
+            for pr in &mut route.path_routes {
+                for node in &mut pr.origins {
+                    if let Some(h) = health_states.get(&node.url) {
+                        node.healthy = h.healthy;
+                        node.latency_ms = h.latency_ms;
+                        node.ewma_latency_ms = h.ewma_latency_ms;
+                        node.consecutive_passes = h.consecutive_passes;
+                        node.consecutive_failures = h.consecutive_failures;
+                    }
+                }
+            }
+        }
+
+        let mut final_routes_map = HashMap::new();
+        for route in new_routes {
+            let norm_host = normalize_host(&route.host);
+            final_routes_map.insert(norm_host, route);
+        }
+
+        let default_nodes: Vec<UpstreamNode> = new_defaults
+            .into_iter()
+            .map(|u| Self::create_node_with_health(u, &health_states))
+            .collect();
+
+        // 3. Atomically swap routes in memory
         {
             let mut routes_guard = self.routes.write().unwrap();
-            let mut indices_guard = self.route_indices.write().unwrap();
             let mut defaults_guard = self.default_nodes.write().unwrap();
 
-            *routes_guard = routes_map;
-            *indices_guard = indices_map;
+            *routes_guard = final_routes_map;
             *defaults_guard = default_nodes;
         }
 
@@ -236,23 +389,40 @@ impl Router {
         Ok(())
     }
 
-    /// Selects lowest EWMA latency healthy upstream node for the given tenant host.
-    /// Fast-path invariant: O(N) scan within tenant's pool with round-robin tie-breaking.
-    /// Rejects unknown hosts with RoutingError::UnknownHost when multi-tenant routing is active.
-    pub fn select_upstream_for_host(&self, host: &str) -> Result<String, RoutingError> {
+    /// Selects lowest EWMA latency healthy upstream node for the given tenant host and request path.
+    /// Fast-path invariant: longest-prefix & highest-priority match within tenant's routes (P1 Path Routing).
+    pub fn select_upstream_for_host_and_path(
+        &self,
+        host: &str,
+        path: &str,
+    ) -> Result<String, RoutingError> {
         let norm_host = normalize_host(host);
 
         if self.is_multi_tenant.load(Ordering::Relaxed) {
             let routes = self.routes.read().unwrap();
-            if let Some(nodes) = routes.get(&norm_host) {
-                let indices = self.route_indices.read().unwrap();
-                let counter = indices
-                    .get(&norm_host)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+            if let Some(domain_route) = routes.get(&norm_host) {
+                let mut matching: Vec<&PathRoute> = domain_route
+                    .path_routes
+                    .iter()
+                    .filter(|pr| path.starts_with(&pr.path_prefix))
+                    .collect();
 
-                select_from_nodes(nodes, &counter)
-                    .ok_or(RoutingError::NoHealthyUpstreams(norm_host))
+                matching.sort_by(|a, b| {
+                    b.priority
+                        .cmp(&a.priority)
+                        .then_with(|| b.path_prefix.len().cmp(&a.path_prefix.len()))
+                });
+
+                if let Some(best) = matching.first() {
+                    select_from_nodes(&best.origins, &best.round_robin_index)
+                        .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
+                } else if !domain_route.origins.is_empty() {
+                    let counter = Arc::new(AtomicUsize::new(0));
+                    select_from_nodes(&domain_route.origins, &counter)
+                        .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
+                } else {
+                    Err(RoutingError::NoHealthyUpstreams(norm_host))
+                }
             } else {
                 Err(RoutingError::UnknownHost(norm_host))
             }
@@ -263,6 +433,24 @@ impl Router {
         }
     }
 
+    /// Selects lowest EWMA latency healthy upstream node for the given tenant host (root path fallback)
+    #[allow(dead_code)]
+    pub fn select_upstream_for_host(&self, host: &str) -> Result<String, RoutingError> {
+        self.select_upstream_for_host_and_path(host, "/")
+    }
+
+    /// Returns tenant security and cache policy if configured for domain
+    pub fn get_domain_policy(
+        &self,
+        host: &str,
+    ) -> Option<(Option<DomainSecurityPolicy>, Option<DomainCachePolicy>)> {
+        let norm_host = normalize_host(host);
+        let routes = self.routes.read().unwrap();
+        routes
+            .get(&norm_host)
+            .map(|dr| (dr.security.clone(), dr.cache.clone()))
+    }
+
     /// Selects an upstream from the default pool or first configured route (legacy/fallback)
     #[allow(dead_code)]
     pub fn select_upstream(&self) -> Option<String> {
@@ -271,8 +459,9 @@ impl Router {
             select_from_nodes(&default_nodes, &self.default_index)
         } else {
             let routes = self.routes.read().unwrap();
-            for nodes in routes.values() {
-                if let Some(target) = select_from_nodes(nodes, &self.default_index) {
+            for domain_route in routes.values() {
+                if let Some(target) = select_from_nodes(&domain_route.origins, &self.default_index)
+                {
                     return Some(target);
                 }
             }
@@ -282,21 +471,60 @@ impl Router {
 
     /// Updates probe latency and health hysteresis for a given target URL across all pools
     pub fn mark_health(&self, url: &str, healthy: bool, latency_ms: u64) {
-        // 1. Update in default nodes
+        // 1. Update persistent health states
         {
-            let mut nodes = self.default_nodes.write().unwrap();
-            if let Some(node) = nodes.iter_mut().find(|n| n.url == url) {
-                update_node_health(node, healthy, latency_ms);
+            let mut states = self.health_states.write().unwrap();
+            let entry = states
+                .entry(url.to_string())
+                .or_insert_with(|| OriginHealthState {
+                    healthy: true,
+                    latency_ms: 10,
+                    ewma_latency_ms: 10.0,
+                    consecutive_passes: 2,
+                    consecutive_failures: 0,
+                });
+            entry.latency_ms = latency_ms;
+            entry.ewma_latency_ms = Self::EWMA_ALPHA * (latency_ms as f64)
+                + (1.0 - Self::EWMA_ALPHA) * entry.ewma_latency_ms;
+            if healthy {
+                entry.consecutive_passes += 1;
+                entry.consecutive_failures = 0;
+                if entry.consecutive_passes >= 2 {
+                    entry.healthy = true;
+                }
+            } else {
+                entry.consecutive_failures += 1;
+                entry.consecutive_passes = 0;
+                if entry.consecutive_failures >= 3 {
+                    entry.healthy = false;
+                }
             }
         }
 
-        // 2. Update across all tenant routes
+        // 2. Update live nodes in default pool
+        {
+            let mut nodes = self.default_nodes.write().unwrap();
+            for node in nodes.iter_mut() {
+                if node.url == url {
+                    update_node_health(node, healthy, latency_ms);
+                }
+            }
+        }
+
+        // 3. Update live nodes across all tenant routes and path routes
         {
             let mut routes = self.routes.write().unwrap();
-            for nodes in routes.values_mut() {
-                for node in nodes.iter_mut() {
+            for domain_route in routes.values_mut() {
+                for node in domain_route.origins.iter_mut() {
                     if node.url == url {
                         update_node_health(node, healthy, latency_ms);
+                    }
+                }
+                for pr in domain_route.path_routes.iter_mut() {
+                    for node in pr.origins.iter_mut() {
+                        if node.url == url {
+                            update_node_health(node, healthy, latency_ms);
+                        }
                     }
                 }
             }
@@ -316,9 +544,14 @@ impl Router {
 
         {
             let routes = self.routes.read().unwrap();
-            for nodes in routes.values() {
-                for n in nodes.iter() {
+            for dr in routes.values() {
+                for n in &dr.origins {
                     set.insert(n.url.clone());
+                }
+                for pr in &dr.path_routes {
+                    for n in &pr.origins {
+                        set.insert(n.url.clone());
+                    }
                 }
             }
         }
@@ -377,9 +610,22 @@ fn is_forbidden_metadata_destination(host: &str) -> bool {
     {
         return true;
     }
-    if let Ok(ip) = lower.parse::<std::net::Ipv4Addr>() {
-        if ip.is_link_local() {
-            return true;
+    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                if ipv4.is_link_local() || ipv4.is_loopback() {
+                    return true;
+                }
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                if ipv6.is_loopback() {
+                    return true;
+                }
+                let segments = ipv6.segments();
+                if (segments[0] & 0xffc0) == 0xfe80 {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -449,9 +695,86 @@ pub fn validate_target_url(host: &str, target_url: &str) -> Result<(), RouterErr
 /// Parses Control Plane PoP configuration sync JSON (or Envoy snapshot) into validated DomainRoutes
 pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, RouterError> {
     #[derive(serde::Deserialize)]
+    struct WireOrigin {
+        address: String,
+        port: u16,
+        #[serde(default = "default_wire_protocol")]
+        protocol: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        sni: Option<String>,
+        #[serde(default)]
+        #[allow(dead_code)]
+        weight: Option<u32>,
+    }
+
+    fn default_wire_protocol() -> String {
+        "HTTP".to_string()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WirePathRoute {
+        #[serde(default = "default_wire_path_prefix")]
+        path_prefix: String,
+        #[serde(default)]
+        priority: u32,
+        #[serde(default)]
+        origins: Vec<WireOrigin>,
+        #[serde(default)]
+        targets: Vec<String>,
+    }
+
+    fn default_wire_path_prefix() -> String {
+        "/".to_string()
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireSecurity {
+        #[serde(default)]
+        waf_enabled: bool,
+        #[serde(default)]
+        block_sqli: bool,
+        #[serde(default)]
+        block_xss: bool,
+        #[serde(default)]
+        block_path_traversal: bool,
+        #[serde(default)]
+        blocked_paths: Vec<String>,
+        #[serde(default)]
+        rate_limit_enabled: bool,
+        #[serde(default)]
+        requests_per_second: u32,
+        #[serde(default)]
+        burst_capacity: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireCache {
+        #[serde(default)]
+        enabled: bool,
+        #[serde(default)]
+        default_ttl_seconds: u64,
+        #[serde(default)]
+        bypass_paths: Vec<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct WireDomainRoute {
+        host: String,
+        #[serde(default)]
+        targets: Vec<String>,
+        #[serde(default)]
+        path_routes: Vec<WirePathRoute>,
+        #[serde(default)]
+        security: Option<WireSecurity>,
+        #[serde(default)]
+        cache: Option<WireCache>,
+    }
+
+    #[derive(serde::Deserialize)]
     struct SyncWire {
         #[serde(default)]
-        routes: Vec<crate::config::DomainRouteConfig>,
+        routes: Vec<WireDomainRoute>,
     }
 
     let wire: SyncWire = serde_json::from_str(json_str).map_err(|e| {
@@ -464,16 +787,78 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
         if norm_host.is_empty() {
             return Err(RouterError::EmptyHost);
         }
-        if r.targets.is_empty() {
+
+        let sec_policy = r.security.map(|s| DomainSecurityPolicy {
+            waf_enabled: s.waf_enabled,
+            block_sqli: s.block_sqli,
+            block_xss: s.block_xss,
+            block_path_traversal: s.block_path_traversal,
+            blocked_paths: s.blocked_paths,
+            rate_limit_enabled: s.rate_limit_enabled,
+            requests_per_second: s.requests_per_second,
+            burst_capacity: s.burst_capacity,
+        });
+
+        let cache_policy = r.cache.map(|c| DomainCachePolicy {
+            enabled: c.enabled,
+            default_ttl_seconds: c.default_ttl_seconds,
+            bypass_paths: c.bypass_paths,
+        });
+
+        if !r.path_routes.is_empty() {
+            let mut domain_path_routes = Vec::new();
+            for pr in r.path_routes {
+                let mut path_origins = Vec::new();
+                if !pr.origins.is_empty() {
+                    for o in pr.origins {
+                        let proto = o.protocol.to_lowercase();
+                        let url = format!("{}://{}:{}", proto, o.address, o.port);
+                        validate_target_url(&norm_host, &url)?;
+                        path_origins.push(Router::create_node(url));
+                    }
+                } else if !pr.targets.is_empty() {
+                    for t in pr.targets {
+                        validate_target_url(&norm_host, &t)?;
+                        path_origins.push(Router::create_node(t));
+                    }
+                }
+                if path_origins.is_empty() {
+                    return Err(RouterError::EmptyTargets(norm_host));
+                }
+                domain_path_routes.push(PathRoute {
+                    path_prefix: pr.path_prefix,
+                    priority: pr.priority,
+                    origins: path_origins,
+                    round_robin_index: Arc::new(AtomicUsize::new(0)),
+                });
+            }
+            result.push(DomainRoute::with_paths(
+                r.host,
+                domain_path_routes,
+                sec_policy,
+                cache_policy,
+            ));
+        } else if !r.targets.is_empty() {
+            let mut origins = Vec::new();
+            for target in &r.targets {
+                validate_target_url(&norm_host, target)?;
+                origins.push(Router::create_node(target.clone()));
+            }
+            result.push(DomainRoute {
+                host: r.host,
+                origins: origins.clone(),
+                path_routes: vec![PathRoute {
+                    path_prefix: "/".to_string(),
+                    priority: 0,
+                    origins,
+                    round_robin_index: Arc::new(AtomicUsize::new(0)),
+                }],
+                security: sec_policy,
+                cache: cache_policy,
+            });
+        } else {
             return Err(RouterError::EmptyTargets(norm_host));
         }
-        for target in &r.targets {
-            validate_target_url(&norm_host, target)?;
-        }
-        result.push(DomainRoute {
-            host: r.host,
-            origins: r.targets.into_iter().map(Router::create_node).collect(),
-        });
     }
     Ok(result)
 }
@@ -647,14 +1032,14 @@ mod tests {
     fn test_multi_tenant_host_isolation_and_unknown_host_rejection() {
         // P1 Finding 1: Multi-tenant host/domain -> origin routing
         let routes = vec![
-            DomainRoute {
-                host: "customer-a.example.com".to_string(),
-                origins: vec![Router::create_node("https://origin-a.internal".to_string())],
-            },
-            DomainRoute {
-                host: "customer-b.example.com".to_string(),
-                origins: vec![Router::create_node("https://origin-b.internal".to_string())],
-            },
+            DomainRoute::new(
+                "customer-a.example.com".to_string(),
+                vec![Router::create_node("https://origin-a.internal".to_string())],
+            ),
+            DomainRoute::new(
+                "customer-b.example.com".to_string(),
+                vec![Router::create_node("https://origin-b.internal".to_string())],
+            ),
         ];
 
         let router = Router::new_multi_tenant(routes, vec![], 5000).unwrap();
@@ -683,12 +1068,12 @@ mod tests {
 
     #[test]
     fn test_multi_tenant_no_healthy_upstreams_error() {
-        let routes = vec![DomainRoute {
-            host: "api.customer.com".to_string(),
-            origins: vec![Router::create_node(
+        let routes = vec![DomainRoute::new(
+            "api.customer.com".to_string(),
+            vec![Router::create_node(
                 "https://origin-fail.internal".to_string(),
             )],
-        }];
+        )];
 
         let router = Router::new_multi_tenant(routes, vec![], 5000).unwrap();
 
@@ -728,14 +1113,14 @@ mod tests {
     fn test_duplicate_route_host_fails_closed() {
         // Finding 5: Duplicate domain routes must fail closed at initialization
         let routes = vec![
-            DomainRoute {
-                host: "customer.example.com".to_string(),
-                origins: vec![Router::create_node("https://origin-a.internal".to_string())],
-            },
-            DomainRoute {
-                host: "CUSTOMER.EXAMPLE.COM:443".to_string(),
-                origins: vec![Router::create_node("https://origin-b.internal".to_string())],
-            },
+            DomainRoute::new(
+                "customer.example.com".to_string(),
+                vec![Router::create_node("https://origin-a.internal".to_string())],
+            ),
+            DomainRoute::new(
+                "CUSTOMER.EXAMPLE.COM:443".to_string(),
+                vec![Router::create_node("https://origin-b.internal".to_string())],
+            ),
         ];
 
         let err = Router::new_multi_tenant(routes, vec![], 5000).unwrap_err();
@@ -748,10 +1133,10 @@ mod tests {
     #[test]
     fn test_empty_targets_and_host_validation() {
         // Finding 6: Empty targets must be rejected at initialization
-        let empty_targets_route = vec![DomainRoute {
-            host: "dead-tenant.example.com".to_string(),
-            origins: vec![],
-        }];
+        let empty_targets_route = vec![DomainRoute::new(
+            "dead-tenant.example.com".to_string(),
+            vec![],
+        )];
         let err = Router::new_multi_tenant(empty_targets_route, vec![], 5000).unwrap_err();
         assert_eq!(
             err,
@@ -759,10 +1144,10 @@ mod tests {
         );
 
         // Empty host must be rejected
-        let empty_host_route = vec![DomainRoute {
-            host: "   ".to_string(),
-            origins: vec![Router::create_node("https://origin-a.internal".to_string())],
-        }];
+        let empty_host_route = vec![DomainRoute::new(
+            "   ".to_string(),
+            vec![Router::create_node("https://origin-a.internal".to_string())],
+        )];
         let err = Router::new_multi_tenant(empty_host_route, vec![], 5000).unwrap_err();
         assert_eq!(err, RouterError::EmptyHost);
     }
@@ -793,10 +1178,10 @@ mod tests {
 
     #[test]
     fn test_atomic_route_update_and_pop_config_sync() {
-        let initial_routes = vec![DomainRoute {
-            host: "tenant-1.com".to_string(),
-            origins: vec![Router::create_node("https://origin-1.internal".to_string())],
-        }];
+        let initial_routes = vec![DomainRoute::new(
+            "tenant-1.com".to_string(),
+            vec![Router::create_node("https://origin-1.internal".to_string())],
+        )];
         let router = Router::new_multi_tenant(initial_routes, vec![], 5000).unwrap();
         assert_eq!(
             router.select_upstream_for_host("tenant-1.com").unwrap(),

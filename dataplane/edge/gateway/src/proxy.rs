@@ -35,6 +35,7 @@ const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 50 * 1024 * 1024; // 50 MiB hard limit for origin responses
 const MAX_CUSTOM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days (Finding 2)
 
 pub const DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS: usize = 256;
@@ -58,26 +59,12 @@ pub async fn handle_request(
     let start_time = Instant::now();
     let method = req.method().clone();
     let uri_string = req.uri().to_string();
+    let path = req.uri().path().to_string();
 
-    // 1. DDoS & Token-Bucket Rate Limiter Check
-    if !state.rate_limiter.check(client_ip) {
-        warn!(ip = %client_ip, uri = %uri_string, "Rate limit exceeded");
-        let body = serde_json::json!({
-            "error": "Rate limit exceeded",
-            "status": 429,
-        });
-        let resp = Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .header("Retry-After", "1")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        return Ok(resp);
-    }
-
-    // 2. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
+    // 1. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();
+    let effective_client_ip = extract_client_ip(&req_headers, client_ip);
+
     let host = match resolve_host(&req_headers, req.uri()) {
         Ok(h) => h,
         Err(status) => {
@@ -96,17 +83,75 @@ pub async fn handle_request(
         }
     };
 
+    // 2. Retrieve Tenant-Specific Policies (P1 Finding 4)
+    let (domain_sec_policy, domain_cache_policy) = state
+        .router
+        .get_domain_policy(&host)
+        .unwrap_or((None, None));
+
+    // 3. DDoS & Token-Bucket Rate Limiter Check (Keyed by Tenant & Client IP, P1/P2 Finding 7)
+    let rate_limit_key = format!("{}:{}", host, effective_client_ip);
+    let custom_rps = domain_sec_policy.as_ref().map(|s| s.requests_per_second);
+    let custom_burst = domain_sec_policy.as_ref().map(|s| s.burst_capacity);
+
+    if !state
+        .rate_limiter
+        .check_key(&rate_limit_key, custom_rps, custom_burst)
+    {
+        warn!(
+            ip = %effective_client_ip,
+            host = %host,
+            uri = %uri_string,
+            "Rate limit exceeded"
+        );
+        let body = serde_json::json!({
+            "error": "Rate limit exceeded",
+            "status": 429,
+        });
+        let resp = Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge/0.1.0")
+            .header("Retry-After", "1")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    // 4. Tenant WAF Path Block Enforcement (P1 Finding 4)
+    if let Some(ref sec) = domain_sec_policy {
+        for blocked_path in &sec.blocked_paths {
+            if path.starts_with(blocked_path) {
+                warn!(
+                    ip = %effective_client_ip,
+                    host = %host,
+                    path = %path,
+                    blocked_path = %blocked_path,
+                    "Request path blocked by tenant security policy"
+                );
+                let body = serde_json::json!({
+                    "error": "Access Denied by Tenant Security Policy",
+                    "status": 403,
+                    "blocked_path": blocked_path,
+                });
+                let resp = Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("Content-Type", "application/json")
+                    .header("Server", "NexusEdge/0.1.0")
+                    .body(Full::new(Bytes::from(body.to_string())))
+                    .unwrap();
+                return Ok(resp);
+            }
+        }
+    }
+
     let user_agent = req_headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
     let auth_header_present = req_headers.contains_key("authorization");
-    let req_cc = req_headers
-        .get("cache-control")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
+    let req_cc = joined_header_values(&req_headers, "cache-control").to_ascii_lowercase();
 
     // Fast-path payload size check from Content-Length header
     if let Some(cl) = req_headers.get("content-length") {
@@ -129,7 +174,7 @@ pub async fn handle_request(
         }
     }
 
-    // 3. Read Body bounded to MAX_REQUEST_BODY_BYTES with global inflight concurrency limit (Finding 4)
+    // 5. Read Body bounded to MAX_REQUEST_BODY_BYTES with global inflight concurrency limit (Finding 4)
     let _buffer_permit = match state.inflight_buffer_semaphore.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
@@ -170,14 +215,14 @@ pub async fn handle_request(
         None
     };
 
-    // 4. WAF Inspection
+    // 6. Global WAF Inspection
     match state
         .waf
         .inspect(&uri_string, user_agent.as_deref(), body_sample)
     {
         WafResult::Blocked { rule, pattern } => {
             warn!(
-                ip = %client_ip,
+                ip = %effective_client_ip,
                 rule = rule,
                 pattern = %pattern,
                 "Request blocked by WAF"
@@ -198,7 +243,7 @@ pub async fn handle_request(
         WafResult::Allowed => {}
     }
 
-    // 5. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111)
+    // 7. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111, P1 Finding 4)
     let scheme = "http";
     let raw_ae = req_headers
         .get("accept-encoding")
@@ -209,10 +254,15 @@ pub async fn handle_request(
 
     let has_cookie = req_headers.contains_key("cookie");
     let has_auth = req_headers.contains_key("authorization");
+    let bypass_cache = domain_cache_policy
+        .as_ref()
+        .map(|c| !c.enabled || c.bypass_paths.iter().any(|bp| path.starts_with(bp)))
+        .unwrap_or(false);
 
     if method == Method::GET
         && !has_cookie
         && !has_auth
+        && !bypass_cache
         && !req_cc.contains("no-cache")
         && !req_cc.contains("no-store")
     {
@@ -235,8 +285,8 @@ pub async fn handle_request(
         }
     }
 
-    // 6. Multi-Tenant Upstream Selection by Host (Finding 1)
-    let upstream_base = match state.router.select_upstream_for_host(&host) {
+    // 8. Multi-Tenant Path-Based Upstream Selection (P1 Finding 3)
+    let upstream_base = match state.router.select_upstream_for_host_and_path(&host, &path) {
         Ok(target) => target,
         Err(crate::router::RoutingError::UnknownHost(h)) => {
             warn!(host = %h, uri = %uri_string, "Unknown host: no tenant domain route configured");
@@ -287,7 +337,7 @@ pub async fn handle_request(
 
     let forward_url = format!("{}{}", upstream_base.trim_end_matches('/'), uri_string);
 
-    // 7. Proxy Forwarding with Strict Header Forwarding (Finding 3)
+    // 9. Proxy Forwarding with Strict Header Forwarding (Finding 3)
     let mut client_req = state.http_client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         &forward_url,
@@ -313,14 +363,12 @@ pub async fn handle_request(
     }
 
     // Attach standard reverse proxy forwarding headers
-    client_req = client_req.header("X-Forwarded-For", client_ip.to_string());
+    client_req = client_req.header("X-Forwarded-For", effective_client_ip.to_string());
     client_req = client_req.header("X-Forwarded-Proto", scheme);
     client_req = client_req.header("X-Forwarded-Host", &host);
     client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
 
     // Forward the original customer Host header upstream (P1).
-    // Hop-by-hop stripping removes unverified hop headers, but multi-tenant upstream origins
-    // require the original client Host to route to the correct tenant / virtual host.
     client_req = client_req.header(reqwest::header::HOST, &host);
 
     if !body_bytes.is_empty() {
@@ -328,9 +376,31 @@ pub async fn handle_request(
     }
 
     match client_req.send().await {
-        Ok(upstream_resp) => {
+        Ok(mut upstream_resp) => {
             let status = StatusCode::from_u16(upstream_resp.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+            // Fast check on upstream Content-Length to avoid buffering excessive responses (P1 Finding 5)
+            if let Some(cl_val) = upstream_resp.headers().get("content-length") {
+                if let Ok(cl) = cl_val.to_str().unwrap_or("0").parse::<usize>() {
+                    if cl > MAX_UPSTREAM_RESPONSE_BYTES {
+                        warn!(
+                            cl = cl,
+                            limit = MAX_UPSTREAM_RESPONSE_BYTES,
+                            "Upstream response Content-Length exceeds maximum limit"
+                        );
+                        let resp = Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .header("Content-Type", "application/json")
+                            .header("Server", "NexusEdge/0.1.0")
+                            .body(Full::new(Bytes::from(
+                                r#"{"error":"Bad Gateway: Upstream response exceeds maximum allowed 50 MiB limit"}"#,
+                            )))
+                            .unwrap();
+                        return Ok(resp);
+                    }
+                }
+            }
 
             let mut headers_to_cache = hyper::HeaderMap::new();
             let mut builder = Response::builder()
@@ -338,12 +408,9 @@ pub async fn handle_request(
                 .header("X-Cache", "MISS")
                 .header("Server", "NexusEdge/0.1.0");
 
-            let resp_cc = upstream_resp
-                .headers()
-                .get("cache-control")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_lowercase();
+            // Multi-value Cache-Control parsing (P1 Finding 6)
+            let resp_cc = joined_reqwest_header_values(upstream_resp.headers(), "cache-control")
+                .to_ascii_lowercase();
             let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
 
             let resp_connection_tokens =
@@ -365,15 +432,40 @@ pub async fn handle_request(
                 }
             }
 
-            let resp_bytes = match upstream_resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("Failed to stream upstream body: {:?}", e);
-                    Bytes::new()
-                }
-            };
+            // Stream upstream response with hard 50 MiB bounded buffer (P1 Finding 5)
+            let mut resp_buf = bytes::BytesMut::new();
+            let mut total_bytes = 0usize;
+            let mut stream_oversized = false;
 
-            // 8. RFC 9111 Shared Cache Evaluation (Finding 6)
+            while let Ok(Some(chunk)) = upstream_resp.chunk().await {
+                total_bytes += chunk.len();
+                if total_bytes > MAX_UPSTREAM_RESPONSE_BYTES {
+                    warn!(
+                        total_bytes = total_bytes,
+                        limit = MAX_UPSTREAM_RESPONSE_BYTES,
+                        "Upstream response stream exceeded maximum allowed limit"
+                    );
+                    stream_oversized = true;
+                    break;
+                }
+                resp_buf.extend_from_slice(&chunk);
+            }
+
+            if stream_oversized {
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Content-Type", "application/json")
+                    .header("Server", "NexusEdge/0.1.0")
+                    .body(Full::new(Bytes::from(
+                        r#"{"error":"Bad Gateway: Upstream response stream exceeded maximum allowed 50 MiB limit"}"#,
+                    )))
+                    .unwrap();
+                return Ok(resp);
+            }
+
+            let resp_bytes = resp_buf.freeze();
+
+            // 10. RFC 9111 Shared Cache Evaluation (Finding 6, P1 Finding 4, 6)
             // Never cache if:
             //   - Not GET
             //   - Not 200 OK
@@ -381,6 +473,7 @@ pub async fn handle_request(
             //   - Authorization header present without explicit public / s-maxage directive
             //   - Origin Cache-Control: no-store or private
             //   - Origin Set-Cookie present
+            //   - Domain Cache Policy specifies bypass_cache
             //   - Body exceeds MAX_CACHEABLE_RESPONSE_BYTES
             let is_vary_star = headers_to_cache
                 .get("vary")
@@ -392,6 +485,7 @@ pub async fn handle_request(
                 && status == StatusCode::OK
                 && !has_cookie
                 && !has_auth
+                && !bypass_cache
                 && !req_cc.contains("no-store")
                 && (!auth_header_present
                     || resp_cc.contains("public")
@@ -403,9 +497,14 @@ pub async fn handle_request(
                 && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
 
             if can_cache {
-                // Parse s-maxage or max-age for custom TTL if specified, bounded to 7 days
+                // Parse s-maxage or max-age for custom TTL if specified, or domain policy fallback bounded to 7 days
                 let custom_ttl = parse_max_age(&resp_cc)
                     .map(Duration::from_secs)
+                    .or_else(|| {
+                        domain_cache_policy
+                            .as_ref()
+                            .map(|c| Duration::from_secs(c.default_ttl_seconds))
+                    })
                     .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
                 state.cache.put(
                     cache_key,
@@ -444,6 +543,44 @@ pub async fn handle_request(
             Ok(resp)
         }
     }
+}
+
+/// Extracts original client IP, trusting forwarding headers only from private/loopback peer (Envoy / local gateway proxy, P1/P2 Finding 7)
+pub fn extract_client_ip(headers: &hyper::HeaderMap, peer_ip: IpAddr) -> IpAddr {
+    let is_trusted_proxy = match peer_ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+    };
+    if is_trusted_proxy {
+        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(first_ip_str) = xff.split(',').next() {
+                if let Ok(ip) = first_ip_str.trim().parse::<IpAddr>() {
+                    return ip;
+                }
+            }
+        }
+    }
+    peer_ip
+}
+
+/// Joins all comma-separated header values for a named header from hyper::HeaderMap (P1 Finding 6)
+pub fn joined_header_values(headers: &hyper::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Joins all comma-separated header values for a named header from reqwest::header::HeaderMap (P1 Finding 6)
+pub fn joined_reqwest_header_values(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Resolves target host according to RFC 9110 / HTTP/2 semantics:
@@ -666,5 +803,44 @@ mod tests {
                 .unwrap(),
             "customer-a.example.com"
         );
+    }
+
+    #[test]
+    fn test_joined_header_values_multiple_cache_control() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("cache-control", "public, max-age=3600".parse().unwrap());
+        headers.append("cache-control", "no-store".parse().unwrap());
+
+        let joined = joined_header_values(&headers, "cache-control").to_ascii_lowercase();
+        assert!(joined.contains("public"));
+        assert!(joined.contains("no-store"));
+        assert_eq!(joined, "public, max-age=3600,no-store");
+    }
+
+    #[test]
+    fn test_extract_client_ip_trusted_proxy() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.42, 172.18.0.2".parse().unwrap(),
+        );
+
+        let peer_docker: IpAddr = "172.18.0.2".parse().unwrap();
+        let client_ip = extract_client_ip(&headers, peer_docker);
+        assert_eq!(client_ip, "198.51.100.42".parse::<IpAddr>().unwrap());
+
+        let peer_loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let client_ip2 = extract_client_ip(&headers, peer_loopback);
+        assert_eq!(client_ip2, "198.51.100.42".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_extract_client_ip_untrusted_direct() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+
+        let public_peer: IpAddr = "203.0.113.50".parse().unwrap();
+        let client_ip = extract_client_ip(&headers, public_peer);
+        assert_eq!(client_ip, public_peer);
     }
 }

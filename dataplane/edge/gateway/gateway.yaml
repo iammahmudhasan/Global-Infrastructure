@@ -8,8 +8,15 @@ upstream:
     - "https://httpbin.org"
   routes:
     - host: "api.nexusedge.io"
-      targets:
-        - "https://httpbin.org"
+      path_routes:
+        - path_prefix: "/api/"
+          priority: 10
+          targets:
+            - "https://httpbin.org"
+        - path_prefix: "/"
+          priority: 0
+          targets:
+            - "https://httpbin.org"
     - host: "app.nexusedge.io"
       targets:
         - "https://httpbin.org"
@@ -21,7 +28,7 @@ upstream:
 
 control_plane:
   enabled: false
-  endpoint: "http://127.0.0.1:8081"
+  endpoint: "http://127.0.0.1:9091"
   pop_id: "singapore"
   poll_interval_secs: 30
 

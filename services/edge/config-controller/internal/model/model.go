@@ -411,10 +411,49 @@ type EdgeNode struct {
 	LastHeartbeat       time.Time `json:"last_heartbeat"`
 }
 
+// GatewayOriginSync models a validated and pinned upstream origin destination
+type GatewayOriginSync struct {
+	Address  string `json:"address"` // Resolved and pinned IP address
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"` // "HTTP" or "HTTPS"
+	SNI      string `json:"sni,omitempty"`
+	Weight   int    `json:"weight,omitempty"`
+}
+
+// GatewayPathRouteSync models a path-prefix matched routing table entry
+type GatewayPathRouteSync struct {
+	PathPrefix string              `json:"path_prefix"`
+	Priority   int                 `json:"priority"`
+	Origins    []GatewayOriginSync `json:"origins"`
+	Targets    []string            `json:"targets,omitempty"`
+}
+
+// GatewaySecuritySync models tenant-level security shield rules
+type GatewaySecuritySync struct {
+	WAFEnabled         bool     `json:"waf_enabled"`
+	BlockSQLi          bool     `json:"block_sqli"`
+	BlockXSS           bool     `json:"block_xss"`
+	BlockPathTraversal bool     `json:"block_path_traversal"`
+	BlockedPaths       []string `json:"blocked_paths,omitempty"`
+	RateLimitEnabled   bool     `json:"rate_limit_enabled"`
+	RequestsPerSecond  uint32   `json:"requests_per_second"`
+	BurstCapacity      uint32   `json:"burst_capacity"`
+}
+
+// GatewayCacheSync models tenant-level cache policy
+type GatewayCacheSync struct {
+	Enabled           bool     `json:"enabled"`
+	DefaultTTLSeconds uint64   `json:"default_ttl_seconds"`
+	BypassPaths       []string `json:"bypass_paths,omitempty"`
+}
+
 // GatewayRouteSync models declarative host-to-origin mapping for the Rust edge gateway
 type GatewayRouteSync struct {
-	Host    string   `json:"host"`
-	Targets []string `json:"targets"`
+	Host       string                 `json:"host"`
+	PathRoutes []GatewayPathRouteSync `json:"path_routes,omitempty"`
+	Targets    []string               `json:"targets,omitempty"`
+	Security   *GatewaySecuritySync   `json:"security,omitempty"`
+	Cache      *GatewayCacheSync      `json:"cache,omitempty"`
 }
 
 // PoPConfigSync delivers synchronized Envoy configuration tailored for a specific PoP
@@ -422,6 +461,7 @@ type PoPConfigSync struct {
 	PoPID           string             `json:"pop_id"`
 	ConfigVersion   string             `json:"config_version"`
 	ChecksumSHA256  string             `json:"checksum_sha256"`
+	CanonicalSHA256 string             `json:"canonical_sha256,omitempty"`
 	CompiledAt      time.Time          `json:"compiled_at"`
 	TopologiesCount int                `json:"topologies_count"`
 	EnvoyConfig     interface{}        `json:"envoy_config"`
