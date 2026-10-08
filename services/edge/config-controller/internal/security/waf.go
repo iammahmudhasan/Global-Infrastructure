@@ -57,6 +57,15 @@ type WAFEngine struct {
 	rateLimiters map[string]*TokenBucket
 }
 
+// Trusted identity headers injected by authenticating edge reverse proxies / gateways (Finding 8)
+var defaultTrustedIdentityHeaders = map[string]bool{
+	"x-authenticated-user": true,
+	"x-consumer-id":        true,
+	"x-jwt-subject":        true,
+	"x-client-dn":          true,
+	"x-nexusedge-identity": true,
+}
+
 func NewWAFEngine() *WAFEngine {
 	return &WAFEngine{
 		rateLimiters: make(map[string]*TokenBucket),
@@ -228,11 +237,21 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 			if matchedRule.PathPrefix != "" {
 				scope = matchedRule.PathPrefix
 			}
+
 			switch matchedRule.KeyType {
 			case "HEADER":
 				if matchedRule.HeaderName != "" && req != nil && req.Header != nil {
-					if hdrVal := req.Header.Get(matchedRule.HeaderName); hdrVal != "" {
+					hdrLower := strings.ToLower(strings.TrimSpace(matchedRule.HeaderName))
+					isTrusted := defaultTrustedIdentityHeaders[hdrLower] ||
+						req.Header.Get("X-Gateway-Identity-Verified") == "true" ||
+						req.Header.Get("X-Auth-Verified") == "true"
+
+					if hdrVal := req.Header.Get(matchedRule.HeaderName); hdrVal != "" && isTrusted {
 						identity = hdrVal
+					} else {
+						// Finding 8: Client-controlled untrusted headers cannot fabricate arbitrary identities.
+						// Fall back to client IP to prevent rate limiting bypass.
+						identity = clientIP
 					}
 				}
 			case "CLIENT_IP":

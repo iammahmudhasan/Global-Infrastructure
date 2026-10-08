@@ -133,19 +133,19 @@ func TestRegistry_AdmitAndReserve(t *testing.T) {
 	reg := registry.NewRegistry()
 
 	// 1. Normal successful admission and reservation
-	err := reg.AdmitAndReserve("workload-1", "bd-dhaka-dgx01", 2)
+	err := reg.AdmitAndReserve("workload-1", "tenant-test", "proj-test", "bd-dhaka-dgx01", 2)
 	if err != nil {
 		t.Fatalf("expected successful AdmitAndReserve, got: %v", err)
 	}
 
 	// Double reservation for same workload must fail
-	if err := reg.AdmitAndReserve("workload-1", "bd-dhaka-dgx01", 1); err != registry.ErrReservationExists {
+	if err := reg.AdmitAndReserve("workload-1", "tenant-test", "proj-test", "bd-dhaka-dgx01", 1); err != registry.ErrReservationExists {
 		t.Errorf("expected ErrReservationExists, got: %v", err)
 	}
 
 	// 2. Insufficient capacity must fail and release trial
 	// bd-dhaka-dgx01 has 8 GPUs total, 2 reserved -> 6 available
-	if err := reg.AdmitAndReserve("workload-big", "bd-dhaka-dgx01", 100); err != registry.ErrInsufficientCapacity {
+	if err := reg.AdmitAndReserve("workload-big", "tenant-test", "proj-test", "bd-dhaka-dgx01", 100); err != registry.ErrInsufficientCapacity {
 		t.Errorf("expected ErrInsufficientCapacity, got: %v", err)
 	}
 
@@ -160,7 +160,7 @@ func TestRegistry_AdmitAndReserve(t *testing.T) {
 		t.Fatalf("expected StateOpen")
 	}
 
-	if err := reg.AdmitAndReserve("workload-cb", "bd-dhaka-dgx01", 1); err != circuitbreaker.ErrCircuitOpen {
+	if err := reg.AdmitAndReserve("workload-cb", "tenant-test", "proj-test", "bd-dhaka-dgx01", 1); err != circuitbreaker.ErrCircuitOpen {
 		t.Errorf("expected ErrCircuitOpen, got: %v", err)
 	}
 }
@@ -244,7 +244,7 @@ func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
 	initialGPUs := b.AvailableGPUs
 
 	workloadID := "wl-execution-01"
-	if err := reg.AdmitAndReserve(workloadID, backendID, 2); err != nil {
+	if err := reg.AdmitAndReserve(workloadID, "tenant-test", "proj-test", backendID, 2); err != nil {
 		t.Fatalf("failed to reserve workload: %v", err)
 	}
 
@@ -285,7 +285,7 @@ func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
 	}
 
 	// Trip breaker via workload failure feedback
-	if err := reg.AdmitAndReserve("wl-fail-1", "failing-node-01", 1); err != nil {
+	if err := reg.AdmitAndReserve("wl-fail-1", "tenant-test", "proj-test", "failing-node-01", 1); err != nil {
 		t.Fatalf("admit 1 failed: %v", err)
 	}
 	_ = reg.CompleteWorkload("wl-fail-1", false)
@@ -294,7 +294,7 @@ func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
 		t.Errorf("expected StateClosed after 1 failure (max 2)")
 	}
 
-	if err := reg.AdmitAndReserve("wl-fail-2", "failing-node-01", 1); err != nil {
+	if err := reg.AdmitAndReserve("wl-fail-2", "tenant-test", "proj-test", "failing-node-01", 1); err != nil {
 		t.Fatalf("admit 2 failed: %v", err)
 	}
 	_ = reg.CompleteWorkload("wl-fail-2", false)
@@ -305,13 +305,13 @@ func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
 	}
 
 	// Subsequent admit must be rejected by circuit breaker
-	if err := reg.AdmitAndReserve("wl-blocked", "failing-node-01", 1); err != circuitbreaker.ErrCircuitOpen {
+	if err := reg.AdmitAndReserve("wl-blocked", "tenant-test", "proj-test", "failing-node-01", 1); err != circuitbreaker.ErrCircuitOpen {
 		t.Errorf("expected ErrCircuitOpen, got %v", err)
 	}
 
 	// 4. Safe release without explicit completion cleans up trial and capacity
 	workloadSafe := "wl-safe-01"
-	if err := reg.AdmitAndReserve(workloadSafe, backendID, 3); err != nil {
+	if err := reg.AdmitAndReserve(workloadSafe, "tenant-test", "proj-test", backendID, 3); err != nil {
 		t.Fatalf("failed to reserve safe workload: %v", err)
 	}
 	if err := reg.Release(workloadSafe); err != nil {
@@ -333,8 +333,8 @@ func TestRegistry_SweepExpiredReservations(t *testing.T) {
 	}
 	initialGPUs := b.AvailableGPUs
 
-	// Reserve capacity
-	if err := reg.AdmitAndReserve("stale-workload", backendID, 4); err != nil {
+	// Reserve capacity with a short 20ms lease for test sweep
+	if err := reg.AdmitAndReserve("stale-workload", "tenant-test", "proj-test", backendID, 4, 20*time.Millisecond); err != nil {
 		t.Fatalf("failed to reserve workload: %v", err)
 	}
 
@@ -343,22 +343,65 @@ func TestRegistry_SweepExpiredReservations(t *testing.T) {
 		t.Fatalf("expected %d GPUs, got %d", initialGPUs-4, bReserved.AvailableGPUs)
 	}
 
-	// 1. Sweeping with 1 hour TTL does not sweep a fresh reservation
-	swept := reg.SweepExpiredReservations(1 * time.Hour)
+	// 1. Sweeping immediately before lease expiry reclaims 0
+	swept := reg.SweepExpiredReservations()
 	if swept != 0 {
-		t.Errorf("expected 0 swept reservations for 1h TTL, got %d", swept)
+		t.Errorf("expected 0 swept reservations before expiry, got %d", swept)
 	}
 
-	// 2. Sweeping with 0 TTL sweeps the reservation immediately
-	time.Sleep(5 * time.Millisecond)
-	swept = reg.SweepExpiredReservations(0)
+	// 2. Wait for lease to expire, then sweep reclaims the capacity
+	time.Sleep(30 * time.Millisecond)
+	swept = reg.SweepExpiredReservations()
 	if swept != 1 {
-		t.Errorf("expected 1 swept reservation for 0 TTL, got %d", swept)
+		t.Errorf("expected 1 swept reservation after lease expiry, got %d", swept)
 	}
 
 	bRestored, _ := reg.Get(backendID)
 	if bRestored.AvailableGPUs != initialGPUs {
 		t.Errorf("expected GPUs restored to %d after sweep, got %d", initialGPUs, bRestored.AvailableGPUs)
+	}
+}
+
+func TestRegistry_OwnershipAndLeaseRenewal(t *testing.T) {
+	reg := registry.NewRegistry()
+	backendID := "bd-dhaka-dgx01"
+
+	err := reg.AdmitAndReserve("wl-owner-01", "tenant-alpha", "proj-alpha", backendID, 2, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("expected admission success, got: %v", err)
+	}
+
+	// 1. Cross-tenant release -> Forbidden
+	err = reg.ReleaseOwned("wl-owner-01", "tenant-beta", "proj-beta", false)
+	if err != registry.ErrReservationForbidden {
+		t.Fatalf("expected ErrReservationForbidden for cross-tenant release, got: %v", err)
+	}
+
+	// 2. Cross-tenant complete -> Forbidden
+	err = reg.CompleteWorkloadOwned("wl-owner-01", "tenant-beta", "proj-beta", true, false)
+	if err != registry.ErrReservationForbidden {
+		t.Fatalf("expected ErrReservationForbidden for cross-tenant complete, got: %v", err)
+	}
+
+	// 3. Cross-tenant lease renewal -> Forbidden
+	_, err = reg.RenewReservation("wl-owner-01", "tenant-beta", "proj-beta", 30*time.Minute, false)
+	if err != registry.ErrReservationForbidden {
+		t.Fatalf("expected ErrReservationForbidden for cross-tenant renew, got: %v", err)
+	}
+
+	// 4. Authorized owner lease renewal -> Success
+	newExpiry, err := reg.RenewReservation("wl-owner-01", "tenant-alpha", "proj-alpha", 45*time.Minute, false)
+	if err != nil {
+		t.Fatalf("expected successful renewal by owner, got: %v", err)
+	}
+	if time.Until(newExpiry) < 40*time.Minute {
+		t.Errorf("expected extended expiry time, got: %v", newExpiry)
+	}
+
+	// 5. Authorized owner release -> Success
+	err = reg.ReleaseOwned("wl-owner-01", "tenant-alpha", "proj-alpha", false)
+	if err != nil {
+		t.Fatalf("expected successful release by owner, got: %v", err)
 	}
 }
 
@@ -376,3 +419,4 @@ func TestRegistry_ReserveEnforcesCircuitBreaker(t *testing.T) {
 		t.Fatalf("expected Reserve to fail when circuit breaker is OPEN")
 	}
 }
+

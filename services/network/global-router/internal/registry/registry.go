@@ -26,15 +26,24 @@ var (
 	ErrInsufficientCapacity = errors.New("insufficient GPU capacity on backend")
 	ErrReservationExists    = errors.New("workload reservation already exists")
 	ErrReservationNotFound  = errors.New("workload reservation not found")
+	ErrReservationForbidden = errors.New("forbidden: reservation belongs to another tenant or project")
 	ErrInvalidBackend       = errors.New("invalid backend: missing required fields or negative capacity/cost/latency")
 )
 
-// Reservation tracks capacity ownership by a specific workload
+const (
+	DefaultLeaseDuration = 15 * time.Minute
+	MaxLeaseDuration     = 2 * time.Hour
+)
+
+// Reservation tracks capacity ownership by a specific workload, tenant, and lease (Findings 1, 2)
 type Reservation struct {
-	WorkloadID string    `json:"workload_id"`
-	BackendID  string    `json:"backend_id"`
-	GPUs       int       `json:"gpus"`
-	ReservedAt time.Time `json:"reserved_at"`
+	WorkloadID     string    `json:"workload_id"`
+	TenantID       string    `json:"tenant_id"`
+	ProjectID      string    `json:"project_id"`
+	BackendID      string    `json:"backend_id"`
+	GPUs           int       `json:"gpus"`
+	ReservedAt     time.Time `json:"reserved_at"`
+	LeaseExpiresAt time.Time `json:"lease_expires_at"`
 }
 
 // ComputeBackend represents a registered heterogeneous execution target (Bare-metal, Cloud, Edge)
@@ -269,10 +278,9 @@ func (r *Registry) UpdateHealth(id string, latencyMs int, healthy bool) {
 	}
 }
 
-// AdmitAndReserve atomically checks circuit breaker admission and reserves compute capacity.
-// If the breaker is in HALF_OPEN state and admits a trial, but capacity reservation fails,
-// the trial in flight is immediately released to prevent deadlock (P2/P1 Finding).
-func (r *Registry) AdmitAndReserve(workloadID, backendID string, count int) error {
+// AdmitAndReserve atomically checks circuit breaker admission and reserves compute capacity
+// bound to a specific tenant, project, and lease duration (Findings 1, 2).
+func (r *Registry) AdmitAndReserve(workloadID, tenantID, projectID, backendID string, count int, leaseDurations ...time.Duration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -302,32 +310,51 @@ func (r *Registry) AdmitAndReserve(workloadID, backendID string, count int) erro
 		return ErrInsufficientCapacity
 	}
 
+	leaseDuration := DefaultLeaseDuration
+	if len(leaseDurations) > 0 && leaseDurations[0] > 0 {
+		leaseDuration = leaseDurations[0]
+	}
+	if leaseDuration > MaxLeaseDuration {
+		leaseDuration = MaxLeaseDuration
+	}
+
+	now := time.Now().UTC()
 	b.AvailableGPUs -= count
 	b.ActiveWorkloads++
 	r.reservations[workloadID] = &Reservation{
-		WorkloadID: workloadID,
-		BackendID:  backendID,
-		GPUs:       count,
-		ReservedAt: time.Now().UTC(),
+		WorkloadID:     workloadID,
+		TenantID:       tenantID,
+		ProjectID:      projectID,
+		BackendID:      backendID,
+		GPUs:           count,
+		ReservedAt:     now,
+		LeaseExpiresAt: now.Add(leaseDuration),
 	}
 	return nil
 }
 
 // Reserve tracks capacity ownership by a specific workload, delegating directly to AdmitAndReserve
-// to guarantee uniform circuit-breaker and health admission validation (Finding 9).
 func (r *Registry) Reserve(workloadID, backendID string, count int) error {
-	return r.AdmitAndReserve(workloadID, backendID, count)
+	return r.AdmitAndReserve(workloadID, "", "", backendID, count, DefaultLeaseDuration)
 }
 
-// CompleteWorkload records the execution outcome (success or failure) of a reserved workload,
-// feeding back directly into the circuit breaker lifecycle and releasing reserved GPU capacity.
-func (r *Registry) CompleteWorkload(workloadID string, success bool) error {
+// CompleteWorkloadOwned verifies caller authorization against reservation ownership before completing workload.
+func (r *Registry) CompleteWorkloadOwned(workloadID, tenantID, projectID string, success bool, isOperator bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	res, exists := r.reservations[workloadID]
 	if !exists {
 		return ErrReservationNotFound
+	}
+
+	if !isOperator {
+		if res.TenantID != "" && res.TenantID != tenantID {
+			return ErrReservationForbidden
+		}
+		if res.ProjectID != "" && projectID != "" && res.ProjectID != projectID {
+			return ErrReservationForbidden
+		}
 	}
 
 	if b, ok := r.backends[res.BackendID]; ok {
@@ -348,15 +375,28 @@ func (r *Registry) CompleteWorkload(workloadID string, success bool) error {
 	return nil
 }
 
-// Release restores reserved GPU capacity using workload reservation ownership validation.
-// If the backend has an in-flight trial probe without an explicit completion outcome, it releases the trial.
-func (r *Registry) Release(workloadID string) error {
+// CompleteWorkload records the execution outcome without ownership restriction (privileged/internal).
+func (r *Registry) CompleteWorkload(workloadID string, success bool) error {
+	return r.CompleteWorkloadOwned(workloadID, "", "", success, true)
+}
+
+// ReleaseOwned verifies caller authorization against reservation ownership before releasing workload capacity.
+func (r *Registry) ReleaseOwned(workloadID, tenantID, projectID string, isOperator bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	res, exists := r.reservations[workloadID]
 	if !exists {
 		return ErrReservationNotFound
+	}
+
+	if !isOperator {
+		if res.TenantID != "" && res.TenantID != tenantID {
+			return ErrReservationForbidden
+		}
+		if res.ProjectID != "" && projectID != "" && res.ProjectID != projectID {
+			return ErrReservationForbidden
+		}
 	}
 
 	if b, ok := r.backends[res.BackendID]; ok {
@@ -373,15 +413,90 @@ func (r *Registry) Release(workloadID string) error {
 	return nil
 }
 
-// SweepExpiredReservations reclaims GPU capacity from abandoned or leaked reservations exceeding ttl.
-// It also resets in-flight trial probes on the backend's circuit breaker to prevent deadlock.
-func (r *Registry) SweepExpiredReservations(ttl time.Duration) int {
+// Release restores reserved GPU capacity without ownership restriction (privileged/internal).
+func (r *Registry) Release(workloadID string) error {
+	return r.ReleaseOwned(workloadID, "", "", true)
+}
+
+// RenewReservation extends the lease duration of an active reservation with ownership validation (Finding 2).
+func (r *Registry) RenewReservation(workloadID, tenantID, projectID string, extendBy time.Duration, isOperator bool) (time.Time, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	res, exists := r.reservations[workloadID]
+	if !exists {
+		return time.Time{}, ErrReservationNotFound
+	}
+
+	if !isOperator {
+		if res.TenantID != "" && res.TenantID != tenantID {
+			return time.Time{}, ErrReservationForbidden
+		}
+		if res.ProjectID != "" && projectID != "" && res.ProjectID != projectID {
+			return time.Time{}, ErrReservationForbidden
+		}
+	}
+
+	if extendBy <= 0 {
+		extendBy = DefaultLeaseDuration
+	} else if extendBy > MaxLeaseDuration {
+		extendBy = MaxLeaseDuration
+	}
+
+	now := time.Now().UTC()
+	res.LeaseExpiresAt = now.Add(extendBy)
+	return res.LeaseExpiresAt, nil
+}
+
+// ReservationActive checks whether an unexpired reservation is active for a workload and tenant (Finding 3).
+func (r *Registry) ReservationActive(workloadID, tenantID, projectID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	res, exists := r.reservations[workloadID]
+	if !exists {
+		return false
+	}
+	if tenantID != "" && res.TenantID != "" && res.TenantID != tenantID {
+		return false
+	}
+	if projectID != "" && res.ProjectID != "" && res.ProjectID != projectID {
+		return false
+	}
+	if !res.LeaseExpiresAt.IsZero() && time.Now().UTC().After(res.LeaseExpiresAt) {
+		return false
+	}
+	return true
+}
+
+// GetReservation retrieves a cloned snapshot of a workload reservation.
+func (r *Registry) GetReservation(workloadID string) (*Reservation, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	res, ok := r.reservations[workloadID]
+	if !ok {
+		return nil, false
+	}
+	cp := *res
+	return &cp, true
+}
+
+// SweepExpiredReservations reclaims GPU capacity from abandoned or expired leases (Finding 2).
+func (r *Registry) SweepExpiredReservations(ttls ...time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now().UTC()
 	swept := 0
 	for wid, res := range r.reservations {
-		if time.Since(res.ReservedAt) >= ttl {
+		isExpired := false
+		if !res.LeaseExpiresAt.IsZero() {
+			isExpired = now.After(res.LeaseExpiresAt)
+		} else if len(ttls) > 0 && ttls[0] > 0 {
+			isExpired = time.Since(res.ReservedAt) >= ttls[0]
+		}
+
+		if isExpired {
 			if b, ok := r.backends[res.BackendID]; ok {
 				b.AvailableGPUs += res.GPUs
 				if b.ActiveWorkloads > 0 {

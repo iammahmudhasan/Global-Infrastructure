@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
 )
@@ -219,15 +220,29 @@ func TestWorkloadDispatch_EndpointRedaction(t *testing.T) {
 		t.Fatalf("expected 200 OK for tenant dispatch, got: %d", recTenant.Code)
 	}
 
-	var tenantDecision scheduler.DispatchDecision
+	var tenantDecision PublicDispatchDecision
 	if err := json.Unmarshal(recTenant.Body.Bytes(), &tenantDecision); err != nil {
 		t.Fatalf("failed to parse tenant decision: %v", err)
 	}
 	if tenantDecision.AssignedBackend == nil {
 		t.Fatalf("expected assigned backend in decision")
 	}
-	if tenantDecision.AssignedBackend.Endpoint != "[REDACTED]" {
-		t.Fatalf("tenant received internal backend endpoint: %s", tenantDecision.AssignedBackend.Endpoint)
+	if tenantDecision.AssignedBackend.ID != "backend-dgx-h100-dispatch" {
+		t.Fatalf("unexpected backend ID: %s", tenantDecision.AssignedBackend.ID)
+	}
+
+	// Verify that internal fields (Endpoint, HourlyCost, Latency, AvailableGPUs) are NOT leaked (Finding 10)
+	var rawMap map[string]interface{}
+	_ = json.Unmarshal(recTenant.Body.Bytes(), &rawMap)
+	rawBackend := rawMap["assigned_backend"].(map[string]interface{})
+	if _, leaked := rawBackend["endpoint"]; leaked {
+		t.Errorf("tenant response must not contain internal endpoint field")
+	}
+	if _, leaked := rawBackend["hourly_cost"]; leaked {
+		t.Errorf("tenant response must not leak internal hourly_cost")
+	}
+	if _, leaked := rawBackend["available_gpus"]; leaked {
+		t.Errorf("tenant response must not leak internal available_gpus")
 	}
 
 	// 2. Operator Dispatch -> Actual internal endpoint must be visible
@@ -369,3 +384,202 @@ func TestWorkload_CompleteAndReleaseLifecycle(t *testing.T) {
 		t.Fatalf("expected 404 on duplicate release, got %d", recRelAgain.Code)
 	}
 }
+
+func TestWorkload_CrossTenantIDORProtection(t *testing.T) {
+	// Finding 1 Verification: Prevent cross-tenant completion, release, or renewal IDOR
+	srv := NewServer()
+	defer srv.Close()
+
+	srv.auth.RegisterTenantWithRole("key-tenant-a", "tenant-a", "proj-a", auth.RoleTenant)
+	srv.auth.RegisterTenantWithRole("key-tenant-b", "tenant-b", "proj-b", auth.RoleTenant)
+	handler := srv.routes()
+
+	backend := &registry.ComputeBackend{
+		ID:            "backend-dgx-h100-idor",
+		Provider:      "baremetal",
+		Region:        "ap-south-2",
+		Endpoint:      "https://dgx-idor.internal/v1",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.00,
+		LatencyP95Ms:  5,
+		Healthy:       true,
+	}
+	srv.registry.Register(backend)
+
+	// 1. Tenant A dispatches workload W
+	dispatchPayload := map[string]interface{}{
+		"workload_id":     "wl-idor-01",
+		"tenant_id":       "tenant-a",
+		"project_id":      "proj-a",
+		"name":            "Tenant A Sensitive Task",
+		"required_gpu":    "H100",
+		"gpus_requested":  4,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-idor-01",
+	}
+	body, _ := json.Marshal(dispatchPayload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant-a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dispatch by tenant A failed: %d, body: %s", rec.Code, rec.Body.String())
+	}
+
+	b, _ := srv.registry.Get("backend-dgx-h100-idor")
+	if b.AvailableGPUs != 4 {
+		t.Fatalf("expected 4 available GPUs after dispatch, got %d", b.AvailableGPUs)
+	}
+
+	// 2. Tenant B attempts release(W) -> 403 Forbidden
+	releaseBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id": "wl-idor-01",
+	})
+	reqRelB := httptest.NewRequest(http.MethodPost, "/api/v1/workload/release", bytes.NewReader(releaseBody))
+	reqRelB.Header.Set("Authorization", "Bearer key-tenant-b")
+	recRelB := httptest.NewRecorder()
+	handler.ServeHTTP(recRelB, reqRelB)
+	if recRelB.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when Tenant B releases Tenant A workload, got: %d (%s)", recRelB.Code, recRelB.Body.String())
+	}
+
+	// GPU capacity unchanged
+	b, _ = srv.registry.Get("backend-dgx-h100-idor")
+	if b.AvailableGPUs != 4 {
+		t.Fatalf("GPU capacity altered by unauthorized release! Got: %d", b.AvailableGPUs)
+	}
+
+	// 3. Tenant B attempts complete(W) with FAILED to sabotage circuit breaker -> 403 Forbidden
+	completeBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id": "wl-idor-01",
+		"status":      "FAILED",
+	})
+	reqCompB := httptest.NewRequest(http.MethodPost, "/api/v1/workload/complete", bytes.NewReader(completeBody))
+	reqCompB.Header.Set("Authorization", "Bearer key-tenant-b")
+	recCompB := httptest.NewRecorder()
+	handler.ServeHTTP(recCompB, reqCompB)
+	if recCompB.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when Tenant B completes Tenant A workload, got: %d (%s)", recCompB.Code, recCompB.Body.String())
+	}
+
+	// Circuit breaker and capacity unchanged
+	if srv.registry.CircuitState("backend-dgx-h100-idor") != circuitbreaker.StateClosed {
+		t.Fatalf("circuit breaker sabotaged by unauthorized tenant failure!")
+	}
+	b, _ = srv.registry.Get("backend-dgx-h100-idor")
+	if b.AvailableGPUs != 4 {
+		t.Fatalf("GPU capacity altered by unauthorized complete! Got: %d", b.AvailableGPUs)
+	}
+
+	// 4. Tenant B attempts renew(W) -> 403 Forbidden
+	renewBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id":    "wl-idor-01",
+		"extend_seconds": 600,
+	})
+	reqRenB := httptest.NewRequest(http.MethodPost, "/api/v1/workload/renew", bytes.NewReader(renewBody))
+	reqRenB.Header.Set("Authorization", "Bearer key-tenant-b")
+	recRenB := httptest.NewRecorder()
+	handler.ServeHTTP(recRenB, reqRenB)
+	if recRenB.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when Tenant B renews Tenant A workload, got: %d (%s)", recRenB.Code, recRenB.Body.String())
+	}
+
+	// 5. Tenant A renew(W) -> 200 OK
+	reqRenA := httptest.NewRequest(http.MethodPost, "/api/v1/workload/renew", bytes.NewReader(renewBody))
+	reqRenA.Header.Set("Authorization", "Bearer key-tenant-a")
+	recRenA := httptest.NewRecorder()
+	handler.ServeHTTP(recRenA, reqRenA)
+	if recRenA.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK when Tenant A renews own workload, got: %d (%s)", recRenA.Code, recRenA.Body.String())
+	}
+
+	// 6. Tenant A release(W) -> 200 OK and capacity restored
+	reqRelA := httptest.NewRequest(http.MethodPost, "/api/v1/workload/release", bytes.NewReader(releaseBody))
+	reqRelA.Header.Set("Authorization", "Bearer key-tenant-a")
+	recRelA := httptest.NewRecorder()
+	handler.ServeHTTP(recRelA, reqRelA)
+	if recRelA.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK when Tenant A releases own workload, got: %d (%s)", recRelA.Code, recRelA.Body.String())
+	}
+
+	b, _ = srv.registry.Get("backend-dgx-h100-idor")
+	if b.AvailableGPUs != 8 {
+		t.Fatalf("expected 8 available GPUs after authorized release, got %d", b.AvailableGPUs)
+	}
+}
+
+func TestWorkload_IdempotencyReservationCoupling(t *testing.T) {
+	// Finding 3 Verification: Swept or released reservation invalidates cached idempotency hit
+	srv := NewServer()
+	defer srv.Close()
+
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-idem", "proj-idem", auth.RoleTenant)
+	handler := srv.routes()
+
+	backend := &registry.ComputeBackend{
+		ID:            "backend-dgx-h100-idem",
+		Provider:      "baremetal",
+		Region:        "ap-south-2",
+		Endpoint:      "https://dgx-idem.internal/v1",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.00,
+		LatencyP95Ms:  5,
+		Healthy:       true,
+	}
+	srv.registry.Register(backend)
+
+	dispatchPayload := map[string]interface{}{
+		"workload_id":     "wl-idem-coupling-01",
+		"tenant_id":       "tenant-idem",
+		"project_id":      "proj-idem",
+		"name":            "Idempotency Coupling Task",
+		"required_gpu":    "H100",
+		"gpus_requested":  2,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-key-coupled-01",
+	}
+	body, _ := json.Marshal(dispatchPayload)
+
+	// 1. First dispatch -> SCHEDULED
+	req1 := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req1.Header.Set("Authorization", "Bearer key-tenant")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first dispatch failed: %d", rec1.Code)
+	}
+
+	// 2. Immediate second dispatch with same key -> Idempotency HIT (cached decision)
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer key-tenant")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second dispatch failed: %d", rec2.Code)
+	}
+
+	// 3. Workload is released by owner -> Idempotency entry is invalidated
+	relBody, _ := json.Marshal(map[string]interface{}{
+		"workload_id": "wl-idem-coupling-01",
+	})
+	reqRel := httptest.NewRequest(http.MethodPost, "/api/v1/workload/release", bytes.NewReader(relBody))
+	reqRel.Header.Set("Authorization", "Bearer key-tenant")
+	recRel := httptest.NewRecorder()
+	handler.ServeHTTP(recRel, reqRel)
+	if recRel.Code != http.StatusOK {
+		t.Fatalf("release failed: %d", recRel.Code)
+	}
+
+	// 4. Retry with same idempotency key -> Re-evaluates freshly rather than returning stale SCHEDULED!
+	// (New reservation will be admitted with the available capacity)
+	req3 := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	req3.Header.Set("Authorization", "Bearer key-tenant")
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("third dispatch failed: %d", rec3.Code)
+	}
+}
+

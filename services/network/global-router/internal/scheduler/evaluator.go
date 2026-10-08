@@ -63,8 +63,14 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		idempotencyKey = fmt.Sprintf("%s:%s:%s", policy.TenantID, projectScope, policy.IdempotencyKey)
 		if cached, found := e.idempotency[idempotencyKey]; found {
 			if now.Before(cached.expiresAt) {
-				cached.lastAccessed = now
-				return cloneDecision(cached.decision), nil
+				// Finding 3: Validate that the underlying reservation is still active in the registry.
+				// If the workload was swept or released, the cached SCHEDULED decision is stale.
+				if !e.reg.ReservationActive(cached.decision.WorkloadID, policy.TenantID, policy.ProjectID) {
+					delete(e.idempotency, idempotencyKey)
+				} else {
+					cached.lastAccessed = now
+					return cloneDecision(cached.decision), nil
+				}
 			}
 		}
 	}
@@ -169,7 +175,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		for _, item := range fallbackList {
 			b := item.backend
 			// Atomically check circuit breaker admission and reserve capacity
-			if err := e.reg.AdmitAndReserve(policy.WorkloadID, b.ID, gpusReq); err == nil {
+			if err := e.reg.AdmitAndReserve(policy.WorkloadID, policy.TenantID, policy.ProjectID, b.ID, gpusReq, registry.DefaultLeaseDuration); err == nil {
 				decision := &DispatchDecision{
 					WorkloadID:      policy.WorkloadID,
 					TenantID:        policy.TenantID,
@@ -238,7 +244,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 
 	for _, item := range scored {
 		// Atomically check circuit breaker admission and reserve capacity
-		if err := e.reg.AdmitAndReserve(policy.WorkloadID, item.backend.ID, gpusReq); err == nil {
+		if err := e.reg.AdmitAndReserve(policy.WorkloadID, policy.TenantID, policy.ProjectID, item.backend.ID, gpusReq, registry.DefaultLeaseDuration); err == nil {
 			bestBackend = item.backend
 			bestScore = item.score
 			break
@@ -377,5 +383,16 @@ func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecisi
 		decision:     cloneDecision(decision),
 		expiresAt:    now.Add(24 * time.Hour),
 		lastAccessed: now,
+	}
+}
+
+// InvalidateByWorkload removes any idempotency cache entry associated with a workload ID (Finding 3).
+func (e *Evaluator) InvalidateByWorkload(workloadID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for k, v := range e.idempotency {
+		if v.decision != nil && v.decision.WorkloadID == workloadID {
+			delete(e.idempotency, k)
+		}
 	}
 }

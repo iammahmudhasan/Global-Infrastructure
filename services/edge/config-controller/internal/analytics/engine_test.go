@@ -365,3 +365,45 @@ func TestEngine_MonthlyBillingIsolation(t *testing.T) {
 		t.Errorf("expected $20.00 base fee only in Nov, got %f", novUsage.TotalCostUSD)
 	}
 }
+
+func TestEngine_TimeSeriesRetentionPruning(t *testing.T) {
+	// Finding 5 Verification: Retain max 30 days of 1-minute time series points, prune older
+	engine := NewEngine()
+	domainID := "dom_prune_test"
+
+	now := time.Now().UTC()
+	oldTime := now.Add(-35 * 24 * time.Hour) // 35 days ago (should be pruned)
+	recentTime := now.Add(-10 * time.Minute)  // 10 minutes ago (should be kept)
+
+	// Ingest event 35 days ago
+	_ = engine.Ingest(model.TelemetryEvent{
+		DomainID:   domainID,
+		RequestID:  "old-req",
+		StatusCode: 200,
+		Timestamp:  oldTime,
+	})
+
+	// Ingest event 10 minutes ago, triggering pruning
+	_ = engine.Ingest(model.TelemetryEvent{
+		DomainID:   domainID,
+		RequestID:  "recent-req",
+		StatusCode: 200,
+		Timestamp:  recentTime,
+	})
+
+	points, err := engine.GetTimeSeries(domainID, 60*24*40) // request past 40 days
+	if err != nil {
+		t.Fatalf("failed to get time series: %v", err)
+	}
+
+	// The 35-day-old point must be pruned
+	for _, p := range points {
+		if p.Timestamp.Before(now.Add(-31 * 24 * time.Hour)) {
+			t.Fatalf("found unpruned point older than 30 days: %v", p.Timestamp)
+		}
+	}
+	if len(points) != 1 {
+		t.Errorf("expected exactly 1 recent point, got %d", len(points))
+	}
+}
+

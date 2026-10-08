@@ -23,6 +23,8 @@ const (
 	pricePerEgressGBUSD      = 0.05         // $0.05 per GB
 	pricePerMillionReqUSD    = 0.75         // $0.75 per 1,000,000 requests
 	baseDomainMonthlyFeeUSD  = 20.00        // $20 base tier fee
+	timeSeriesRetention      = 30 * 24 * time.Hour
+	pruneInterval            = 5 * time.Minute
 )
 
 // ReservoirSampler maintains a bounded, statistically representative sample of latency measurements
@@ -118,6 +120,7 @@ type DomainAggregator struct {
 	sampler         *ReservoirSampler
 	timeSeriesMap   map[int64]*model.TimeSeriesPoint // Unix minute timestamp -> aggregate
 	monthlyUsage    map[string]*MonthlyUsageCounter  // YYYY-MM -> monthly usage counter
+	lastPrunedAt    time.Time
 	lastUpdated     time.Time
 }
 
@@ -204,6 +207,17 @@ func (da *DomainAggregator) Record(event model.TelemetryEvent) {
 	// Incremental average latency for this window
 	point.AvgLatencyMs = ((point.AvgLatencyMs * float64(point.Requests-1)) + event.LatencyMs) / float64(point.Requests)
 	point.AvgLatencyMs = roundDecimals(point.AvgLatencyMs, 2)
+
+	// Periodic time-series retention pruning: limit memory growth to 30 days (Finding 5)
+	if da.lastPrunedAt.IsZero() || eventTime.Sub(da.lastPrunedAt) >= pruneInterval {
+		cutoff := eventTime.Add(-timeSeriesRetention).Truncate(time.Minute).Unix()
+		for ts := range da.timeSeriesMap {
+			if ts < cutoff {
+				delete(da.timeSeriesMap, ts)
+			}
+		}
+		da.lastPrunedAt = eventTime
+	}
 }
 
 func (da *DomainAggregator) Summary() model.AnalyticsSummary {

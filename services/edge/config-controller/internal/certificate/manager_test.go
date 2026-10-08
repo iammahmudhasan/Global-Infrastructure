@@ -55,6 +55,12 @@ func TestCertificateManager_Workflow(t *testing.T) {
 		t.Fatalf("expected non-empty CertPEM and PrivateKeyPEM")
 	}
 
+	// 2b. Replay Protection (Finding 4): Attempting to reuse already validated challenge must fail
+	_, err = mgr.ValidateAndIssueCertificate(challenge.Token)
+	if err != certificate.ErrChallengeAlreadyUsed {
+		t.Fatalf("expected ErrChallengeAlreadyUsed on replay, got: %v", err)
+	}
+
 	// Cryptographic verification of PEM block
 	block, _ := pem.Decode([]byte(issuedCert.CertPEM))
 	if block == nil || block.Type != "CERTIFICATE" {

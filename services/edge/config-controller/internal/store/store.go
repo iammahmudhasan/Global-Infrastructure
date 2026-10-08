@@ -9,10 +9,19 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 )
 
+const (
+	MaxOriginsPerPool          = 256
+	MaxWAFRulesPerDomain       = 1000
+	MaxRateLimitRulesPerDomain = 500
+	MaxCacheRulesPerDomain     = 1000
+)
+
 var (
 	ErrNotFound             = errors.New("entity not found")
 	ErrAlreadyExists        = errors.New("entity already exists")
 	ErrMixedOriginProtocols = errors.New("all origins in an origin pool must share the same protocol")
+	ErrOriginPoolFull       = errors.New("origin pool limit reached (max 256)")
+	ErrRuleLimitExceeded    = errors.New("rule limit exceeded for domain")
 )
 
 type Store struct {
@@ -261,6 +270,10 @@ func (s *Store) AddOrigin(o *model.Origin) error {
 		return ErrNotFound
 	}
 
+	if len(pool.Origins) >= MaxOriginsPerPool {
+		return ErrOriginPoolFull
+	}
+
 	for _, existing := range pool.Origins {
 		if existing.Protocol != o.Protocol {
 			return ErrMixedOriginProtocols
@@ -412,6 +425,9 @@ func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
 	}
+	if len(s.wafRules[domainID]) >= MaxWAFRulesPerDomain {
+		return ErrRuleLimitExceeded
+	}
 	s.wafRules[domainID] = append(s.wafRules[domainID], rule)
 	if s.security[domainID] != nil {
 		s.security[domainID].WAFRules = s.wafRules[domainID]
@@ -461,6 +477,9 @@ func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) 
 
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
+	}
+	if len(rules) > MaxRateLimitRulesPerDomain {
+		return ErrRuleLimitExceeded
 	}
 	cloned := append([]model.RateLimitRule(nil), rules...)
 	s.rateLimits[domainID] = cloned
@@ -523,6 +542,9 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
+	}
+	if len(s.cacheRules[domainID]) >= MaxCacheRulesPerDomain {
+		return ErrRuleLimitExceeded
 	}
 	s.cacheRules[domainID] = append(s.cacheRules[domainID], rule)
 	if s.cache[domainID] != nil {

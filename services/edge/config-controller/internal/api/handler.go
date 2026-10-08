@@ -719,11 +719,18 @@ func (h *APIHandler) handleProbePool(w http.ResponseWriter, r *http.Request, poo
 	var mu sync.Mutex
 	results := make([]*model.OriginEndpointState, 0, len(pool.Origins))
 
+	// Finding 6 Fix 2: Limit active probe goroutine fanout to avoid socket/network starvation
+	const maxProbeConcurrency = 32
+	sem := make(chan struct{}, maxProbeConcurrency)
+
 	for i := range pool.Origins {
 		orig := pool.Origins[i]
 		wg.Add(1)
 		go func(o model.Origin) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			current := h.store.GetOriginHealthState(o.ID)
 			newState := h.monitor.ProbeEndpoint(r.Context(), &o, hm, current)
 			h.store.SaveOriginHealthState(newState)
@@ -796,6 +803,16 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 		return
 	}
 
+	pool, err := h.store.GetOriginPool(routes[0].PoolID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "origin pool not found")
+		return
+	}
+	if len(pool.Origins) >= store.MaxOriginsPerPool {
+		writeError(w, http.StatusConflict, "origin pool limit reached (max 256)")
+		return
+	}
+
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req AddOriginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -844,6 +861,10 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 	}
 
 	if err := h.store.AddOrigin(origin); err != nil {
+		if errors.Is(err, store.ErrOriginPoolFull) {
+			writeError(w, http.StatusConflict, "origin pool limit reached (max 256)")
+			return
+		}
 		if errors.Is(err, store.ErrMixedOriginProtocols) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -892,6 +913,10 @@ func (h *APIHandler) handleAddWAFRule(w http.ResponseWriter, r *http.Request, do
 	rule.Enabled = true
 
 	if err := h.store.AddWAFRule(domainID, rule); err != nil {
+		if errors.Is(err, store.ErrRuleLimitExceeded) {
+			writeError(w, http.StatusConflict, "waf rule limit reached for domain (max 1000)")
+			return
+		}
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -928,6 +953,12 @@ func (h *APIHandler) handleSetRateLimits(w http.ResponseWriter, r *http.Request,
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid rate limits payload")
+		return
+	}
+
+	// Finding 7: Validate rate limit rule cardinality per domain
+	if len(body.Rules) > store.MaxRateLimitRulesPerDomain {
+		writeError(w, http.StatusConflict, "rate limit rule limit reached for domain (max 500)")
 		return
 	}
 
@@ -969,6 +1000,10 @@ func (h *APIHandler) handleSetRateLimits(w http.ResponseWriter, r *http.Request,
 	}
 
 	if err := h.store.SetRateLimitRules(domainID, body.Rules); err != nil {
+		if errors.Is(err, store.ErrRuleLimitExceeded) {
+			writeError(w, http.StatusConflict, "rate limit rule limit reached for domain (max 500)")
+			return
+		}
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -1078,6 +1113,10 @@ func (h *APIHandler) handleAddCacheRule(w http.ResponseWriter, r *http.Request, 
 	rule.Enabled = true
 
 	if err := h.store.AddCacheRule(domainID, rule); err != nil {
+		if errors.Is(err, store.ErrRuleLimitExceeded) {
+			writeError(w, http.StatusConflict, "cache rule limit reached for domain (max 1000)")
+			return
+		}
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}

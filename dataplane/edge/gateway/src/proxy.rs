@@ -373,10 +373,8 @@ pub async fn handle_request(
         Err(err) => {
             warn!(url = %forward_url, error = %err, "Upstream connection failed");
             let body = serde_json::json!({
-                "error": "Upstream Gateway Timeout / Unreachable",
+                "error": "upstream unavailable",
                 "status": 502,
-                "node": state.config.server.node_id,
-                "details": err.to_string(),
             });
             let resp = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)

@@ -1927,3 +1927,188 @@ func TestEvaluate_ClientIPValidation(t *testing.T) {
 		t.Fatalf("expected 200 OK for valid client_ip, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestHandler_OriginPoolCapacityLimit(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	onboardBody, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "origin-limit.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(onboardBody))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("onboard failed: %d: %s", w.Code, w.Body.String())
+	}
+
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	// Fetch the origin pool created during onboarding
+	routes := st.GetRoutes(res.DomainID)
+	if len(routes) == 0 {
+		t.Fatalf("no routes found for domain")
+	}
+	pool, err := st.GetOriginPool(routes[0].PoolID)
+	if err != nil {
+		t.Fatalf("failed to get origin pool: %v", err)
+	}
+
+	// Pool already has 1 origin. Add 255 more to reach MaxOriginsPerPool (256)
+	for i := 2; i <= store.MaxOriginsPerPool; i++ {
+		orig := &model.Origin{
+			ID:       fmt.Sprintf("orig-%d", i),
+			PoolID:   pool.ID,
+			Address:  fmt.Sprintf("origin-%d.example.com", i),
+			Port:     443,
+			Protocol: "HTTPS",
+			Weight:   10,
+			Healthy:  true,
+		}
+		if err := st.AddOrigin(orig); err != nil {
+			t.Fatalf("failed to add origin %d: %v", i, err)
+		}
+	}
+
+	// Now pool has exactly 256 origins. Attempting to add 257th via API must fail with 409 Conflict
+	addBody, _ := json.Marshal(map[string]interface{}{
+		"address":  "overflow-origin.example.com",
+		"port":     443,
+		"protocol": "HTTPS",
+		"weight":   10,
+	})
+	addReq := httptest.NewRequest(http.MethodPost, "/v1/domains/"+res.DomainID+"/origins", bytes.NewReader(addBody))
+	addRec := httptest.NewRecorder()
+	handler.ServeHTTP(addRec, addReq)
+
+	if addRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when origin pool is full, got %d: %s", addRec.Code, addRec.Body.String())
+	}
+	if !strings.Contains(addRec.Body.String(), "origin pool limit reached (max 256)") {
+		t.Errorf("expected error message to mention origin pool limit, got: %s", addRec.Body.String())
+	}
+}
+
+func TestHandler_RuleCardinalityLimits(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	onboardBody, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "cardinality.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/domains", bytes.NewReader(onboardBody))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("onboard failed: %d: %s", w.Code, w.Body.String())
+	}
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+	domainID := res.DomainID
+
+	// 1. WAF Rules Limit (MaxWAFRulesPerDomain = 1000)
+	for i := 0; i < store.MaxWAFRulesPerDomain; i++ {
+		rule := model.WAFRule{
+			ID:        fmt.Sprintf("waf-%d", i),
+			DomainID:  domainID,
+			Name:      fmt.Sprintf("rule-%d", i),
+			Pattern:   fmt.Sprintf("/pattern-%d", i),
+			Action:    model.WAFActionBlock,
+			MatchType: model.WAFMatchPathPrefix,
+			Enabled:   true,
+		}
+		if err := st.AddWAFRule(domainID, rule); err != nil {
+			t.Fatalf("failed to add pre-populated WAF rule %d: %v", i, err)
+		}
+	}
+
+	// 1001st WAF rule via API -> 409 Conflict
+	wafBody, _ := json.Marshal(map[string]interface{}{
+		"name":       "overflow-rule",
+		"pattern":    "/overflow",
+		"action":     "BLOCK",
+		"match_type": "PATH_PREFIX",
+	})
+	wafReq := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/waf/rules", bytes.NewReader(wafBody))
+	wafRec := httptest.NewRecorder()
+	handler.ServeHTTP(wafRec, wafReq)
+
+	if wafRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when WAF rule limit is exceeded, got %d: %s", wafRec.Code, wafRec.Body.String())
+	}
+	if !strings.Contains(wafRec.Body.String(), "waf rule limit reached for domain (max 1000)") {
+		t.Errorf("unexpected WAF rule limit error message: %s", wafRec.Body.String())
+	}
+
+	// 2. Rate Limit Rules Limit (MaxRateLimitRulesPerDomain = 500)
+	// Sending 501 rules via API -> 409 Conflict
+	oversizedRL := make([]map[string]interface{}, store.MaxRateLimitRulesPerDomain+1)
+	for i := range oversizedRL {
+		oversizedRL[i] = map[string]interface{}{
+			"requests_per_minute": 100,
+			"burst_size":          10,
+			"key_type":            "CLIENT_IP",
+		}
+	}
+	rlPayload, _ := json.Marshal(map[string]interface{}{
+		"rules": oversizedRL,
+	})
+	rlReq := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/rate-limits", bytes.NewReader(rlPayload))
+	rlRec := httptest.NewRecorder()
+	handler.ServeHTTP(rlRec, rlReq)
+
+	if rlRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when rate limit count exceeds 500, got %d: %s", rlRec.Code, rlRec.Body.String())
+	}
+	if !strings.Contains(rlRec.Body.String(), "rate limit rule limit reached for domain (max 500)") {
+		t.Errorf("unexpected Rate Limit limit error message: %s", rlRec.Body.String())
+	}
+
+	// 3. Cache Rules Limit (MaxCacheRulesPerDomain = 1000)
+	for i := 0; i < store.MaxCacheRulesPerDomain; i++ {
+		cRule := model.CacheRule{
+			ID:          fmt.Sprintf("cache-%d", i),
+			DomainID:    domainID,
+			Name:        fmt.Sprintf("crule-%d", i),
+			PathPattern: fmt.Sprintf("/cache/%d/*", i),
+			TTLSeconds:  3600,
+			Enabled:     true,
+		}
+		if err := st.AddCacheRule(domainID, cRule); err != nil {
+			t.Fatalf("failed to add pre-populated cache rule %d: %v", i, err)
+		}
+	}
+
+	// 1001st Cache rule via API -> 409 Conflict
+	cacheBody, _ := json.Marshal(map[string]interface{}{
+		"name":         "overflow-cache",
+		"path_pattern": "/overflow/*",
+		"ttl_seconds":  3600,
+	})
+	cacheReq := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/cache/rules", bytes.NewReader(cacheBody))
+	cacheRec := httptest.NewRecorder()
+	handler.ServeHTTP(cacheRec, cacheReq)
+
+	if cacheRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when cache rule limit is exceeded, got %d: %s", cacheRec.Code, cacheRec.Body.String())
+	}
+	if !strings.Contains(cacheRec.Body.String(), "cache rule limit reached for domain (max 1000)") {
+		t.Errorf("unexpected Cache rule limit error message: %s", cacheRec.Body.String())
+	}
+}
+

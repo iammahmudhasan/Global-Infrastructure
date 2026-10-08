@@ -21,10 +21,11 @@ import (
 )
 
 var (
-	ErrDomainNotFound    = errors.New("domain not found in store")
-	ErrChallengeExpired  = errors.New("acme challenge has expired")
-	ErrChallengeNotFound = errors.New("acme challenge not found")
-	ErrCertNotFound      = errors.New("certificate not found for domain")
+	ErrDomainNotFound       = errors.New("domain not found in store")
+	ErrChallengeExpired     = errors.New("acme challenge has expired")
+	ErrChallengeNotFound    = errors.New("acme challenge not found")
+	ErrChallengeAlreadyUsed = errors.New("acme challenge has already been consumed")
+	ErrCertNotFound         = errors.New("certificate not found for domain")
 )
 
 type Manager struct {
@@ -100,6 +101,11 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 	if time.Now().UTC().After(challenge.ExpiresAt) {
 		m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusFailed)
 		return nil, ErrChallengeExpired
+	}
+
+	// Finding 4: Replay Protection - ACME challenge can only be consumed once
+	if challenge.Status != model.ChallengeStatusPending {
+		return nil, ErrChallengeAlreadyUsed
 	}
 
 	cert := m.store.GetCertificate(challenge.DomainID)

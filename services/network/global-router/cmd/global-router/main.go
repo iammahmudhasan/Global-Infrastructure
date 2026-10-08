@@ -230,7 +230,7 @@ func (s *Server) routes() http.Handler {
 		json.NewEncoder(w).Encode(publicDispatchDecision(decision, isOperator))
 	})
 
-	// 5. Workload Completion Lifecycle API (Finding 2)
+	// 5. Workload Completion Lifecycle API (Findings 1, 2, 3)
 	mux.HandleFunc("/api/v1/workload/complete", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -252,8 +252,17 @@ func (s *Server) routes() http.Handler {
 			return
 		}
 
+		tenantID, _ := r.Context().Value(auth.TenantContextKey).(string)
+		projectID, _ := r.Context().Value(auth.ProjectContextKey).(string)
+		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+
 		success := !strings.EqualFold(req.Status, "FAILED")
-		if err := s.registry.CompleteWorkload(req.WorkloadID, success); err != nil {
+		if err := s.registry.CompleteWorkloadOwned(req.WorkloadID, tenantID, projectID, success, isOperator); err != nil {
+			if errors.Is(err, registry.ErrReservationForbidden) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: cannot complete workload belonging to another tenant or project"})
+				return
+			}
 			if errors.Is(err, registry.ErrReservationNotFound) {
 				w.WriteHeader(http.StatusNotFound)
 				json.NewEncoder(w).Encode(map[string]string{"error": "workload reservation not found"})
@@ -264,6 +273,9 @@ func (s *Server) routes() http.Handler {
 			return
 		}
 
+		// Finding 3: Invalidate cached idempotency entry for this workload
+		s.evaluator.InvalidateByWorkload(req.WorkloadID)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -273,7 +285,7 @@ func (s *Server) routes() http.Handler {
 		})
 	})
 
-	// 6. Workload Release API
+	// 6. Workload Release API (Findings 1, 3)
 	mux.HandleFunc("/api/v1/workload/release", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -294,7 +306,75 @@ func (s *Server) routes() http.Handler {
 			return
 		}
 
-		if err := s.registry.Release(req.WorkloadID); err != nil {
+		tenantID, _ := r.Context().Value(auth.TenantContextKey).(string)
+		projectID, _ := r.Context().Value(auth.ProjectContextKey).(string)
+		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+
+		if err := s.registry.ReleaseOwned(req.WorkloadID, tenantID, projectID, isOperator); err != nil {
+			if errors.Is(err, registry.ErrReservationForbidden) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: cannot release workload belonging to another tenant or project"})
+				return
+			}
+			if errors.Is(err, registry.ErrReservationNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				json.NewEncoder(w).Encode(map[string]string{"error": "workload reservation not found"})
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+
+		// Finding 3: Invalidate cached idempotency entry for this workload
+		s.evaluator.InvalidateByWorkload(req.WorkloadID)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":      "RELEASED",
+			"workload_id": req.WorkloadID,
+		})
+	})
+
+	// 7. Workload Lease Renewal API (Finding 2)
+	mux.HandleFunc("/api/v1/workload/renew", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			WorkloadID    string `json:"workload_id"`
+			ExtendSeconds int    `json:"extend_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "invalid renew request body"})
+			return
+		}
+		if req.WorkloadID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "workload_id is required"})
+			return
+		}
+
+		tenantID, _ := r.Context().Value(auth.TenantContextKey).(string)
+		projectID, _ := r.Context().Value(auth.ProjectContextKey).(string)
+		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+
+		extendBy := registry.DefaultLeaseDuration
+		if req.ExtendSeconds > 0 {
+			extendBy = time.Duration(req.ExtendSeconds) * time.Second
+		}
+
+		newExpiry, err := s.registry.RenewReservation(req.WorkloadID, tenantID, projectID, extendBy, isOperator)
+		if err != nil {
+			if errors.Is(err, registry.ErrReservationForbidden) {
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: cannot renew workload belonging to another tenant or project"})
+				return
+			}
 			if errors.Is(err, registry.ErrReservationNotFound) {
 				w.WriteHeader(http.StatusNotFound)
 				json.NewEncoder(w).Encode(map[string]string{"error": "workload reservation not found"})
@@ -308,8 +388,9 @@ func (s *Server) routes() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":      "RELEASED",
-			"workload_id": req.WorkloadID,
+			"status":           "RENEWED",
+			"workload_id":      req.WorkloadID,
+			"lease_expires_at": newExpiry.Format(time.RFC3339),
 		})
 	})
 
@@ -319,26 +400,75 @@ func (s *Server) routes() http.Handler {
 	return telemetry.RequestCorrelationMiddleware(handler)
 }
 
-func publicDispatchDecision(d *scheduler.DispatchDecision, operator bool) *scheduler.DispatchDecision {
+// PublicDispatchBackend projects only safe fields to non-operator tenants (Finding 10)
+type PublicDispatchBackend struct {
+	ID           string               `json:"id"`
+	Provider     string               `json:"provider"`
+	Region       string               `json:"region"`
+	GPUModel     string               `json:"gpu_model"`
+	Healthy      bool                 `json:"healthy"`
+	CircuitState circuitbreaker.State `json:"circuit_state"`
+}
+
+type PublicDispatchDecision struct {
+	WorkloadID      string                 `json:"workload_id"`
+	TenantID        string                 `json:"tenant_id"`
+	ProjectID       string                 `json:"project_id"`
+	Status          string                 `json:"status"`
+	AssignedBackend *PublicDispatchBackend `json:"assigned_backend,omitempty"`
+	GPUsAllocated   int                    `json:"gpus_allocated"`
+	CompositeScore  float64                `json:"composite_score"`
+	Reason          string                 `json:"reason"`
+	ReasonCodes     []string               `json:"reason_codes,omitempty"`
+	Alternatives    []string               `json:"alternatives,omitempty"`
+	FallbackUsed    bool                   `json:"fallback_used"`
+	CalculatedAt    time.Time              `json:"calculated_at"`
+}
+
+func publicDispatchDecision(d *scheduler.DispatchDecision, operator bool) interface{} {
 	if d == nil {
 		return nil
 	}
-	cp := *d
-	if d.AssignedBackend != nil {
-		backend := *d.AssignedBackend
-		if !operator {
-			backend.Endpoint = "[REDACTED]"
+	if operator {
+		cp := *d
+		if d.AssignedBackend != nil {
+			backend := *d.AssignedBackend
+			backend.Breaker = nil
+			cp.AssignedBackend = &backend
 		}
-		backend.Breaker = nil
-		cp.AssignedBackend = &backend
+		if d.ReasonCodes != nil {
+			cp.ReasonCodes = append([]string(nil), d.ReasonCodes...)
+		}
+		if d.Alternatives != nil {
+			cp.Alternatives = append([]string(nil), d.Alternatives...)
+		}
+		return &cp
 	}
-	if d.ReasonCodes != nil {
-		cp.ReasonCodes = append([]string(nil), d.ReasonCodes...)
+
+	pub := &PublicDispatchDecision{
+		WorkloadID:     d.WorkloadID,
+		TenantID:       d.TenantID,
+		ProjectID:      d.ProjectID,
+		Status:         d.Status,
+		GPUsAllocated:  d.GPUsAllocated,
+		CompositeScore: d.CompositeScore,
+		Reason:         d.Reason,
+		ReasonCodes:    d.ReasonCodes,
+		Alternatives:   d.Alternatives,
+		FallbackUsed:   d.FallbackUsed,
+		CalculatedAt:   d.CalculatedAt,
 	}
-	if d.Alternatives != nil {
-		cp.Alternatives = append([]string(nil), d.Alternatives...)
+	if d.AssignedBackend != nil {
+		pub.AssignedBackend = &PublicDispatchBackend{
+			ID:           d.AssignedBackend.ID,
+			Provider:     d.AssignedBackend.Provider,
+			Region:       d.AssignedBackend.Region,
+			GPUModel:     d.AssignedBackend.GPUModel,
+			Healthy:      d.AssignedBackend.Healthy,
+			CircuitState: d.AssignedBackend.CircuitState,
+		}
 	}
-	return &cp
+	return pub
 }
 
 const maxRequestBody = 1 << 20 // 1 MiB
