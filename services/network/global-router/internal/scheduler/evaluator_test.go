@@ -465,3 +465,26 @@ func TestIdempotencyDecisionPointerIsolation(t *testing.T) {
 		t.Errorf("cached decision reason codes slice was mutated! Expected len %d, got %d", origReasonCodesLen, len(d2.ReasonCodes))
 	}
 }
+
+func TestIdempotency_BoundedMemoryCapacity(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	dummyDecision := &scheduler.DispatchDecision{
+		WorkloadID: "wl-dummy",
+		TenantID:   "tenant-test",
+		ProjectID:  "proj-test",
+		Status:     "SCHEDULED",
+	}
+
+	// Insert more than MaxIdempotencyEntries (10000 + 50)
+	for i := 0; i < scheduler.MaxIdempotencyEntries+50; i++ {
+		key := fmt.Sprintf("tenant-test:proj-test:key-%06d", i)
+		eval.RecordIdempotencyForTesting(key, dummyDecision)
+	}
+
+	count := eval.IdempotencyCount()
+	if count > scheduler.MaxIdempotencyEntries {
+		t.Fatalf("idempotency cache exceeded maximum bounds! got: %d, max: %d", count, scheduler.MaxIdempotencyEntries)
+	}
+}

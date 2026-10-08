@@ -1,8 +1,10 @@
 package compiler_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -695,6 +697,146 @@ func TestCompiler_RoutePriorityOrdering(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		if prefixes[i] != expectedOrder[i] {
 			t.Errorf("route index %d mismatch: expected prefix %s, got %s (full order: %v)", i, expectedOrder[i], prefixes[i], prefixes)
+		}
+	}
+}
+
+func TestCompiler_RuntimeDNSRebindingSSRF(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	// Onboard customer domain with FQDN origin
+	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj-dns-rebinding",
+		Hostname:       "app.customer.com",
+		OriginAddress:  "customer-origin.example.com",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard error: %v", err)
+	}
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+	_, err = svc.VerifyDomain(res.DomainID)
+	if err != nil {
+		t.Fatalf("verify error: %v", err)
+	}
+
+	topologies := st.GetActiveTopologies()
+
+	// 1. Initial Resolution: Safe public IP (203.0.113.10)
+	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "customer-origin.example.com" {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		}
+		return nil, net.UnknownNetworkError("nxdomain")
+	})
+
+	cfg1, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("compile error on safe dns: %v", err)
+	}
+
+	var originCluster1 *compiler.Cluster
+	for i := range cfg1.StaticResources.Clusters {
+		if strings.HasPrefix(cfg1.StaticResources.Clusters[i].Name, "cluster_") {
+			originCluster1 = &cfg1.StaticResources.Clusters[i]
+			break
+		}
+	}
+	if originCluster1 == nil {
+		t.Fatalf("expected origin cluster to be generated for safe public IP")
+	}
+	if originCluster1.Type != "STATIC" {
+		t.Errorf("expected cluster type STATIC for IP-pinned resolution, got %s", originCluster1.Type)
+	}
+	if len(originCluster1.LoadAssignment.Endpoints[0].LbEndpoints) != 1 {
+		t.Fatalf("expected 1 lb endpoint, got %d", len(originCluster1.LoadAssignment.Endpoints[0].LbEndpoints))
+	}
+	epAddr := originCluster1.LoadAssignment.Endpoints[0].LbEndpoints[0].Endpoint.Address.SocketAddress.Address
+	if epAddr != "203.0.113.10" {
+		t.Fatalf("expected pinned endpoint 203.0.113.10, got %s", epAddr)
+	}
+
+	// 2. DNS Rebinding / SSRF attack: DNS changes and resolves to 127.0.0.1 (loopback)
+	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "customer-origin.example.com" {
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}
+		return nil, net.UnknownNetworkError("nxdomain")
+	})
+
+	cfg2, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("compile error on rebinding dns: %v", err)
+	}
+
+	var originCluster2 *compiler.Cluster
+	for i := range cfg2.StaticResources.Clusters {
+		if strings.HasPrefix(cfg2.StaticResources.Clusters[i].Name, "cluster_") {
+			originCluster2 = &cfg2.StaticResources.Clusters[i]
+			break
+		}
+	}
+	if originCluster2 != nil {
+		for _, loc := range originCluster2.LoadAssignment.Endpoints {
+			for _, lbEp := range loc.LbEndpoints {
+				addr := lbEp.Endpoint.Address.SocketAddress.Address
+				if addr == "127.0.0.1" || strings.HasPrefix(addr, "127.") {
+					t.Fatalf("CRITICAL SECURITY VULNERABILITY: DNS rebinding allowed loopback 127.0.0.1 to be installed in Envoy cluster!")
+				}
+			}
+		}
+	}
+
+	// 3. DNS Rebinding to Cloud Metadata (169.254.169.254)
+	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "customer-origin.example.com" {
+			return []net.IP{net.ParseIP("169.254.169.254")}, nil
+		}
+		return nil, net.UnknownNetworkError("nxdomain")
+	})
+
+	cfg3, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("compile error on metadata dns: %v", err)
+	}
+
+	for _, cl := range cfg3.StaticResources.Clusters {
+		for _, loc := range cl.LoadAssignment.Endpoints {
+			for _, lbEp := range loc.LbEndpoints {
+				addr := lbEp.Endpoint.Address.SocketAddress.Address
+				if addr == "169.254.169.254" {
+					t.Fatalf("CRITICAL SECURITY VULNERABILITY: DNS rebinding allowed metadata IP 169.254.169.254 in Envoy cluster!")
+				}
+			}
+		}
+	}
+
+	// 4. Mixed resolution containing safe + RFC1918 private IP (10.0.0.1) -> Must reject completely
+	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
+		if host == "customer-origin.example.com" {
+			return []net.IP{net.ParseIP("203.0.113.10"), net.ParseIP("10.0.0.1")}, nil
+		}
+		return nil, net.UnknownNetworkError("nxdomain")
+	})
+
+	cfg4, err := comp.Compile(topologies)
+	if err != nil {
+		t.Fatalf("compile error on mixed dns: %v", err)
+	}
+
+	for _, cl := range cfg4.StaticResources.Clusters {
+		for _, loc := range cl.LoadAssignment.Endpoints {
+			for _, lbEp := range loc.LbEndpoints {
+				addr := lbEp.Endpoint.Address.SocketAddress.Address
+				if addr == "10.0.0.1" {
+					t.Fatalf("CRITICAL SECURITY VULNERABILITY: Mixed DNS resolution allowed private IP 10.0.0.1 in Envoy cluster!")
+				}
+			}
 		}
 	}
 }

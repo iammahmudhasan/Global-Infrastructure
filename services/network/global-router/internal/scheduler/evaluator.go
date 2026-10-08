@@ -301,10 +301,62 @@ func cloneDecision(d *DispatchDecision) *DispatchDecision {
 	return &cp
 }
 
+const MaxIdempotencyEntries = 10000
+
+func (e *Evaluator) IdempotencyCount() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.idempotency)
+}
+
+func (e *Evaluator) RecordIdempotencyForTesting(key string, decision *DispatchDecision) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.recordIdempotencyLocked(key, decision)
+}
+
 func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecision) {
 	if key == "" {
 		return
 	}
+
+	// Update existing entry if present
+	if _, exists := e.idempotency[key]; exists {
+		e.idempotency[key] = &cachedDecision{
+			decision:  cloneDecision(decision),
+			expiresAt: time.Now().Add(24 * time.Hour),
+		}
+		return
+	}
+
+	// Enforce bounded memory pool to prevent unbounded cache growth (Finding 4)
+	if len(e.idempotency) >= MaxIdempotencyEntries {
+		now := time.Now()
+		// 1. Purge expired entries
+		for k, v := range e.idempotency {
+			if now.After(v.expiresAt) {
+				delete(e.idempotency, k)
+			}
+		}
+
+		// 2. If still at or above capacity, evict oldest / earliest expiring entry
+		if len(e.idempotency) >= MaxIdempotencyEntries {
+			var oldestKey string
+			var oldestExp time.Time
+			first := true
+			for k, v := range e.idempotency {
+				if first || v.expiresAt.Before(oldestExp) {
+					oldestKey = k
+					oldestExp = v.expiresAt
+					first = false
+				}
+			}
+			if oldestKey != "" {
+				delete(e.idempotency, oldestKey)
+			}
+		}
+	}
+
 	e.idempotency[key] = &cachedDecision{
 		decision:  cloneDecision(decision),
 		expiresAt: time.Now().Add(24 * time.Hour),

@@ -114,12 +114,21 @@ func ValidateOriginAddress(addr string) error {
 	return nil
 }
 
-func isPrivateOrReservedIP(ip net.IP) bool {
+// IsPrivateOrReservedIP checks whether an IP address belongs to loopback, private (RFC 1918),
+// link-local, cloud metadata (169.254.169.254), carrier-grade NAT (100.64.0.0/10),
+// broadcast, multicast, or IPv6 ULA/link-local ranges (Anti-SSRF Protection).
+func IsPrivateOrReservedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
 	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
 		return true
 	}
 
 	if ipv4 := ip.To4(); ipv4 != nil {
+		if ipv4[0] == 0 {
+			return true
+		}
 		if ipv4[0] == 10 {
 			return true
 		}
@@ -135,6 +144,9 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 		if ipv4[0] == 169 && ipv4[1] == 254 {
 			return true
 		}
+		if ipv4[0] >= 224 {
+			return true
+		}
 		if ipv4[0] == 255 && ipv4[1] == 255 && ipv4[2] == 255 && ipv4[3] == 255 {
 			return true
 		}
@@ -145,6 +157,10 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 	}
 
 	return false
+}
+
+func isPrivateOrReservedIP(ip net.IP) bool {
+	return IsPrivateOrReservedIP(ip)
 }
 
 func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, error) {

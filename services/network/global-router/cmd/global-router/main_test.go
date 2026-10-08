@@ -179,3 +179,79 @@ func TestGlobalRouter_BodySizeLimit(t *testing.T) {
 		t.Errorf("expected body to indicate payload error, got: %s", rec.Body.String())
 	}
 }
+
+func TestWorkloadDispatch_EndpointRedaction(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant-user", "tenant-cbr-banking", "proj-finance-secure", auth.RoleTenant)
+	srv.auth.RegisterTenantWithRole("key-operator-user", "tenant-admin", "proj-core", auth.RolePlatformOperator)
+	handler := srv.routes()
+
+	srv.registry.Register(&registry.ComputeBackend{
+		ID:            "backend-dgx-h100-dispatch",
+		Provider:      "baremetal",
+		Region:        "ap-south-2",
+		Endpoint:      "https://dgx01.internal/v1",
+		GPUModel:      "H100",
+		AvailableGPUs: 8,
+		HourlyCost:    2.00,
+		LatencyP95Ms:  5,
+		Healthy:       true,
+	})
+
+	dispatchPayload := map[string]interface{}{
+		"workload_id":     "wl-dispatch-redact-01",
+		"tenant_id":       "tenant-cbr-banking",
+		"name":            "Inference Task",
+		"required_gpu":    "H100",
+		"gpus_requested":  1,
+		"objective":       "LOW_LATENCY",
+		"idempotency_key": "idem-redact-01",
+	}
+	body, _ := json.Marshal(dispatchPayload)
+
+	// 1. Tenant Dispatch -> Endpoint must be [REDACTED]
+	reqTenant := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(body))
+	reqTenant.Header.Set("Authorization", "Bearer key-tenant-user")
+	recTenant := httptest.NewRecorder()
+	handler.ServeHTTP(recTenant, reqTenant)
+
+	if recTenant.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for tenant dispatch, got: %d", recTenant.Code)
+	}
+
+	var tenantDecision scheduler.DispatchDecision
+	if err := json.Unmarshal(recTenant.Body.Bytes(), &tenantDecision); err != nil {
+		t.Fatalf("failed to parse tenant decision: %v", err)
+	}
+	if tenantDecision.AssignedBackend == nil {
+		t.Fatalf("expected assigned backend in decision")
+	}
+	if tenantDecision.AssignedBackend.Endpoint != "[REDACTED]" {
+		t.Fatalf("tenant received internal backend endpoint: %s", tenantDecision.AssignedBackend.Endpoint)
+	}
+
+	// 2. Operator Dispatch -> Actual internal endpoint must be visible
+	dispatchPayload["workload_id"] = "wl-dispatch-operator-01"
+	dispatchPayload["idempotency_key"] = "idem-operator-01"
+	bodyOp, _ := json.Marshal(dispatchPayload)
+
+	reqOperator := httptest.NewRequest(http.MethodPost, "/api/v1/workload/dispatch", bytes.NewReader(bodyOp))
+	reqOperator.Header.Set("Authorization", "Bearer key-operator-user")
+	recOperator := httptest.NewRecorder()
+	handler.ServeHTTP(recOperator, reqOperator)
+
+	if recOperator.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator dispatch, got: %d", recOperator.Code)
+	}
+
+	var opDecision scheduler.DispatchDecision
+	if err := json.Unmarshal(recOperator.Body.Bytes(), &opDecision); err != nil {
+		t.Fatalf("failed to parse operator decision: %v", err)
+	}
+	if opDecision.AssignedBackend == nil {
+		t.Fatalf("expected assigned backend in decision")
+	}
+	if opDecision.AssignedBackend.Endpoint != "https://dgx01.internal/v1" {
+		t.Fatalf("operator should receive actual endpoint, got: %s", opDecision.AssignedBackend.Endpoint)
+	}
+}

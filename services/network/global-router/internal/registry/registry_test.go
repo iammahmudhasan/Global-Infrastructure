@@ -361,3 +361,18 @@ func TestRegistry_SweepExpiredReservations(t *testing.T) {
 		t.Errorf("expected GPUs restored to %d after sweep, got %d", initialGPUs, bRestored.AvailableGPUs)
 	}
 }
+
+func TestRegistry_ReserveEnforcesCircuitBreaker(t *testing.T) {
+	reg := registry.NewRegistry()
+	backendID := "bd-dhaka-dgx01"
+
+	// Trip circuit breaker with consecutive failures
+	for i := 0; i < 3; i++ {
+		reg.UpdateHealth(backendID, 500, false)
+	}
+
+	err := reg.Reserve("test-blocked-workload", backendID, 1)
+	if err == nil {
+		t.Fatalf("expected Reserve to fail when circuit breaker is OPEN")
+	}
+}

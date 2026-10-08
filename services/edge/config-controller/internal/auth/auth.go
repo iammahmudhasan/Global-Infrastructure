@@ -45,6 +45,7 @@ type TenantRecord struct {
 	ProjectID       string
 	Role            Role
 	NodeID          string
+	PoPID           string
 	APIKey          string
 	AllowedProjects map[string]bool
 	Active          bool
@@ -56,6 +57,7 @@ type TenantContext struct {
 	ProjectID       string
 	Role            Role
 	NodeID          string
+	PoPID           string
 	AllowedProjects map[string]bool
 	IsDevBypass     bool
 }
@@ -82,9 +84,10 @@ func (a *Authenticator) loadFromEnv() {
 			if len(parts) >= 3 {
 				role := RoleTenant
 				nodeID := ""
+				popID := ""
 				extra := []string{}
 				if len(parts) > 3 {
-					// Format: key:tenant:proj:role:extraProj1/nodeID...
+					// Format: key:tenant:proj:role:extraProj1/nodeID:popID...
 					switch strings.ToUpper(parts[3]) {
 					case "PLATFORM_OPERATOR", "OPERATOR", "ADMIN":
 						role = RolePlatformOperator
@@ -92,6 +95,9 @@ func (a *Authenticator) loadFromEnv() {
 						role = RoleEdgeNode
 						if len(parts) > 4 {
 							nodeID = parts[4]
+						}
+						if len(parts) > 5 {
+							popID = parts[5]
 						}
 					default:
 						extra = append(extra, parts[3])
@@ -101,7 +107,11 @@ func (a *Authenticator) loadFromEnv() {
 					}
 				}
 				if role == RoleEdgeNode && nodeID != "" {
-					a.RegisterNode(parts[0], parts[1], parts[2], nodeID)
+					if popID != "" {
+						a.RegisterNodeWithPoP(parts[0], parts[1], parts[2], nodeID, popID)
+					} else {
+						a.RegisterNode(parts[0], parts[1], parts[2], nodeID)
+					}
 				} else {
 					a.RegisterTenantWithRole(parts[0], parts[1], parts[2], role, extra...)
 				}
@@ -114,7 +124,7 @@ func (a *Authenticator) loadFromEnv() {
 	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
 		a.RegisterTenantWithRole("dev-fixture-key-01", "tenant-system", "proj-core", RolePlatformOperator, "prj-enterprise-01")
 		a.RegisterTenantWithRole("dev-fixture-key-banking", "tenant-cbr-banking", "proj-fintech-prod", RoleTenant)
-		a.RegisterNode("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", "edge-node-01", "*")
+		a.RegisterNodeWithPoP("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", "edge-node-01", "dhaka", "*")
 	}
 }
 
@@ -145,6 +155,10 @@ func (a *Authenticator) RegisterTenantWithRole(apiKey, tenantID, projectID strin
 }
 
 func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string, extraProjects ...string) {
+	a.RegisterNodeWithPoP(apiKey, tenantID, projectID, nodeID, "", extraProjects...)
+}
+
+func (a *Authenticator) RegisterNodeWithPoP(apiKey, tenantID, projectID, nodeID, popID string, extraProjects ...string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -161,6 +175,7 @@ func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string,
 		ProjectID:       projectID,
 		Role:            RoleEdgeNode,
 		NodeID:          nodeID,
+		PoPID:           popID,
 		APIKey:          apiKey,
 		AllowedProjects: allowed,
 		Active:          true,
@@ -223,6 +238,22 @@ func (a *Authenticator) AuthorizeRole(ctx context.Context, requiredRoles ...Role
 	return false
 }
 
+// AuthorizePoP verifies that an edge node is specifically authorized for the target PoP (Finding 3).
+// Operators and dev bypass callers retain global PoP management authority.
+func (a *Authenticator) AuthorizePoP(ctx context.Context, popID string) bool {
+	tc, ok := FromContext(ctx)
+	if !ok || tc == nil {
+		return false
+	}
+	if tc.IsDevBypass || tc.Role == RolePlatformOperator {
+		return true
+	}
+	return tc.Role == RoleEdgeNode &&
+		tc.NodeID != "" &&
+		tc.PoPID != "" &&
+		(tc.PoPID == "*" || strings.EqualFold(tc.PoPID, popID))
+}
+
 // FromContext extracts the TenantContext from request context
 func FromContext(ctx context.Context) (*TenantContext, bool) {
 	tc, ok := ctx.Value(TenantContextKey).(*TenantContext)
@@ -271,6 +302,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 				ProjectID:       record.ProjectID,
 				Role:            record.Role,
 				NodeID:          record.NodeID,
+				PoPID:           record.PoPID,
 				AllowedProjects: record.AllowedProjects,
 				IsDevBypass:     false,
 			}

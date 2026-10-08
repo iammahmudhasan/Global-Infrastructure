@@ -313,35 +313,10 @@ func (r *Registry) AdmitAndReserve(workloadID, backendID string, count int) erro
 	return nil
 }
 
-// Reserve tracks capacity ownership by a specific workload, preventing double reservations
+// Reserve tracks capacity ownership by a specific workload, delegating directly to AdmitAndReserve
+// to guarantee uniform circuit-breaker and health admission validation (Finding 9).
 func (r *Registry) Reserve(workloadID, backendID string, count int) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.reservations[workloadID]; exists {
-		return ErrReservationExists
-	}
-
-	b, ok := r.backends[backendID]
-	if !ok {
-		return ErrBackendNotFound
-	}
-	if count <= 0 {
-		count = 1
-	}
-	if b.AvailableGPUs < count {
-		return ErrInsufficientCapacity
-	}
-
-	b.AvailableGPUs -= count
-	b.ActiveWorkloads++
-	r.reservations[workloadID] = &Reservation{
-		WorkloadID: workloadID,
-		BackendID:  backendID,
-		GPUs:       count,
-		ReservedAt: time.Now().UTC(),
-	}
-	return nil
+	return r.AdmitAndReserve(workloadID, backendID, count)
 }
 
 // CompleteWorkload records the execution outcome (success or failure) of a reserved workload,

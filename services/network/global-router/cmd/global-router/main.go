@@ -12,10 +12,22 @@ import (
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/telemetry"
 )
+
+// BackendSummary minimizes metadata exposure for tenant callers (Finding 8)
+type BackendSummary struct {
+	ID           string               `json:"id"`
+	Provider     string               `json:"provider"`
+	Region       string               `json:"region"`
+	GPUModel     string               `json:"gpu_model"`
+	Endpoint     string               `json:"endpoint"`
+	Healthy      bool                 `json:"healthy"`
+	CircuitState circuitbreaker.State `json:"circuit_state"`
+}
 
 type Server struct {
 	auth      *auth.Authenticator
@@ -80,13 +92,28 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/backends", func(w http.ResponseWriter, r *http.Request) {
 		backends := s.registry.List()
 		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
-		if !isOperator {
-			// Redact internal endpoints for tenant view to prevent topology disclosure
-			for _, b := range backends {
-				b.Endpoint = "[REDACTED]"
-			}
-		}
 		w.Header().Set("Content-Type", "application/json")
+
+		if !isOperator {
+			summaries := make([]BackendSummary, 0, len(backends))
+			for _, b := range backends {
+				summaries = append(summaries, BackendSummary{
+					ID:           b.ID,
+					Provider:     b.Provider,
+					Region:       b.Region,
+					GPUModel:     b.GPUModel,
+					Endpoint:     "[REDACTED]",
+					Healthy:      b.Healthy,
+					CircuitState: b.CircuitState,
+				})
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"count":    len(summaries),
+				"backends": summaries,
+			})
+			return
+		}
+
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"count":    len(backends),
 			"backends": backends,
@@ -169,14 +196,37 @@ func (s *Server) routes() http.Handler {
 			true,
 		)
 
+		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(decision)
+		json.NewEncoder(w).Encode(publicDispatchDecision(decision, isOperator))
 	})
 
 	// Wrap in middleware chain: Correlation -> BodySizeLimit -> Auth (Rule 6: Dependency Direction)
 	handler := s.auth.Middleware(mux)
 	handler = bodySizeLimitMiddleware(handler)
 	return telemetry.RequestCorrelationMiddleware(handler)
+}
+
+func publicDispatchDecision(d *scheduler.DispatchDecision, operator bool) *scheduler.DispatchDecision {
+	if d == nil {
+		return nil
+	}
+	cp := *d
+	if d.AssignedBackend != nil {
+		backend := *d.AssignedBackend
+		if !operator {
+			backend.Endpoint = "[REDACTED]"
+		}
+		backend.Breaker = nil
+		cp.AssignedBackend = &backend
+	}
+	if d.ReasonCodes != nil {
+		cp.ReasonCodes = append([]string(nil), d.ReasonCodes...)
+	}
+	if d.Alternatives != nil {
+		cp.Alternatives = append([]string(nil), d.Alternatives...)
+	}
+	return &cp
 }
 
 const maxRequestBody = 1 << 20 // 1 MiB

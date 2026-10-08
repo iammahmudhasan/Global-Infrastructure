@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -627,23 +628,58 @@ func (h *APIHandler) handleSetHealthMonitor(w http.ResponseWriter, r *http.Reque
 	if hm.Protocol == "" {
 		hm.Protocol = model.HealthCheckProtocolHTTP
 	}
+
 	if hm.Path == "" {
 		hm.Path = "/healthz"
 	}
-	if hm.IntervalSeconds <= 0 {
+	if len(hm.Path) > 1024 || !strings.HasPrefix(hm.Path, "/") || strings.ContainsAny(hm.Path, "\r\n\t") {
+		writeError(w, http.StatusBadRequest, "health check path must be a valid path starting with / (max 1024 characters, no control characters)")
+		return
+	}
+
+	// Bounds validation (Finding 6)
+	if hm.IntervalSeconds == 0 {
 		hm.IntervalSeconds = 10
+	} else if hm.IntervalSeconds < 1 || hm.IntervalSeconds > 3600 {
+		writeError(w, http.StatusBadRequest, "interval_seconds must be between 1 and 3600 seconds")
+		return
 	}
-	if hm.TimeoutSeconds <= 0 {
+
+	if hm.TimeoutSeconds == 0 {
 		hm.TimeoutSeconds = 2
+	} else if hm.TimeoutSeconds < 1 || hm.TimeoutSeconds > 60 {
+		writeError(w, http.StatusBadRequest, "timeout_seconds must be between 1 and 60 seconds")
+		return
 	}
-	if hm.HealthyThreshold <= 0 {
+
+	if hm.TimeoutSeconds > hm.IntervalSeconds {
+		writeError(w, http.StatusBadRequest, "timeout_seconds cannot exceed interval_seconds")
+		return
+	}
+
+	if hm.HealthyThreshold == 0 {
 		hm.HealthyThreshold = 2
+	} else if hm.HealthyThreshold < 1 || hm.HealthyThreshold > 10 {
+		writeError(w, http.StatusBadRequest, "healthy_threshold must be between 1 and 10")
+		return
 	}
-	if hm.UnhealthyThreshold <= 0 {
+
+	if hm.UnhealthyThreshold == 0 {
 		hm.UnhealthyThreshold = 3
+	} else if hm.UnhealthyThreshold < 1 || hm.UnhealthyThreshold > 10 {
+		writeError(w, http.StatusBadRequest, "unhealthy_threshold must be between 1 and 10")
+		return
 	}
+
 	if len(hm.ExpectedStatusCodes) == 0 {
 		hm.ExpectedStatusCodes = []int{200}
+	} else {
+		for _, code := range hm.ExpectedStatusCodes {
+			if code < 100 || code > 599 {
+				writeError(w, http.StatusBadRequest, "expected_status_codes must be valid HTTP status codes between 100 and 599")
+				return
+			}
+		}
 	}
 
 	h.store.SaveHealthMonitor(&hm)
@@ -896,11 +932,39 @@ func (h *APIHandler) handleSetRateLimits(w http.ResponseWriter, r *http.Request,
 	}
 
 	for i := range body.Rules {
-		body.Rules[i].ID = "rl-" + generateHex(4)
-		body.Rules[i].DomainID = domainID
-		body.Rules[i].Enabled = true
-		if body.Rules[i].KeyType == "" {
-			body.Rules[i].KeyType = "CLIENT_IP"
+		rule := &body.Rules[i]
+		rule.ID = "rl-" + generateHex(4)
+		rule.DomainID = domainID
+		rule.Enabled = true
+
+		// Rule parameter validation (Finding 7)
+		if rule.RequestsPerMinute < 1 || rule.RequestsPerMinute > 10_000_000 {
+			writeError(w, http.StatusBadRequest, "requests_per_minute must be between 1 and 10,000,000")
+			return
+		}
+		if rule.BurstSize < 0 || rule.BurstSize > 1_000_000 {
+			writeError(w, http.StatusBadRequest, "burst_size must be between 0 and 1,000,000")
+			return
+		}
+
+		if rule.KeyType == "" {
+			rule.KeyType = "CLIENT_IP"
+		}
+		switch rule.KeyType {
+		case "CLIENT_IP":
+		case "HEADER":
+			if strings.TrimSpace(rule.HeaderName) == "" {
+				writeError(w, http.StatusBadRequest, "header_name is required when key_type is HEADER")
+				return
+			}
+		default:
+			writeError(w, http.StatusBadRequest, "invalid key_type: must be CLIENT_IP or HEADER")
+			return
+		}
+
+		if rule.PathPrefix != "" && !strings.HasPrefix(rule.PathPrefix, "/") {
+			writeError(w, http.StatusBadRequest, "path_prefix must start with /")
+			return
 		}
 	}
 
@@ -1258,6 +1322,11 @@ func (h *APIHandler) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.ClientIP == "" || net.ParseIP(req.ClientIP) == nil {
+		writeError(w, http.StatusBadRequest, "client_ip must be a valid IP address")
+		return
+	}
+
 	domain, err := h.store.GetDomain(req.DomainID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "domain not found")
@@ -1334,9 +1403,10 @@ func (h *APIHandler) handleEnvoyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RBAC Boundary (Finding 9): Only Platform Operators or Edge Nodes can inspect global compiled Envoy configuration
-	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
-		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+	// RBAC Boundary (Finding 9, Finding 3): Only Platform Operators can inspect global compiled Envoy configuration.
+	// Edge nodes must retrieve their PoP-scoped configuration via /v1/edge/pops/{pop_id}/config.
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+		writeError(w, http.StatusForbidden, "forbidden: operator role required for global envoy configuration")
 		return
 	}
 
@@ -1542,12 +1612,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 	popID := strings.ToLower(parts[0])
 
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+
+	if !h.authenticator.AuthorizePoP(r.Context(), popID) {
+		writeError(w, http.StatusForbidden, "edge node is not authorized for this PoP")
+		return
+	}
+
 	if len(parts) == 1 {
 		if r.Method == http.MethodGet {
-			if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
-				writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
-				return
-			}
 			pop, err := h.popManager.GetPoP(popID)
 			if err != nil {
 				writeError(w, http.StatusNotFound, err.Error())

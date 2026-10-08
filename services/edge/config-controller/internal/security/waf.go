@@ -251,10 +251,52 @@ type TokenBucket struct {
 	mu         sync.Mutex
 }
 
+const maxRateLimiters = 10000
+
+func (e *WAFEngine) RateLimiterCount() int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return len(e.rateLimiters)
+}
+
 func (e *WAFEngine) allowRate(key string, rpm int) bool {
 	e.mu.Lock()
 	tb, exists := e.rateLimiters[key]
 	if !exists {
+		// Bounded memory enforcement to prevent memory exhaustion (Finding 5)
+		if len(e.rateLimiters) >= maxRateLimiters {
+			now := time.Now()
+			// 1. Purge buckets idle for more than 5 minutes
+			for k, b := range e.rateLimiters {
+				b.mu.Lock()
+				idle := now.Sub(b.lastUpdate)
+				b.mu.Unlock()
+				if idle > 5*time.Minute {
+					delete(e.rateLimiters, k)
+				}
+			}
+
+			// 2. If still at max capacity, evict the oldest bucket
+			if len(e.rateLimiters) >= maxRateLimiters {
+				var oldestKey string
+				var oldestTime time.Time
+				first := true
+				for k, b := range e.rateLimiters {
+					b.mu.Lock()
+					lu := b.lastUpdate
+					b.mu.Unlock()
+					if first || lu.Before(oldestTime) {
+						oldestKey = k
+						oldestTime = lu
+						first = false
+					}
+				}
+				if oldestKey != "" {
+					delete(e.rateLimiters, oldestKey)
+				}
+			}
+		}
+
 		capacity := float64(rpm)
 		tb = &TokenBucket{
 			tokens:     capacity,

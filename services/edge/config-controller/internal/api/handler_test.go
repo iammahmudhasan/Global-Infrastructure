@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1293,7 +1294,7 @@ func TestEdgeNodeHeartbeat_IdentityBinding(t *testing.T) {
 
 	// Register specific EdgeNode credentials
 	authInst := handler.Authenticator()
-	authInst.RegisterNode("key-node-01", "tenant-infra", "proj-infra", "edge-node-01")
+	authInst.RegisterNodeWithPoP("key-node-01", "tenant-infra", "proj-infra", "edge-node-01", "dhaka")
 	authInst.RegisterTenantWithRole("key-operator", "tenant-sys", "proj-core", auth.RolePlatformOperator, "*")
 
 	heartbeatPayload, _ := json.Marshal(map[string]interface{}{
@@ -1336,7 +1337,7 @@ func TestPoPAndRoutingAccessControl(t *testing.T) {
 
 	authInst.RegisterTenantWithRole("key-tenant-user", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
 	authInst.RegisterTenantWithRole("key-operator-user", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
-	authInst.RegisterNode("key-node-user", "tenant-infra", "proj-infra", "edge-node-01")
+	authInst.RegisterNodeWithPoP("key-node-user", "tenant-infra", "proj-infra", "edge-node-01", "dhaka")
 
 	endpoints := []string{
 		"/v1/edge/pops",
@@ -1379,7 +1380,7 @@ func TestNodeRegistration_OperatorOnly(t *testing.T) {
 	authInst := handler.Authenticator()
 
 	authInst.RegisterTenantWithRole("key-operator", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
-	authInst.RegisterNode("key-node", "tenant-infra", "proj-infra", "edge-node-01")
+	authInst.RegisterNodeWithPoP("key-node", "tenant-infra", "proj-infra", "edge-node-01", "dhaka")
 	authInst.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
 
 	nodePayload, _ := json.Marshal(map[string]interface{}{
@@ -1560,5 +1561,288 @@ func TestEdgeTelemetry_DomainValidationAndAuthorization(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for authorized telemetry, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEdgeNode_PoPScopingAndCrossPoPIsolation(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	// Register edge-node scoped specifically to "dhaka"
+	authInst.RegisterNodeWithPoP("key-node-dhaka", "tenant-infra", "proj-infra", "edge-node-dhaka", "dhaka")
+	authInst.RegisterTenantWithRole("key-operator", "tenant-sys", "proj-core", auth.RolePlatformOperator, "*")
+
+	// 1. Authorized PoP access: dhaka node accessing dhaka PoP -> 200 OK
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka", nil)
+	req.Header.Set("X-API-Key", "key-node-dhaka")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for dhaka node accessing dhaka pop, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Cross-PoP unauthorized access: dhaka node accessing singapore PoP -> 403 Forbidden
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore", nil)
+	req.Header.Set("X-API-Key", "key-node-dhaka")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "edge node is not authorized for this PoP") {
+		t.Fatalf("expected 403 Forbidden for cross-PoP access, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Edge node accessing global envoy-config -> 403 Forbidden (operator only)
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/envoy-config", nil)
+	req.Header.Set("X-API-Key", "key-node-dhaka")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "operator role required") {
+		t.Fatalf("expected 403 Forbidden for edge node on global envoy-config, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Platform Operator can access global envoy-config -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/envoy-config", nil)
+	req.Header.Set("X-API-Key", "key-operator")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator on global envoy-config, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHealthMonitor_InputBoundsValidation(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+
+	// Create domain
+	bodyDomain, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "hm-bounds.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-user/domains", bytes.NewReader(bodyDomain))
+	req.Header.Set("X-API-Key", "key-tenant")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var res struct {
+		DomainID     string `json:"domain_id"`
+		OriginPoolID string `json:"origin_pool_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	testCases := []struct {
+		name    string
+		payload map[string]interface{}
+		wantErr string
+	}{
+		{
+			name: "interval seconds too high",
+			payload: map[string]interface{}{
+				"path":             "/healthz",
+				"interval_seconds": 999999,
+				"timeout_seconds":  2,
+			},
+			wantErr: "interval_seconds must be between 1 and 3600",
+		},
+		{
+			name: "timeout seconds too high",
+			payload: map[string]interface{}{
+				"path":             "/healthz",
+				"interval_seconds": 100,
+				"timeout_seconds":  75,
+			},
+			wantErr: "timeout_seconds must be between 1 and 60",
+		},
+		{
+			name: "timeout exceeds interval",
+			payload: map[string]interface{}{
+				"path":             "/healthz",
+				"interval_seconds": 5,
+				"timeout_seconds":  10,
+			},
+			wantErr: "timeout_seconds cannot exceed interval_seconds",
+		},
+		{
+			name: "healthy threshold out of bounds",
+			payload: map[string]interface{}{
+				"path":              "/healthz",
+				"interval_seconds":  10,
+				"timeout_seconds":   2,
+				"healthy_threshold": 99,
+			},
+			wantErr: "healthy_threshold must be between 1 and 10",
+		},
+		{
+			name: "unhealthy threshold > 10",
+			payload: map[string]interface{}{
+				"path":                "/healthz",
+				"interval_seconds":    10,
+				"timeout_seconds":     2,
+				"unhealthy_threshold": 25,
+			},
+			wantErr: "unhealthy_threshold must be between 1 and 10",
+		},
+		{
+			name: "invalid status code",
+			payload: map[string]interface{}{
+				"path":                  "/healthz",
+				"interval_seconds":      10,
+				"timeout_seconds":       2,
+				"expected_status_codes": []int{200, 999},
+			},
+			wantErr: "expected_status_codes must be valid HTTP status codes",
+		},
+	}
+
+	for _, tc := range testCases {
+		data, _ := json.Marshal(tc.payload)
+		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v1/pools/%s/health-monitor", res.OriginPoolID), bytes.NewReader(data))
+		r.Header.Set("X-API-Key", "key-tenant")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.wantErr) {
+			t.Errorf("[%s] expected 400 Bad Request containing '%s', got %d: %s", tc.name, tc.wantErr, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestRateLimits_InputBoundsValidation(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+
+	bodyDomain, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "rl-bounds.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-user/domains", bytes.NewReader(bodyDomain))
+	req.Header.Set("X-API-Key", "key-tenant")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	testCases := []struct {
+		name    string
+		rules   []map[string]interface{}
+		wantErr string
+	}{
+		{
+			name: "rpm 0 rejected",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 0, "burst_size": 10},
+			},
+			wantErr: "requests_per_minute must be between 1 and 10,000,000",
+		},
+		{
+			name: "rpm excessive rejected",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 99_000_000, "burst_size": 10},
+			},
+			wantErr: "requests_per_minute must be between 1 and 10,000,000",
+		},
+		{
+			name: "burst size negative rejected",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 100, "burst_size": -5},
+			},
+			wantErr: "burst_size must be between 0 and 1,000,000",
+		},
+		{
+			name: "invalid key type",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 100, "burst_size": 10, "key_type": "COOKIE"},
+			},
+			wantErr: "invalid key_type: must be CLIENT_IP or HEADER",
+		},
+		{
+			name: "header key type without header name",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 100, "burst_size": 10, "key_type": "HEADER", "header_name": ""},
+			},
+			wantErr: "header_name is required when key_type is HEADER",
+		},
+		{
+			name: "path prefix missing leading slash",
+			rules: []map[string]interface{}{
+				{"requests_per_minute": 100, "burst_size": 10, "path_prefix": "no-slash"},
+			},
+			wantErr: "path_prefix must start with /",
+		},
+	}
+
+	for _, tc := range testCases {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"rules": tc.rules,
+		})
+		r := httptest.NewRequest(http.MethodPost, fmt.Sprintf("/v1/domains/%s/rate-limits", res.DomainID), bytes.NewReader(payload))
+		r.Header.Set("X-API-Key", "key-tenant")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), tc.wantErr) {
+			t.Errorf("[%s] expected 400 Bad Request containing '%s', got %d: %s", tc.name, tc.wantErr, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestEvaluate_ClientIPValidation(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+
+	bodyDomain, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "eval-bounds.example.com",
+		"origin_address":  "origin.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-user/domains", bytes.NewReader(bodyDomain))
+	req.Header.Set("X-API-Key", "key-tenant")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var res struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &res)
+
+	// 1. Empty or malformed client IP -> 400 Bad Request
+	badIPs := []string{"", "not-an-ip", "999.999.999.999", "abc::xyz"}
+	for _, badIP := range badIPs {
+		evalPayload, _ := json.Marshal(map[string]interface{}{
+			"domain_id": res.DomainID,
+			"client_ip": badIP,
+			"method":    "GET",
+			"path":      "/",
+		})
+		r := httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(evalPayload))
+		r.Header.Set("X-API-Key", "key-tenant")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, r)
+
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "client_ip must be a valid IP address") {
+			t.Errorf("expected 400 Bad Request for bad client_ip '%s', got %d: %s", badIP, rec.Code, rec.Body.String())
+		}
+	}
+
+	// 2. Valid client IP -> 200 OK
+	validPayload, _ := json.Marshal(map[string]interface{}{
+		"domain_id": res.DomainID,
+		"client_ip": "203.0.113.195",
+		"method":    "GET",
+		"path":      "/",
+	})
+	r := httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(validPayload))
+	r.Header.Set("X-API-Key", "key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid client_ip, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

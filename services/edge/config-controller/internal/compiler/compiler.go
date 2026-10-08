@@ -1,6 +1,7 @@
 package compiler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
@@ -137,6 +139,9 @@ type Endpoint struct {
 	Address Address `json:"address"`
 }
 
+// DNSResolver resolves a domain name into IP addresses for validation and static pinning.
+type DNSResolver func(ctx context.Context, host string) ([]net.IP, error)
+
 // Compiler transforms domain topologies from the control plane into Envoy v3 configuration
 type Compiler struct {
 	adminPort   int
@@ -145,6 +150,7 @@ type Compiler struct {
 	acmeHost    string
 	acmePort    int
 	edgeVersion string
+	resolver    DNSResolver
 }
 
 func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
@@ -177,6 +183,10 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 		acmePort:    acmePort,
 		edgeVersion: "v1.0.0",
 	}
+}
+
+func (c *Compiler) SetDNSResolver(r DNSResolver) {
+	c.resolver = r
 }
 
 // Compile compiles active domain topologies into an Envoy v3 configuration
@@ -759,10 +769,10 @@ func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate, settings *
 	}
 }
 
-// Runtime DNS Rebinding Security Boundary:
-// In V0, customer origins with hostnames use STRICT_DNS directly.
-// While onboarding validates resolved IPs, runtime DNS rebinding protection (Egress Proxy /
-// IP-pinned EDS allowlists) is scheduled for V1.
+// Runtime DNS Rebinding Protection (Option B: Validated IP-pinned STATIC endpoints):
+// Resolves origin hostnames, validates that all resolved destination IPs are public and safe,
+// and pins them as STATIC cluster endpoints with preserved SNI, completely shielding Envoy
+// from runtime DNS rebinding to loopback, RFC1918, or cloud metadata ranges (P1 Finding).
 func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Cluster {
 	// Determine cluster discovery type: STRICT_DNS for domain origins, STATIC for raw IPs
 	clusterType := "STRICT_DNS"
@@ -776,31 +786,89 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 			continue // Exclude unhealthy endpoints from active rotation (Rule 16)
 		}
 
-		if net.ParseIP(o.Address) == nil {
-			isAllIPs = false
+		weight := o.Weight
+		if weight <= 0 {
+			weight = 100
 		}
+
 		if o.Protocol == model.ProtocolHTTPS {
 			hasHTTPS = true
 		} else {
 			hasHTTP = true
 		}
 
-		weight := o.Weight
-		if weight <= 0 {
-			weight = 100
-		}
-
-		lbEndpoints = append(lbEndpoints, LbEndpoint{
-			Endpoint: Endpoint{
-				Address: Address{
-					SocketAddress: SocketAddress{
-						Address:   o.Address,
-						PortValue: o.Port,
+		parsedIP := net.ParseIP(o.Address)
+		if parsedIP != nil {
+			// Direct IP destination: validate against SSRF private/reserved ranges
+			if onboarding.IsPrivateOrReservedIP(parsedIP) {
+				continue // Exclude unsafe private IP destination
+			}
+			lbEndpoints = append(lbEndpoints, LbEndpoint{
+				Endpoint: Endpoint{
+					Address: Address{
+						SocketAddress: SocketAddress{
+							Address:   o.Address,
+							PortValue: o.Port,
+						},
 					},
 				},
-			},
-			LoadBalancingWeight: weight,
-		})
+				LoadBalancingWeight: weight,
+			})
+		} else {
+			// Origin is an FQDN:
+			if c.resolver != nil {
+				resolvedIPs, err := c.resolver(context.Background(), o.Address)
+				if err != nil {
+					// Unresolvable origin: fail-closed to prevent routing to unverified destinations
+					continue
+				}
+
+				// Validate every resolved IP against private / loopback / metadata ranges (anti-rebinding)
+				hasUnsafeIP := false
+				var safeIPs []net.IP
+				for _, ip := range resolvedIPs {
+					if onboarding.IsPrivateOrReservedIP(ip) {
+						hasUnsafeIP = true
+						break
+					}
+					safeIPs = append(safeIPs, ip)
+				}
+
+				if hasUnsafeIP || len(safeIPs) == 0 {
+					// SSRF / DNS Rebinding detected! Reject completely - never install private destinations in config!
+					continue
+				}
+
+				// Pin validated public IPs as STATIC endpoints
+				for _, ip := range safeIPs {
+					lbEndpoints = append(lbEndpoints, LbEndpoint{
+						Endpoint: Endpoint{
+							Address: Address{
+								SocketAddress: SocketAddress{
+									Address:   ip.String(),
+									PortValue: o.Port,
+								},
+							},
+						},
+						LoadBalancingWeight: weight,
+					})
+				}
+			} else {
+				// No resolver injected (backward-compatible fallback): retain STRICT_DNS
+				isAllIPs = false
+				lbEndpoints = append(lbEndpoints, LbEndpoint{
+					Endpoint: Endpoint{
+						Address: Address{
+							SocketAddress: SocketAddress{
+								Address:   o.Address,
+								PortValue: o.Port,
+							},
+						},
+					},
+					LoadBalancingWeight: weight,
+				})
+			}
+		}
 	}
 
 	if isAllIPs && len(lbEndpoints) > 0 {
