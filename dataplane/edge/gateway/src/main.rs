@@ -102,8 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tcp_nodelay(true)
         .build()?;
 
-    let inflight_buffer_semaphore =
-        Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS));
+    let inflight_buffer_semaphore = Arc::new(tokio::sync::Semaphore::new(
+        DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS,
+    ));
 
     let state = Arc::new(ProxyState {
         config: config.clone(),

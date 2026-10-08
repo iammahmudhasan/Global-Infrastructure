@@ -56,7 +56,11 @@ impl EdgeCache {
             enabled,
             default_ttl: Duration::from_secs(ttl_seconds),
             max_entries,
-            max_bytes: if max_bytes == 0 { 100 * 1024 * 1024 } else { max_bytes },
+            max_bytes: if max_bytes == 0 {
+                100 * 1024 * 1024
+            } else {
+                max_bytes
+            },
             store: Arc::new(RwLock::new(CacheStore::default())),
         }
     }
@@ -192,7 +196,10 @@ impl EdgeCache {
         }
 
         // 4. Hard capacity guarantee (both count and byte budget): Evict earliest expiring entry until within limits
-        while (total_entries >= self.max_entries || store.current_bytes + entry_bytes > self.max_bytes) && !store.entries.is_empty() {
+        while (total_entries >= self.max_entries
+            || store.current_bytes + entry_bytes > self.max_bytes)
+            && !store.entries.is_empty()
+        {
             let mut earliest_expiry: Option<(String, usize, Instant)> = None;
 
             for (k, variants) in store.entries.iter() {
@@ -245,7 +252,13 @@ impl EdgeCache {
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.store.read().unwrap().entries.values().map(|v| v.len()).sum()
+        self.store
+            .read()
+            .unwrap()
+            .entries
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
 
     #[allow(dead_code)]

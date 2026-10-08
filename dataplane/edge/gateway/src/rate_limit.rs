@@ -72,10 +72,7 @@ impl RateLimiter {
         let mut buckets = self.buckets.write().unwrap();
         if !buckets.contains_key(&client_ip) && buckets.len() >= self.max_buckets {
             // Evict oldest bucket by last_update to prevent memory exhaustion (Finding 3)
-            if let Some((&oldest_ip, _)) = buckets
-                .iter()
-                .min_by_key(|(_, b)| b.last_update)
-            {
+            if let Some((&oldest_ip, _)) = buckets.iter().min_by_key(|(_, b)| b.last_update) {
                 buckets.remove(&oldest_ip);
             }
         }
