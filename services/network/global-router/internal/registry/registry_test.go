@@ -361,4 +361,3 @@ func TestRegistry_SweepExpiredReservations(t *testing.T) {
 		t.Errorf("expected GPUs restored to %d after sweep, got %d", initialGPUs, bRestored.AvailableGPUs)
 	}
 }
-

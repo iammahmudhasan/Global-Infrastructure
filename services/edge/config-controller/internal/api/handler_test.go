@@ -1562,4 +1562,3 @@ func TestEdgeTelemetry_DomainValidationAndAuthorization(t *testing.T) {
 		t.Fatalf("expected 200 OK for authorized telemetry, got %d: %s", w.Code, w.Body.String())
 	}
 }
-

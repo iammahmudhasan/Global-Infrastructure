@@ -465,4 +465,3 @@ func TestIdempotencyDecisionPointerIsolation(t *testing.T) {
 		t.Errorf("cached decision reason codes slice was mutated! Expected len %d, got %d", origReasonCodesLen, len(d2.ReasonCodes))
 	}
 }
-

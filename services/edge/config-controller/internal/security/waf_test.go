@@ -248,4 +248,3 @@ func TestWAF_PriorityAndAllowSemantics(t *testing.T) {
 			resFlood.Blocked, resFlood.StatusCode)
 	}
 }
-
