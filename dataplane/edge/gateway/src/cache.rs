@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use hyper::header::HeaderMap;
 use hyper::StatusCode;
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -34,10 +35,62 @@ impl CachedResponse {
     }
 }
 
+/// Min-heap index entry for O(log N) earliest-expiry eviction (Finding 6)
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpiryIndexEntry {
+    expires_at: Instant,
+    key: String,
+    vary_headers: Vec<(String, Option<String>)>,
+}
+
+impl Ord for ExpiryIndexEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering so BinaryHeap functions as a min-heap on expires_at
+        other
+            .expires_at
+            .cmp(&self.expires_at)
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+impl PartialOrd for ExpiryIndexEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 #[derive(Default)]
 struct CacheStore {
     current_bytes: usize,
+    total_entries: usize,
     entries: HashMap<String, Vec<CachedResponse>>,
+    expiry_heap: BinaryHeap<ExpiryIndexEntry>,
+}
+
+impl CacheStore {
+    fn remove_variant(&mut self, candidate: &ExpiryIndexEntry) -> bool {
+        let removed_bytes = self.entries.get_mut(&candidate.key).and_then(|variants| {
+            variants
+                .iter()
+                .position(|v| {
+                    v.expires_at == candidate.expires_at && v.vary_headers == candidate.vary_headers
+                })
+                .map(|idx| variants.remove(idx).size_in_bytes())
+        });
+
+        if let Some(bytes) = removed_bytes {
+            self.current_bytes = self.current_bytes.saturating_sub(bytes);
+            self.total_entries = self.total_entries.saturating_sub(1);
+            if let Some(variants) = self.entries.get(&candidate.key) {
+                if variants.is_empty() {
+                    self.entries.remove(&candidate.key);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Bounded earliest-expiry eviction cache with RFC 9111 Vary header and byte limit support.
@@ -168,97 +221,84 @@ impl EdgeCache {
                 .map(|idx| (idx, variants[idx].size_in_bytes()))
         });
         if let Some((idx, old_bytes)) = existing_match {
-            store.entries.get_mut(&key).unwrap()[idx] = entry;
+            store.entries.get_mut(&key).unwrap()[idx] = entry.clone();
             store.current_bytes = store.current_bytes.saturating_sub(old_bytes) + entry_bytes;
+            store.expiry_heap.push(ExpiryIndexEntry {
+                expires_at: entry.expires_at,
+                key,
+                vary_headers: entry.vary_headers,
+            });
             return;
         }
 
-        // 2. Count total active variants across all keys
-        let mut total_entries: usize = store.entries.values().map(|v| v.len()).sum();
-
-        // 3. Evict expired entries if approaching count or byte limit
-        if total_entries >= self.max_entries || store.current_bytes + entry_bytes > self.max_bytes {
-            let now = Instant::now();
-            let mut expired_bytes = 0usize;
-            for variants in store.entries.values_mut() {
-                variants.retain(|v| {
-                    if v.expires_at <= now {
-                        expired_bytes += v.size_in_bytes();
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-            store.current_bytes = store.current_bytes.saturating_sub(expired_bytes);
-            store.entries.retain(|_, v| !v.is_empty());
-            total_entries = store.entries.values().map(|v| v.len()).sum();
-        }
-
-        // 4. Hard capacity guarantee (both count and byte budget): Evict earliest expiring entry until within limits
-        while (total_entries >= self.max_entries
-            || store.current_bytes + entry_bytes > self.max_bytes)
-            && !store.entries.is_empty()
-        {
-            let mut earliest_expiry: Option<(String, usize, Instant)> = None;
-
-            for (k, variants) in store.entries.iter() {
-                for (idx, v) in variants.iter().enumerate() {
-                    match earliest_expiry {
-                        None => earliest_expiry = Some((k.clone(), idx, v.expires_at)),
-                        Some((_, _, min_exp)) if v.expires_at < min_exp => {
-                            earliest_expiry = Some((k.clone(), idx, v.expires_at));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            if let Some((victim_key, victim_idx, _)) = earliest_expiry {
-                let mut victim_bytes = 0;
-                if let Some(variants) = store.entries.get_mut(&victim_key) {
-                    if victim_idx < variants.len() {
-                        let victim = variants.remove(victim_idx);
-                        victim_bytes = victim.size_in_bytes();
-                    }
-                }
-                store.current_bytes = store.current_bytes.saturating_sub(victim_bytes);
-                if let Some(variants) = store.entries.get(&victim_key) {
-                    if variants.is_empty() {
-                        store.entries.remove(&victim_key);
-                    }
-                }
-                total_entries = store.entries.values().map(|v| v.len()).sum();
-            } else {
+        // 2. Proactive eviction of expired entries using min-heap peek (O(log N))
+        let now = Instant::now();
+        while let Some(top) = store.expiry_heap.peek() {
+            if top.expires_at > now {
                 break;
             }
+            let candidate = store.expiry_heap.pop().unwrap();
+            store.remove_variant(&candidate);
         }
 
-        // 5. Insert new variant and increment byte count
+        // 3. Hard capacity guarantee (both count and byte budget): Evict earliest expiring entries via min-heap (O(log N))
+        while (store.total_entries >= self.max_entries
+            || store.current_bytes + entry_bytes > self.max_bytes)
+            && !store.expiry_heap.is_empty()
+        {
+            if let Some(candidate) = store.expiry_heap.pop() {
+                store.remove_variant(&candidate);
+            }
+        }
+
+        if store.total_entries >= self.max_entries
+            || store.current_bytes + entry_bytes > self.max_bytes
+        {
+            return;
+        }
+
+        // 4. Insert new variant and increment byte/entry counts
         store.current_bytes += entry_bytes;
+        store.total_entries += 1;
+        store.expiry_heap.push(ExpiryIndexEntry {
+            expires_at: entry.expires_at,
+            key: key.clone(),
+            vary_headers: entry.vary_headers.clone(),
+        });
         let variants = store.entries.entry(key).or_default();
         variants.push(entry);
+
+        // 5. Periodic heap hygiene: compact heap if dead entries significantly exceed live entries
+        if store.expiry_heap.len() > 1000 && store.expiry_heap.len() > store.total_entries * 3 {
+            let mut new_heap = BinaryHeap::with_capacity(store.total_entries);
+            for (k, variants) in &store.entries {
+                for v in variants {
+                    new_heap.push(ExpiryIndexEntry {
+                        expires_at: v.expires_at,
+                        key: k.clone(),
+                        vary_headers: v.vary_headers.clone(),
+                    });
+                }
+            }
+            store.expiry_heap = new_heap;
+        }
     }
 
     #[allow(dead_code)]
     pub fn purge(&self, key: &str) {
         let mut store = self.store.write().unwrap();
         if let Some(variants) = store.entries.remove(key) {
+            let count = variants.len();
             for v in variants {
                 store.current_bytes = store.current_bytes.saturating_sub(v.size_in_bytes());
             }
+            store.total_entries = store.total_entries.saturating_sub(count);
         }
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.store
-            .read()
-            .unwrap()
-            .entries
-            .values()
-            .map(|v| v.len())
-            .sum()
+        self.store.read().unwrap().total_entries
     }
 
     #[allow(dead_code)]

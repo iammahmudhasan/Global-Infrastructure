@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -38,13 +39,27 @@ impl TokenBucket {
     }
 }
 
+#[derive(Default)]
+struct BucketStore {
+    buckets: HashMap<IpAddr, TokenBucket>,
+    access_queue: VecDeque<(IpAddr, Instant)>,
+}
+
+impl Deref for BucketStore {
+    type Target = HashMap<IpAddr, TokenBucket>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buckets
+    }
+}
+
 #[derive(Clone)]
 pub struct RateLimiter {
     enabled: bool,
     capacity: f64,
     refill_rate: f64,
     max_buckets: usize,
-    buckets: Arc<RwLock<HashMap<IpAddr, TokenBucket>>>,
+    buckets: Arc<RwLock<BucketStore>>,
 }
 
 impl RateLimiter {
@@ -60,7 +75,7 @@ impl RateLimiter {
             capacity: capacity as f64,
             refill_rate: rps as f64,
             max_buckets,
-            buckets: Arc::new(RwLock::new(HashMap::new())),
+            buckets: Arc::new(RwLock::new(BucketStore::default())),
         }
     }
 
@@ -69,31 +84,54 @@ impl RateLimiter {
             return true;
         }
 
-        let mut buckets = self.buckets.write().unwrap();
-        if !buckets.contains_key(&client_ip) && buckets.len() >= self.max_buckets {
-            // Evict oldest bucket by last_update to prevent memory exhaustion (Finding 3)
-            if let Some((&oldest_ip, _)) = buckets.iter().min_by_key(|(_, b)| b.last_update) {
-                buckets.remove(&oldest_ip);
+        let mut store = self.buckets.write().unwrap();
+        if !store.buckets.contains_key(&client_ip) && store.buckets.len() >= self.max_buckets {
+            // Amortized O(1) eviction via lazy LRU access queue (Finding 5)
+            while let Some((candidate_ip, candidate_ts)) = store.access_queue.pop_front() {
+                if let Some(bucket) = store.buckets.get(&candidate_ip) {
+                    if bucket.last_update == candidate_ts {
+                        store.buckets.remove(&candidate_ip);
+                        break;
+                    }
+                }
             }
         }
 
-        let bucket = buckets
+        let capacity = self.capacity;
+        let refill_rate = self.refill_rate;
+        let bucket = store
+            .buckets
             .entry(client_ip)
-            .or_insert_with(|| TokenBucket::new(self.capacity, self.refill_rate));
+            .or_insert_with(|| TokenBucket::new(capacity, refill_rate));
 
-        bucket.try_consume(1.0)
+        let allowed = bucket.try_consume(1.0);
+        let update_time = bucket.last_update;
+        store.access_queue.push_back((client_ip, update_time));
+
+        // Periodic hygiene: trim dead items from access_queue if it grows significantly larger than capacity
+        if store.access_queue.len() > self.max_buckets * 3 {
+            let BucketStore {
+                buckets,
+                access_queue,
+            } = &mut *store;
+            access_queue.retain(|(ip, ts)| buckets.get(ip).is_some_and(|b| b.last_update == *ts));
+        }
+
+        allowed
     }
 
     pub fn cleanup_stale(&self) {
-        let mut buckets = self.buckets.write().unwrap();
+        let mut store = self.buckets.write().unwrap();
         let now = Instant::now();
         // Remove buckets not accessed in 10 minutes
-        buckets.retain(|_, b| now.duration_since(b.last_update).as_secs() < 600);
+        store
+            .buckets
+            .retain(|_, b| now.duration_since(b.last_update).as_secs() < 600);
     }
 
     #[allow(dead_code)]
     pub fn bucket_count(&self) -> usize {
-        self.buckets.read().unwrap().len()
+        self.buckets.read().unwrap().buckets.len()
     }
 }
 
@@ -133,5 +171,35 @@ mod tests {
         assert!(!buckets.contains_key(&ip1), "ip1 should have been evicted");
         assert!(buckets.contains_key(&ip2));
         assert!(buckets.contains_key(&ip3));
+    }
+
+    #[test]
+    fn test_lru_bucket_eviction_order() {
+        let limiter = RateLimiter::with_max_buckets(true, 10, 10, 2);
+        let ip1: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip2: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let ip3: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
+
+        assert!(limiter.check(ip1));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(limiter.check(ip2));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Access ip1 again, making ip2 the least recently used
+        assert!(limiter.check(ip1));
+
+        // ip3 should trigger eviction of LRU bucket (ip2)
+        assert!(limiter.check(ip3));
+        assert_eq!(limiter.bucket_count(), 2);
+
+        let buckets = limiter.buckets.read().unwrap();
+        assert!(
+            buckets.contains_key(&ip1),
+            "ip1 was refreshed so it must remain"
+        );
+        assert!(
+            !buckets.contains_key(&ip2),
+            "ip2 was LRU so it must be evicted"
+        );
+        assert!(buckets.contains_key(&ip3), "ip3 must be present");
     }
 }

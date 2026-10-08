@@ -2147,3 +2147,97 @@ func TestHandler_RuleCardinalityLimits(t *testing.T) {
 		t.Errorf("unexpected Cache rule limit error message: %s", cacheRec.Body.String())
 	}
 }
+
+func TestHandler_WAFAndCacheRuleFieldSizeBounds(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	domainID := "dom-size-bounds"
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "prj-alpha", Hostname: "size-bounds.example.com"})
+
+	// 1. Oversized WAF rule name (> 128 chars)
+	longName := strings.Repeat("A", 129)
+	wafBody, _ := json.Marshal(map[string]interface{}{
+		"name":       longName,
+		"pattern":    "/api/test",
+		"action":     "BLOCK",
+		"match_type": "PATH_PREFIX",
+	})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/waf/rules", bytes.NewReader(wafBody)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized WAF name, got %d", w.Code)
+	}
+
+	// 2. Oversized WAF rule pattern (> 4096 chars)
+	longPattern := strings.Repeat("B", 4097)
+	wafBody2, _ := json.Marshal(map[string]interface{}{
+		"name":       "valid-name",
+		"pattern":    longPattern,
+		"action":     "BLOCK",
+		"match_type": "PATH_PREFIX",
+	})
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/waf/rules", bytes.NewReader(wafBody2)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized WAF pattern, got %d", w.Code)
+	}
+
+	// 3. Oversized Cache rule ignored_params (> 64 items)
+	var tooManyParams []string
+	for i := 0; i < 65; i++ {
+		tooManyParams = append(tooManyParams, fmt.Sprintf("p%d", i))
+	}
+	cacheBody, _ := json.Marshal(map[string]interface{}{
+		"name":           "valid-cache",
+		"path_pattern":   "/cache/*",
+		"ignored_params": tooManyParams,
+	})
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/cache/rules", bytes.NewReader(cacheBody)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for too many ignored params, got %d", w.Code)
+	}
+}
+
+func TestHandler_EvaluationFieldSizeBounds(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	domainID := "dom-eval-bounds"
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "prj-alpha", Hostname: "eval-bounds.example.com"})
+	st.SaveSecurityPolicy(&model.SecurityPolicy{DomainID: domainID, WAFEnabled: true})
+
+	// 1. Oversized path (> 4096)
+	longPath := "/" + strings.Repeat("x", 4097)
+	body, _ := json.Marshal(map[string]interface{}{
+		"domain_id": domainID,
+		"client_ip": "198.51.100.1",
+		"method":    "GET",
+		"path":      longPath,
+	})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized evaluation path, got %d", w.Code)
+	}
+
+	// 2. Oversized user-agent (> 1024)
+	longUA := strings.Repeat("u", 1025)
+	body, _ = json.Marshal(map[string]interface{}{
+		"domain_id":  domainID,
+		"client_ip":  "198.51.100.1",
+		"method":     "GET",
+		"path":       "/api/test",
+		"user_agent": longUA,
+	})
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for oversized user-agent, got %d", w.Code)
+	}
+}

@@ -16,6 +16,23 @@ const (
 	MaxRateLimitRulesPerDomain  = 500
 	MaxCacheRulesPerDomain      = 1000
 	DefaultMaxDomainsPerProject = 50 // Default per-project domain ceiling (Finding 2)
+
+	// WAF Rule Size Limits (Finding 2)
+	MaxWAFRuleName        = 128
+	MaxWAFRuleDescription = 1024
+	MaxWAFRulePattern     = 4096
+
+	// Cache Rule Size Limits (Finding 3)
+	MaxCacheRuleName        = 128
+	MaxCachePathPattern     = 4096
+	MaxCacheRuleParamCount  = 64
+	MaxCacheRuleParamLength = 128
+	MaxCustomHeaderCount    = 32
+	MaxCustomHeaderName     = 256
+
+	// Security Event Bounds (Finding 1)
+	MaxSecurityEventsPerDomain          = 1000
+	MaxSecurityEventByteBudgetPerDomain = 4 * 1024 * 1024 // 4 MiB cap per domain
 )
 
 var (
@@ -25,6 +42,7 @@ var (
 	ErrOriginPoolFull       = errors.New("origin pool limit reached (max 256)")
 	ErrRuleLimitExceeded    = errors.New("rule limit exceeded for domain")
 	ErrProjectQuotaExceeded = errors.New("project domain quota exceeded")
+	ErrRuleSizeExceeded     = errors.New("rule field exceeds maximum allowed size")
 )
 
 type ProjectQuota struct {
@@ -534,6 +552,9 @@ func (s *Store) AddWAFRule(domainID string, rule model.WAFRule) error {
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
 	}
+	if len(rule.Name) > MaxWAFRuleName || len(rule.Description) > MaxWAFRuleDescription || len(rule.Pattern) > MaxWAFRulePattern {
+		return ErrRuleSizeExceeded
+	}
 	if len(s.wafRules[domainID]) >= MaxWAFRulesPerDomain {
 		return ErrRuleLimitExceeded
 	}
@@ -604,15 +625,41 @@ func (s *Store) GetRateLimitRules(domainID string) []model.RateLimitRule {
 	return append([]model.RateLimitRule(nil), s.rateLimits[domainID]...)
 }
 
+func securityEventSize(ev model.SecurityEvent) int {
+	return len(ev.ID) + len(ev.DomainID) + len(ev.ClientIP) + len(ev.Method) +
+		len(ev.Path) + len(ev.UserAgent) + len(ev.RuleTriggered) + len(ev.Action) + len(ev.Details) + 64
+}
+
 func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Append and keep recent 1000 events per domain in memory
-	events := append(s.events[ev.DomainID], ev)
-	if len(events) > 1000 {
-		events = events[len(events)-1000:]
+	// Truncate fields defensively to prevent individual oversized payloads (Finding 1)
+	if len(ev.Path) > 2048 {
+		ev.Path = ev.Path[:2048]
 	}
+	if len(ev.UserAgent) > 512 {
+		ev.UserAgent = ev.UserAgent[:512]
+	}
+	if len(ev.Details) > 1024 {
+		ev.Details = ev.Details[:1024]
+	}
+
+	events := append(s.events[ev.DomainID], ev)
+	if len(events) > MaxSecurityEventsPerDomain {
+		events = events[len(events)-MaxSecurityEventsPerDomain:]
+	}
+
+	// Enforce byte budget per domain (Finding 1)
+	totalBytes := 0
+	for _, e := range events {
+		totalBytes += securityEventSize(e)
+	}
+	for totalBytes > MaxSecurityEventByteBudgetPerDomain && len(events) > 1 {
+		totalBytes -= securityEventSize(events[0])
+		events = events[1:]
+	}
+
 	s.events[ev.DomainID] = events
 }
 
@@ -652,6 +699,31 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 	if _, exists := s.domains[domainID]; !exists {
 		return ErrNotFound
 	}
+	if len(rule.Name) > MaxCacheRuleName || len(rule.PathPattern) > MaxCachePathPattern {
+		return ErrRuleSizeExceeded
+	}
+	if len(rule.IgnoredParams) > MaxCacheRuleParamCount || len(rule.IncludedParams) > MaxCacheRuleParamCount {
+		return ErrRuleSizeExceeded
+	}
+	for _, p := range rule.IgnoredParams {
+		if len(p) > MaxCacheRuleParamLength {
+			return ErrRuleSizeExceeded
+		}
+	}
+	for _, p := range rule.IncludedParams {
+		if len(p) > MaxCacheRuleParamLength {
+			return ErrRuleSizeExceeded
+		}
+	}
+	if len(rule.CustomHeadersToInclude) > MaxCustomHeaderCount {
+		return ErrRuleSizeExceeded
+	}
+	for _, h := range rule.CustomHeadersToInclude {
+		if len(h) > MaxCustomHeaderName {
+			return ErrRuleSizeExceeded
+		}
+	}
+
 	if len(s.cacheRules[domainID]) >= MaxCacheRulesPerDomain {
 		return ErrRuleLimitExceeded
 	}

@@ -926,6 +926,18 @@ func (h *APIHandler) handleAddWAFRule(w http.ResponseWriter, r *http.Request, do
 		writeError(w, http.StatusBadRequest, "name and pattern are required")
 		return
 	}
+	if len(rule.Name) > store.MaxWAFRuleName {
+		writeError(w, http.StatusBadRequest, "waf rule name exceeds maximum length (128)")
+		return
+	}
+	if len(rule.Description) > store.MaxWAFRuleDescription {
+		writeError(w, http.StatusBadRequest, "waf rule description exceeds maximum length (1024)")
+		return
+	}
+	if len(rule.Pattern) > store.MaxWAFRulePattern {
+		writeError(w, http.StatusBadRequest, "waf rule pattern exceeds maximum length (4096)")
+		return
+	}
 	if rule.Action == "" {
 		rule.Action = model.WAFActionBlock
 	}
@@ -939,6 +951,10 @@ func (h *APIHandler) handleAddWAFRule(w http.ResponseWriter, r *http.Request, do
 	if err := h.store.AddWAFRule(domainID, rule); err != nil {
 		if errors.Is(err, store.ErrRuleLimitExceeded) {
 			writeError(w, http.StatusConflict, "waf rule limit reached for domain (max 1000)")
+			return
+		}
+		if errors.Is(err, store.ErrRuleSizeExceeded) {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeError(w, http.StatusNotFound, err.Error())
@@ -1129,6 +1145,44 @@ func (h *APIHandler) handleAddCacheRule(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, "name and path_pattern are required")
 		return
 	}
+	if len(rule.Name) > store.MaxCacheRuleName {
+		writeError(w, http.StatusBadRequest, "cache rule name exceeds maximum length (128)")
+		return
+	}
+	if len(rule.PathPattern) > store.MaxCachePathPattern {
+		writeError(w, http.StatusBadRequest, "cache rule path_pattern exceeds maximum length (4096)")
+		return
+	}
+	if len(rule.IgnoredParams) > store.MaxCacheRuleParamCount {
+		writeError(w, http.StatusBadRequest, "ignored_params count exceeds limit (64)")
+		return
+	}
+	for _, p := range rule.IgnoredParams {
+		if len(p) > store.MaxCacheRuleParamLength {
+			writeError(w, http.StatusBadRequest, "ignored parameter exceeds max length (128)")
+			return
+		}
+	}
+	if len(rule.IncludedParams) > store.MaxCacheRuleParamCount {
+		writeError(w, http.StatusBadRequest, "included_params count exceeds limit (64)")
+		return
+	}
+	for _, p := range rule.IncludedParams {
+		if len(p) > store.MaxCacheRuleParamLength {
+			writeError(w, http.StatusBadRequest, "included parameter exceeds max length (128)")
+			return
+		}
+	}
+	if len(rule.CustomHeadersToInclude) > store.MaxCustomHeaderCount {
+		writeError(w, http.StatusBadRequest, "custom_headers_to_include count exceeds limit (32)")
+		return
+	}
+	for _, ch := range rule.CustomHeadersToInclude {
+		if len(ch) > store.MaxCustomHeaderName {
+			writeError(w, http.StatusBadRequest, "custom header name exceeds max length (256)")
+			return
+		}
+	}
 	if rule.TTLSeconds <= 0 {
 		rule.TTLSeconds = 3600
 	}
@@ -1139,6 +1193,10 @@ func (h *APIHandler) handleAddCacheRule(w http.ResponseWriter, r *http.Request, 
 	if err := h.store.AddCacheRule(domainID, rule); err != nil {
 		if errors.Is(err, store.ErrRuleLimitExceeded) {
 			writeError(w, http.StatusConflict, "cache rule limit reached for domain (max 1000)")
+			return
+		}
+		if errors.Is(err, store.ErrRuleSizeExceeded) {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeError(w, http.StatusNotFound, err.Error())
@@ -1363,6 +1421,15 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const (
+	maxEvalPath      = 4096
+	maxEvalQuery     = 8192
+	maxEvalUserAgent = 1024
+	maxEvalHeaders   = 64
+	maxEvalHeaderKey = 256
+	maxEvalHeaderVal = 4096
+)
+
 type EvaluateRequest struct {
 	DomainID  string            `json:"domain_id"`
 	ClientIP  string            `json:"client_ip"`
@@ -1389,6 +1456,22 @@ func (h *APIHandler) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 	if req.DomainID == "" {
 		writeError(w, http.StatusBadRequest, "domain_id is required")
 		return
+	}
+
+	if len(req.Path) > maxEvalPath || len(req.Query) > maxEvalQuery || len(req.UserAgent) > maxEvalUserAgent {
+		writeError(w, http.StatusBadRequest, "evaluation input exceeds size limits")
+		return
+	}
+
+	if len(req.Headers) > maxEvalHeaders {
+		writeError(w, http.StatusBadRequest, "headers count exceeds limit (max 64)")
+		return
+	}
+	for k, v := range req.Headers {
+		if len(k) > maxEvalHeaderKey || len(v) > maxEvalHeaderVal {
+			writeError(w, http.StatusBadRequest, "header key or value exceeds maximum allowed size")
+			return
+		}
 	}
 
 	if req.ClientIP == "" || net.ParseIP(req.ClientIP) == nil {

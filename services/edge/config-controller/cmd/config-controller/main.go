@@ -44,7 +44,27 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 5. Run Server in Background
+	// 5. Background Sweeper Task (Garbage-collect unverified pending domains older than 24h - Finding 4)
+	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
+	defer stopSweeper()
+
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				swept := domainSvc.SweepExpiredPendingDomains(24 * time.Hour)
+				if swept > 0 {
+					log.Printf("[INFO] Swept %d expired pending domains", swept)
+				}
+			case <-sweeperCtx.Done():
+				return
+			}
+		}
+	}()
+
+	// 6. Run Server in Background
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -56,7 +76,7 @@ func main() {
 		}
 	}()
 
-	// 6. Graceful Shutdown
+	// 7. Graceful Shutdown
 	<-stopChan
 	log.Printf("[INFO] Shutting down NexusEdge Config Controller gracefully...")
 
