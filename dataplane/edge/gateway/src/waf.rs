@@ -60,7 +60,7 @@ impl WafEngine {
         if let Some(ua) = user_agent {
             if self.bad_agents_regex.is_match(ua) {
                 return WafResult::Blocked {
-                    rule: "MALICIOUS_SCANNER_USER_AGENT",
+                    rule: "KNOWN_MALICIOUS_SCANNER",
                     pattern: ua.to_string(),
                 };
             }

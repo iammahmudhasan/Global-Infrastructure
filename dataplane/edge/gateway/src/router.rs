@@ -751,16 +751,17 @@ pub fn is_private_or_reserved_ip(ip: std::net::IpAddr) -> bool {
 
 pub fn is_forbidden_destination(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
-    if lower == "169.254.169.254"
-        || lower == "metadata.google.internal"
-        || lower == "metadata.titus.internal"
-        || lower == "instance-data"
-        || lower == "100.100.100.200"
-        || lower == "localhost"
+    let unbracketed = lower.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed == "169.254.169.254"
+        || unbracketed == "metadata.google.internal"
+        || unbracketed == "metadata.titus.internal"
+        || unbracketed == "instance-data"
+        || unbracketed == "100.100.100.200"
+        || unbracketed == "localhost"
     {
         return true;
     }
-    if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
         return is_private_or_reserved_ip(ip);
     }
     false

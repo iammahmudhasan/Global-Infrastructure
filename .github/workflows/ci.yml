@@ -71,7 +71,7 @@ jobs:
         run: cargo check --manifest-path dataplane/edge/gateway/Cargo.toml
 
       - name: Rust Test
-        run: cargo test --manifest-path dataplane/edge/gateway/Cargo.toml
+        run: cargo test --manifest-path dataplane/edge/gateway/Cargo.toml -- --nocapture
 
   python-intelligence:
     name: Python Intelligence Schedulers
