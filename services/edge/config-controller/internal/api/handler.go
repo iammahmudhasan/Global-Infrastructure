@@ -2069,6 +2069,34 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		cfgJSON, _ := envoyCfg.ToJSON()
 		hash := sha256.Sum256(cfgJSON)
 		checksum := hex.EncodeToString(hash[:])
+
+		gatewayRoutes := make([]model.GatewayRouteSync, 0, len(topologies))
+		for _, topo := range topologies {
+			if topo == nil || topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
+				continue
+			}
+			var targets []string
+			for _, pool := range topo.Pools {
+				if pool == nil {
+					continue
+				}
+				for _, o := range pool.Origins {
+					proto := strings.ToLower(string(o.Protocol))
+					if proto == "" {
+						proto = "http"
+					}
+					targetURL := fmt.Sprintf("%s://%s:%d", proto, o.Address, o.Port)
+					targets = append(targets, targetURL)
+				}
+			}
+			if len(targets) > 0 {
+				gatewayRoutes = append(gatewayRoutes, model.GatewayRouteSync{
+					Host:    strings.ToLower(topo.Domain.Hostname),
+					Targets: targets,
+				})
+			}
+		}
+
 		syncResult := model.PoPConfigSync{
 			PoPID:           pop.ID,
 			ConfigVersion:   "v1.0.0-" + checksum[:8],
@@ -2076,6 +2104,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			CompiledAt:      time.Now().UTC(),
 			TopologiesCount: len(topologies),
 			EnvoyConfig:     envoyCfg,
+			Routes:          gatewayRoutes,
 		}
 		writeJSON(w, http.StatusOK, syncResult)
 

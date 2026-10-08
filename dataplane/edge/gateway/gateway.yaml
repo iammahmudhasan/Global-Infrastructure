@@ -6,8 +6,24 @@ server:
 upstream:
   targets:
     - "https://httpbin.org"
+  routes:
+    - host: "api.nexusedge.io"
+      targets:
+        - "https://httpbin.org"
+    - host: "app.nexusedge.io"
+      targets:
+        - "https://httpbin.org"
+    - host: "customer-a.example.com"
+      targets:
+        - "https://httpbin.org"
   health_check_path: "/status/200"
   timeout_ms: 5000
+
+control_plane:
+  enabled: false
+  endpoint: "http://127.0.0.1:8081"
+  pop_id: "singapore"
+  poll_interval_secs: 30
 
 rate_limit:
   enabled: true

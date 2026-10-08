@@ -411,14 +411,21 @@ type EdgeNode struct {
 	LastHeartbeat       time.Time `json:"last_heartbeat"`
 }
 
+// GatewayRouteSync models declarative host-to-origin mapping for the Rust edge gateway
+type GatewayRouteSync struct {
+	Host    string   `json:"host"`
+	Targets []string `json:"targets"`
+}
+
 // PoPConfigSync delivers synchronized Envoy configuration tailored for a specific PoP
 type PoPConfigSync struct {
-	PoPID           string      `json:"pop_id"`
-	ConfigVersion   string      `json:"config_version"`
-	ChecksumSHA256  string      `json:"checksum_sha256"`
-	CompiledAt      time.Time   `json:"compiled_at"`
-	TopologiesCount int         `json:"topologies_count"`
-	EnvoyConfig     interface{} `json:"envoy_config"`
+	PoPID           string             `json:"pop_id"`
+	ConfigVersion   string             `json:"config_version"`
+	ChecksumSHA256  string             `json:"checksum_sha256"`
+	CompiledAt      time.Time          `json:"compiled_at"`
+	TopologiesCount int                `json:"topologies_count"`
+	EnvoyConfig     interface{}        `json:"envoy_config"`
+	Routes          []GatewayRouteSync `json:"routes,omitempty"`
 }
 
 // LatencyRoute models inter-PoP or PoP-to-Origin physical fiber RTT

@@ -9,6 +9,8 @@ pub struct GatewayConfig {
     pub rate_limit: RateLimitConfig,
     pub waf: WafConfig,
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub control_plane: ControlPlaneConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +60,47 @@ pub struct CacheConfig {
     pub max_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControlPlaneConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_control_plane_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_pop_id")]
+    pub pop_id: String,
+    #[serde(default = "default_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default)]
+    pub auth_token: String,
+    #[serde(default)]
+    pub snapshot_file: Option<String>,
+}
+
+fn default_control_plane_endpoint() -> String {
+    "http://127.0.0.1:8081".to_string()
+}
+
+fn default_pop_id() -> String {
+    "singapore".to_string()
+}
+
+fn default_poll_interval_secs() -> u64 {
+    30
+}
+
+impl Default for ControlPlaneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: default_control_plane_endpoint(),
+            pop_id: default_pop_id(),
+            poll_interval_secs: default_poll_interval_secs(),
+            auth_token: String::new(),
+            snapshot_file: None,
+        }
+    }
+}
+
 fn default_max_cache_bytes() -> usize {
     100 * 1024 * 1024 // 100 MB hard ceiling
 }
@@ -93,6 +136,7 @@ impl Default for GatewayConfig {
                 max_entries: 10000,
                 max_bytes: 100 * 1024 * 1024,
             },
+            control_plane: ControlPlaneConfig::default(),
         }
     }
 }

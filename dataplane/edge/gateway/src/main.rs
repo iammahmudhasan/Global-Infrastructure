@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.cache.max_entries,
         config.cache.max_bytes,
     );
-    let router = Router::from_upstream_config(&config.upstream);
+    let router = Router::from_upstream_config(&config.upstream)?;
 
     let http_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
@@ -125,6 +125,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cleaner_limiter.cleanup_stale();
         }
     });
+
+    // 5. Control Plane Dynamic Snapshot Synchronizer (P1 Consistency Bridge)
+    if config.control_plane.enabled || config.control_plane.snapshot_file.is_some() {
+        let sync_router = router.clone();
+        let cp_cfg = config.control_plane.clone();
+        let sync_client = http_client.clone();
+
+        tokio::spawn(async move {
+            let interval_secs = cp_cfg.poll_interval_secs.max(5);
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+            loop {
+                interval.tick().await;
+
+                // Option A: Synchronize from local/mounted snapshot file
+                if let Some(ref snapshot_path) = cp_cfg.snapshot_file {
+                    if let Ok(content) = tokio::fs::read_to_string(snapshot_path).await {
+                        if let Ok(new_routes) = router::parse_pop_config_routes(&content) {
+                            if let Err(e) = sync_router.update_routes(new_routes, vec![]) {
+                                tracing::warn!(
+                                    "Failed to atomically swap routes from snapshot file: {}",
+                                    e
+                                );
+                            } else {
+                                tracing::info!(
+                                    "Atomically synchronized edge routes from snapshot file: {}",
+                                    snapshot_path
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config
+                if cp_cfg.enabled {
+                    let url = format!(
+                        "{}/v1/edge/pops/{}/config",
+                        cp_cfg.endpoint.trim_end_matches('/'),
+                        cp_cfg.pop_id
+                    );
+                    let mut req_builder = sync_client.get(&url);
+                    if !cp_cfg.auth_token.is_empty() {
+                        req_builder = req_builder
+                            .header("Authorization", format!("Bearer {}", cp_cfg.auth_token));
+                    }
+                    match req_builder.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(body_str) = resp.text().await {
+                                match router::parse_pop_config_routes(&body_str) {
+                                    Ok(new_routes) => {
+                                        if let Err(e) =
+                                            sync_router.update_routes(new_routes, vec![])
+                                        {
+                                            tracing::warn!(
+                                                "Failed to apply routes from control plane: {}",
+                                                e
+                                            );
+                                        } else {
+                                            tracing::info!(pop_id = %cp_cfg.pop_id, "Atomically refreshed PoP routes from Control Plane");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to parse Control Plane PoP routes payload: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!(status = %resp.status(), "Control Plane config endpoint returned non-success");
+                        }
+                        Err(e) => {
+                            tracing::debug!("Control Plane sync probe idle: {:?}", e);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // 5. Autonomous Upstream Health Probing Loop (Findings 8, 9, 14)
     let health_router = router.clone();

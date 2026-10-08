@@ -12,7 +12,7 @@ use reqwest::Client as HttpClient;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -268,6 +268,21 @@ pub async fn handle_request(
                 .unwrap();
             return Ok(resp);
         }
+        Err(e) => {
+            error!(error = %e, host = %host, "Routing resolution error");
+            let body = serde_json::json!({
+                "error": "Bad Gateway: Upstream routing resolution error",
+                "details": e.to_string(),
+                "status": 502,
+            });
+            let resp = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
     };
 
     let forward_url = format!("{}{}", upstream_base.trim_end_matches('/'), uri_string);
@@ -302,6 +317,11 @@ pub async fn handle_request(
     client_req = client_req.header("X-Forwarded-Proto", scheme);
     client_req = client_req.header("X-Forwarded-Host", &host);
     client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
+
+    // Forward the original customer Host header upstream (P1).
+    // Hop-by-hop stripping removes unverified hop headers, but multi-tenant upstream origins
+    // require the original client Host to route to the correct tenant / virtual host.
+    client_req = client_req.header(reqwest::header::HOST, &host);
 
     if !body_bytes.is_empty() {
         client_req = client_req.body(body_bytes.clone());
@@ -618,5 +638,33 @@ mod tests {
             .map(|v| v.to_str().unwrap())
             .collect();
         assert_eq!(vary_values, vec!["Origin", "Accept-Encoding"]);
+    }
+
+    #[test]
+    fn test_client_req_preserves_customer_host_header() {
+        let host = "customer-a.example.com";
+        let client = reqwest::Client::new();
+        let mut client_req =
+            client.request(reqwest::Method::GET, "https://origin-a.internal/api/v1");
+        client_req = client_req.header(reqwest::header::HOST, host);
+        client_req = client_req.header("X-Forwarded-Host", host);
+        let req = client_req.build().unwrap();
+
+        assert_eq!(
+            req.headers()
+                .get(reqwest::header::HOST)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "customer-a.example.com"
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-forwarded-host")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "customer-a.example.com"
+        );
     }
 }
