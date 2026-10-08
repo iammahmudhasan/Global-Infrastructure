@@ -22,11 +22,12 @@ var (
 )
 
 type OnboardRequest struct {
-	ProjectID      string `json:"project_id"`
-	Hostname       string `json:"hostname"`        // e.g. "api.customer.com"
-	OriginAddress  string `json:"origin_address"`  // e.g. "origin.customer.internal" or "203.0.113.10"
-	OriginPort     int    `json:"origin_port"`     // default 443
-	OriginProtocol string `json:"origin_protocol"` // "HTTPS" or "HTTP"
+	ProjectID      string   `json:"project_id"`
+	Hostname       string   `json:"hostname"`               // e.g. "api.customer.com"
+	OriginAddress  string   `json:"origin_address"`         // e.g. "origin.customer.internal" or "203.0.113.10"
+	OriginPort     int      `json:"origin_port"`            // default 443
+	OriginProtocol string   `json:"origin_protocol"`        // "HTTPS" or "HTTP"
+	AllowedPoPs    []string `json:"allowed_pops,omitempty"` // empty means global / all PoPs
 }
 
 type OnboardResponse struct {
@@ -205,6 +206,7 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 		OnboardingType:    "CNAME",
 		CNAMETarget:       cnameTarget,
 		VerificationToken: verificationToken,
+		AllowedPoPs:       req.AllowedPoPs,
 		CreatedAt:         time.Now().UTC(),
 		UpdatedAt:         time.Now().UTC(),
 	}
@@ -220,18 +222,20 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 		ProjectID:   req.ProjectID,
 		Name:        fmt.Sprintf("primary-pool-%s", hostname),
 		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		AllowedPoPs: req.AllowedPoPs,
 	}
 	s.store.SaveOriginPool(pool)
 
 	originID := generateID("orig")
 	origin := &model.Origin{
-		ID:       originID,
-		PoolID:   poolID,
-		Address:  req.OriginAddress,
-		Port:     req.OriginPort,
-		Protocol: model.Protocol(req.OriginProtocol),
-		Weight:   100,
-		Healthy:  true,
+		ID:          originID,
+		PoolID:      poolID,
+		Address:     req.OriginAddress,
+		Port:        req.OriginPort,
+		Protocol:    model.Protocol(req.OriginProtocol),
+		Weight:      100,
+		Healthy:     true,
+		AllowedPoPs: req.AllowedPoPs,
 	}
 	if err := s.store.AddOrigin(origin); err != nil {
 		_ = s.store.DeleteDomain(domainID)

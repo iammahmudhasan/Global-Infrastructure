@@ -471,9 +471,64 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 	return config, nil
 }
 
-// CompileForPoP compiles domain topologies into an Envoy configuration tailored for a specific PoP
+func isPoPAllowed(allowed []string, target string) bool {
+	if len(allowed) == 0 {
+		return true // empty means global / all PoPs
+	}
+	for _, p := range allowed {
+		if strings.EqualFold(strings.TrimSpace(p), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// CompileForPoP compiles domain topologies into an Envoy configuration tailored for a specific PoP (P1 Finding).
+// It defensively filters topologies by popID, ensuring domains and origins restricted to other PoPs are excluded.
 func (c *Compiler) CompileForPoP(popID string, topologies []*store.DomainTopology) (*EnvoyConfig, error) {
-	config, err := c.Compile(topologies)
+	targetPoP := strings.ToLower(strings.TrimSpace(popID))
+	filteredTopologies := make([]*store.DomainTopology, 0, len(topologies))
+
+	for _, topo := range topologies {
+		if topo == nil || topo.Domain == nil || topo.Domain.Status != model.DomainStatusActive {
+			continue
+		}
+
+		// Filter domains restricted to other PoPs (P1 Isolation)
+		if !isPoPAllowed(topo.Domain.AllowedPoPs, targetPoP) {
+			continue
+		}
+
+		// Filter origin pools and individual origins
+		filteredPools := make(map[string]*model.OriginPool)
+		for poolID, pool := range topo.Pools {
+			if pool == nil {
+				continue
+			}
+			if !isPoPAllowed(pool.AllowedPoPs, targetPoP) {
+				continue
+			}
+
+			var validOrigins []model.Origin
+			for _, o := range pool.Origins {
+				if isPoPAllowed(o.AllowedPoPs, targetPoP) {
+					validOrigins = append(validOrigins, o)
+				}
+			}
+
+			if len(validOrigins) > 0 {
+				poolCopy := *pool
+				poolCopy.Origins = validOrigins
+				filteredPools[poolID] = &poolCopy
+			}
+		}
+
+		topoCopy := *topo
+		topoCopy.Pools = filteredPools
+		filteredTopologies = append(filteredTopologies, &topoCopy)
+	}
+
+	config, err := c.Compile(filteredTopologies)
 	if err != nil {
 		return nil, err
 	}

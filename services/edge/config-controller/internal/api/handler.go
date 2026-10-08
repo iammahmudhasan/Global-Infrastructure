@@ -42,6 +42,7 @@ type APIHandler struct {
 	analyticsEngine *analytics.Engine
 	popManager      *pop.Manager
 	authenticator   *auth.Authenticator
+	limiter         *ControlPlaneLimiter
 	handlerChain    http.Handler
 	mux             *http.ServeMux
 }
@@ -61,6 +62,7 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 		analyticsEngine: analytics.NewEngine(),
 		popManager:      pop.NewManager(),
 		authenticator:   authenticator,
+		limiter:         NewControlPlaneLimiter(100.0, 100, 50),
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
 	}
@@ -72,6 +74,47 @@ func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Co
 func (h *APIHandler) SetAuthenticator(a *auth.Authenticator) {
 	h.authenticator = a
 	h.handlerChain = a.Middleware(h.mux)
+}
+
+// SetLimiter allows overriding or configuring the control-plane limiter (e.g. for testing)
+func (h *APIHandler) SetLimiter(l *ControlPlaneLimiter) {
+	h.limiter = l
+}
+
+func (h *APIHandler) resolveClientKey(r *http.Request) string {
+	if tc, ok := auth.FromContext(r.Context()); ok {
+		if tc.ProjectID != "" {
+			return "project:" + tc.ProjectID
+		}
+		if tc.TenantID != "" {
+			return "tenant:" + tc.TenantID
+		}
+		if tc.NodeID != "" {
+			return "node:" + tc.NodeID
+		}
+	}
+	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+		return "apikey:" + apiKey
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return "ip:" + host
+	}
+	return "ip:" + r.RemoteAddr
+}
+
+func (h *APIHandler) acquireControlPlaneSlot(w http.ResponseWriter, r *http.Request) (func(), bool) {
+	if h.limiter == nil {
+		return func() {}, true
+	}
+	clientKey := h.resolveClientKey(r)
+	release, err := h.limiter.Acquire(clientKey)
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, err.Error())
+		return nil, false
+	}
+	return release, true
 }
 
 func (h *APIHandler) Authenticator() *auth.Authenticator {
@@ -738,6 +781,12 @@ func (h *APIHandler) handleGetPoolHealth(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *APIHandler) handleProbePool(w http.ResponseWriter, r *http.Request, pool *model.OriginPool) {
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	hm := h.store.GetHealthMonitor(pool.ID)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -814,10 +863,11 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 }
 
 type AddOriginRequest struct {
-	Address  string `json:"address"`
-	Port     int    `json:"port"`
-	Protocol string `json:"protocol"`
-	Weight   int    `json:"weight"`
+	Address     string   `json:"address"`
+	Port        int      `json:"port"`
+	Protocol    string   `json:"protocol"`
+	Weight      int      `json:"weight"`
+	AllowedPoPs []string `json:"allowed_pops,omitempty"`
 }
 
 func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, domainID string) {
@@ -875,13 +925,14 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 
 	originID := "orig-" + generateHex(4)
 	origin := &model.Origin{
-		ID:       originID,
-		PoolID:   routes[0].PoolID,
-		Address:  req.Address,
-		Port:     req.Port,
-		Protocol: model.Protocol(req.Protocol),
-		Weight:   req.Weight,
-		Healthy:  true,
+		ID:          originID,
+		PoolID:      routes[0].PoolID,
+		Address:     req.Address,
+		Port:        req.Port,
+		Protocol:    model.Protocol(req.Protocol),
+		Weight:      req.Weight,
+		Healthy:     true,
+		AllowedPoPs: req.AllowedPoPs,
 	}
 
 	if err := h.store.AddOrigin(origin); err != nil {
@@ -1037,11 +1088,23 @@ func (h *APIHandler) handleSetRateLimits(w http.ResponseWriter, r *http.Request,
 			writeError(w, http.StatusBadRequest, "path_prefix must start with /")
 			return
 		}
+		if len(rule.PathPrefix) > store.MaxRateLimitPathPrefix {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("path_prefix length exceeds maximum allowed (%d characters)", store.MaxRateLimitPathPrefix))
+			return
+		}
+		if len(rule.HeaderName) > store.MaxRateLimitHeaderName {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("header_name length exceeds maximum allowed (%d characters)", store.MaxRateLimitHeaderName))
+			return
+		}
 	}
 
 	if err := h.store.SetRateLimitRules(domainID, body.Rules); err != nil {
 		if errors.Is(err, store.ErrRuleLimitExceeded) {
 			writeError(w, http.StatusConflict, "rate limit rule limit reached for domain (max 500)")
+			return
+		}
+		if errors.Is(err, store.ErrRuleSizeExceeded) {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeError(w, http.StatusNotFound, err.Error())
@@ -1116,6 +1179,10 @@ func (h *APIHandler) handleUpdateCachePolicy(w http.ResponseWriter, r *http.Requ
 		cp.CacheEnabled = *update.CacheEnabled
 	}
 	if update.DefaultTTLSeconds != nil {
+		if *update.DefaultTTLSeconds < 0 || *update.DefaultTTLSeconds > store.MaxCacheTTLSeconds {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("default_ttl_seconds must be between 0 and %d", store.MaxCacheTTLSeconds))
+			return
+		}
 		cp.DefaultTTLSeconds = *update.DefaultTTLSeconds
 	}
 	if update.RespectOriginHeaders != nil {
@@ -1183,7 +1250,11 @@ func (h *APIHandler) handleAddCacheRule(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
-	if rule.TTLSeconds <= 0 {
+	if rule.TTLSeconds < 0 || rule.TTLSeconds > store.MaxCacheTTLSeconds {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("ttl_seconds must be between 0 and %d", store.MaxCacheTTLSeconds))
+		return
+	}
+	if rule.TTLSeconds == 0 {
 		rule.TTLSeconds = 3600
 	}
 	rule.ID = "cache-rule-" + generateHex(4)
@@ -1308,6 +1379,11 @@ func (h *APIHandler) handleCacheLookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
 
 	var req CacheLookupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1446,6 +1522,11 @@ func (h *APIHandler) handleEvaluate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
 
 	var req EvaluateRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1577,6 +1658,12 @@ func (h *APIHandler) handleEnvoyConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
 	topologies := h.store.GetActiveTopologies()
 	cfg, err := h.compiler.Compile(topologies)
 	if err != nil {
@@ -1619,6 +1706,12 @@ func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
 		return
 	}
+
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
 
 	// Request Body Limit (Finding 19): Bounded to 1 MiB to prevent memory exhaustion
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -1950,12 +2043,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		release, ok := h.acquireControlPlaneSlot(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+
 		pop, err := h.popManager.GetPoP(popID)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		topologies := h.store.GetActiveTopologies()
+		topologies := h.store.GetActiveTopologiesForPoP(popID)
 		envoyCfg, err := h.compiler.CompileForPoP(popID, topologies)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to compile pop config: "+err.Error())

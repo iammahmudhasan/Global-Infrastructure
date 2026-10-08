@@ -2241,3 +2241,317 @@ func TestHandler_EvaluationFieldSizeBounds(t *testing.T) {
 		t.Fatalf("expected 400 Bad Request for oversized user-agent, got %d", w.Code)
 	}
 }
+
+func TestHandler_PoPConfigIsolationScope(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterTenantWithRole("key-operator", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
+	authInst.RegisterNodeWithPoP("key-node-dhaka", "tenant-infra", "proj-infra", "edge-node-01", "dhaka")
+	authInst.RegisterNodeWithPoP("key-node-singapore", "tenant-infra", "proj-infra", "edge-node-02", "singapore")
+	handler.SetAuthenticator(authInst)
+
+	// 1. Onboard Domain A restricted to Dhaka only
+	resDhaka, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "proj-infra",
+		Hostname:       "dhaka.example.com",
+		OriginAddress:  "203.0.113.10",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+		AllowedPoPs:    []string{"dhaka"},
+	})
+	if err != nil {
+		t.Fatalf("failed to onboard dhaka domain: %v", err)
+	}
+	_, _ = svc.VerifyDomain(resDhaka.DomainID)
+
+	// 2. Onboard Domain B restricted to Singapore only
+	resSingapore, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "proj-infra",
+		Hostname:       "singapore.example.com",
+		OriginAddress:  "203.0.113.20",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+		AllowedPoPs:    []string{"singapore"},
+	})
+	if err != nil {
+		t.Fatalf("failed to onboard singapore domain: %v", err)
+	}
+	_, _ = svc.VerifyDomain(resSingapore.DomainID)
+
+	// 3. Onboard Global Domain C with two origins: one for dhaka, one for frankfurt
+	resGlobal, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "proj-infra",
+		Hostname:       "global.example.com",
+		OriginAddress:  "203.0.113.30",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+		AllowedPoPs:    []string{}, // Global domain
+	})
+	if err != nil {
+		t.Fatalf("failed to onboard global domain: %v", err)
+	}
+	_, _ = svc.VerifyDomain(resGlobal.DomainID)
+
+	// Restrict the default origin of global domain to dhaka
+	routes := st.GetRoutes(resGlobal.DomainID)
+	pool, _ := st.GetOriginPool(routes[0].PoolID)
+	if len(pool.Origins) > 0 {
+		pool.Origins[0].AllowedPoPs = []string{"dhaka"}
+		st.SaveOriginPool(pool)
+	}
+
+	// Add second origin to global domain restricted to frankfurt
+	frankfurtOrig := &model.Origin{
+		ID:          "orig-frankfurt",
+		PoolID:      routes[0].PoolID,
+		Address:     "198.51.100.99",
+		Port:        443,
+		Protocol:    model.ProtocolHTTPS,
+		Weight:      100,
+		Healthy:     true,
+		AllowedPoPs: []string{"frankfurt"},
+	}
+	_ = st.AddOrigin(frankfurtOrig)
+
+	// 4. Node bound to Dhaka requests /v1/edge/pops/dhaka/config
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/config", nil)
+	req.Header.Set("X-API-Key", "key-node-dhaka")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from pop config sync, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var syncResp model.PoPConfigSync
+	if err := json.Unmarshal(w.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("failed to unmarshal pop config sync: %v", err)
+	}
+
+	cfgBytes, _ := json.Marshal(syncResp.EnvoyConfig)
+	cfgStr := string(cfgBytes)
+
+	// MUST contain dhaka.example.com
+	if !strings.Contains(cfgStr, "dhaka.example.com") {
+		t.Errorf("expected dhaka pop config to contain dhaka.example.com, got:\n%s", cfgStr)
+	}
+
+	// MUST NOT contain singapore.example.com (P1 Leak Prevention)
+	if strings.Contains(cfgStr, "singapore.example.com") {
+		t.Errorf("LEAK DETECTED: dhaka pop config contains singapore-only domain singapore.example.com!")
+	}
+
+	// MUST contain dhaka origin address (203.0.113.30 or 203.0.113.10)
+	if !strings.Contains(cfgStr, "203.0.113.30") && !strings.Contains(cfgStr, "203.0.113.10") {
+		t.Errorf("expected dhaka pop config to contain dhaka origin")
+	}
+
+	// MUST NOT contain frankfurt-only origin (198.51.100.99) (P1 Origin Leak Prevention)
+	if strings.Contains(cfgStr, "198.51.100.99") {
+		t.Errorf("LEAK DETECTED: dhaka pop config contains frankfurt-only origin 198.51.100.99!")
+	}
+
+	// 5. Node bound to Singapore requests /v1/edge/pops/singapore/config
+	reqSin := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	reqSin.Header.Set("X-API-Key", "key-node-singapore")
+	wSin := httptest.NewRecorder()
+	handler.ServeHTTP(wSin, reqSin)
+	if wSin.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from singapore config sync, got %d: %s", wSin.Code, wSin.Body.String())
+	}
+
+	cfgStrSin := string(wSin.Body.Bytes())
+
+	if !strings.Contains(cfgStrSin, "singapore.example.com") {
+		t.Errorf("expected singapore pop config to contain singapore.example.com")
+	}
+	if strings.Contains(cfgStrSin, "dhaka.example.com") {
+		t.Errorf("LEAK DETECTED: singapore pop config contains dhaka-only domain dhaka.example.com!")
+	}
+}
+
+func TestHandler_RateLimitFieldBounds(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterTenantWithRole("key-tenant-rl", "tenant-alpha", "prj-alpha", auth.RoleTenant, "prj-alpha")
+	handler.SetAuthenticator(authInst)
+
+	domainID := "dom-rl-bounds"
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "prj-alpha", Hostname: "rl-bounds.example.com"})
+
+	// 1. PathPrefix > 4096 characters -> 400 Bad Request
+	longPrefix := "/" + strings.Repeat("a", 4097)
+	body, _ := json.Marshal(map[string]interface{}{
+		"rules": []model.RateLimitRule{
+			{
+				PathPrefix:        longPrefix,
+				RequestsPerMinute: 100,
+				BurstSize:         10,
+				KeyType:           "CLIENT_IP",
+			},
+		},
+	})
+	r1 := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/rate-limits", bytes.NewReader(body))
+	r1.Header.Set("X-API-Key", "key-tenant-rl")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusBadRequest || !strings.Contains(w1.Body.String(), "path_prefix length exceeds maximum allowed") {
+		t.Fatalf("expected 400 Bad Request for oversized path_prefix, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. HeaderName > 256 characters -> 400 Bad Request
+	longHeader := strings.Repeat("H", 257)
+	body, _ = json.Marshal(map[string]interface{}{
+		"rules": []model.RateLimitRule{
+			{
+				PathPrefix:        "/api",
+				HeaderName:        longHeader,
+				RequestsPerMinute: 100,
+				BurstSize:         10,
+				KeyType:           "HEADER",
+			},
+		},
+	})
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/rate-limits", bytes.NewReader(body))
+	r2.Header.Set("X-API-Key", "key-tenant-rl")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusBadRequest || !strings.Contains(w2.Body.String(), "header_name length exceeds maximum allowed") {
+		t.Fatalf("expected 400 Bad Request for oversized header_name, got %d: %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestHandler_CacheTTLBounds(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterTenantWithRole("key-tenant-cache", "tenant-alpha", "prj-alpha", auth.RoleTenant, "prj-alpha")
+	handler.SetAuthenticator(authInst)
+
+	domainID := "dom-cache-ttl-bounds"
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "prj-alpha", Hostname: "cache-ttl-bounds.example.com"})
+	st.SaveCachePolicy(&model.CachePolicy{ID: "cp-1", DomainID: domainID, CacheEnabled: true, DefaultTTLSeconds: 3600})
+
+	// 1. Add CacheRule with TTLSeconds > MaxCacheTTLSeconds (604800) -> 400 Bad Request
+	bodyRule, _ := json.Marshal(map[string]interface{}{
+		"name":         "overflow-rule",
+		"path_pattern": "/assets/*",
+		"ttl_seconds":  store.MaxCacheTTLSeconds + 1,
+	})
+	r1 := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/cache/rules", bytes.NewReader(bodyRule))
+	r1.Header.Set("X-API-Key", "key-tenant-cache")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusBadRequest || !strings.Contains(w1.Body.String(), "ttl_seconds must be between 0 and") {
+		t.Fatalf("expected 400 Bad Request for oversized cache rule TTL, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. Add CacheRule with negative TTLSeconds -> 400 Bad Request
+	bodyNegative, _ := json.Marshal(map[string]interface{}{
+		"name":         "negative-rule",
+		"path_pattern": "/negative/*",
+		"ttl_seconds":  -50,
+	})
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/cache/rules", bytes.NewReader(bodyNegative))
+	r2.Header.Set("X-API-Key", "key-tenant-cache")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusBadRequest || !strings.Contains(w2.Body.String(), "ttl_seconds must be between 0 and") {
+		t.Fatalf("expected 400 Bad Request for negative cache rule TTL, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// 3. Update CachePolicy with DefaultTTLSeconds > MaxCacheTTLSeconds -> 400 Bad Request
+	oversizedTTL := store.MaxCacheTTLSeconds + 100
+	bodyPolicy, _ := json.Marshal(map[string]interface{}{
+		"default_ttl_seconds": oversizedTTL,
+	})
+	r3 := httptest.NewRequest(http.MethodPatch, "/v1/domains/"+domainID+"/cache/policy", bytes.NewReader(bodyPolicy))
+	r3.Header.Set("X-API-Key", "key-tenant-cache")
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, r3)
+	if w3.Code != http.StatusBadRequest || !strings.Contains(w3.Body.String(), "default_ttl_seconds must be between 0 and") {
+		t.Fatalf("expected 400 Bad Request for oversized cache policy default TTL, got %d: %s", w3.Code, w3.Body.String())
+	}
+
+	// 4. Update CachePolicy with negative DefaultTTLSeconds -> 400 Bad Request
+	negativeTTL := -10
+	bodyPolicyNeg, _ := json.Marshal(map[string]interface{}{
+		"default_ttl_seconds": negativeTTL,
+	})
+	r4 := httptest.NewRequest(http.MethodPatch, "/v1/domains/"+domainID+"/cache/policy", bytes.NewReader(bodyPolicyNeg))
+	r4.Header.Set("X-API-Key", "key-tenant-cache")
+	w4 := httptest.NewRecorder()
+	handler.ServeHTTP(w4, r4)
+	if w4.Code != http.StatusBadRequest || !strings.Contains(w4.Body.String(), "default_ttl_seconds must be between 0 and") {
+		t.Fatalf("expected 400 Bad Request for negative cache policy default TTL, got %d: %s", w4.Code, w4.Body.String())
+	}
+}
+
+func TestHandler_ControlPlaneRateLimiter(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	handler := api.NewAPIHandler(st, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterTenantWithRole("key-tenant-limited", "tenant-alpha", "prj-alpha", auth.RoleTenant, "prj-alpha")
+	handler.SetAuthenticator(authInst)
+
+	// Configure strict limiter: 1 token/sec, burst of 2 tokens, max 10 concurrent
+	limiter := api.NewControlPlaneLimiter(1.0, 2, 10)
+	handler.SetLimiter(limiter)
+
+	domainID := "dom-cp-limiter"
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "prj-alpha", Hostname: "cp-limit.example.com"})
+	st.SaveSecurityPolicy(&model.SecurityPolicy{DomainID: domainID, WAFEnabled: true})
+
+	evalPayload, _ := json.Marshal(map[string]interface{}{
+		"domain_id": domainID,
+		"client_ip": "198.51.100.1",
+		"method":    "GET",
+		"path":      "/test",
+	})
+
+	// Request 1: uses token 1 (burst: 2) -> OK
+	r1 := httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(evalPayload))
+	r1.Header.Set("X-API-Key", "key-tenant-limited")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, r1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on request 1, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// Request 2: uses token 2 (burst: 2) -> OK
+	r2 := httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(evalPayload))
+	r2.Header.Set("X-API-Key", "key-tenant-limited")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, r2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on request 2, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	// Request 3: burst exhausted, rate limit hit -> 429 Too Many Requests
+	r3 := httptest.NewRequest(http.MethodPost, "/v1/edge/evaluate", bytes.NewReader(evalPayload))
+	r3.Header.Set("X-API-Key", "key-tenant-limited")
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, r3)
+	if w3.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 Too Many Requests on request 3, got %d: %s", w3.Code, w3.Body.String())
+	}
+	if w3.Header().Get("Retry-After") != "1" {
+		t.Errorf("expected Retry-After: 1 header on 429 response, got %s", w3.Header().Get("Retry-After"))
+	}
+}

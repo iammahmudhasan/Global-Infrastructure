@@ -30,6 +30,13 @@ const (
 	MaxCustomHeaderCount    = 32
 	MaxCustomHeaderName     = 256
 
+	// Rate Limit Rule Field Limits (P2 Finding 2)
+	MaxRateLimitPathPrefix = 4096
+	MaxRateLimitHeaderName = 256
+
+	// Cache TTL Limits (P2 Finding 3)
+	MaxCacheTTLSeconds = 7 * 24 * 60 * 60 // 7 days (604,800 seconds)
+
 	// Security Event Bounds (Finding 1)
 	MaxSecurityEventsPerDomain          = 1000
 	MaxSecurityEventByteBudgetPerDomain = 4 * 1024 * 1024 // 4 MiB cap per domain
@@ -143,6 +150,7 @@ func cloneOrigin(o *model.Origin) *model.Origin {
 		return nil
 	}
 	cp := *o
+	cp.AllowedPoPs = append([]string(nil), o.AllowedPoPs...)
 	return &cp
 }
 
@@ -151,6 +159,7 @@ func cloneDomain(d *model.Domain) *model.Domain {
 		return nil
 	}
 	cp := *d
+	cp.AllowedPoPs = append([]string(nil), d.AllowedPoPs...)
 	return &cp
 }
 
@@ -159,7 +168,12 @@ func cloneOriginPool(p *model.OriginPool) *model.OriginPool {
 		return nil
 	}
 	cp := *p
-	cp.Origins = append([]model.Origin(nil), p.Origins...)
+	cp.AllowedPoPs = append([]string(nil), p.AllowedPoPs...)
+	cp.Origins = make([]model.Origin, len(p.Origins))
+	for i, o := range p.Origins {
+		cp.Origins[i] = o
+		cp.Origins[i].AllowedPoPs = append([]string(nil), o.AllowedPoPs...)
+	}
 	if p.HealthMonitor != nil {
 		hm := *p.HealthMonitor
 		if hm.ExpectedStatusCodes != nil {
@@ -611,6 +625,11 @@ func (s *Store) SetRateLimitRules(domainID string, rules []model.RateLimitRule) 
 	if len(rules) > MaxRateLimitRulesPerDomain {
 		return ErrRuleLimitExceeded
 	}
+	for _, r := range rules {
+		if len(r.PathPrefix) > MaxRateLimitPathPrefix || len(r.HeaderName) > MaxRateLimitHeaderName {
+			return ErrRuleSizeExceeded
+		}
+	}
 	cloned := append([]model.RateLimitRule(nil), rules...)
 	s.rateLimits[domainID] = cloned
 	if s.security[domainID] != nil {
@@ -683,7 +702,15 @@ func (s *Store) GetSecurityEvents(domainID string, limit int) []model.SecurityEv
 func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.cache[cp.DomainID] = cloneCachePolicy(cp)
+	cloned := cloneCachePolicy(cp)
+	if cloned != nil {
+		if cloned.DefaultTTLSeconds < 0 {
+			cloned.DefaultTTLSeconds = 0
+		} else if cloned.DefaultTTLSeconds > MaxCacheTTLSeconds {
+			cloned.DefaultTTLSeconds = MaxCacheTTLSeconds
+		}
+	}
+	s.cache[cp.DomainID] = cloned
 }
 
 func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
@@ -722,6 +749,9 @@ func (s *Store) AddCacheRule(domainID string, rule model.CacheRule) error {
 		if len(h) > MaxCustomHeaderName {
 			return ErrRuleSizeExceeded
 		}
+	}
+	if rule.TTLSeconds < 0 || rule.TTLSeconds > MaxCacheTTLSeconds {
+		return ErrRuleSizeExceeded
 	}
 
 	if len(s.cacheRules[domainID]) >= MaxCacheRulesPerDomain {
@@ -864,6 +894,96 @@ func (s *Store) GetActiveTopologies() []*DomainTopology {
 		for _, r := range topo.Routes {
 			if pool, exists := s.pools[r.PoolID]; exists {
 				topo.Pools[r.PoolID] = cloneOriginPool(pool)
+			}
+		}
+
+		topologies = append(topologies, topo)
+	}
+
+	sort.Slice(topologies, func(i, j int) bool {
+		if topologies[i].Domain == nil {
+			return false
+		}
+		if topologies[j].Domain == nil {
+			return true
+		}
+
+		left := strings.ToLower(topologies[i].Domain.Hostname)
+		right := strings.ToLower(topologies[j].Domain.Hostname)
+
+		if left != right {
+			return left < right
+		}
+
+		return topologies[i].Domain.ID < topologies[j].Domain.ID
+	})
+
+	return topologies
+}
+
+func containsPoP(allowedPoPs []string, targetPoP string) bool {
+	if len(allowedPoPs) == 0 {
+		return true // Unrestricted / Global
+	}
+	target := strings.ToLower(strings.TrimSpace(targetPoP))
+	for _, p := range allowedPoPs {
+		if strings.EqualFold(strings.TrimSpace(p), target) {
+			return true
+		}
+	}
+	return false
+}
+
+// GetActiveTopologiesForPoP extracts active domains and origin topologies allowed for a specific PoP (P1 PoP Scoping)
+func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	targetPoP := strings.ToLower(strings.TrimSpace(popID))
+	var topologies []*DomainTopology
+
+	for _, d := range s.domains {
+		if d.Status != model.DomainStatusActive {
+			continue // Only compile active, verified domains (Rule 17)
+		}
+
+		// Filter domains restricted to other PoPs (P1 Finding)
+		if !containsPoP(d.AllowedPoPs, targetPoP) {
+			continue
+		}
+
+		routes := make([]*model.Route, 0, len(s.routes[d.ID]))
+		for _, r := range s.routes[d.ID] {
+			routes = append(routes, cloneRoute(r))
+		}
+
+		topo := &DomainTopology{
+			Domain:      cloneDomain(d),
+			Routes:      routes,
+			Pools:       make(map[string]*model.OriginPool),
+			Security:    cloneSecurityPolicy(s.security[d.ID]),
+			Cache:       cloneCachePolicy(s.cache[d.ID]),
+			Certificate: cloneCertificate(s.certificates[d.ID]),
+			TLSSettings: cloneTLSSettings(s.tlsSettings[d.ID]),
+		}
+
+		for _, r := range topo.Routes {
+			if pool, exists := s.pools[r.PoolID]; exists {
+				// Filter origin pools restricted to other PoPs
+				if !containsPoP(pool.AllowedPoPs, targetPoP) {
+					continue
+				}
+
+				clonedPool := cloneOriginPool(pool)
+				// Filter individual origins restricted to other PoPs
+				filteredOrigins := make([]model.Origin, 0, len(clonedPool.Origins))
+				for _, o := range clonedPool.Origins {
+					if containsPoP(o.AllowedPoPs, targetPoP) {
+						filteredOrigins = append(filteredOrigins, o)
+					}
+				}
+				clonedPool.Origins = filteredOrigins
+				topo.Pools[r.PoolID] = clonedPool
 			}
 		}
 

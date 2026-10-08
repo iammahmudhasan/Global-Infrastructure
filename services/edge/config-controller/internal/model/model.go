@@ -33,6 +33,7 @@ type Domain struct {
 	OnboardingType    string       `json:"onboarding_type"` // "CNAME" or "NAMESERVER"
 	CNAMETarget       string       `json:"cname_target"`    // e.g. "cname-d101.edge.nexusedge.net"
 	VerificationToken string       `json:"verification_token,omitempty"`
+	AllowedPoPs       []string     `json:"allowed_pops,omitempty"` // empty means global / all PoPs
 	CreatedAt         time.Time    `json:"created_at"`
 	UpdatedAt         time.Time    `json:"updated_at"`
 }
@@ -97,16 +98,18 @@ type OriginPool struct {
 	LBAlgorithm   LBAlgorithm    `json:"lb_algorithm"`
 	HealthMonitor *HealthMonitor `json:"health_monitor,omitempty"`
 	Origins       []Origin       `json:"origins"`
+	AllowedPoPs   []string       `json:"allowed_pops,omitempty"` // empty means global / all PoPs
 }
 
 type Origin struct {
-	ID       string   `json:"id"`
-	PoolID   string   `json:"pool_id"`
-	Address  string   `json:"address"` // FQDN or IP
-	Port     int      `json:"port"`
-	Protocol Protocol `json:"protocol"` // "HTTP" or "HTTPS"
-	Weight   int      `json:"weight"`
-	Healthy  bool     `json:"healthy"`
+	ID          string   `json:"id"`
+	PoolID      string   `json:"pool_id"`
+	Address     string   `json:"address"` // FQDN or IP
+	Port        int      `json:"port"`
+	Protocol    Protocol `json:"protocol"` // "HTTP" or "HTTPS"
+	Weight      int      `json:"weight"`
+	Healthy     bool     `json:"healthy"`
+	AllowedPoPs []string `json:"allowed_pops,omitempty"` // empty means global / all PoPs
 }
 
 type Route struct {
