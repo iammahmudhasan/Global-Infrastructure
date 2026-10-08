@@ -128,12 +128,16 @@ pub struct DomainRoute {
 
 impl DomainRoute {
     pub fn new(host: String, origins: Vec<UpstreamNode>) -> Self {
-        let path_routes = vec![PathRoute {
-            path_prefix: "/".to_string(),
-            priority: 0,
-            origins: origins.clone(),
-            round_robin_index: Arc::new(AtomicUsize::new(0)),
-        }];
+        let path_routes = if origins.is_empty() {
+            vec![]
+        } else {
+            vec![PathRoute {
+                path_prefix: "/".to_string(),
+                priority: 0,
+                origins: origins.clone(),
+                round_robin_index: Arc::new(AtomicUsize::new(0)),
+            }]
+        };
         Self {
             host,
             origins,
@@ -236,7 +240,13 @@ impl Router {
             if routes_map.contains_key(&norm_host) {
                 return Err(RouterError::DuplicateHost(norm_host));
             }
-            if route.origins.is_empty() && route.path_routes.is_empty() {
+            let total_targets = route.origins.len()
+                + route
+                    .path_routes
+                    .iter()
+                    .map(|pr| pr.origins.len())
+                    .sum::<usize>();
+            if total_targets == 0 {
                 return Err(RouterError::EmptyTargets(norm_host));
             }
             for node in &route.origins {
@@ -322,7 +332,13 @@ impl Router {
             if routes_map.contains_key(&norm_host) {
                 return Err(RouterError::DuplicateHost(norm_host));
             }
-            if route.origins.is_empty() && route.path_routes.is_empty() {
+            let total_targets = route.origins.len()
+                + route
+                    .path_routes
+                    .iter()
+                    .map(|pr| pr.origins.len())
+                    .sum::<usize>();
+            if total_targets == 0 {
                 return Err(RouterError::EmptyTargets(norm_host));
             }
             for node in &route.origins {
