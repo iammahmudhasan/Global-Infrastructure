@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod dns;
 mod proxy;
 mod rate_limit;
 mod router;
@@ -7,6 +8,7 @@ mod waf;
 
 use crate::cache::EdgeCache;
 use crate::config::GatewayConfig;
+use crate::dns::PinnedDnsResolver;
 use crate::proxy::{handle_request, ProxyState, DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS};
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
@@ -18,6 +20,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use reqwest::Client as HttpClient;
 use sha2::Digest;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -34,13 +37,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
 
     // 2. Load Configuration (from gateway.yaml if present, or defaults)
-    let config = if std::path::Path::new("gateway.yaml").exists() {
+    let mut config = if std::path::Path::new("gateway.yaml").exists() {
         info!("Loading configuration from gateway.yaml");
         GatewayConfig::load_from_file("gateway.yaml")?
     } else {
         info!("gateway.yaml not found, applying default enterprise configuration");
-        GatewayConfig::default()
+        let mut cfg = GatewayConfig::default();
+        cfg.apply_env_overrides();
+        cfg
     };
+    config.apply_env_overrides();
+
+    if config.control_plane.enabled {
+        if config.control_plane.endpoint.trim().is_empty() {
+            return Err("Control plane is enabled but endpoint is empty".into());
+        }
+        if config.control_plane.pop_id.trim().is_empty() {
+            return Err("Control plane is enabled but pop_id is empty".into());
+        }
+    }
 
     println!(
         r#"
@@ -82,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // 3. Initialize Shared State Engines
+    let dns_resolver = Arc::new(PinnedDnsResolver::new());
+
     let rate_limiter = RateLimiter::new(
         config.rate_limit.enabled,
         config.rate_limit.requests_per_second,
@@ -95,10 +112,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.cache.max_bytes,
     );
     let router = Router::from_upstream_config(&config.upstream)?;
+    router.sync_dns_resolver(&dns_resolver);
 
     let http_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
         .redirect(reqwest::redirect::Policy::none()) // Prevent upstream redirect-following SSRF attacks (RFC 9110)
+        .dns_resolver(Arc::clone(&dns_resolver))
         .pool_max_idle_per_host(256)
         .tcp_nodelay(true)
         .build()?;
@@ -106,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inflight_buffer_semaphore = Arc::new(tokio::sync::Semaphore::new(
         DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS,
     ));
+    let aggregate_buffered_bytes = Arc::new(AtomicUsize::new(0));
 
     let state = Arc::new(ProxyState {
         config: config.clone(),
@@ -115,6 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         router: router.clone(),
         http_client: http_client.clone(),
         inflight_buffer_semaphore,
+        aggregate_buffered_bytes,
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
@@ -130,6 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 5. Control Plane Dynamic Snapshot Synchronizer (P1 Consistency Bridge)
     if config.control_plane.enabled || config.control_plane.snapshot_file.is_some() {
         let sync_router = router.clone();
+        let sync_dns = Arc::clone(&dns_resolver);
         let cp_cfg = config.control_plane.clone();
         let sync_client = http_client.clone();
 
@@ -149,6 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     e
                                 );
                             } else {
+                                sync_router.sync_dns_resolver(&sync_dns);
                                 tracing::info!(
                                     "Atomically synchronized edge routes from snapshot file: {}",
                                     snapshot_path
@@ -162,7 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if cp_cfg.enabled {
                     let is_secure_endpoint = cp_cfg.endpoint.starts_with("https://")
                         || cp_cfg.endpoint.starts_with("http://127.0.0.1")
-                        || cp_cfg.endpoint.starts_with("http://localhost");
+                        || cp_cfg.endpoint.starts_with("http://localhost")
+                        || cp_cfg.endpoint.starts_with("http://config-controller")
+                        || cp_cfg.auth_token.is_empty();
                     if !is_secure_endpoint {
                         tracing::warn!(
                             endpoint = %cp_cfg.endpoint,
@@ -216,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                                 e
                                             );
                                         } else {
+                                            sync_router.sync_dns_resolver(&sync_dns);
                                             tracing::info!(pop_id = %cp_cfg.pop_id, "Atomically refreshed PoP routes from Control Plane");
                                         }
                                     }
@@ -245,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let health_client = HttpClient::builder()
         .timeout(Duration::from_millis(config.upstream.timeout_ms))
         .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF / open-redirect attacks
+        .dns_resolver(Arc::clone(&dns_resolver))
         .pool_max_idle_per_host(64)
         .tcp_nodelay(true)
         .build()?;

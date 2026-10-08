@@ -2,6 +2,8 @@ package api_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2752,5 +2754,74 @@ func TestStore_PoPTopologySnapshotCaching(t *testing.T) {
 	t3 := st.GetActiveTopologiesForPoP("dhaka")
 	if len(t3) != 0 {
 		t.Fatalf("expected 0 topologies after cache invalidation and status change, got %d", len(t3))
+	}
+}
+
+func TestPoP_SnapshotChecksumMatchesResponseBody(t *testing.T) {
+	handler := setupTestServer()
+	st := handler.Store()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterTenantWithRole("key-ops-checksum", "tenant-ops", "prj-test", auth.RolePlatformOperator, "*")
+
+	_ = st.SaveDomain(&model.Domain{
+		ID:          "dom-checksum-test",
+		ProjectID:   "prj-test",
+		Hostname:    "test.example.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"singapore"},
+	})
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          "pool-checksum-test",
+		ProjectID:   "prj-test",
+		AllowedPoPs: []string{"singapore"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-cs",
+				PoolID:      "pool-checksum-test",
+				Address:     "203.0.113.88",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				AllowedPoPs: []string{"singapore"},
+			},
+		},
+	})
+	st.SaveRoute(&model.Route{
+		ID:         "rt-cs",
+		DomainID:   "dom-checksum-test",
+		PoolID:     "pool-checksum-test",
+		PathPrefix: "/",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req.Header.Set("X-API-Key", "key-ops-checksum")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	headerChecksum := w.Header().Get("X-Snapshot-Checksum")
+	if headerChecksum == "" {
+		t.Fatalf("expected non-empty X-Snapshot-Checksum header")
+	}
+
+	bodyBytes := w.Body.Bytes()
+	bodySum := sha256.Sum256(bodyBytes)
+	expectedChecksum := hex.EncodeToString(bodySum[:])
+
+	if headerChecksum != expectedChecksum {
+		t.Fatalf("checksum mismatch: header has %s, but body SHA-256 is %s", headerChecksum, expectedChecksum)
+	}
+
+	// Verify that any tampering of the response body breaks checksum parity
+	tamperedBytes := append(bodyBytes, byte('!'))
+	tamperedSum := sha256.Sum256(tamperedBytes)
+	tamperedChecksum := hex.EncodeToString(tamperedSum[:])
+	if headerChecksum == tamperedChecksum {
+		t.Fatalf("tampered body unexpectedly matched original checksum")
 	}
 }

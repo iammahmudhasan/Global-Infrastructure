@@ -6,6 +6,8 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct UpstreamNode {
     pub url: String,
+    pub sni: Option<String>,
+    pub destination_addr: Option<std::net::SocketAddr>,
     pub healthy: bool,
     pub latency_ms: u64,
     pub ewma_latency_ms: f64,
@@ -16,6 +18,10 @@ pub struct UpstreamNode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterError {
     UnknownHost(String),
+    NoMatchingPath {
+        host: String,
+        path: String,
+    },
     NoHealthyUpstreams(String),
     DuplicateHost(String),
     EmptyHost,
@@ -40,6 +46,13 @@ impl std::fmt::Display for RouterError {
         match self {
             RouterError::UnknownHost(host) => {
                 write!(f, "No tenant domain route configured for host: {}", host)
+            }
+            RouterError::NoMatchingPath { host, path } => {
+                write!(
+                    f,
+                    "No matching path route configured for host '{}' and path '{}'",
+                    host, path
+                )
             }
             RouterError::NoHealthyUpstreams(host) => {
                 write!(f, "No healthy upstream nodes available for host: {}", host)
@@ -153,13 +166,9 @@ impl DomainRoute {
         security: Option<DomainSecurityPolicy>,
         cache: Option<DomainCachePolicy>,
     ) -> Self {
-        let mut origins = Vec::new();
-        for pr in &path_routes {
-            origins.extend(pr.origins.clone());
-        }
         Self {
             host,
-            origins,
+            origins: Vec::new(),
             path_routes,
             security,
             cache,
@@ -182,8 +191,18 @@ impl Router {
     pub const EWMA_ALPHA: f64 = 0.2;
 
     pub fn create_node(url: String) -> UpstreamNode {
+        Self::create_node_full(url, None, None)
+    }
+
+    pub fn create_node_full(
+        url: String,
+        sni: Option<String>,
+        destination_addr: Option<std::net::SocketAddr>,
+    ) -> UpstreamNode {
         UpstreamNode {
             url,
+            sni,
+            destination_addr,
             healthy: true,
             latency_ms: 10,
             ewma_latency_ms: 10.0,
@@ -196,9 +215,20 @@ impl Router {
         url: String,
         health_states: &HashMap<String, OriginHealthState>,
     ) -> UpstreamNode {
+        Self::create_node_full_with_health(url, None, None, health_states)
+    }
+
+    pub fn create_node_full_with_health(
+        url: String,
+        sni: Option<String>,
+        destination_addr: Option<std::net::SocketAddr>,
+        health_states: &HashMap<String, OriginHealthState>,
+    ) -> UpstreamNode {
         if let Some(h) = health_states.get(&url) {
             UpstreamNode {
                 url,
+                sni,
+                destination_addr,
                 healthy: h.healthy,
                 latency_ms: h.latency_ms,
                 ewma_latency_ms: h.ewma_latency_ms,
@@ -206,7 +236,7 @@ impl Router {
                 consecutive_failures: h.consecutive_failures,
             }
         } else {
-            Self::create_node(url)
+            Self::create_node_full(url, sni, destination_addr)
         }
     }
 
@@ -437,7 +467,10 @@ impl Router {
                     select_from_nodes(&domain_route.origins, &counter)
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else {
-                    Err(RoutingError::NoHealthyUpstreams(norm_host))
+                    Err(RoutingError::NoMatchingPath {
+                        host: norm_host,
+                        path: path.to_string(),
+                    })
                 }
             } else {
                 Err(RoutingError::UnknownHost(norm_host))
@@ -579,6 +612,42 @@ impl Router {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// Returns all DNS domain -> pinned SocketAddr mappings across all active routes
+    pub fn dns_mappings(&self) -> HashMap<String, Vec<std::net::SocketAddr>> {
+        let mut map: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
+        {
+            let default_nodes = self.default_nodes.read().unwrap();
+            for n in default_nodes.iter() {
+                if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
+                    map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
+                }
+            }
+        }
+        {
+            let routes = self.routes.read().unwrap();
+            for dr in routes.values() {
+                for n in &dr.origins {
+                    if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
+                        map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
+                    }
+                }
+                for pr in &dr.path_routes {
+                    for n in &pr.origins {
+                        if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
+                            map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
+                        }
+                    }
+                }
+            }
+        }
+        map
+    }
+
+    /// Synchronizes current route DNS mappings into the given PinnedDnsResolver
+    pub fn sync_dns_resolver(&self, resolver: &crate::dns::PinnedDnsResolver) {
+        resolver.set_all(self.dns_mappings());
+    }
 }
 
 /// Normalizes an incoming Host or authority string to lowercase, safely stripping port.
@@ -615,40 +684,87 @@ pub fn normalize_host(host: &str) -> String {
     trimmed.to_ascii_lowercase()
 }
 
-/// Identifies link-local and cloud metadata destinations (AWS/GCP/Azure/Alibaba link-local IPs and hostnames)
-fn is_forbidden_metadata_destination(host: &str) -> bool {
+/// Identifies private RFC 1918, loopback, link-local, carrier-grade NAT, multicast,
+/// broadcast, and IPv6 ULA / link-local destinations (Anti-SSRF Parity with Control Plane).
+pub fn is_private_or_reserved_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // 0.0.0.0/8 (Unspecified)
+            if octets[0] == 0 {
+                return true;
+            }
+            // 10.0.0.0/8 (RFC 1918)
+            if octets[0] == 10 {
+                return true;
+            }
+            // 100.64.0.0/10 (CGNAT / Shared Address Space)
+            if octets[0] == 100 && (64..=127).contains(&octets[1]) {
+                return true;
+            }
+            // 127.0.0.0/8 (Loopback)
+            if octets[0] == 127 {
+                return true;
+            }
+            // 169.254.0.0/16 (Link-local)
+            if octets[0] == 169 && octets[1] == 254 {
+                return true;
+            }
+            // 172.16.0.0/12 (RFC 1918)
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return true;
+            }
+            // 192.168.0.0/16 (RFC 1918)
+            if octets[0] == 192 && octets[1] == 168 {
+                return true;
+            }
+            // 224.0.0.0/4 (Multicast) and 240.0.0.0/4 (Reserved / Broadcast)
+            if octets[0] >= 224 {
+                return true;
+            }
+            false
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return true;
+            }
+            let segments = ipv6.segments();
+            // fe80::/10 (Link-local unicast)
+            if (segments[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // fc00::/7 (Unique Local Address - ULA)
+            if (segments[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            // ff00::/8 (Multicast)
+            if (segments[0] & 0xff00) == 0xff00 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+pub fn is_forbidden_destination(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
     if lower == "169.254.169.254"
         || lower == "metadata.google.internal"
         || lower == "metadata.titus.internal"
         || lower == "instance-data"
         || lower == "100.100.100.200"
+        || lower == "localhost"
     {
         return true;
     }
     if let Ok(ip) = lower.parse::<std::net::IpAddr>() {
-        match ip {
-            std::net::IpAddr::V4(ipv4) => {
-                if ipv4.is_link_local() || ipv4.is_loopback() {
-                    return true;
-                }
-            }
-            std::net::IpAddr::V6(ipv6) => {
-                if ipv6.is_loopback() {
-                    return true;
-                }
-                let segments = ipv6.segments();
-                if (segments[0] & 0xffc0) == 0xfe80 {
-                    return true;
-                }
-            }
-        }
+        return is_private_or_reserved_ip(ip);
     }
     false
 }
 
 /// Validates target upstream URLs: ensures scheme is http/https, host is valid,
-/// rejects embedded user credentials, and enforces cloud metadata SSRF protection.
+/// rejects embedded user credentials, and enforces cloud metadata & private SSRF protection.
 pub fn validate_target_url(host: &str, target_url: &str) -> Result<(), RouterError> {
     let trimmed = target_url.trim();
     if trimmed.is_empty() {
@@ -697,11 +813,11 @@ pub fn validate_target_url(host: &str, target_url: &str) -> Result<(), RouterErr
         });
     }
 
-    if is_forbidden_metadata_destination(url_host) {
+    if is_forbidden_destination(url_host) {
         return Err(RouterError::UnsafeTargetUrl {
             host: host.to_string(),
             url: target_url.to_string(),
-            reason: "Target URL targets cloud metadata or forbidden link-local service".to_string(),
+            reason: "Target URL targets private RFC 1918, loopback, cloud metadata, or reserved destination".to_string(),
         });
     }
 
@@ -778,6 +894,8 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
     struct WireDomainRoute {
         host: String,
         #[serde(default)]
+        origins: Vec<WireOrigin>,
+        #[serde(default)]
         targets: Vec<String>,
         #[serde(default)]
         path_routes: Vec<WirePathRoute>,
@@ -796,6 +914,29 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
     let wire: SyncWire = serde_json::from_str(json_str).map_err(|e| {
         RouterError::InvalidPayload(format!("Failed to parse PoP sync JSON: {}", e))
     })?;
+
+    fn parse_wire_origin(norm_host: &str, o: &WireOrigin) -> Result<UpstreamNode, RouterError> {
+        let proto = o.protocol.to_lowercase();
+        let is_https = proto == "https";
+        let sni_trimmed = o.sni.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
+        let dest_addr = format!("{}:{}", o.address, o.port)
+            .parse::<std::net::SocketAddr>()
+            .ok();
+
+        let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
+            (true, Some(sni_host)) if sni_host != o.address => {
+                let target_url = format!("https://{}:{}", sni_host, o.port);
+                (target_url, Some(sni_host.to_string()), dest_addr)
+            }
+            _ => {
+                let target_url = format!("{}://{}:{}", proto, o.address, o.port);
+                (target_url, None, dest_addr)
+            }
+        };
+
+        validate_target_url(norm_host, &url)?;
+        Ok(Router::create_node_full(url, sni, destination_addr))
+    }
 
     let mut result = Vec::new();
     for r in wire.routes {
@@ -826,11 +967,8 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             for pr in r.path_routes {
                 let mut path_origins = Vec::new();
                 if !pr.origins.is_empty() {
-                    for o in pr.origins {
-                        let proto = o.protocol.to_lowercase();
-                        let url = format!("{}://{}:{}", proto, o.address, o.port);
-                        validate_target_url(&norm_host, &url)?;
-                        path_origins.push(Router::create_node(url));
+                    for o in &pr.origins {
+                        path_origins.push(parse_wire_origin(&norm_host, o)?);
                     }
                 } else if !pr.targets.is_empty() {
                     for t in pr.targets {
@@ -854,6 +992,23 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
                 sec_policy,
                 cache_policy,
             ));
+        } else if !r.origins.is_empty() {
+            let mut origins = Vec::new();
+            for o in &r.origins {
+                origins.push(parse_wire_origin(&norm_host, o)?);
+            }
+            result.push(DomainRoute {
+                host: r.host,
+                origins: origins.clone(),
+                path_routes: vec![PathRoute {
+                    path_prefix: "/".to_string(),
+                    priority: 0,
+                    origins,
+                    round_robin_index: Arc::new(AtomicUsize::new(0)),
+                }],
+                security: sec_policy,
+                cache: cache_policy,
+            });
         } else if !r.targets.is_empty() {
             let mut origins = Vec::new();
             for target in &r.targets {
@@ -1170,9 +1325,27 @@ mod tests {
 
     #[test]
     fn test_target_url_ssrf_and_schema_validation() {
-        // Finding 7: Validate scheme, credentials, and cloud metadata SSRF destinations
+        // Finding 7 & P2 Finding 8: Validate scheme, credentials, and cloud metadata / private SSRF destinations
         assert!(validate_target_url("cust", "https://origin.example.com:443").is_ok());
-        assert!(validate_target_url("cust", "http://10.0.0.1:8080").is_ok());
+        assert!(validate_target_url("cust", "https://203.0.113.20:443").is_ok());
+
+        // RFC 1918 private IPv4 destinations rejected
+        let err = validate_target_url("cust", "http://10.0.0.1:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://172.16.5.1:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://192.168.1.1:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+
+        // Loopback IPv4 rejected
+        let err = validate_target_url("cust", "http://127.0.0.1:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+
+        // IPv6 ULA & Link-local rejected
+        let err = validate_target_url("cust", "http://[fc00::1]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://[fe80::1]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
         // Invalid scheme (e.g. ftp)
         let err = validate_target_url("cust", "ftp://origin.example.com").unwrap_err();
@@ -1190,6 +1363,96 @@ mod tests {
         let err = validate_target_url("cust", "http://metadata.google.internal/computeMetadata")
             .unwrap_err();
         assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+    }
+
+    #[test]
+    fn test_path_routing_fallback_isolation_rejects_unmatched_path() {
+        // P1 Finding 3: Path routing without root route must fail closed for unmatched paths
+        let path_routes = vec![
+            PathRoute {
+                path_prefix: "/admin/".to_string(),
+                priority: 10,
+                origins: vec![Router::create_node("https://admin.internal".to_string())],
+                round_robin_index: Arc::new(AtomicUsize::new(0)),
+            },
+            PathRoute {
+                path_prefix: "/api/".to_string(),
+                priority: 20,
+                origins: vec![Router::create_node("https://api.internal".to_string())],
+                round_robin_index: Arc::new(AtomicUsize::new(0)),
+            },
+        ];
+
+        let domain_route =
+            DomainRoute::with_paths("customer.example.com".to_string(), path_routes, None, None);
+
+        let router = Router::new_multi_tenant(vec![domain_route], vec![], 5000).unwrap();
+
+        // Matching routes route properly
+        assert_eq!(
+            router
+                .select_upstream_for_host_and_path("customer.example.com", "/admin/users")
+                .unwrap(),
+            "https://admin.internal"
+        );
+        assert_eq!(
+            router
+                .select_upstream_for_host_and_path("customer.example.com", "/api/v1/data")
+                .unwrap(),
+            "https://api.internal"
+        );
+
+        // Unmatched path without root fallback MUST NOT leak origins - must return NoMatchingPath
+        let unmatched_err = router
+            .select_upstream_for_host_and_path("customer.example.com", "/unknown")
+            .unwrap_err();
+        assert_eq!(
+            unmatched_err,
+            RoutingError::NoMatchingPath {
+                host: "customer.example.com".to_string(),
+                path: "/unknown".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_sni_origin_resolution_and_pinned_dns_mapping() {
+        // P1 Finding 2: HTTPS origin with pinned IP uses SNI hostname for URL and records destination address
+        let pop_json = r#"{
+            "pop_id": "singapore",
+            "config_version": "v1.2.0-pinned",
+            "routes": [
+                {
+                    "host": "customer.example.com",
+                    "origins": [
+                        {
+                            "address": "203.0.113.20",
+                            "port": 443,
+                            "protocol": "HTTPS",
+                            "sni": "origin.customer.com"
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let parsed_routes = parse_pop_config_routes(pop_json).unwrap();
+        assert_eq!(parsed_routes.len(), 1);
+        let node = &parsed_routes[0].origins[0];
+        assert_eq!(node.url, "https://origin.customer.com:443");
+        assert_eq!(node.sni, Some("origin.customer.com".to_string()));
+        let expected_addr: std::net::SocketAddr = "203.0.113.20:443".parse().unwrap();
+        assert_eq!(node.destination_addr, Some(expected_addr));
+
+        let router = Router::new_multi_tenant(parsed_routes, vec![], 5000).unwrap();
+        let mappings = router.dns_mappings();
+        assert_eq!(
+            mappings.get("origin.customer.com"),
+            Some(&vec![expected_addr])
+        );
+
+        let resolver = crate::dns::PinnedDnsResolver::new();
+        router.sync_dns_resolver(&resolver);
     }
 
     #[test]

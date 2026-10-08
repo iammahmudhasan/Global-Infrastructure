@@ -127,6 +127,10 @@ func (h *APIHandler) PoPManager() *pop.Manager {
 	return h.popManager
 }
 
+func (h *APIHandler) Store() *store.Store {
+	return h.store
+}
+
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global 1 MiB body size cap prevents unbounded memory exhaustion across all control plane JSON endpoints
 	const maxControlPlaneBody = 1 << 20 // 1 MiB
@@ -2076,7 +2080,6 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		canonicalBytes, _ := json.Marshal(gatewayRoutes)
 		canonicalSum := sha256.Sum256(canonicalBytes)
 		canonicalHash := hex.EncodeToString(canonicalSum[:])
-		w.Header().Set("X-Snapshot-Checksum", canonicalHash)
 
 		syncResult := model.PoPConfigSync{
 			PoPID:           pop.ID,
@@ -2088,7 +2091,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			EnvoyConfig:     envoyCfg,
 			Routes:          gatewayRoutes,
 		}
-		writeJSON(w, http.StatusOK, syncResult)
+
+		respBytes, err := json.Marshal(syncResult)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to marshal pop config: "+err.Error())
+			return
+		}
+		bodySum := sha256.Sum256(respBytes)
+		bodyHash := hex.EncodeToString(bodySum[:])
+		w.Header().Set("X-Snapshot-Checksum", bodyHash)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBytes)
 
 	default:
 		writeError(w, http.StatusNotFound, "unknown pop action: "+action)

@@ -102,8 +102,14 @@ impl RateLimiter {
             }
         }
 
-        let capacity = custom_burst.map(|c| c as f64).unwrap_or(self.capacity);
-        let refill_rate = custom_rps.map(|r| r as f64).unwrap_or(self.refill_rate);
+        let capacity = custom_burst
+            .filter(|&c| c > 0)
+            .map(|c| c as f64)
+            .unwrap_or(self.capacity);
+        let refill_rate = custom_rps
+            .filter(|&r| r > 0)
+            .map(|r| r as f64)
+            .unwrap_or(self.refill_rate);
         let bucket = store
             .buckets
             .entry(key.to_string())
@@ -212,5 +218,14 @@ mod tests {
             buckets.contains_key(&ip3.to_string()),
             "ip3 must be present"
         );
+    }
+
+    #[test]
+    fn test_zero_custom_rate_limit_fallback() {
+        let limiter = RateLimiter::new(true, 10, 20);
+        // If custom limits are zero, check_key must fall back to default capacity/refill
+        // instead of setting capacity=0 and blocking every request
+        assert!(limiter.check_key("tenant.example.com:1.2.3.4", Some(0), Some(0)));
+        assert!(limiter.check_key("tenant.example.com:1.2.3.4", Some(0), Some(0)));
     }
 }

@@ -35,10 +35,47 @@ const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
-const MAX_UPSTREAM_RESPONSE_BYTES: usize = 50 * 1024 * 1024; // 50 MiB hard limit for origin responses
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB hard limit for origin responses
+pub const MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB aggregate limit (P1 Finding 5)
 const MAX_CUSTOM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days (Finding 2)
 
 pub const DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS: usize = 256;
+
+pub struct BufferBudgetGuard {
+    tracker: Arc<std::sync::atomic::AtomicUsize>,
+    allocated: usize,
+    limit: usize,
+}
+
+impl BufferBudgetGuard {
+    pub fn new(tracker: Arc<std::sync::atomic::AtomicUsize>, limit: usize) -> Self {
+        Self {
+            tracker,
+            allocated: 0,
+            limit,
+        }
+    }
+
+    pub fn try_allocate(&mut self, bytes: usize) -> Result<(), ()> {
+        let current = self.tracker.load(std::sync::atomic::Ordering::Relaxed);
+        if current + bytes > self.limit {
+            return Err(());
+        }
+        self.tracker
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.allocated += bytes;
+        Ok(())
+    }
+}
+
+impl Drop for BufferBudgetGuard {
+    fn drop(&mut self) {
+        if self.allocated > 0 {
+            self.tracker
+                .fetch_sub(self.allocated, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ProxyState {
@@ -49,6 +86,7 @@ pub struct ProxyState {
     pub router: Router,
     pub http_client: HttpClient,
     pub inflight_buffer_semaphore: Arc<tokio::sync::Semaphore>,
+    pub aggregate_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 pub async fn handle_request(
@@ -89,10 +127,13 @@ pub async fn handle_request(
         .get_domain_policy(&host)
         .unwrap_or((None, None));
 
-    // 3. DDoS & Token-Bucket Rate Limiter Check (Keyed by Tenant & Client IP, P1/P2 Finding 7)
+    // 3. DDoS & Token-Bucket Rate Limiter Check (Keyed by Tenant & Client IP, P1 Finding 4)
     let rate_limit_key = format!("{}:{}", host, effective_client_ip);
-    let custom_rps = domain_sec_policy.as_ref().map(|s| s.requests_per_second);
-    let custom_burst = domain_sec_policy.as_ref().map(|s| s.burst_capacity);
+    let (custom_rps, custom_burst) = domain_sec_policy
+        .as_ref()
+        .filter(|p| p.rate_limit_enabled && p.requests_per_second > 0 && p.burst_capacity > 0)
+        .map(|p| (Some(p.requests_per_second), Some(p.burst_capacity)))
+        .unwrap_or((None, None));
 
     if !state
         .rate_limiter
@@ -215,11 +256,13 @@ pub async fn handle_request(
         None
     };
 
-    // 6. Global WAF Inspection
-    match state
-        .waf
-        .inspect(&uri_string, user_agent.as_deref(), body_sample)
-    {
+    // 6. Tenant & Global WAF Inspection (Finding 7)
+    match state.waf.inspect_with_tenant_policy(
+        &uri_string,
+        user_agent.as_deref(),
+        body_sample,
+        domain_sec_policy.as_ref(),
+    ) {
         WafResult::Blocked { rule, pattern } => {
             warn!(
                 ip = %effective_client_ip,
@@ -297,6 +340,22 @@ pub async fn handle_request(
             });
             let resp = Response::builder()
                 .status(StatusCode::MISDIRECTED_REQUEST)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+        Err(crate::router::RoutingError::NoMatchingPath { host: h, path: p }) => {
+            warn!(host = %h, path = %p, "No matching route configured for requested path");
+            let body = serde_json::json!({
+                "error": "Not Found: No matching route configured for requested path",
+                "host": h,
+                "path": p,
+                "status": 404,
+            });
+            let resp = Response::builder()
+                .status(StatusCode::NOT_FOUND)
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge/0.1.0")
                 .body(Full::new(Bytes::from(body.to_string())))
@@ -432,23 +491,75 @@ pub async fn handle_request(
                 }
             }
 
-            // Stream upstream response with hard 50 MiB bounded buffer (P1 Finding 5)
+            // Stream upstream response with hard 10 MiB bounded buffer and aggregate memory budgeting (P1 Finding 5)
             let mut resp_buf = bytes::BytesMut::new();
             let mut total_bytes = 0usize;
             let mut stream_oversized = false;
+            let mut stream_error = false;
+            let mut aggregate_limit_exceeded = false;
+            let mut buffer_guard = BufferBudgetGuard::new(
+                Arc::clone(&state.aggregate_buffered_bytes),
+                MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
+            );
 
-            while let Ok(Some(chunk)) = upstream_resp.chunk().await {
-                total_bytes += chunk.len();
-                if total_bytes > MAX_UPSTREAM_RESPONSE_BYTES {
-                    warn!(
-                        total_bytes = total_bytes,
-                        limit = MAX_UPSTREAM_RESPONSE_BYTES,
-                        "Upstream response stream exceeded maximum allowed limit"
-                    );
-                    stream_oversized = true;
-                    break;
+            loop {
+                match upstream_resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        total_bytes += chunk.len();
+                        if total_bytes > MAX_UPSTREAM_RESPONSE_BYTES {
+                            warn!(
+                                total_bytes = total_bytes,
+                                limit = MAX_UPSTREAM_RESPONSE_BYTES,
+                                "Upstream response stream exceeded maximum allowed limit"
+                            );
+                            stream_oversized = true;
+                            break;
+                        }
+                        if buffer_guard.try_allocate(chunk.len()).is_err() {
+                            warn!(
+                                total_bytes = total_bytes,
+                                limit = MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
+                                "Gateway aggregate response buffer capacity exceeded"
+                            );
+                            aggregate_limit_exceeded = true;
+                            break;
+                        }
+                        resp_buf.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            "Upstream stream connection interrupted during response transfer"
+                        );
+                        stream_error = true;
+                        break;
+                    }
                 }
-                resp_buf.extend_from_slice(&chunk);
+            }
+
+            if stream_error {
+                let resp = Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header("Content-Type", "application/json")
+                    .header("Server", "NexusEdge/0.1.0")
+                    .body(Full::new(Bytes::from(
+                        r#"{"error":"Bad Gateway: Upstream connection interrupted during response transfer"}"#,
+                    )))
+                    .unwrap();
+                return Ok(resp);
+            }
+
+            if aggregate_limit_exceeded {
+                let resp = Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("Content-Type", "application/json")
+                    .header("Server", "NexusEdge/0.1.0")
+                    .body(Full::new(Bytes::from(
+                        r#"{"error":"Service Unavailable: Gateway response buffer capacity exceeded under memory pressure"}"#,
+                    )))
+                    .unwrap();
+                return Ok(resp);
             }
 
             if stream_oversized {
@@ -457,7 +568,7 @@ pub async fn handle_request(
                     .header("Content-Type", "application/json")
                     .header("Server", "NexusEdge/0.1.0")
                     .body(Full::new(Bytes::from(
-                        r#"{"error":"Bad Gateway: Upstream response stream exceeded maximum allowed 50 MiB limit"}"#,
+                        r#"{"error":"Bad Gateway: Upstream response stream exceeded maximum allowed limit"}"#,
                     )))
                     .unwrap();
                 return Ok(resp);
@@ -842,5 +953,29 @@ mod tests {
         let public_peer: IpAddr = "203.0.113.50".parse().unwrap();
         let client_ip = extract_client_ip(&headers, public_peer);
         assert_eq!(client_ip, public_peer);
+    }
+
+    #[test]
+    fn test_buffer_budget_guard_lifecycle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let limit = 1000;
+
+        {
+            let mut guard = BufferBudgetGuard::new(Arc::clone(&tracker), limit);
+            assert!(guard.try_allocate(400).is_ok());
+            assert_eq!(tracker.load(Ordering::Relaxed), 400);
+
+            assert!(guard.try_allocate(500).is_ok());
+            assert_eq!(tracker.load(Ordering::Relaxed), 900);
+
+            // Exceeds limit (900 + 200 > 1000)
+            assert!(guard.try_allocate(200).is_err());
+            assert_eq!(tracker.load(Ordering::Relaxed), 900);
+        }
+
+        // On drop, guard must decrement allocated bytes
+        assert_eq!(tracker.load(Ordering::Relaxed), 0);
     }
 }

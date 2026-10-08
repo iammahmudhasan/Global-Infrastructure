@@ -162,7 +162,50 @@ impl GatewayConfig {
         path: P,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let content = fs::read_to_string(path)?;
-        let config: GatewayConfig = serde_yaml::from_str(&content)?;
+        let mut config: GatewayConfig = serde_yaml::from_str(&content)?;
+        config.apply_env_overrides();
         Ok(config)
+    }
+
+    pub fn apply_env_overrides(&mut self) {
+        if let Ok(v) = std::env::var("NEXUSEDGE_LISTEN_ADDR") {
+            if !v.trim().is_empty() {
+                self.server.listen_addr = v;
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_NODE_ID") {
+            if !v.trim().is_empty() {
+                self.server.node_id = v;
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_REGION") {
+            if !v.trim().is_empty() {
+                self.server.region = v;
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_ENABLED") {
+            let lower = v.trim().to_ascii_lowercase();
+            self.control_plane.enabled = lower == "true" || lower == "1";
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_ENDPOINT") {
+            if !v.trim().is_empty() {
+                self.control_plane.endpoint = v;
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_POP_ID") {
+            if !v.trim().is_empty() {
+                self.control_plane.pop_id = v;
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_POLL_INTERVAL_SECS") {
+            if let Ok(secs) = v.trim().parse::<u64>() {
+                if secs > 0 {
+                    self.control_plane.poll_interval_secs = secs;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_AUTH_TOKEN") {
+            self.control_plane.auth_token = v;
+        }
     }
 }
