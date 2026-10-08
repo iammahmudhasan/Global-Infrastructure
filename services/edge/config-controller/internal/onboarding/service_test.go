@@ -1,7 +1,9 @@
 package onboarding_test
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
@@ -245,5 +247,80 @@ func TestVerifyDomain_PositiveAllowlistDevGate(t *testing.T) {
 	}
 	if domain.Status != model.DomainStatusActive {
 		t.Errorf("expected ACTIVE status, got %s", domain.Status)
+	}
+}
+
+func TestOnboardDomain_ProjectQuotaEnforcement(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+
+	projectID := "prj-quota-svc-test"
+	st.SetProjectQuota(projectID, store.ProjectQuota{MaxDomains: 2})
+
+	// 1st domain -> success
+	_, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      projectID,
+		Hostname:       "d1.quota.example.com",
+		OriginAddress:  "198.51.100.1",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("d1 onboard failed: %v", err)
+	}
+
+	// 2nd domain -> success
+	_, err = svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      projectID,
+		Hostname:       "d2.quota.example.com",
+		OriginAddress:  "198.51.100.2",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("d2 onboard failed: %v", err)
+	}
+
+	// 3rd domain -> quota exceeded
+	_, err = svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      projectID,
+		Hostname:       "d3.quota.example.com",
+		OriginAddress:  "198.51.100.3",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if !errors.Is(err, store.ErrProjectQuotaExceeded) {
+		t.Fatalf("expected ErrProjectQuotaExceeded, got: %v", err)
+	}
+}
+
+func TestOnboardDomain_SweepExpiredPendingDomains(t *testing.T) {
+	st := store.NewStore()
+	svc := onboarding.NewDomainService(st)
+
+	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
+		ProjectID:      "prj-sweep-test",
+		Hostname:       "sweep-target.example.com",
+		OriginAddress:  "198.51.100.10",
+		OriginPort:     443,
+		OriginProtocol: "HTTPS",
+	})
+	if err != nil {
+		t.Fatalf("onboard failed: %v", err)
+	}
+
+	// Manually set domain CreatedAt to 72 hours ago
+	dom, _ := st.GetDomain(res.DomainID)
+	dom.CreatedAt = time.Now().UTC().Add(-72 * time.Hour)
+	_ = st.SaveDomain(dom) // Overwrite doesn't re-add to hostIndex since it's already there or we can sweep directly
+
+	// Sweep older than 24 hours
+	swept := svc.SweepExpiredPendingDomains(24 * time.Hour)
+	if swept == 0 {
+		t.Fatalf("expected at least 1 domain swept, got %d", swept)
+	}
+
+	if _, err := st.GetDomain(res.DomainID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("domain should have been swept")
 	}
 }

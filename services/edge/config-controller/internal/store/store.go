@@ -5,15 +5,17 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 )
 
 const (
-	MaxOriginsPerPool          = 256
-	MaxWAFRulesPerDomain       = 1000
-	MaxRateLimitRulesPerDomain = 500
-	MaxCacheRulesPerDomain     = 1000
+	MaxOriginsPerPool           = 256
+	MaxWAFRulesPerDomain        = 1000
+	MaxRateLimitRulesPerDomain  = 500
+	MaxCacheRulesPerDomain      = 1000
+	DefaultMaxDomainsPerProject = 50 // Default per-project domain ceiling (Finding 2)
 )
 
 var (
@@ -22,60 +24,99 @@ var (
 	ErrMixedOriginProtocols = errors.New("all origins in an origin pool must share the same protocol")
 	ErrOriginPoolFull       = errors.New("origin pool limit reached (max 256)")
 	ErrRuleLimitExceeded    = errors.New("rule limit exceeded for domain")
+	ErrProjectQuotaExceeded = errors.New("project domain quota exceeded")
 )
 
+type ProjectQuota struct {
+	MaxDomains int
+}
+
 type Store struct {
-	mu           sync.RWMutex
-	domains      map[string]*model.Domain
-	hostIndex    map[string]string // hostname -> domain ID
-	pools        map[string]*model.OriginPool
-	origins      map[string]*model.Origin
-	routes       map[string][]*model.Route             // domain ID -> routes
-	security     map[string]*model.SecurityPolicy      // domain ID -> policy
-	wafRules     map[string][]model.WAFRule            // domain ID -> WAF rules
-	rateLimits   map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
-	events       map[string][]model.SecurityEvent      // domain ID -> Security events
-	cache        map[string]*model.CachePolicy         // domain ID -> policy
-	cacheRules   map[string][]model.CacheRule          // domain ID -> Cache rules
-	monitors     map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
-	healthStates map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
-	certificates map[string]*model.Certificate         // domain ID -> certificate
-	challenges   map[string]*model.ACMEChallenge       // token -> ACMEChallenge
-	tlsSettings  map[string]*model.TLSSettings         // domain ID -> TLSSettings
+	mu                 sync.RWMutex
+	domains            map[string]*model.Domain
+	hostIndex          map[string]string // hostname -> domain ID
+	projectQuotas      map[string]ProjectQuota
+	projectDomainCount map[string]int
+	pools              map[string]*model.OriginPool
+	origins            map[string]*model.Origin
+	routes             map[string][]*model.Route             // domain ID -> routes
+	security           map[string]*model.SecurityPolicy      // domain ID -> policy
+	wafRules           map[string][]model.WAFRule            // domain ID -> WAF rules
+	rateLimits         map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
+	events             map[string][]model.SecurityEvent      // domain ID -> Security events
+	cache              map[string]*model.CachePolicy         // domain ID -> policy
+	cacheRules         map[string][]model.CacheRule          // domain ID -> Cache rules
+	monitors           map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
+	healthStates       map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
+	certificates       map[string]*model.Certificate         // domain ID -> certificate
+	challenges         map[string]*model.ACMEChallenge       // token -> ACMEChallenge
+	tlsSettings        map[string]*model.TLSSettings         // domain ID -> TLSSettings
 }
 
 func NewStore() *Store {
 	return &Store{
-		domains:      make(map[string]*model.Domain),
-		hostIndex:    make(map[string]string),
-		pools:        make(map[string]*model.OriginPool),
-		origins:      make(map[string]*model.Origin),
-		routes:       make(map[string][]*model.Route),
-		security:     make(map[string]*model.SecurityPolicy),
-		wafRules:     make(map[string][]model.WAFRule),
-		rateLimits:   make(map[string][]model.RateLimitRule),
-		events:       make(map[string][]model.SecurityEvent),
-		cache:        make(map[string]*model.CachePolicy),
-		cacheRules:   make(map[string][]model.CacheRule),
-		monitors:     make(map[string]*model.HealthMonitor),
-		healthStates: make(map[string]*model.OriginEndpointState),
-		certificates: make(map[string]*model.Certificate),
-		challenges:   make(map[string]*model.ACMEChallenge),
-		tlsSettings:  make(map[string]*model.TLSSettings),
+		domains:            make(map[string]*model.Domain),
+		hostIndex:          make(map[string]string),
+		projectQuotas:      make(map[string]ProjectQuota),
+		projectDomainCount: make(map[string]int),
+		pools:              make(map[string]*model.OriginPool),
+		origins:            make(map[string]*model.Origin),
+		routes:             make(map[string][]*model.Route),
+		security:           make(map[string]*model.SecurityPolicy),
+		wafRules:           make(map[string][]model.WAFRule),
+		rateLimits:         make(map[string][]model.RateLimitRule),
+		events:             make(map[string][]model.SecurityEvent),
+		cache:              make(map[string]*model.CachePolicy),
+		cacheRules:         make(map[string][]model.CacheRule),
+		monitors:           make(map[string]*model.HealthMonitor),
+		healthStates:       make(map[string]*model.OriginEndpointState),
+		certificates:       make(map[string]*model.Certificate),
+		challenges:         make(map[string]*model.ACMEChallenge),
+		tlsSettings:        make(map[string]*model.TLSSettings),
 	}
+}
+
+func (s *Store) SetProjectQuota(projectID string, quota ProjectQuota) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.projectQuotas[projectID] = quota
+}
+
+func (s *Store) GetProjectQuota(projectID string) ProjectQuota {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if q, ok := s.projectQuotas[projectID]; ok && q.MaxDomains > 0 {
+		return q
+	}
+	return ProjectQuota{MaxDomains: DefaultMaxDomainsPerProject}
 }
 
 func (s *Store) SaveDomain(d *model.Domain) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.hostIndex[d.Hostname]; exists {
+	if existingID, exists := s.hostIndex[d.Hostname]; exists && existingID != d.ID {
 		return ErrAlreadyExists
+	}
+
+	isNew := s.domains[d.ID] == nil
+	if isNew {
+		maxDomains := DefaultMaxDomainsPerProject
+		if q, ok := s.projectQuotas[d.ProjectID]; ok && q.MaxDomains > 0 {
+			maxDomains = q.MaxDomains
+		}
+
+		if d.ProjectID != "" && s.projectDomainCount[d.ProjectID] >= maxDomains {
+			return ErrProjectQuotaExceeded
+		}
 	}
 
 	cloned := cloneDomain(d)
 	s.domains[d.ID] = cloned
 	s.hostIndex[d.Hostname] = d.ID
+	if isNew && d.ProjectID != "" {
+		s.projectDomainCount[d.ProjectID]++
+	}
 	return nil
 }
 
@@ -238,6 +279,74 @@ func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 	}
 	d.Status = status
 	return nil
+}
+
+func (s *Store) deleteDomainLocked(domainID string) error {
+	dom, ok := s.domains[domainID]
+	if !ok {
+		return ErrNotFound
+	}
+
+	delete(s.hostIndex, dom.Hostname)
+	if dom.ProjectID != "" && s.projectDomainCount[dom.ProjectID] > 0 {
+		s.projectDomainCount[dom.ProjectID]--
+		if s.projectDomainCount[dom.ProjectID] == 0 {
+			delete(s.projectDomainCount, dom.ProjectID)
+		}
+	}
+	delete(s.domains, domainID)
+
+	// Cascade delete routes & associated pools and origins (Finding 2)
+	routes := s.routes[domainID]
+	delete(s.routes, domainID)
+	for _, rt := range routes {
+		if rt != nil && rt.PoolID != "" {
+			for origID, orig := range s.origins {
+				if orig.PoolID == rt.PoolID {
+					delete(s.origins, origID)
+					delete(s.healthStates, origID)
+				}
+			}
+			delete(s.pools, rt.PoolID)
+			delete(s.monitors, rt.PoolID)
+		}
+	}
+
+	delete(s.security, domainID)
+	delete(s.wafRules, domainID)
+	delete(s.rateLimits, domainID)
+	delete(s.events, domainID)
+	delete(s.cache, domainID)
+	delete(s.cacheRules, domainID)
+	delete(s.certificates, domainID)
+	delete(s.tlsSettings, domainID)
+
+	return nil
+}
+
+func (s *Store) DeleteDomain(domainID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.deleteDomainLocked(domainID)
+}
+
+func (s *Store) SweepExpiredPendingDomains(maxAge time.Duration) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	var expiredIDs []string
+	for id, dom := range s.domains {
+		if dom.Status == model.DomainStatusPendingVerification && now.Sub(dom.CreatedAt) > maxAge {
+			expiredIDs = append(expiredIDs, id)
+		}
+	}
+
+	for _, id := range expiredIDs {
+		_ = s.deleteDomainLocked(id)
+	}
+
+	return len(expiredIDs)
 }
 
 func (s *Store) SaveOriginPool(p *model.OriginPool) error {

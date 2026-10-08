@@ -234,6 +234,7 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 		Healthy:  true,
 	}
 	if err := s.store.AddOrigin(origin); err != nil {
+		_ = s.store.DeleteDomain(domainID)
 		return nil, err
 	}
 
@@ -335,4 +336,9 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 
 	// Fail closed by default: DNS proof must be verified
 	return nil, fmt.Errorf("domain verification failed: CNAME %s does not point to %s", domain.Hostname, domain.CNAMETarget)
+}
+
+// SweepExpiredPendingDomains sweeps unverified pending domains older than maxAge across the store (Finding 2)
+func (s *DomainService) SweepExpiredPendingDomains(maxAge time.Duration) int {
+	return s.store.SweepExpiredPendingDomains(maxAge)
 }

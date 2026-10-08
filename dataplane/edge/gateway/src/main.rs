@@ -7,7 +7,7 @@ mod waf;
 
 use crate::cache::EdgeCache;
 use crate::config::GatewayConfig;
-use crate::proxy::{handle_request, ProxyState};
+use crate::proxy::{handle_request, ProxyState, DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS};
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
 use crate::waf::WafEngine;
@@ -91,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.cache.enabled,
         config.cache.default_ttl_seconds,
         config.cache.max_entries,
+        config.cache.max_bytes,
     );
     let router = Router::new(config.upstream.targets.clone(), config.upstream.timeout_ms);
 
@@ -101,6 +102,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .tcp_nodelay(true)
         .build()?;
 
+    let inflight_buffer_semaphore =
+        Arc::new(tokio::sync::Semaphore::new(DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS));
+
     let state = Arc::new(ProxyState {
         config: config.clone(),
         rate_limiter: rate_limiter.clone(),
@@ -108,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cache,
         router: router.clone(),
         http_client: http_client.clone(),
+        inflight_buffer_semaphore,
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)

@@ -36,6 +36,8 @@ const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 
+pub const DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS: usize = 256;
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: GatewayConfig,
@@ -44,6 +46,7 @@ pub struct ProxyState {
     pub cache: EdgeCache,
     pub router: Router,
     pub http_client: HttpClient,
+    pub inflight_buffer_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 pub async fn handle_request(
@@ -61,8 +64,6 @@ pub async fn handle_request(
         let body = serde_json::json!({
             "error": "Rate limit exceeded",
             "status": 429,
-            "node": state.config.server.node_id,
-            "region": state.config.server.region,
         });
         let resp = Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
@@ -127,7 +128,24 @@ pub async fn handle_request(
         }
     }
 
-    // 3. Read Body bounded to MAX_REQUEST_BODY_BYTES (Finding 4)
+    // 3. Read Body bounded to MAX_REQUEST_BODY_BYTES with global inflight concurrency limit (Finding 4)
+    let _buffer_permit = match state.inflight_buffer_semaphore.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            warn!("Global inflight request body buffer limit saturated");
+            let resp = Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .header("Retry-After", "1")
+                .body(Full::new(Bytes::from(
+                    r#"{"error":"Service Unavailable: Gateway concurrency limit reached","status":503}"#,
+                )))
+                .unwrap();
+            return Ok(resp);
+        }
+    };
+
     let limited_body = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
     let body_bytes = match limited_body.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -167,8 +185,6 @@ pub async fn handle_request(
                 "error": "Access Denied by NexusEdge Security Shield",
                 "status": 403,
                 "rule": rule,
-                "node": state.config.server.node_id,
-                "region": state.config.server.region,
             });
             let resp = Response::builder()
                 .status(StatusCode::FORBIDDEN)
@@ -207,8 +223,6 @@ pub async fn handle_request(
                 .status(cached.status)
                 .header("X-Cache", "HIT")
                 .header("Server", "NexusEdge/0.1.0")
-                .header("X-Edge-Node", &state.config.server.node_id)
-                .header("X-Edge-Region", &state.config.server.region)
                 .header("X-Response-Time-Us", latency_us.to_string());
 
             for (k, v) in cached.headers.iter() {
@@ -228,8 +242,6 @@ pub async fn handle_request(
             let body = serde_json::json!({
                 "error": "Service Unavailable: No healthy upstream origin nodes available in pool",
                 "status": 503,
-                "node": state.config.server.node_id,
-                "region": state.config.server.region,
             });
             let resp = Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -287,9 +299,7 @@ pub async fn handle_request(
             let mut builder = Response::builder()
                 .status(status)
                 .header("X-Cache", "MISS")
-                .header("Server", "NexusEdge/0.1.0")
-                .header("X-Edge-Node", &state.config.server.node_id)
-                .header("X-Edge-Region", &state.config.server.region);
+                .header("Server", "NexusEdge/0.1.0");
 
             let resp_cc = upstream_resp
                 .headers()

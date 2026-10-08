@@ -41,20 +41,32 @@ func (c *CachedResponse) Age() int {
 	return int(time.Since(c.CachedAt).Seconds())
 }
 
+const DefaultMaxCacheBytes = 256 * 1024 * 1024 // 256 MiB default hard ceiling (Finding 6)
+
 // CacheEngine manages edge caching, key normalization, evaluation, and invalidation
 type CacheEngine struct {
-	mu      sync.RWMutex
-	storage map[string]*CachedResponse // cacheKey -> CachedResponse
-	maxKeys int
+	mu           sync.RWMutex
+	storage      map[string]*CachedResponse // cacheKey -> CachedResponse
+	maxKeys      int
+	maxBytes     int64
+	currentBytes int64
 }
 
 func NewCacheEngine(maxKeys int) *CacheEngine {
+	return NewCacheEngineWithBytes(maxKeys, DefaultMaxCacheBytes)
+}
+
+func NewCacheEngineWithBytes(maxKeys int, maxBytes int64) *CacheEngine {
 	if maxKeys <= 0 {
 		maxKeys = 100000
 	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxCacheBytes
+	}
 	return &CacheEngine{
-		storage: make(map[string]*CachedResponse),
-		maxKeys: maxKeys,
+		storage:  make(map[string]*CachedResponse),
+		maxKeys:  maxKeys,
+		maxBytes: maxBytes,
 	}
 }
 
@@ -324,27 +336,57 @@ func (e *CacheEngine) Lookup(key string) (*CachedResponse, CacheStatus) {
 	return item, CacheStatusHit
 }
 
-// Store writes a response into the cache
+func responseSize(key string, headers map[string]string, body []byte) int64 {
+	size := int64(len(key) + len(body))
+	for k, v := range headers {
+		size += int64(len(k) + len(v) + 32)
+	}
+	return size + 128 // memory overhead estimate
+}
+
+// Store writes a response into the cache respecting both maxKeys and maxBytes limits
 func (e *CacheEngine) Store(key string, statusCode int, headers map[string]string, body []byte, ttlSeconds int) *CachedResponse {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if len(e.storage) >= e.maxKeys {
-		evicted := false
+	entryBytes := responseSize(key, headers, body)
+	if entryBytes > e.maxBytes {
+		return nil
+	}
+
+	// If replacing an existing key, deduct previous size
+	if existing, ok := e.storage[key]; ok {
+		e.currentBytes -= responseSize(existing.Key, existing.Headers, existing.Body)
+	}
+
+	// Evict entries while over key count or byte ceiling (Finding 6)
+	for (len(e.storage) >= e.maxKeys || e.currentBytes+entryBytes > e.maxBytes) && len(e.storage) > 0 {
+		var victimKey string
+		var oldestExpiry time.Time
+
+		// Evict expired first, or earliest expiring entry
 		for k, v := range e.storage {
 			if time.Now().After(v.ExpiresAt) {
-				delete(e.storage, k)
-				evicted = true
+				victimKey = k
 				break
 			}
-		}
-		if !evicted {
-			// Enforce hard bound: evict arbitrary key if none are expired (Finding 20)
-			for k := range e.storage {
-				delete(e.storage, k)
-				break
+			if victimKey == "" || v.ExpiresAt.Before(oldestExpiry) {
+				victimKey = k
+				oldestExpiry = v.ExpiresAt
 			}
 		}
+
+		if victimKey != "" {
+			victim := e.storage[victimKey]
+			delete(e.storage, victimKey)
+			e.currentBytes -= responseSize(victim.Key, victim.Headers, victim.Body)
+		} else {
+			break
+		}
+	}
+
+	if e.currentBytes < 0 {
+		e.currentBytes = 0
 	}
 
 	now := time.Now().UTC()
@@ -363,6 +405,7 @@ func (e *CacheEngine) Store(key string, statusCode int, headers map[string]strin
 	}
 
 	e.storage[key] = cached
+	e.currentBytes += entryBytes
 	return cached
 }
 
@@ -374,13 +417,25 @@ func (e *CacheEngine) Purge(target string) int {
 	purged := 0
 	target = strings.TrimSpace(target)
 
-	for k := range e.storage {
+	for k, v := range e.storage {
 		if target == "*" || k == target || strings.HasPrefix(k, target) ||
 			strings.HasPrefix(k, "https://"+target) || strings.HasPrefix(k, "http://"+target) {
 			delete(e.storage, k)
+			e.currentBytes -= responseSize(v.Key, v.Headers, v.Body)
 			purged++
 		}
 	}
 
+	if e.currentBytes < 0 {
+		e.currentBytes = 0
+	}
+
 	return purged
+}
+
+// CurrentBytes returns the active in-memory byte total of cached items
+func (e *CacheEngine) CurrentBytes() int64 {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.currentBytes
 }

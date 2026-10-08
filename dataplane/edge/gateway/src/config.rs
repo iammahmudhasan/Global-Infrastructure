@@ -45,6 +45,12 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub default_ttl_seconds: u64,
     pub max_entries: usize,
+    #[serde(default = "default_max_cache_bytes")]
+    pub max_bytes: usize,
+}
+
+fn default_max_cache_bytes() -> usize {
+    100 * 1024 * 1024 // 100 MB hard ceiling
 }
 
 impl Default for GatewayConfig {
@@ -75,6 +81,7 @@ impl Default for GatewayConfig {
                 enabled: true,
                 default_ttl_seconds: 60,
                 max_entries: 10000,
+                max_bytes: 100 * 1024 * 1024,
             },
         }
     }

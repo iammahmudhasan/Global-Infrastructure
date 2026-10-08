@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -349,5 +350,121 @@ func TestStore_SetterMutationResistance(t *testing.T) {
 	freshCache := st.GetCachePolicy("dom-postsave")
 	if freshCache.DefaultTTLSeconds != 300 {
 		t.Errorf("store cache policy mutated post-save! Expected 300, got %d", freshCache.DefaultTTLSeconds)
+	}
+}
+
+func TestStore_ProjectDomainQuota(t *testing.T) {
+	st := store.NewStore()
+	projectID := "prj-quota-test"
+	st.SetProjectQuota(projectID, store.ProjectQuota{MaxDomains: 2})
+
+	d1 := &model.Domain{ID: "dom-q1", ProjectID: projectID, Hostname: "q1.example.com", Status: model.DomainStatusPendingVerification}
+	d2 := &model.Domain{ID: "dom-q2", ProjectID: projectID, Hostname: "q2.example.com", Status: model.DomainStatusPendingVerification}
+	d3 := &model.Domain{ID: "dom-q3", ProjectID: projectID, Hostname: "q3.example.com", Status: model.DomainStatusPendingVerification}
+
+	if err := st.SaveDomain(d1); err != nil {
+		t.Fatalf("unexpected error saving d1: %v", err)
+	}
+	if err := st.SaveDomain(d2); err != nil {
+		t.Fatalf("unexpected error saving d2: %v", err)
+	}
+
+	// 3rd domain must exceed quota
+	err := st.SaveDomain(d3)
+	if !errors.Is(err, store.ErrProjectQuotaExceeded) {
+		t.Fatalf("expected ErrProjectQuotaExceeded, got %v", err)
+	}
+
+	// Deleting d1 should free up quota
+	if err := st.DeleteDomain("dom-q1"); err != nil {
+		t.Fatalf("failed to delete d1: %v", err)
+	}
+
+	if err := st.SaveDomain(d3); err != nil {
+		t.Fatalf("expected d3 save to succeed after deleting d1, got %v", err)
+	}
+}
+
+func TestStore_DeleteDomainCascade(t *testing.T) {
+	st := store.NewStore()
+	domainID := "dom-cascade-test"
+	poolID := "pool-cascade-test"
+
+	_ = st.SaveDomain(&model.Domain{ID: domainID, ProjectID: "p1", Hostname: "cascade.example.com"})
+	_ = st.SaveOriginPool(&model.OriginPool{ID: poolID, ProjectID: "p1", Name: "pool-1"})
+	_ = st.AddOrigin(&model.Origin{ID: "orig-1", PoolID: poolID, Address: "1.1.1.1", Port: 443, Protocol: model.ProtocolHTTPS})
+	st.SaveRoute(&model.Route{ID: "rt-1", DomainID: domainID, PoolID: poolID, PathPrefix: "/"})
+	st.SaveSecurityPolicy(&model.SecurityPolicy{ID: "sec-1", DomainID: domainID, WAFEnabled: true})
+	st.SaveCachePolicy(&model.CachePolicy{ID: "c-1", DomainID: domainID, CacheEnabled: true})
+
+	// Delete domain
+	if err := st.DeleteDomain(domainID); err != nil {
+		t.Fatalf("failed to delete domain: %v", err)
+	}
+
+	// Verify all cascades were deleted
+	if _, err := st.GetDomain(domainID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("domain still exists after delete")
+	}
+	if _, err := st.GetDomainByHost("cascade.example.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("hostIndex still has domain after delete")
+	}
+	if len(st.GetRoutes(domainID)) != 0 {
+		t.Errorf("routes still exist after delete")
+	}
+	if _, err := st.GetOriginPool(poolID); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("pool still exists after delete")
+	}
+	if st.GetSecurityPolicy(domainID) != nil {
+		t.Errorf("security policy still exists after delete")
+	}
+	if st.GetCachePolicy(domainID) != nil {
+		t.Errorf("cache policy still exists after delete")
+	}
+}
+
+func TestStore_SweepExpiredPendingDomains(t *testing.T) {
+	st := store.NewStore()
+
+	// 1. Old pending domain (should be swept)
+	st.SaveDomain(&model.Domain{
+		ID:        "dom-old-pending",
+		ProjectID: "p1",
+		Hostname:  "old.example.com",
+		Status:    model.DomainStatusPendingVerification,
+		CreatedAt: time.Now().UTC().Add(-48 * time.Hour),
+	})
+
+	// 2. Fresh pending domain (should NOT be swept)
+	st.SaveDomain(&model.Domain{
+		ID:        "dom-fresh-pending",
+		ProjectID: "p1",
+		Hostname:  "fresh.example.com",
+		Status:    model.DomainStatusPendingVerification,
+		CreatedAt: time.Now().UTC().Add(-1 * time.Hour),
+	})
+
+	// 3. Old active domain (should NOT be swept)
+	st.SaveDomain(&model.Domain{
+		ID:        "dom-old-active",
+		ProjectID: "p1",
+		Hostname:  "active.example.com",
+		Status:    model.DomainStatusActive,
+		CreatedAt: time.Now().UTC().Add(-48 * time.Hour),
+	})
+
+	swept := st.SweepExpiredPendingDomains(24 * time.Hour)
+	if swept != 1 {
+		t.Fatalf("expected 1 swept domain, got %d", swept)
+	}
+
+	if _, err := st.GetDomain("dom-old-pending"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("expected old pending domain to be swept")
+	}
+	if _, err := st.GetDomain("dom-fresh-pending"); err != nil {
+		t.Errorf("fresh pending domain should remain")
+	}
+	if _, err := st.GetDomain("dom-old-active"); err != nil {
+		t.Errorf("old active domain should remain")
 	}
 }

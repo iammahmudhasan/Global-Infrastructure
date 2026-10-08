@@ -203,3 +203,43 @@ func TestCacheEngineLookupStorePurge(t *testing.T) {
 		t.Fatalf("expected MISS after purge, got %s", status)
 	}
 }
+
+func TestCacheEngine_ByteLimitEviction(t *testing.T) {
+	// Configure engine with room for only ~300 bytes (room for roughly 1 entry)
+	engine := cache.NewCacheEngineWithBytes(100, 350)
+
+	body1 := []byte("first-sample-payload")
+	stored1 := engine.Store("https://example.com/asset1", 200, map[string]string{"Content-Type": "text/plain"}, body1, 60)
+	if stored1 == nil {
+		t.Fatalf("expected stored1 to succeed")
+	}
+
+	if engine.CurrentBytes() <= 0 {
+		t.Fatalf("expected currentBytes > 0, got %d", engine.CurrentBytes())
+	}
+
+	// Store second entry which forces eviction of asset1 due to byte limit
+	body2 := []byte("second-sample-payload")
+	stored2 := engine.Store("https://example.com/asset2", 200, map[string]string{"Content-Type": "text/plain"}, body2, 120)
+	if stored2 == nil {
+		t.Fatalf("expected stored2 to succeed")
+	}
+
+	// asset1 should be evicted
+	_, status1 := engine.Lookup("https://example.com/asset1")
+	if status1 != cache.CacheStatusMiss {
+		t.Errorf("expected asset1 to be evicted due to byte budget, got %s", status1)
+	}
+
+	// asset2 should be present
+	_, status2 := engine.Lookup("https://example.com/asset2")
+	if status2 != cache.CacheStatusHit {
+		t.Errorf("expected asset2 to be present, got %s", status2)
+	}
+
+	// Purge asset2 and check currentBytes returns to 0
+	engine.Purge("https://example.com/asset2")
+	if engine.CurrentBytes() != 0 {
+		t.Errorf("expected 0 bytes after purge, got %d", engine.CurrentBytes())
+	}
+}

@@ -17,22 +17,47 @@ pub struct CachedResponse {
     pub vary_headers: Vec<(String, Option<String>)>,
 }
 
-/// Bounded earliest-expiry eviction cache with RFC 9111 Vary header support.
+impl CachedResponse {
+    /// Calculate the memory footprint of this cached entry
+    pub fn size_in_bytes(&self) -> usize {
+        let headers_bytes: usize = self
+            .headers
+            .iter()
+            .map(|(k, v)| k.as_str().len() + v.len() + 32)
+            .sum();
+        let vary_bytes: usize = self
+            .vary_headers
+            .iter()
+            .map(|(k, v)| k.len() + v.as_ref().map_or(0, |s| s.len()) + 32)
+            .sum();
+        self.body.len() + headers_bytes + vary_bytes + 64
+    }
+}
+
+#[derive(Default)]
+struct CacheStore {
+    current_bytes: usize,
+    entries: HashMap<String, Vec<CachedResponse>>,
+}
+
+/// Bounded earliest-expiry eviction cache with RFC 9111 Vary header and byte limit support.
 #[derive(Clone)]
 pub struct EdgeCache {
     enabled: bool,
     default_ttl: Duration,
     max_entries: usize,
-    store: Arc<RwLock<HashMap<String, Vec<CachedResponse>>>>,
+    max_bytes: usize,
+    store: Arc<RwLock<CacheStore>>,
 }
 
 impl EdgeCache {
-    pub fn new(enabled: bool, ttl_seconds: u64, max_entries: usize) -> Self {
+    pub fn new(enabled: bool, ttl_seconds: u64, max_entries: usize, max_bytes: usize) -> Self {
         Self {
             enabled,
             default_ttl: Duration::from_secs(ttl_seconds),
             max_entries,
-            store: Arc::new(RwLock::new(HashMap::new())),
+            max_bytes: if max_bytes == 0 { 100 * 1024 * 1024 } else { max_bytes },
+            store: Arc::new(RwLock::new(CacheStore::default())),
         }
     }
 
@@ -43,7 +68,7 @@ impl EdgeCache {
         }
 
         let store = self.store.read().unwrap();
-        if let Some(variants) = store.get(key) {
+        if let Some(variants) = store.entries.get(key) {
             let now = Instant::now();
             for entry in variants {
                 if now < entry.expires_at {
@@ -78,7 +103,7 @@ impl EdgeCache {
         custom_ttl: Option<Duration>,
         req_headers: Option<&HeaderMap>,
     ) {
-        if !self.enabled || self.max_entries == 0 || !status.is_success() {
+        if !self.enabled || self.max_entries == 0 || self.max_bytes == 0 || !status.is_success() {
             return;
         }
 
@@ -124,77 +149,108 @@ impl EdgeCache {
             vary_headers,
         };
 
+        let entry_bytes = entry.size_in_bytes();
+        if entry_bytes > self.max_bytes {
+            return; // Individual entry exceeds entire cache capacity
+        }
+
         let mut store = self.store.write().unwrap();
 
-        // 1. If an exact variant already exists for this key, update in-place without evicting others (Finding 8)
-        if let Some(variants) = store.get_mut(&key) {
-            if let Some(existing) = variants
-                .iter_mut()
-                .find(|v| v.vary_headers == entry.vary_headers)
-            {
-                *existing = entry;
-                return;
-            }
+        // 1. If an exact variant already exists for this key, update in-place
+        let existing_match = store.entries.get(&key).and_then(|variants| {
+            variants
+                .iter()
+                .position(|v| v.vary_headers == entry.vary_headers)
+                .map(|idx| (idx, variants[idx].size_in_bytes()))
+        });
+        if let Some((idx, old_bytes)) = existing_match {
+            store.entries.get_mut(&key).unwrap()[idx] = entry;
+            store.current_bytes = store.current_bytes.saturating_sub(old_bytes) + entry_bytes;
+            return;
         }
 
-        // 2. Count total active variants across all keys for new variant insertion
-        let mut total_entries: usize = store.values().map(|v| v.len()).sum();
+        // 2. Count total active variants across all keys
+        let mut total_entries: usize = store.entries.values().map(|v| v.len()).sum();
 
-        if total_entries >= self.max_entries {
-            // 1. Evict expired entries
+        // 3. Evict expired entries if approaching count or byte limit
+        if total_entries >= self.max_entries || store.current_bytes + entry_bytes > self.max_bytes {
             let now = Instant::now();
-            for variants in store.values_mut() {
-                variants.retain(|v| v.expires_at > now);
+            let mut expired_bytes = 0usize;
+            for variants in store.entries.values_mut() {
+                variants.retain(|v| {
+                    if v.expires_at <= now {
+                        expired_bytes += v.size_in_bytes();
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
-            store.retain(|_, v| !v.is_empty());
+            store.current_bytes = store.current_bytes.saturating_sub(expired_bytes);
+            store.entries.retain(|_, v| !v.is_empty());
+            total_entries = store.entries.values().map(|v| v.len()).sum();
+        }
 
-            // Recalculate count
-            total_entries = store.values().map(|v| v.len()).sum();
+        // 4. Hard capacity guarantee (both count and byte budget): Evict earliest expiring entry until within limits
+        while (total_entries >= self.max_entries || store.current_bytes + entry_bytes > self.max_bytes) && !store.entries.is_empty() {
+            let mut earliest_expiry: Option<(String, usize, Instant)> = None;
 
-            // 2. Hard capacity guarantee: Evict earliest expiring entry
-            if total_entries >= self.max_entries {
-                let mut earliest_expiry: Option<(String, usize, Instant)> = None;
-
-                for (k, variants) in store.iter() {
-                    for (idx, v) in variants.iter().enumerate() {
-                        match earliest_expiry {
-                            None => earliest_expiry = Some((k.clone(), idx, v.expires_at)),
-                            Some((_, _, min_exp)) if v.expires_at < min_exp => {
-                                earliest_expiry = Some((k.clone(), idx, v.expires_at));
-                            }
-                            _ => {}
+            for (k, variants) in store.entries.iter() {
+                for (idx, v) in variants.iter().enumerate() {
+                    match earliest_expiry {
+                        None => earliest_expiry = Some((k.clone(), idx, v.expires_at)),
+                        Some((_, _, min_exp)) if v.expires_at < min_exp => {
+                            earliest_expiry = Some((k.clone(), idx, v.expires_at));
                         }
+                        _ => {}
                     }
                 }
+            }
 
-                if let Some((victim_key, victim_idx, _)) = earliest_expiry {
-                    if let Some(variants) = store.get_mut(&victim_key) {
-                        if victim_idx < variants.len() {
-                            variants.remove(victim_idx);
-                        }
-                    }
-                    if let Some(variants) = store.get(&victim_key) {
-                        if variants.is_empty() {
-                            store.remove(&victim_key);
-                        }
+            if let Some((victim_key, victim_idx, _)) = earliest_expiry {
+                let mut victim_bytes = 0;
+                if let Some(variants) = store.entries.get_mut(&victim_key) {
+                    if victim_idx < variants.len() {
+                        let victim = variants.remove(victim_idx);
+                        victim_bytes = victim.size_in_bytes();
                     }
                 }
+                store.current_bytes = store.current_bytes.saturating_sub(victim_bytes);
+                if let Some(variants) = store.entries.get(&victim_key) {
+                    if variants.is_empty() {
+                        store.entries.remove(&victim_key);
+                    }
+                }
+                total_entries = store.entries.values().map(|v| v.len()).sum();
+            } else {
+                break;
             }
         }
 
-        let variants = store.entry(key).or_default();
+        // 5. Insert new variant and increment byte count
+        store.current_bytes += entry_bytes;
+        let variants = store.entries.entry(key).or_default();
         variants.push(entry);
     }
 
     #[allow(dead_code)]
     pub fn purge(&self, key: &str) {
         let mut store = self.store.write().unwrap();
-        store.remove(key);
+        if let Some(variants) = store.entries.remove(key) {
+            for v in variants {
+                store.current_bytes = store.current_bytes.saturating_sub(v.size_in_bytes());
+            }
+        }
     }
 
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.store.read().unwrap().values().map(|v| v.len()).sum()
+        self.store.read().unwrap().entries.values().map(|v| v.len()).sum()
+    }
+
+    #[allow(dead_code)]
+    pub fn current_bytes(&self) -> usize {
+        self.store.read().unwrap().current_bytes
     }
 }
 
@@ -205,7 +261,7 @@ mod tests {
 
     #[test]
     fn test_zero_max_entries_guard() {
-        let cache = EdgeCache::new(true, 3600, 0);
+        let cache = EdgeCache::new(true, 3600, 0, 1024 * 1024);
         let headers = HeaderMap::new();
         let body = Bytes::from("payload");
 
@@ -223,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_hard_max_entries_eviction() {
-        let cache = EdgeCache::new(true, 3600, 2);
+        let cache = EdgeCache::new(true, 3600, 2, 1024 * 1024);
         let headers = HeaderMap::new();
         let body = Bytes::from("payload");
 
@@ -265,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_vary_header_isolation() {
-        let cache = EdgeCache::new(true, 3600, 10);
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert("vary", HeaderValue::from_static("Origin, Accept-Language"));
 
@@ -326,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_vary_star_rejected() {
-        let cache = EdgeCache::new(true, 3600, 10);
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert("vary", HeaderValue::from_static("*"));
 
@@ -345,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_vary_missing_vs_empty_and_multiple_headers() {
-        let cache = EdgeCache::new(true, 3600, 10);
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
         let mut resp_headers = HeaderMap::new();
         // Multiple Vary header lines
         resp_headers.append("vary", HeaderValue::from_static("X-Custom-Auth"));
@@ -396,7 +452,7 @@ mod tests {
     #[test]
     fn test_in_place_variant_replacement_does_not_evict_other_entries() {
         // Cache at capacity limit 2
-        let cache = EdgeCache::new(true, 3600, 2);
+        let cache = EdgeCache::new(true, 3600, 2, 1024 * 1024);
 
         // Insert key1
         cache.put(
@@ -449,5 +505,48 @@ mod tests {
         let hit_k1 = cache.get("key1", None);
         assert!(hit_k1.is_some());
         assert_eq!(hit_k1.unwrap().body, Bytes::from("updated-payload-1"));
+    }
+
+    #[test]
+    fn test_byte_limit_eviction() {
+        // P1 Finding 1: EdgeCache hard byte limit enforcement
+        let dummy_resp = CachedResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from_static(b"sample"),
+            expires_at: Instant::now(),
+            vary_headers: vec![],
+        };
+        let single_entry_bytes = dummy_resp.size_in_bytes();
+
+        // Allow max 100 entries, but only enough bytes for 1 entry
+        let max_bytes = single_entry_bytes + 20;
+        let cache = EdgeCache::new(true, 3600, 100, max_bytes);
+
+        cache.put(
+            "key1".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(b"sample"),
+            Some(Duration::from_secs(10)),
+            None,
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(cache.current_bytes() <= max_bytes);
+
+        // Inserting key2 should exceed byte limit and evict key1
+        cache.put(
+            "key2".to_string(),
+            StatusCode::OK,
+            HeaderMap::new(),
+            Bytes::from_static(b"sample"),
+            Some(Duration::from_secs(20)),
+            None,
+        );
+
+        assert_eq!(cache.len(), 1, "key1 should be evicted due to byte limit");
+        assert!(cache.get("key1", None).is_none());
+        assert!(cache.get("key2", None).is_some());
+        assert!(cache.current_bytes() <= max_bytes);
     }
 }

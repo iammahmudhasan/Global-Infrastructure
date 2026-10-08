@@ -205,6 +205,10 @@ func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, 
 
 	res, err := h.service.OnboardDomain(req)
 	if err != nil {
+		if errors.Is(err, store.ErrProjectQuotaExceeded) || strings.Contains(err.Error(), "quota exceeded") {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		if strings.Contains(err.Error(), "already exists") {
 			writeError(w, http.StatusConflict, err.Error())
 			return
@@ -249,12 +253,24 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 
 	if len(parts) == 1 {
 		// /v1/domains/{domain_id}
-		if r.Method == http.MethodGet {
+		switch r.Method {
+		case http.MethodGet:
 			writeJSON(w, http.StatusOK, domain)
 			return
+		case http.MethodDelete:
+			if err := h.store.DeleteDomain(domainID); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"status":    "deleted",
+				"domain_id": domainID,
+			})
+			return
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
 		}
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
 	}
 
 	action := parts[1]
