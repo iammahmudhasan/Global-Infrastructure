@@ -98,12 +98,14 @@ func GenerateCacheKey(scheme, host, path, rawQuery string, reqHeaders http.Heade
 	}
 
 	// 4. Custom Vary Headers in Key
-	if len(customHeaders) > 0 && reqHeaders != nil {
+	if len(customHeaders) > 0 {
 		sort.Strings(customHeaders)
 		var headerParts []string
 		for _, h := range customHeaders {
-			val := reqHeaders.Get(h)
-			if val != "" {
+			val, present := getHeaderPresence(reqHeaders, h)
+			if !present {
+				headerParts = append(headerParts, fmt.Sprintf("%s=__absent__", strings.ToLower(h)))
+			} else {
 				headerParts = append(headerParts, fmt.Sprintf("%s=%s", strings.ToLower(h), strings.TrimSpace(val)))
 			}
 		}
@@ -113,6 +115,22 @@ func GenerateCacheKey(scheme, host, path, rawQuery string, reqHeaders http.Heade
 	}
 
 	return baseKey
+}
+
+func getHeaderPresence(headers http.Header, name string) (string, bool) {
+	if headers == nil {
+		return "", false
+	}
+	if vals, ok := headers[http.CanonicalHeaderKey(name)]; ok {
+		return strings.Join(vals, ","), true
+	}
+	lowerName := strings.ToLower(name)
+	for k, vals := range headers {
+		if strings.ToLower(k) == lowerName {
+			return strings.Join(vals, ","), true
+		}
+	}
+	return "", false
 }
 
 func normalizeQueryString(rawQuery string, mode model.QueryStringHandling, ignored, included []string) string {

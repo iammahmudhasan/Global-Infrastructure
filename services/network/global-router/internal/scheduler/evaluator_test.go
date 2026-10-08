@@ -149,8 +149,11 @@ func TestIdempotency(t *testing.T) {
 		t.Fatalf("second evaluation failed: %v", err)
 	}
 
-	if decision1 != decision2 {
-		t.Errorf("expected identical cached pointer for idempotent key")
+	if decision1 == decision2 {
+		t.Errorf("expected distinct pointer copies for idempotent key to prevent mutation leakage")
+	}
+	if decision1.WorkloadID != decision2.WorkloadID || decision1.AssignedBackend.ID != decision2.AssignedBackend.ID {
+		t.Errorf("expected identical decision contents for idempotent key, got %+v vs %+v", decision1, decision2)
 	}
 }
 
@@ -419,3 +422,47 @@ func TestSchedulerEnforcesCircuitBreakerAdmission(t *testing.T) {
 		t.Fatalf("expected rejection when circuit breaker is OPEN, got nil error")
 	}
 }
+
+func TestIdempotencyDecisionPointerIsolation(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
+
+	policy := scheduler.DispatchPolicy{
+		WorkloadID:     "idempotent-wl-1",
+		TenantID:       "tenant-test",
+		ProjectID:      "proj-test",
+		IdempotencyKey: "idem-key-isolate",
+		Objective:      scheduler.ObjectiveLatency,
+	}
+
+	d1, err := eval.Evaluate(policy)
+	if err != nil {
+		t.Fatalf("first evaluate failed: %v", err)
+	}
+
+	origBackend := d1.AssignedBackend.ID
+	origGPUs := d1.GPUsAllocated
+	origReasonCodesLen := len(d1.ReasonCodes)
+
+	// Mutate the returned decision object
+	d1.AssignedBackend.ID = "mutated-backend-id"
+	d1.GPUsAllocated = 99999
+	d1.ReasonCodes = append(d1.ReasonCodes, "tampered-code")
+
+	// Call Evaluate again with same idempotency key
+	d2, err := eval.Evaluate(policy)
+	if err != nil {
+		t.Fatalf("second evaluate failed: %v", err)
+	}
+
+	if d2.AssignedBackend.ID != origBackend {
+		t.Errorf("cached decision backend was mutated! Expected %s, got %s", origBackend, d2.AssignedBackend.ID)
+	}
+	if d2.GPUsAllocated != origGPUs {
+		t.Errorf("cached decision GPUs was mutated! Expected %d, got %d", origGPUs, d2.GPUsAllocated)
+	}
+	if len(d2.ReasonCodes) != origReasonCodesLen {
+		t.Errorf("cached decision reason codes slice was mutated! Expected len %d, got %d", origReasonCodesLen, len(d2.ReasonCodes))
+	}
+}
+

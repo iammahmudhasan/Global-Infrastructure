@@ -15,6 +15,14 @@ type contextKey string
 const (
 	TenantContextKey  contextKey = "tenant_id"
 	ProjectContextKey contextKey = "project_id"
+	RoleContextKey    contextKey = "role"
+)
+
+type Role string
+
+const (
+	RoleTenant           Role = "TENANT"
+	RolePlatformOperator Role = "PLATFORM_OPERATOR"
 )
 
 var (
@@ -28,6 +36,7 @@ type TenantRecord struct {
 	TenantID  string
 	ProjectID string
 	APIKey    string
+	Role      Role
 	Active    bool
 }
 
@@ -45,14 +54,24 @@ func NewAuthenticator() *Authenticator {
 	return a
 }
 
-// loadFromEnv loads API keys from NEXUSEDGE_API_KEYS (format: key:tenant_id:project_id,...)
-// or loads clearly labeled development mock keys if NEXUSEDGE_DEV_MODE is enabled.
+func isExplicitDevEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "development" || env == "test"
+}
+
+// loadFromEnv loads API keys from NEXUSEDGE_API_KEYS (format: key:tenant_id:project_id[:role],...)
+// or loads clearly labeled development mock keys if NEXUSEDGE_DEV_MODE is enabled in an explicit dev environment.
 func (a *Authenticator) loadFromEnv() {
 	rawKeys := os.Getenv("NEXUSEDGE_API_KEYS")
 	if rawKeys != "" {
 		for _, entry := range strings.Split(rawKeys, ",") {
 			parts := strings.Split(strings.TrimSpace(entry), ":")
-			if len(parts) == 3 {
+			if len(parts) == 4 {
+				a.RegisterTenantWithRole(parts[0], parts[1], parts[2], Role(strings.ToUpper(parts[3])))
+			} else if len(parts) == 3 {
 				a.RegisterTenant(parts[0], parts[1], parts[2])
 			}
 		}
@@ -60,21 +79,43 @@ func (a *Authenticator) loadFromEnv() {
 	}
 
 	// In explicit local development mode, register synthetic mock fixtures
-	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
-		a.RegisterTenant("dev-fixture-adminkey-mock-01", "tenant-system", "proj-core")
-		a.RegisterTenant("dev-fixture-banking-mock-01", "tenant-cbr-banking", "proj-fintech-prod")
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
+		a.RegisterTenantWithRole("dev-fixture-adminkey-mock-01", "tenant-system", "proj-core", RolePlatformOperator)
+		a.RegisterTenantWithRole("dev-fixture-banking-mock-01", "tenant-cbr-banking", "proj-fintech-prod", RoleTenant)
 	}
 }
 
 func (a *Authenticator) RegisterTenant(apiKey, tenantID, projectID string) {
+	a.RegisterTenantWithRole(apiKey, tenantID, projectID, RoleTenant)
+}
+
+func (a *Authenticator) RegisterTenantWithRole(apiKey, tenantID, projectID string, role Role) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if role == "" {
+		role = RoleTenant
+	}
 	a.tenants[apiKey] = &TenantRecord{
 		TenantID:  tenantID,
 		ProjectID: projectID,
 		APIKey:    apiKey,
+		Role:      role,
 		Active:    true,
 	}
+}
+
+// AuthorizeRole checks whether the authenticated identity has one of the allowed roles
+func (a *Authenticator) AuthorizeRole(ctx context.Context, allowedRoles ...Role) bool {
+	r, ok := ctx.Value(RoleContextKey).(Role)
+	if !ok || r == "" {
+		return false
+	}
+	for _, req := range allowedRoles {
+		if r == req {
+			return true
+		}
+	}
+	return false
 }
 
 // ValidateKey verifies API key in constant time to prevent timing attacks (Rule 17)
@@ -130,6 +171,7 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 
 		ctx := context.WithValue(r.Context(), TenantContextKey, record.TenantID)
 		ctx = context.WithValue(ctx, ProjectContextKey, record.ProjectID)
+		ctx = context.WithValue(ctx, RoleContextKey, record.Role)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

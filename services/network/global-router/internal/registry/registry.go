@@ -397,3 +397,29 @@ func (r *Registry) Release(workloadID string) error {
 	delete(r.reservations, workloadID)
 	return nil
 }
+
+// SweepExpiredReservations reclaims GPU capacity from abandoned or leaked reservations exceeding ttl.
+// It also resets in-flight trial probes on the backend's circuit breaker to prevent deadlock.
+func (r *Registry) SweepExpiredReservations(ttl time.Duration) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	swept := 0
+	for wid, res := range r.reservations {
+		if time.Since(res.ReservedAt) >= ttl {
+			if b, ok := r.backends[res.BackendID]; ok {
+				b.AvailableGPUs += res.GPUs
+				if b.ActiveWorkloads > 0 {
+					b.ActiveWorkloads--
+				}
+				if b.Breaker != nil {
+					b.Breaker.ReleaseTrial()
+					b.CircuitState = b.Breaker.State()
+				}
+			}
+			delete(r.reservations, wid)
+			swept++
+		}
+	}
+	return swept
+}

@@ -62,7 +62,7 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		idempotencyKey = fmt.Sprintf("%s:%s:%s", policy.TenantID, projectScope, policy.IdempotencyKey)
 		if cached, found := e.idempotency[idempotencyKey]; found {
 			if now.Before(cached.expiresAt) {
-				return cached.decision, nil
+				return cloneDecision(cached.decision), nil
 			}
 		}
 	}
@@ -280,7 +280,25 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 	}
 
 	e.recordIdempotencyLocked(idempotencyKey, decision)
-	return decision, nil
+	return cloneDecision(decision), nil
+}
+
+func cloneDecision(d *DispatchDecision) *DispatchDecision {
+	if d == nil {
+		return nil
+	}
+	cp := *d
+	if d.AssignedBackend != nil {
+		backend := *d.AssignedBackend
+		cp.AssignedBackend = &backend
+	}
+	if d.ReasonCodes != nil {
+		cp.ReasonCodes = append([]string(nil), d.ReasonCodes...)
+	}
+	if d.Alternatives != nil {
+		cp.Alternatives = append([]string(nil), d.Alternatives...)
+	}
+	return &cp
 }
 
 func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecision) {
@@ -288,7 +306,7 @@ func (e *Evaluator) recordIdempotencyLocked(key string, decision *DispatchDecisi
 		return
 	}
 	e.idempotency[key] = &cachedDecision{
-		decision:  decision,
+		decision:  cloneDecision(decision),
 		expiresAt: time.Now().Add(24 * time.Hour),
 	}
 }

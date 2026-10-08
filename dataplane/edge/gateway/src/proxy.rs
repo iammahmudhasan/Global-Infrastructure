@@ -76,7 +76,23 @@ pub async fn handle_request(
 
     // 2. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();
-    let host = resolve_host(&req_headers, req.uri());
+    let host = match resolve_host(&req_headers, req.uri()) {
+        Ok(h) => h,
+        Err(status) => {
+            let body = serde_json::json!({
+                "error": "Bad Request",
+                "message": "Host and authority mismatch or missing host header",
+                "status": status.as_u16(),
+            });
+            let resp = Response::builder()
+                .status(status)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+    };
 
     let user_agent = req_headers
         .get("user-agent")
@@ -289,7 +305,7 @@ pub async fn handle_request(
                     HeaderName::from_bytes(k.as_str().as_bytes()),
                     HeaderValue::from_bytes(v.as_bytes()),
                 ) {
-                    headers_to_cache.insert(hn.clone(), hv.clone());
+                    headers_to_cache.append(hn.clone(), hv.clone());
                     builder = builder.header(hn, hv);
                 }
             }
@@ -374,15 +390,24 @@ pub async fn handle_request(
 }
 
 /// Resolves target host according to RFC 9110 / HTTP/2 semantics:
-/// Prefers the Host header when present; falls back to URI authority (e.g. from HTTP/2 :authority);
-/// defaults to "localhost" if both are absent.
-pub fn resolve_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> String {
-    headers
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| uri.authority().map(|a| a.as_str().to_owned()))
-        .unwrap_or_else(|| "localhost".to_string())
+/// Rejects ambiguous requests where both Host and :authority are present but mismatch (RFC 9113 §8.3.1).
+/// Prefers the matching host/authority; fails closed if neither is present.
+pub fn resolve_host(headers: &hyper::HeaderMap, uri: &hyper::Uri) -> Result<String, StatusCode> {
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+    let authority = uri.authority().map(|a| a.as_str());
+
+    match (host, authority) {
+        (Some(h), Some(a)) => {
+            if !h.eq_ignore_ascii_case(a) {
+                Err(StatusCode::BAD_REQUEST)
+            } else {
+                Ok(h.to_string())
+            }
+        }
+        (Some(h), None) => Ok(h.to_string()),
+        (None, Some(a)) => Ok(a.to_string()),
+        (None, None) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 /// Identifies standard RFC 9110 / RFC 7230 hop-by-hop response headers
@@ -458,26 +483,50 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_host_with_host_header() {
+    fn test_resolve_host_with_host_header_only() {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("host", "customer-a.example.com".parse().unwrap());
         let uri: hyper::Uri = "/api/v1".parse().unwrap();
-        assert_eq!(resolve_host(&headers, &uri), "customer-a.example.com");
+        assert_eq!(
+            resolve_host(&headers, &uri).unwrap(),
+            "customer-a.example.com"
+        );
     }
 
     #[test]
-    fn test_resolve_host_http2_authority() {
+    fn test_resolve_host_http2_authority_only() {
         let headers = hyper::HeaderMap::new();
-        // In HTTP/2, :authority is parsed into URI authority while Host header is absent
         let uri: hyper::Uri = "https://customer-b.example.com/api/v1".parse().unwrap();
-        assert_eq!(resolve_host(&headers, &uri), "customer-b.example.com");
+        assert_eq!(
+            resolve_host(&headers, &uri).unwrap(),
+            "customer-b.example.com"
+        );
     }
 
     #[test]
-    fn test_resolve_host_fallback_localhost() {
+    fn test_resolve_host_matching_host_and_authority() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("host", "customer-a.example.com".parse().unwrap());
+        let uri: hyper::Uri = "https://customer-a.example.com/api/v1".parse().unwrap();
+        assert_eq!(
+            resolve_host(&headers, &uri).unwrap(),
+            "customer-a.example.com"
+        );
+    }
+
+    #[test]
+    fn test_resolve_host_mismatch_rejected() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("host", "attacker.example.com".parse().unwrap());
+        let uri: hyper::Uri = "https://customer-a.example.com/api/v1".parse().unwrap();
+        assert_eq!(resolve_host(&headers, &uri), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn test_resolve_host_missing_fails_closed() {
         let headers = hyper::HeaderMap::new();
         let uri: hyper::Uri = "/relative/path".parse().unwrap();
-        assert_eq!(resolve_host(&headers, &uri), "localhost");
+        assert_eq!(resolve_host(&headers, &uri), Err(StatusCode::BAD_REQUEST));
     }
 
     #[test]
@@ -499,5 +548,24 @@ mod tests {
         assert!(tokens.contains("x-custom-header"));
         assert!(tokens.contains("keep-alive"));
         assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn test_headers_to_cache_preserves_multiple_vary() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.append("vary", "Origin".parse().unwrap());
+        headers.append("vary", "Accept-Encoding".parse().unwrap());
+
+        let mut headers_to_cache = hyper::HeaderMap::new();
+        for (k, v) in headers.iter() {
+            headers_to_cache.append(k.clone(), v.clone());
+        }
+
+        let vary_values: Vec<&str> = headers_to_cache
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(vary_values, vec!["Origin", "Accept-Encoding"]);
     }
 }

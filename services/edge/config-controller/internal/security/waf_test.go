@@ -182,3 +182,70 @@ func TestRateLimiter(t *testing.T) {
 		t.Fatalf("expected request 3 to be rate-limited (429), got blocked=%v, code=%d", res3.Blocked, res3.StatusCode)
 	}
 }
+
+func TestWAF_PriorityAndAllowSemantics(t *testing.T) {
+	engine := security.NewWAFEngine()
+	policy := &model.SecurityPolicy{
+		DomainID:         "dom-priority-test",
+		WAFEnabled:       true,
+		WAFMode:          "BLOCK",
+		OWASPProtection:  true,
+		RateLimitEnabled: true,
+		RateLimitRPM:     1, // Only 1 request allowed per minute
+		WAFRules: []model.WAFRule{
+			{
+				ID:        "rule-block-api",
+				Name:      "block-api-broad",
+				MatchType: model.WAFMatchPathPrefix,
+				Pattern:   "/api",
+				Action:    model.WAFActionBlock,
+				Priority:  10, // Lower priority
+				Enabled:   true,
+			},
+			{
+				ID:        "rule-allow-public",
+				Name:      "allow-public-specific",
+				MatchType: model.WAFMatchPathPrefix,
+				Pattern:   "/api/public",
+				Action:    model.WAFActionAllow,
+				Priority:  100, // Higher priority: overrides lower priority block
+				Enabled:   true,
+			},
+		},
+	}
+
+	// 1. Higher-priority ALLOW rule overrides lower-priority BLOCK rule for clean request
+	reqPublic := newTestRequest("GET", "/api/public/info", "198.51.100.10", "Mozilla/5.0")
+	resPublic := engine.EvaluateRequest(reqPublic, policy)
+	if resPublic.Blocked {
+		t.Fatalf("expected /api/public/info to be allowed by high-priority rule, got blocked: %s", resPublic.Reason)
+	}
+	if resPublic.RuleTriggered != "custom_rule_allow-public-specific" {
+		t.Errorf("expected rule triggered to be custom_rule_allow-public-specific, got %s", resPublic.RuleTriggered)
+	}
+
+	// 2. Lower-priority BLOCK rule catches other paths
+	reqPrivate := newTestRequest("GET", "/api/private/secret", "198.51.100.11", "Mozilla/5.0")
+	resPrivate := engine.EvaluateRequest(reqPrivate, policy)
+	if !resPrivate.Blocked || resPrivate.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected /api/private/secret to be blocked, got blocked=%v", resPrivate.Blocked)
+	}
+
+	// 3. Custom ALLOW rule MUST NOT bypass OWASP attack signatures (SQLi, XSS, etc.)
+	reqExploit := newTestRequest("GET", "/api/public/search?q=1%20UNION%20SELECT%201", "198.51.100.12", "Mozilla/5.0")
+	resExploit := engine.EvaluateRequest(reqExploit, policy)
+	if !resExploit.Blocked || resExploit.RuleTriggered != "OWASP_CRS_SQL_INJECTION" {
+		t.Fatalf("expected SQL injection on allowed path to be blocked by OWASP CRS, got blocked=%v, rule=%s",
+			resExploit.Blocked, resExploit.RuleTriggered)
+	}
+
+	// 4. Custom ALLOW rule MUST NOT bypass Rate Limiting
+	// Client 198.51.100.10 already consumed 1 token above; 2nd request must be rate-limited (429)
+	reqFlood := newTestRequest("GET", "/api/public/info", "198.51.100.10", "Mozilla/5.0")
+	resFlood := engine.EvaluateRequest(reqFlood, policy)
+	if !resFlood.Blocked || resFlood.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected second request to /api/public to be rate limited (429), got blocked=%v, code=%d",
+			resFlood.Blocked, resFlood.StatusCode)
+	}
+}
+

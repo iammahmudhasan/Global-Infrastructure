@@ -1415,3 +1415,151 @@ func TestNodeRegistration_OperatorOnly(t *testing.T) {
 		t.Fatalf("expected 201 Created for operator node registration, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestCachePurge_CrossTenantAndGlobalScope(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant-a", "tenant-a", "proj-a", auth.RoleTenant, "proj-a")
+	authInst.RegisterTenantWithRole("key-tenant-b", "tenant-b", "proj-b", auth.RoleTenant, "proj-b")
+	authInst.RegisterTenantWithRole("key-operator", "operator", "proj-core", auth.RolePlatformOperator, "*")
+
+	// Onboard domain A for tenant A
+	bodyA, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "tenant-a.example.com",
+		"origin_address":  "origin-a.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	reqA := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-a/domains", bytes.NewReader(bodyA))
+	reqA.Header.Set("X-API-Key", "key-tenant-a")
+	wA := httptest.NewRecorder()
+	handler.ServeHTTP(wA, reqA)
+	if wA.Code != http.StatusCreated {
+		t.Fatalf("failed to onboard domain A: %d %s", wA.Code, wA.Body.String())
+	}
+	var resA struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(wA.Body.Bytes(), &resA)
+
+	// 1. Tenant A purges own URL -> 200 OK
+	purgeOwn := []byte(`{"target":"https://tenant-a.example.com/api/v1/data"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/domains/"+resA.DomainID+"/cache/purge", bytes.NewReader(purgeOwn))
+	req.Header.Set("X-API-Key", "key-tenant-a")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for tenant purging own domain URL, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Tenant A purges victim URL -> 403 Forbidden
+	purgeVictim := []byte(`{"target":"https://victim-b.example.com/secret"}`)
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+resA.DomainID+"/cache/purge", bytes.NewReader(purgeVictim))
+	req.Header.Set("X-API-Key", "key-tenant-a")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "outside domain scope") {
+		t.Fatalf("expected 403 Forbidden for cross-domain victim purge, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Tenant A attempts global target "*" -> 403 Forbidden
+	purgeGlobal := []byte(`{"target":"*"}`)
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+resA.DomainID+"/cache/purge", bytes.NewReader(purgeGlobal))
+	req.Header.Set("X-API-Key", "key-tenant-a")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "requires platform operator role") {
+		t.Fatalf("expected 403 Forbidden for non-operator global purge, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Operator purges global target "*" -> 200 OK
+	req = httptest.NewRequest(http.MethodPost, "/v1/domains/"+resA.DomainID+"/cache/purge", bytes.NewReader(purgeGlobal))
+	req.Header.Set("X-API-Key", "key-operator")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator global purge, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestEdgeTelemetry_DomainValidationAndAuthorization(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterNode("key-node-scoped", "tenant-infra", "proj-a", "edge-node-01") // Only authorized for proj-a
+	authInst.RegisterTenantWithRole("key-tenant-a", "tenant-a", "proj-a", auth.RoleTenant, "proj-a")
+	authInst.RegisterTenantWithRole("key-tenant-b", "tenant-b", "proj-b", auth.RoleTenant, "proj-b")
+
+	// Domain A in proj-a
+	bodyA, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "service-a.example.com",
+		"origin_address":  "origin-a.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	reqA := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-a/domains", bytes.NewReader(bodyA))
+	reqA.Header.Set("X-API-Key", "key-tenant-a")
+	wA := httptest.NewRecorder()
+	handler.ServeHTTP(wA, reqA)
+	var resA struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(wA.Body.Bytes(), &resA)
+
+	// Domain B in proj-b
+	bodyB, _ := json.Marshal(map[string]interface{}{
+		"hostname":        "service-b.example.com",
+		"origin_address":  "origin-b.example.com",
+		"origin_port":     443,
+		"origin_protocol": "HTTPS",
+	})
+	reqB := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-b/domains", bytes.NewReader(bodyB))
+	reqB.Header.Set("X-API-Key", "key-tenant-b")
+	wB := httptest.NewRecorder()
+	handler.ServeHTTP(wB, reqB)
+	var resB struct {
+		DomainID string `json:"domain_id"`
+	}
+	_ = json.Unmarshal(wB.Body.Bytes(), &resB)
+
+	now := time.Now().UTC()
+
+	// 1. Non-existent domain ID -> 400 Bad Request
+	badDomainEvent := []model.TelemetryEvent{
+		{DomainID: "non-existent-domain", StatusCode: 200, BytesSent: 100, Timestamp: now},
+	}
+	bodyBad, _ := json.Marshal(badDomainEvent)
+	req := httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(bodyBad))
+	req.Header.Set("X-API-Key", "key-node-scoped")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "domain not found") {
+		t.Fatalf("expected 400 Bad Request for unverified domain, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Foreign domain ID (proj-b) from node scoped only to proj-a -> 403 Forbidden
+	foreignDomainEvent := []model.TelemetryEvent{
+		{DomainID: resB.DomainID, StatusCode: 200, BytesSent: 100, Timestamp: now},
+	}
+	bodyForeign, _ := json.Marshal(foreignDomainEvent)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(bodyForeign))
+	req.Header.Set("X-API-Key", "key-node-scoped")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "not authorized") {
+		t.Fatalf("expected 403 Forbidden for unauthorized project domain, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Valid authorized domain ID (proj-a) -> 200 OK
+	validEvent := []model.TelemetryEvent{
+		{DomainID: resA.DomainID, StatusCode: 200, BytesSent: 100, Timestamp: now},
+	}
+	bodyValid, _ := json.Marshal(validEvent)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/telemetry", bytes.NewReader(bodyValid))
+	req.Header.Set("X-API-Key", "key-node-scoped")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for authorized telemetry, got %d: %s", w.Code, w.Body.String())
+	}
+}
+

@@ -114,7 +114,7 @@ func (a *Authenticator) loadFromEnv() {
 	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && isExplicitDevEnvironment() {
 		a.RegisterTenantWithRole("dev-fixture-key-01", "tenant-system", "proj-core", RolePlatformOperator, "prj-enterprise-01")
 		a.RegisterTenantWithRole("dev-fixture-key-banking", "tenant-cbr-banking", "proj-fintech-prod", RoleTenant)
-		a.RegisterNode("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", "edge-node-01")
+		a.RegisterNode("dev-fixture-key-node", "tenant-edge-nodes", "proj-infra", "edge-node-01", "*")
 	}
 }
 
@@ -144,12 +144,17 @@ func (a *Authenticator) RegisterTenantWithRole(apiKey, tenantID, projectID strin
 	}
 }
 
-func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string) {
+func (a *Authenticator) RegisterNode(apiKey, tenantID, projectID, nodeID string, extraProjects ...string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	allowed := make(map[string]bool)
 	allowed[projectID] = true
+	for _, p := range extraProjects {
+		if p != "" {
+			allowed[p] = true
+		}
+	}
 
 	a.tenants[apiKey] = &TenantRecord{
 		TenantID:        tenantID,
@@ -190,6 +195,9 @@ func (a *Authenticator) AuthorizeProject(ctx context.Context, projectID string) 
 		return false
 	}
 	if tc.IsDevBypass {
+		return true
+	}
+	if tc.Role == RolePlatformOperator {
 		return true
 	}
 	if tc.AllowedProjects["*"] {

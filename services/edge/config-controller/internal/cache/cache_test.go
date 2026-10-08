@@ -47,10 +47,22 @@ func TestCacheKeyNormalization(t *testing.T) {
 	}
 	headersGzip := http.Header{"Accept-Encoding": []string{"gzip"}}
 	headersBr := http.Header{"Accept-Encoding": []string{"br"}}
+	headersEmpty := http.Header{"Accept-Encoding": []string{""}}
+	headersAbsent := http.Header{}
+
 	keyGzip := cache.GenerateCacheKey("https", "api.example.com", "/data", "", headersGzip, policy, ruleWithHeader)
 	keyBr := cache.GenerateCacheKey("https", "api.example.com", "/data", "", headersBr, policy, ruleWithHeader)
+	keyEmpty := cache.GenerateCacheKey("https", "api.example.com", "/data", "", headersEmpty, policy, ruleWithHeader)
+	keyAbsent := cache.GenerateCacheKey("https", "api.example.com", "/data", "", headersAbsent, policy, ruleWithHeader)
+
 	if keyGzip == keyBr {
 		t.Fatalf("expected distinct cache keys for different Accept-Encoding headers")
+	}
+	if keyEmpty == keyAbsent {
+		t.Fatalf("expected distinct cache keys for empty header (%q) vs absent header (%q)", keyEmpty, keyAbsent)
+	}
+	if keyEmpty == keyGzip || keyAbsent == keyGzip {
+		t.Fatalf("expected empty/absent header keys to differ from value-bearing keys")
 	}
 }
 

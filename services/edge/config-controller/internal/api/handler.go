@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -1050,15 +1051,45 @@ func (h *APIHandler) handlePurgeCache(w http.ResponseWriter, r *http.Request, do
 	_ = json.NewDecoder(r.Body).Decode(&body)
 
 	domain, _ := h.store.GetDomain(domainID)
-	target := body.Target
-	if target == "" {
+	target := strings.TrimSpace(body.Target)
+
+	if target == "*" {
+		// Global cache purge requires Platform Operator role (P1 finding)
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			writeError(w, http.StatusForbidden, "global cache purge requires platform operator role")
+			return
+		}
+	} else if target == "" {
 		if domain != nil {
 			target = domain.Hostname
 		} else {
 			target = domainID
 		}
-	} else if domain != nil && target != "*" && !strings.Contains(target, "://") && !strings.HasPrefix(target, domain.Hostname) {
-		target = domain.Hostname + "/" + strings.TrimPrefix(target, "/")
+	} else {
+		// Validate that the target does not target another domain outside this domain scope
+		var targetHost string
+		if strings.Contains(target, "://") {
+			parsed, err := url.Parse(target)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid purge target URL")
+				return
+			}
+			targetHost = parsed.Hostname()
+		} else {
+			parts := strings.SplitN(target, "/", 2)
+			if strings.Contains(parts[0], ".") {
+				targetHost = parts[0]
+			}
+		}
+
+		if targetHost != "" {
+			if domain != nil && !strings.EqualFold(targetHost, domain.Hostname) {
+				writeError(w, http.StatusForbidden, "purge target is outside domain scope")
+				return
+			}
+		} else if domain != nil {
+			target = domain.Hostname + "/" + strings.TrimPrefix(target, "/")
+		}
 	}
 
 	purged := h.cacheEngine.Purge(target)
@@ -1361,36 +1392,46 @@ func (h *APIHandler) handleEdgeTelemetry(w http.ResponseWriter, r *http.Request)
 	}
 
 	trimmed := strings.TrimSpace(string(bodyBytes))
+	var events []model.TelemetryEvent
 	if strings.HasPrefix(trimmed, "[") {
-		var events []model.TelemetryEvent
 		if err := json.Unmarshal(bodyBytes, &events); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid telemetry events batch: "+err.Error())
 			return
 		}
-		count, err := h.analyticsEngine.IngestBatch(events)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+	} else {
+		var single model.TelemetryEvent
+		if err := json.Unmarshal(bodyBytes, &single); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid telemetry event: "+err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"status":   "ingested",
-			"ingested": count,
-		})
-		return
+		events = []model.TelemetryEvent{single}
 	}
 
-	var event model.TelemetryEvent
-	if err := json.Unmarshal(bodyBytes, &event); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid telemetry event: "+err.Error())
-		return
+	// Pre-validate all events: ensure domain exists and caller is authorized for the project (P1 finding)
+	for i, ev := range events {
+		if ev.DomainID == "" {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("event [%d]: domain_id is required", i))
+			return
+		}
+		domain, err := h.store.GetDomain(ev.DomainID)
+		if err != nil || domain == nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("event [%d]: domain not found (%s)", i, ev.DomainID))
+			return
+		}
+		if !h.authenticator.AuthorizeProject(r.Context(), domain.ProjectID) {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("event [%d]: forbidden, caller not authorized for domain %s", i, ev.DomainID))
+			return
+		}
 	}
-	if err := h.analyticsEngine.Ingest(event); err != nil {
+
+	count, err := h.analyticsEngine.IngestBatch(events)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":   "ingested",
-		"ingested": 1,
+		"ingested": count,
 	})
 }
 

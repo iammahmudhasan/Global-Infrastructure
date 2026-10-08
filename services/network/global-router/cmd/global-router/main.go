@@ -79,6 +79,13 @@ func (s *Server) routes() http.Handler {
 	// 3. Compute Backends Registry API
 	mux.HandleFunc("/api/v1/backends", func(w http.ResponseWriter, r *http.Request) {
 		backends := s.registry.List()
+		isOperator := s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+		if !isOperator {
+			// Redact internal endpoints for tenant view to prevent topology disclosure
+			for _, b := range backends {
+				b.Endpoint = "[REDACTED]"
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"count":    len(backends),
@@ -89,6 +96,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/backends/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		if !s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			http.Error(w, `{"error":"forbidden: platform operator role required"}`, http.StatusForbidden)
 			return
 		}
 

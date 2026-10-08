@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -73,49 +74,9 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	rawQuery := req.URL.RawQuery
 	userAgent := req.UserAgent()
 
-	// 1. Check Customer WAF Rules (Highest Priority: IP, Path, Headers)
-	for _, rule := range policy.WAFRules {
-		if !rule.Enabled {
-			continue
-		}
-
-		matched := false
-		switch rule.MatchType {
-		case model.WAFMatchIPCIDR:
-			matched = matchIPCIDR(clientIP, rule.Pattern)
-		case model.WAFMatchPathPrefix:
-			matched = strings.HasPrefix(path, rule.Pattern)
-		case model.WAFMatchHeader:
-			parts := strings.SplitN(rule.Pattern, ":", 2)
-			if len(parts) == 2 {
-				headerVal := req.Header.Get(strings.TrimSpace(parts[0]))
-				matched = strings.Contains(strings.ToLower(headerVal), strings.ToLower(strings.TrimSpace(parts[1])))
-			}
-		case model.WAFMatchQueryParam:
-			matched = strings.Contains(strings.ToLower(rawQuery), strings.ToLower(rule.Pattern))
-		}
-
-		if matched {
-			if rule.Action == model.WAFActionBlock {
-				return EvaluationResult{
-					Blocked:       true,
-					StatusCode:    http.StatusForbidden,
-					RuleTriggered: fmt.Sprintf("custom_rule_%s", rule.Name),
-					Action:        model.WAFActionBlock,
-					Reason:        fmt.Sprintf("blocked by custom rule: %s", rule.Name),
-				}
-			}
-			if rule.Action == model.WAFActionAllow {
-				return EvaluationResult{
-					Blocked:       false,
-					RuleTriggered: fmt.Sprintf("custom_rule_%s", rule.Name),
-					Action:        model.WAFActionAllow,
-				}
-			}
-		}
-	}
-
-	// 2. OWASP CRS Attack Signatures (if enabled or default WAF enabled)
+	// 1. OWASP CRS Attack Signatures (Global Mandatory Security Rules)
+	// Mandatory security signatures execute first so malicious attacks (SQLi, XSS, Path Traversal, RCE, Scanner UA)
+	// cannot be bypassed by customer allow rules or overrides.
 	unescapedQuery, err := url.QueryUnescape(rawQuery)
 	if err != nil {
 		unescapedQuery = rawQuery
@@ -129,7 +90,7 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	// A. Scanner User-Agent check
 	if scannerUAPatterns.MatchString(userAgent) {
 		return EvaluationResult{
-			Blocked:       policy.WAFMode == "BLOCK",
+			Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
 			StatusCode:    http.StatusForbidden,
 			RuleTriggered: "OWASP_CRS_MALICIOUS_SCANNER",
 			Action:        model.WAFActionBlock,
@@ -141,7 +102,7 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	for _, p := range pathTraversalPatterns {
 		if p.MatchString(fullTarget) {
 			return EvaluationResult{
-				Blocked:       policy.WAFMode == "BLOCK",
+				Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
 				StatusCode:    http.StatusForbidden,
 				RuleTriggered: "OWASP_CRS_PATH_TRAVERSAL",
 				Action:        model.WAFActionBlock,
@@ -154,7 +115,7 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	for _, p := range sqliPatterns {
 		if p.MatchString(fullTarget) {
 			return EvaluationResult{
-				Blocked:       policy.WAFMode == "BLOCK",
+				Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
 				StatusCode:    http.StatusForbidden,
 				RuleTriggered: "OWASP_CRS_SQL_INJECTION",
 				Action:        model.WAFActionBlock,
@@ -167,7 +128,7 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	for _, p := range xssPatterns {
 		if p.MatchString(fullTarget) {
 			return EvaluationResult{
-				Blocked:       policy.WAFMode == "BLOCK",
+				Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
 				StatusCode:    http.StatusForbidden,
 				RuleTriggered: "OWASP_CRS_CROSS_SITE_SCRIPTING",
 				Action:        model.WAFActionBlock,
@@ -180,7 +141,7 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 	for _, p := range rcePatterns {
 		if p.MatchString(fullTarget) {
 			return EvaluationResult{
-				Blocked:       policy.WAFMode == "BLOCK",
+				Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
 				StatusCode:    http.StatusForbidden,
 				RuleTriggered: "OWASP_CRS_COMMAND_INJECTION",
 				Action:        model.WAFActionBlock,
@@ -189,7 +150,58 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 		}
 	}
 
-	// 3. Rate Limiting Check
+	// 2. Customer WAF Rules (evaluated strictly in descending Priority order)
+	var matchedAllowRule *model.WAFRule
+	if len(policy.WAFRules) > 0 {
+		sortedRules := make([]model.WAFRule, len(policy.WAFRules))
+		copy(sortedRules, policy.WAFRules)
+		sort.SliceStable(sortedRules, func(i, j int) bool {
+			return sortedRules[i].Priority > sortedRules[j].Priority
+		})
+
+		for i := range sortedRules {
+			rule := &sortedRules[i]
+			if !rule.Enabled {
+				continue
+			}
+
+			matched := false
+			switch rule.MatchType {
+			case model.WAFMatchIPCIDR:
+				matched = matchIPCIDR(clientIP, rule.Pattern)
+			case model.WAFMatchPathPrefix:
+				matched = strings.HasPrefix(path, rule.Pattern)
+			case model.WAFMatchHeader:
+				parts := strings.SplitN(rule.Pattern, ":", 2)
+				if len(parts) == 2 {
+					headerVal := req.Header.Get(strings.TrimSpace(parts[0]))
+					matched = strings.Contains(strings.ToLower(headerVal), strings.ToLower(strings.TrimSpace(parts[1])))
+				}
+			case model.WAFMatchQueryParam:
+				matched = strings.Contains(strings.ToLower(rawQuery), strings.ToLower(rule.Pattern))
+			}
+
+			if matched {
+				if rule.Action == model.WAFActionBlock {
+					return EvaluationResult{
+						Blocked:       true,
+						StatusCode:    http.StatusForbidden,
+						RuleTriggered: fmt.Sprintf("custom_rule_%s", rule.Name),
+						Action:        model.WAFActionBlock,
+						Reason:        fmt.Sprintf("blocked by custom rule: %s", rule.Name),
+					}
+				}
+				if rule.Action == model.WAFActionAllow {
+					// ALLOW overrides subsequent lower-priority customer rules,
+					// but cannot bypass mandatory OWASP checks (evaluated above) or rate limits (evaluated below).
+					matchedAllowRule = rule
+					break
+				}
+			}
+		}
+	}
+
+	// 3. Rate Limiting Check (remains outside WAF allow semantics)
 	if policy.RateLimitEnabled {
 		limitRPM := policy.RateLimitRPM
 		if limitRPM <= 0 {
@@ -213,6 +225,14 @@ func (e *WAFEngine) EvaluateRequest(req *http.Request, policy *model.SecurityPol
 				Action:        model.WAFActionBlock,
 				Reason:        fmt.Sprintf("rate limit of %d requests/min exceeded for client %s", limitRPM, clientIP),
 			}
+		}
+	}
+
+	if matchedAllowRule != nil {
+		return EvaluationResult{
+			Blocked:       false,
+			RuleTriggered: fmt.Sprintf("custom_rule_%s", matchedAllowRule.Name),
+			Action:        model.WAFActionAllow,
 		}
 	}
 

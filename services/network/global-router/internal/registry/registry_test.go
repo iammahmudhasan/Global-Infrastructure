@@ -322,3 +322,43 @@ func TestRegistry_CompleteWorkloadLifecycle(t *testing.T) {
 		t.Errorf("expected GPUs restored to %d, got %d", initialGPUs, restored.AvailableGPUs)
 	}
 }
+
+func TestRegistry_SweepExpiredReservations(t *testing.T) {
+	reg := registry.NewRegistry()
+
+	backendID := "bd-dhaka-dgx01"
+	b, err := reg.Get(backendID)
+	if err != nil {
+		t.Fatalf("failed to get backend: %v", err)
+	}
+	initialGPUs := b.AvailableGPUs
+
+	// Reserve capacity
+	if err := reg.AdmitAndReserve("stale-workload", backendID, 4); err != nil {
+		t.Fatalf("failed to reserve workload: %v", err)
+	}
+
+	bReserved, _ := reg.Get(backendID)
+	if bReserved.AvailableGPUs != initialGPUs-4 {
+		t.Fatalf("expected %d GPUs, got %d", initialGPUs-4, bReserved.AvailableGPUs)
+	}
+
+	// 1. Sweeping with 1 hour TTL does not sweep a fresh reservation
+	swept := reg.SweepExpiredReservations(1 * time.Hour)
+	if swept != 0 {
+		t.Errorf("expected 0 swept reservations for 1h TTL, got %d", swept)
+	}
+
+	// 2. Sweeping with 0 TTL sweeps the reservation immediately
+	time.Sleep(5 * time.Millisecond)
+	swept = reg.SweepExpiredReservations(0)
+	if swept != 1 {
+		t.Errorf("expected 1 swept reservation for 0 TTL, got %d", swept)
+	}
+
+	bRestored, _ := reg.Get(backendID)
+	if bRestored.AvailableGPUs != initialGPUs {
+		t.Errorf("expected GPUs restored to %d after sweep, got %d", initialGPUs, bRestored.AvailableGPUs)
+	}
+}
+
