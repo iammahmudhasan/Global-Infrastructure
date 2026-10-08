@@ -613,30 +613,33 @@ impl Router {
         self.timeout
     }
 
-    /// Returns all DNS domain -> pinned SocketAddr mappings across all active routes
+    /// Returns all DNS domain -> pinned SocketAddr mappings across all active routes (deduplicated)
     pub fn dns_mappings(&self) -> HashMap<String, Vec<std::net::SocketAddr>> {
         let mut map: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
+        let mut insert_node = |n: &UpstreamNode| {
+            if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
+                let addrs = map.entry(sni.to_ascii_lowercase()).or_default();
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        };
+
         {
             let default_nodes = self.default_nodes.read().unwrap();
             for n in default_nodes.iter() {
-                if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
-                    map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
-                }
+                insert_node(n);
             }
         }
         {
             let routes = self.routes.read().unwrap();
             for dr in routes.values() {
                 for n in &dr.origins {
-                    if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
-                        map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
-                    }
+                    insert_node(n);
                 }
                 for pr in &dr.path_routes {
                     for n in &pr.origins {
-                        if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
-                            map.entry(sni.to_ascii_lowercase()).or_default().push(addr);
-                        }
+                        insert_node(n);
                     }
                 }
             }
