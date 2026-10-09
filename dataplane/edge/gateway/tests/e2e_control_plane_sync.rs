@@ -758,12 +758,13 @@ async fn test_e2e_snapshot_content_length_budget_exceeded() {
                     let builder = server_builder.clone();
                     tokio::spawn(async move {
                         let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                            // Produce payload of 16 MiB + 1024 bytes so Full sets Content-Length matching body length
+                            let big_body = vec![b' '; MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024];
                             let resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .header("Content-Type", "application/json")
-                                .header("Content-Length", (MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024).to_string())
                                 .header("X-Snapshot-Checksum", "deadbeef")
-                                .body(Full::new(Bytes::from_static(b"{}")))
+                                .body(Full::new(Bytes::from(big_body)))
                                 .unwrap();
                             Ok::<_, hyper::Error>(resp)
                         });
@@ -801,6 +802,36 @@ async fn test_e2e_snapshot_content_length_budget_exceeded() {
     let _ = shutdown_tx.send(());
 }
 
+struct ChunkedBody {
+    chunks: std::collections::VecDeque<Bytes>,
+}
+
+impl hyper::body::Body for ChunkedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(chunk) = self.chunks.pop_front() {
+            std::task::Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+        } else {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        let mut hint = hyper::body::SizeHint::new();
+        hint.set_lower(0);
+        hint
+    }
+}
+
 #[tokio::test]
 async fn test_e2e_snapshot_streaming_chunk_overflow() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -821,13 +852,17 @@ async fn test_e2e_snapshot_streaming_chunk_overflow() {
                     let builder = server_builder.clone();
                     tokio::spawn(async move {
                         let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
-                            // Produce a payload of 16 MiB + 1024 bytes without Content-Length
-                            let big_chunk = vec![b' '; MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024];
+                            // Produce 17 chunks of 1 MiB each with ChunkedBody (no Content-Length header)
+                            let mut chunks = std::collections::VecDeque::new();
+                            for _ in 0..17 {
+                                chunks.push_back(Bytes::from(vec![b' '; 1024 * 1024]));
+                            }
+                            let body = ChunkedBody { chunks };
                             let resp = Response::builder()
                                 .status(StatusCode::OK)
                                 .header("Content-Type", "application/json")
                                 .header("X-Snapshot-Checksum", "deadbeef")
-                                .body(Full::new(Bytes::from(big_chunk)))
+                                .body(body)
                                 .unwrap();
                             Ok::<_, hyper::Error>(resp)
                         });
