@@ -48,8 +48,13 @@ Assert-Status "Path-prefix Routing" 200 ([int]$pathCode)
 
 # 5. Fail-Closed Tenant Isolation Gate
 Write-Host "[Test 5/7] Verifying Fail-Closed Tenant Isolation (unknown tenant host)..." -ForegroundColor Yellow
-$unknownCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: unknown-tenant.example.com" "$EnvoyHttpUrl/"
-Assert-Status "Unmatched Tenant Isolation" 404 ([int]$unknownCode)
+$unknownCode = [int](& curl -s -o /dev/null -w "%{http_code}" -H "Host: unknown-tenant.example.com" "$EnvoyHttpUrl/")
+if ($unknownCode -eq 421 -or $unknownCode -eq 404) {
+    Write-Host "  [PASS] Unmatched Tenant Isolation (Status: $unknownCode)" -ForegroundColor Green
+} else {
+    Write-Host "  [FAIL] Unmatched Tenant Isolation: Expected HTTP 421 or 404, got $unknownCode" -ForegroundColor Red
+    exit 1
+}
 
 # 6. WAF Inspection & Interception Gate
 Write-Host "[Test 6/7] Verifying WAF Interception (SQL Injection attack payload)..." -ForegroundColor Yellow

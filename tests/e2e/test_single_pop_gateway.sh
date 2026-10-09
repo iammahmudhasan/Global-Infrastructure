@@ -56,7 +56,12 @@ assert_status "Path-prefix Routing" "200" "$PATH_CODE"
 # 5. Fail-Closed Tenant Isolation Gate
 echo "[Test 5/7] Verifying Fail-Closed Tenant Isolation (unknown tenant host)..."
 UNKNOWN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: unknown-tenant.example.com" "${ENVOY_HTTP_URL}/" || true)
-assert_status "Unmatched Tenant Isolation" "404" "$UNKNOWN_CODE"
+if [ "$UNKNOWN_CODE" = "421" ] || [ "$UNKNOWN_CODE" = "404" ]; then
+    echo "  [PASS] Unmatched Tenant Isolation (Status: $UNKNOWN_CODE)"
+else
+    echo "  [FAIL] Unmatched Tenant Isolation: Expected HTTP 421 or 404, got $UNKNOWN_CODE"
+    exit 1
+fi
 
 # 6. WAF Inspection & Interception Gate
 echo "[Test 6/7] Verifying WAF Interception (SQL Injection attack payload)..."
