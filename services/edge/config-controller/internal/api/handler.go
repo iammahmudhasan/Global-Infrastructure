@@ -2233,11 +2233,15 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 				if onboarding.IsPrivateOrReservedIP(parsedIP) {
 					continue
 				}
+				sniHost := o.SNI
+				if sniHost == "" {
+					sniHost = o.Address
+				}
 				origins = append(origins, model.GatewayOriginSync{
 					Address:  parsedIP.String(),
 					Port:     o.Port,
 					Protocol: proto,
-					SNI:      o.Address,
+					SNI:      sniHost,
 					Weight:   o.Weight,
 				})
 				targets = append(targets, fmt.Sprintf("%s://%s:%d", strings.ToLower(proto), parsedIP.String(), o.Port))

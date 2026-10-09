@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
@@ -26,6 +28,79 @@ func main() {
 
 	// 1. Initialize In-Memory Data Store (backed by Postgres in full cluster)
 	dataStore := store.NewStore()
+
+	// In explicit local development mode, seed active fixture domain for PoPs
+	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+		env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+		if env == "development" || env == "test" {
+			devDomain := &model.Domain{
+				ID:             "dom-dev-api",
+				ProjectID:      "proj-core",
+				Hostname:       "api.nexusedge.io",
+				Status:         model.DomainStatusActive,
+				OnboardingType: "CNAME",
+				CNAMETarget:    "edge.nexusedge.net",
+				AllowedPoPs:    []string{"singapore", "dhaka"},
+				CreatedAt:      time.Now().UTC(),
+				UpdatedAt:      time.Now().UTC(),
+			}
+			_ = dataStore.SaveDomain(devDomain)
+
+			devPool := &model.OriginPool{
+				ID:          "pool-dev-httpbin",
+				ProjectID:   "proj-core",
+				Name:        "httpbin-origin-pool",
+				LBAlgorithm: model.LBAlgorithmRoundRobin,
+				Origins: []model.Origin{
+					{
+						ID:          "orig-dev-httpbin",
+						PoolID:      "pool-dev-httpbin",
+						Address:     "54.159.186.149",
+						Port:        443,
+						Protocol:    model.ProtocolHTTPS,
+						SNI:         "httpbin.org",
+						Weight:      100,
+						Healthy:     true,
+						AllowedPoPs: []string{"singapore", "dhaka"},
+					},
+				},
+			}
+			_ = dataStore.SaveOriginPool(devPool)
+
+			devRouteRoot := &model.Route{
+				ID:         "route-dev-root",
+				DomainID:   devDomain.ID,
+				PoolID:     devPool.ID,
+				PathPrefix: "/",
+				Priority:   0,
+				TimeoutMs:  5000,
+			}
+			dataStore.SaveRoute(devRouteRoot)
+
+			devRouteApi := &model.Route{
+				ID:         "route-dev-api",
+				DomainID:   devDomain.ID,
+				PoolID:     devPool.ID,
+				PathPrefix: "/api/",
+				Priority:   10,
+				TimeoutMs:  5000,
+			}
+			dataStore.SaveRoute(devRouteApi)
+
+			devSec := &model.SecurityPolicy{
+				ID:               "sec-dev-01",
+				DomainID:         devDomain.ID,
+				WAFEnabled:       true,
+				WAFMode:          "BLOCK",
+				OWASPProtection:  true,
+				RateLimitEnabled: true,
+				RateLimitRPM:     6000,
+			}
+			dataStore.SaveSecurityPolicy(devSec)
+
+			log.Printf("[INFO] Seeded development fixture domain: %s (status=%s, origin=54.159.186.149:443)", devDomain.Hostname, devDomain.Status)
+		}
+	}
 
 	// 2. Initialize Onboarding Domain Service
 	domainSvc := onboarding.NewDomainService(dataStore)

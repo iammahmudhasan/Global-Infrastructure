@@ -4,25 +4,40 @@ server:
   region: "ap-southeast-1"
 
 upstream:
-  targets:
-    - "https://httpbin.org"
+  origins:
+    - address: "54.159.186.149"
+      port: 443
+      protocol: "HTTPS"
+      sni: "httpbin.org"
   routes:
     - host: "api.nexusedge.io"
       path_routes:
         - path_prefix: "/api/"
           priority: 10
-          targets:
-            - "https://httpbin.org"
+          origins:
+            - address: "54.159.186.149"
+              port: 443
+              protocol: "HTTPS"
+              sni: "httpbin.org"
         - path_prefix: "/"
           priority: 0
-          targets:
-            - "https://httpbin.org"
+          origins:
+            - address: "54.159.186.149"
+              port: 443
+              protocol: "HTTPS"
+              sni: "httpbin.org"
     - host: "app.nexusedge.io"
-      targets:
-        - "https://httpbin.org"
+      origins:
+        - address: "54.159.186.149"
+          port: 443
+          protocol: "HTTPS"
+          sni: "httpbin.org"
     - host: "customer-a.example.com"
-      targets:
-        - "https://httpbin.org"
+      origins:
+        - address: "54.159.186.149"
+          port: 443
+          protocol: "HTTPS"
+          sni: "httpbin.org"
   health_check_path: "/status/200"
   timeout_ms: 5000
 

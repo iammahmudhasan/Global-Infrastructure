@@ -21,12 +21,31 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticOriginConfig {
+    pub address: String,
+    pub port: u16,
+    #[serde(default = "default_static_origin_protocol")]
+    pub protocol: String,
+    #[serde(default)]
+    pub sni: Option<String>,
+    #[serde(default)]
+    pub weight: Option<u32>,
+}
+
+fn default_static_origin_protocol() -> String {
+    "HTTP".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathRouteConfig {
     #[serde(default = "default_path_prefix")]
     pub path_prefix: String,
     #[serde(default)]
     pub priority: u32,
+    #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub origins: Vec<StaticOriginConfig>,
 }
 
 fn default_path_prefix() -> String {
@@ -39,6 +58,8 @@ pub struct DomainRouteConfig {
     #[serde(default)]
     pub targets: Vec<String>,
     #[serde(default)]
+    pub origins: Vec<StaticOriginConfig>,
+    #[serde(default)]
     pub path_routes: Vec<PathRouteConfig>,
 }
 
@@ -46,6 +67,8 @@ pub struct DomainRouteConfig {
 pub struct UpstreamConfig {
     #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub origins: Vec<StaticOriginConfig>,
     #[serde(default)]
     pub routes: Vec<DomainRouteConfig>,
     pub health_check_path: String,
@@ -131,6 +154,7 @@ impl Default for GatewayConfig {
             },
             upstream: UpstreamConfig {
                 targets: vec!["http://127.0.0.1:3000".to_string()],
+                origins: vec![],
                 routes: vec![],
                 health_check_path: "/healthz".to_string(),
                 timeout_ms: 5000,

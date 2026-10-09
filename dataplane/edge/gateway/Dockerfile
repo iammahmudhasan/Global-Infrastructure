@@ -11,7 +11,7 @@ RUN cargo build --release
 # Runtime Stage
 FROM debian:bullseye-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /usr/src/nexusedge/target/release/nexusedge-gateway /app/nexusedge-gateway

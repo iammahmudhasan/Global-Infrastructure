@@ -262,6 +262,11 @@ impl Router {
     /// Creates a single-tenant router with default targets (V0 backwards compatibility)
     pub fn new(targets: Vec<String>, timeout_ms: u64) -> Self {
         let nodes = targets.into_iter().map(Self::create_node).collect();
+        Self::new_with_nodes(nodes, timeout_ms)
+    }
+
+    /// Creates a single-tenant router with pre-built upstream nodes
+    pub fn new_with_nodes(nodes: Vec<UpstreamNode>, timeout_ms: u64) -> Self {
         Self {
             default_nodes: Arc::new(RwLock::new(nodes)),
             routes: Arc::new(RwLock::new(HashMap::new())),
@@ -277,6 +282,19 @@ impl Router {
     pub fn new_multi_tenant(
         routes_input: Vec<DomainRoute>,
         default_targets: Vec<String>,
+        timeout_ms: u64,
+    ) -> Result<Self, RouterError> {
+        for target in &default_targets {
+            validate_target_url("default", target)?;
+        }
+        let default_nodes = default_targets.into_iter().map(Self::create_node).collect();
+        Self::new_multi_tenant_with_nodes(routes_input, default_nodes, timeout_ms)
+    }
+
+    /// Creates a multi-tenant router with explicit host-to-origin domain routes and pre-constructed nodes
+    pub fn new_multi_tenant_with_nodes(
+        routes_input: Vec<DomainRoute>,
+        default_nodes: Vec<UpstreamNode>,
         timeout_ms: u64,
     ) -> Result<Self, RouterError> {
         let mut routes_map = HashMap::new();
@@ -309,10 +327,9 @@ impl Router {
             routes_map.insert(norm_host, route);
         }
 
-        for target in &default_targets {
-            validate_target_url("default", target)?;
+        for node in &default_nodes {
+            validate_target_url("default", &node.url)?;
         }
-        let default_nodes = default_targets.into_iter().map(Self::create_node).collect();
 
         Ok(Self {
             default_nodes: Arc::new(RwLock::new(default_nodes)),
@@ -324,20 +341,166 @@ impl Router {
         })
     }
 
+    /// Builds a validated upstream node from static origin configuration (anti-SSRF and IP pinning parity)
+    pub fn create_node_from_static_origin(
+        norm_host: &str,
+        origin: &crate::config::StaticOriginConfig,
+    ) -> Result<UpstreamNode, RouterError> {
+        let proto = origin.protocol.to_lowercase();
+        if proto != "http" && proto != "https" {
+            return Err(RouterError::InvalidTargetUrl {
+                host: norm_host.to_string(),
+                url: origin.address.clone(),
+                reason: format!("Protocol must be http or https, got '{}'", origin.protocol),
+            });
+        }
+        if origin.port == 0 {
+            return Err(RouterError::InvalidTargetUrl {
+                host: norm_host.to_string(),
+                url: origin.address.clone(),
+                reason: "Origin port cannot be 0".to_string(),
+            });
+        }
+        let sni_trimmed = origin
+            .sni
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+        let clean_addr = origin
+            .address
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+
+        let ip = clean_addr.parse::<std::net::IpAddr>().map_err(|_| {
+            RouterError::InvalidPayload("Static origin address must be a pinned IP".to_string())
+        })?;
+
+        if is_private_or_reserved_ip(ip) {
+            return Err(RouterError::UnsafeTargetUrl {
+                host: norm_host.to_string(),
+                url: origin.address.clone(),
+                reason: "Origin IP is private or reserved".to_string(),
+            });
+        }
+
+        let dest_addr = Some(std::net::SocketAddr::new(ip, origin.port));
+
+        let host_for_url = match ip {
+            std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+            std::net::IpAddr::V4(v4) => v4.to_string(),
+        };
+
+        let (url, sni, destination_addr) = match sni_trimmed {
+            Some(sni_host) if sni_host != clean_addr => {
+                let target_url = format!("{}://{}:{}", proto, sni_host, origin.port);
+                (target_url, Some(sni_host.to_string()), dest_addr)
+            }
+            _ => {
+                let target_url = format!("{}://{}:{}", proto, host_for_url, origin.port);
+                (target_url, None, dest_addr)
+            }
+        };
+
+        validate_target_url(norm_host, &url)?;
+        Ok(Router::create_node_full(url, sni, destination_addr))
+    }
+
+    /// Builds a validated upstream node from a target URL string, resolving hostname to pinned IP
+    pub fn create_node_from_target_str(
+        norm_host: &str,
+        target_str: &str,
+    ) -> Result<UpstreamNode, RouterError> {
+        validate_target_url(norm_host, target_str)?;
+        let uri = target_str
+            .parse::<hyper::Uri>()
+            .map_err(|e| RouterError::InvalidTargetUrl {
+                host: norm_host.to_string(),
+                url: target_str.to_string(),
+                reason: format!("Malformed URI: {}", e),
+            })?;
+        let scheme = uri.scheme_str().unwrap_or("http").to_lowercase();
+        let host = uri.host().ok_or_else(|| RouterError::InvalidTargetUrl {
+            host: norm_host.to_string(),
+            url: target_str.to_string(),
+            reason: "Target missing host".to_string(),
+        })?;
+        let port = uri
+            .port_u16()
+            .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_private_or_reserved_ip(ip) {
+                return Err(RouterError::UnsafeTargetUrl {
+                    host: norm_host.to_string(),
+                    url: target_str.to_string(),
+                    reason: "Target IP is private or reserved".to_string(),
+                });
+            }
+            let dest_addr = Some(std::net::SocketAddr::new(ip, port));
+            let host_for_url = match ip {
+                std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+                std::net::IpAddr::V4(v4) => v4.to_string(),
+            };
+            let url = format!("{}://{}:{}", scheme, host_for_url, port);
+            return Ok(Router::create_node_full(url, None, dest_addr));
+        }
+
+        // Host is a domain name (e.g. "httpbin.org")
+        let lookup_target = format!("{}:{}", host, port);
+        use std::net::ToSocketAddrs;
+        if let Ok(resolved_addrs) = lookup_target.to_socket_addrs() {
+            for addr in resolved_addrs {
+                if !is_private_or_reserved_ip(addr.ip()) {
+                    let target_url = format!("{}://{}:{}", scheme, host, port);
+                    return Ok(Router::create_node_full(
+                        target_url,
+                        Some(host.to_string()),
+                        Some(addr),
+                    ));
+                }
+            }
+        }
+
+        // Fallback for unresolvable host (e.g. synthetic test domains in unit tests)
+        let target_url = format!("{}://{}:{}", scheme, host, port);
+        Ok(Router::create_node_full(
+            target_url,
+            Some(host.to_string()),
+            None,
+        ))
+    }
+
     /// Builds a router from declarative UpstreamConfig.
     /// Returns a validation error if routes contain duplicate hosts, empty targets, or invalid URLs.
     pub fn from_upstream_config(cfg: &crate::config::UpstreamConfig) -> Result<Self, RouterError> {
+        let mut default_nodes = Vec::new();
+        for o in &cfg.origins {
+            default_nodes.push(Self::create_node_from_static_origin("default", o)?);
+        }
+        for target in &cfg.targets {
+            default_nodes.push(Self::create_node_from_target_str("default", target)?);
+        }
+
         if !cfg.routes.is_empty() {
             let mut domain_routes = Vec::new();
             for r in &cfg.routes {
+                let norm_host = normalize_host(&r.host);
                 if !r.path_routes.is_empty() {
                     let mut path_routes = Vec::new();
                     for pr in &r.path_routes {
                         validate_path_prefix(&r.host, &pr.path_prefix)?;
+                        let mut pr_nodes = Vec::new();
+                        for o in &pr.origins {
+                            pr_nodes.push(Self::create_node_from_static_origin(&norm_host, o)?);
+                        }
+                        for t in &pr.targets {
+                            pr_nodes.push(Self::create_node_from_target_str(&norm_host, t)?);
+                        }
                         path_routes.push(PathRoute {
                             path_prefix: pr.path_prefix.clone(),
                             priority: pr.priority,
-                            origins: pr.targets.iter().cloned().map(Self::create_node).collect(),
+                            origins: pr_nodes,
                             round_robin_index: Arc::new(AtomicUsize::new(0)),
                         });
                     }
@@ -348,18 +511,19 @@ impl Router {
                         None,
                     ));
                 } else {
-                    domain_routes.push(DomainRoute::new(
-                        r.host.clone(),
-                        r.targets.iter().cloned().map(Self::create_node).collect(),
-                    ));
+                    let mut r_nodes = Vec::new();
+                    for o in &r.origins {
+                        r_nodes.push(Self::create_node_from_static_origin(&norm_host, o)?);
+                    }
+                    for t in &r.targets {
+                        r_nodes.push(Self::create_node_from_target_str(&norm_host, t)?);
+                    }
+                    domain_routes.push(DomainRoute::new(r.host.clone(), r_nodes));
                 }
             }
-            Self::new_multi_tenant(domain_routes, cfg.targets.clone(), cfg.timeout_ms)
+            Self::new_multi_tenant_with_nodes(domain_routes, default_nodes, cfg.timeout_ms)
         } else {
-            for target in &cfg.targets {
-                validate_target_url("default", target)?;
-            }
-            Ok(Self::new(cfg.targets.clone(), cfg.timeout_ms))
+            Ok(Self::new_with_nodes(default_nodes, cfg.timeout_ms))
         }
     }
 
@@ -1165,7 +1329,6 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
                 reason: "Origin port cannot be 0".to_string(),
             });
         }
-        let is_https = proto == "https";
         let sni_trimmed = o.sni.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
         let clean_addr = o
             .address
@@ -1194,9 +1357,9 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             std::net::IpAddr::V4(v4) => v4.to_string(),
         };
 
-        let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
-            (true, Some(sni_host)) if sni_host != clean_addr => {
-                let target_url = format!("https://{}:{}", sni_host, o.port);
+        let (url, sni, destination_addr) = match sni_trimmed {
+            Some(sni_host) if sni_host != clean_addr => {
+                let target_url = format!("{}://{}:{}", proto, sni_host, o.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
             _ => {

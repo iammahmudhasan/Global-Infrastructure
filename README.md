@@ -264,12 +264,14 @@ go run cmd/config-controller/main.go
 
 ### 2. Onboard a Test/Development Domain
 ```bash
+# Note: Provide a publicly routable origin IP or FQDN that you control (e.g., 93.184.216.34 or origin.example.com).
+# Private RFC 1918, loopback, and RFC 5737 documentation ranges (such as 198.51.100.0/24) are rejected by anti-SSRF enforcement.
 curl -s -X POST http://127.0.0.1:9091/v1/projects/prj-enterprise-01/domains \
   -H "Content-Type: application/json" \
   -H "X-API-Key: dev-fixture-key-01" \
   -d '{
     "hostname": "api.dev.example.com",
-    "origin_address": "198.51.100.10",
+    "origin_address": "93.184.216.34",
     "origin_port": 443,
     "origin_protocol": "HTTPS"
   }'

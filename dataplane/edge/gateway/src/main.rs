@@ -1,20 +1,13 @@
-mod cache;
-mod config;
-mod dns;
-mod proxy;
-mod rate_limit;
-mod router;
-mod sync;
-mod waf;
-
-use crate::cache::EdgeCache;
-use crate::config::GatewayConfig;
-use crate::dns::PinnedDnsResolver;
-use crate::proxy::{handle_request, ProxyState, DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS};
-use crate::rate_limit::RateLimiter;
-use crate::router::Router;
-use crate::sync::fetch_and_apply_control_plane_snapshot;
-use crate::waf::WafEngine;
+use nexusedge_gateway::cache::EdgeCache;
+use nexusedge_gateway::config::GatewayConfig;
+use nexusedge_gateway::dns::PinnedDnsResolver;
+use nexusedge_gateway::proxy::{
+    handle_request, ProxyState, DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS,
+};
+use nexusedge_gateway::rate_limit::RateLimiter;
+use nexusedge_gateway::router::{self, Router};
+use nexusedge_gateway::sync::fetch_and_apply_control_plane_snapshot;
+use nexusedge_gateway::waf::WafEngine;
 
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;

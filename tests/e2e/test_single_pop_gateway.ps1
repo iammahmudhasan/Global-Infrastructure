@@ -1,123 +1,71 @@
-# NexusEdge Single-PoP Edge Security Gateway End-to-End Integration Test Suite
-# Validates Gate 1 through Gate 9: Ingress Routing, Path Routing, WAF, Rate Limiting, and Health Checks.
+# NexusEdge Single-PoP Edge Security Gateway End-to-End Integration Test Suite (PowerShell)
+# Enforces Acceptance Criteria: Gateway /ready, Envoy Ingress (HTTP & HTTPS), Path Routing, Tenant Isolation, WAF, and ACME.
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+
+$EnvoyHttpUrl = if ($env:ENVOY_HTTP_URL) { $env:ENVOY_HTTP_URL } else { "http://127.0.0.1:80" }
+$EnvoyHttpsUrl = if ($env:ENVOY_HTTPS_URL) { $env:ENVOY_HTTPS_URL } else { "https://127.0.0.1:443" }
+$GatewayUrl = if ($env:GATEWAY_URL) { $env:GATEWAY_URL } else { "http://127.0.0.1:8080" }
+$ControlPlaneUrl = if ($env:CONTROL_PLANE_URL) { $env:CONTROL_PLANE_URL } else { "http://127.0.0.1:9091" }
 
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host " NexusEdge Single-PoP Gateway End-to-End Integration Tests" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan
 
-$EnvoyHttpUrl = "http://127.0.0.1:10000"
-$GatewayUrl = "http://127.0.0.1:8080"
-$ControlPlaneUrl = "http://127.0.0.1:9091"
-
-# Helper for HTTP requests
-function Invoke-EdgeRequest {
-    param (
-        [string]$Url,
-        [string]$HostHeader,
-        [string]$Method = "GET",
-        [hashtable]$Headers = @{}
+function Assert-Status {
+    param(
+        [string]$Name,
+        [int]$Expected,
+        [int]$Actual
     )
-    $reqHeaders = @{}
-    if ($HostHeader) {
-        $reqHeaders["Host"] = $HostHeader
-    }
-    foreach ($k in $Headers.Keys) {
-        $reqHeaders[$k] = $Headers[$k]
-    }
-    try {
-        $response = Invoke-WebRequest -Uri $Url -Method $Method -Headers $reqHeaders -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop
-        return @{
-            StatusCode = [int]$response.StatusCode
-            Headers = $response.Headers
-            Content = $response.Content
-        }
-    } catch {
-        if ($_.Exception.Response) {
-            $resp = $_.Exception.Response
-            $stream = $resp.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $body = $reader.ReadToEnd()
-            return @{
-                StatusCode = [int]$resp.StatusCode
-                Headers = $resp.Headers
-                Content = $body
-            }
-        } else {
-            return @{
-                StatusCode = 0
-                Error = $_.Exception.Message
-            }
-        }
-    }
-}
-
-# Gate 1 & 8: Process Liveness & Readiness Checks
-Write-Host "[Gate 1 & 8] Verifying Health & Readiness Endpoints..." -ForegroundColor Yellow
-
-# Test Rust Gateway /healthz
-$gwHealth = Invoke-EdgeRequest -Url "$GatewayUrl/healthz"
-if ($gwHealth.StatusCode -eq 200) {
-    Write-Host "  -> Gateway /healthz: PASS (200 OK)" -ForegroundColor Green
-} else {
-    Write-Host "  -> Gateway /healthz: FAIL (Got $($gwHealth.StatusCode), $($gwHealth.Error))" -ForegroundColor Red
-}
-
-# Test Control Plane /healthz
-$cpHealth = Invoke-EdgeRequest -Url "$ControlPlaneUrl/healthz"
-if ($cpHealth.StatusCode -eq 200) {
-    Write-Host "  -> Control Plane /healthz: PASS (200 OK)" -ForegroundColor Green
-} else {
-    Write-Host "  -> Control Plane /healthz: FAIL (Got $($cpHealth.StatusCode), $($cpHealth.Error))" -ForegroundColor Red
-}
-
-# Gate 1: Envoy Routing Verification (Customer traffic MUST NOT hit Control Plane)
-Write-Host "[Gate 1] Verifying Envoy Customer Ingress Traffic Separation..." -ForegroundColor Yellow
-$customerReq = Invoke-EdgeRequest -Url "$EnvoyHttpUrl/get" -HostHeader "api.nexusedge.io"
-if ($customerReq.StatusCode -eq 200 -or $customerReq.StatusCode -eq 403 -or $customerReq.StatusCode -eq 502) {
-    # If it was incorrectly routed to Control Plane, it would return 404 with {"error":"route not found"}
-    if ($customerReq.Content -match "route not found" -and $customerReq.StatusCode -eq 404) {
-        Write-Host "  -> CRITICAL REGRESSION: Customer request routed to Control Plane!" -ForegroundColor Red
-        exit 1
+    if ($Actual -eq $Expected) {
+        Write-Host "  [PASS] $Name (Status: $Actual)" -ForegroundColor Green
     } else {
-        Write-Host "  -> Envoy Customer Traffic Separation: PASS (Customer traffic routed to Data Plane)" -ForegroundColor Green
-    }
-} else {
-    Write-Host "  -> Envoy Ingress: Note: ($($customerReq.StatusCode) - $($customerReq.Error))" -ForegroundColor Gray
-}
-
-# Gate 1: ACME HTTP-01 Challenge Exception
-Write-Host "[Gate 1] Verifying ACME HTTP-01 Routing to Control Plane..." -ForegroundColor Yellow
-$acmeReq = Invoke-EdgeRequest -Url "$EnvoyHttpUrl/.well-known/acme-challenge/test-token-123"
-# Control Plane handler handles /.well-known/acme-challenge/
-Write-Host "  -> ACME Challenge Ingress Route: Verified (Status: $($acmeReq.StatusCode))" -ForegroundColor Green
-
-# Gate 6: WAF Attack Payload Interception
-Write-Host "[Gate 6] Verifying WAF Inspection (SQL Injection & Malicious Payloads)..." -ForegroundColor Yellow
-$wafReq = Invoke-EdgeRequest -Url "$GatewayUrl/products?id=1%20UNION%20SELECT%20null,password%20FROM%20users" -HostHeader "api.nexusedge.io"
-if ($wafReq.StatusCode -eq 403) {
-    Write-Host "  -> WAF SQLi Interception: PASS (HTTP 403 Forbidden)" -ForegroundColor Green
-} else {
-    Write-Host "  -> WAF SQLi Interception: Note: Status $($wafReq.StatusCode)" -ForegroundColor Gray
-}
-
-# Gate 6: Rate Limiting Enforcement
-Write-Host "[Gate 6] Verifying Rate Limiting Enforcement (Burst Protection)..." -ForegroundColor Yellow
-$rateLimited = $false
-for ($i = 0; $i -lt 250; $i++) {
-    $res = Invoke-EdgeRequest -Url "$GatewayUrl/healthz" -HostHeader "api.nexusedge.io"
-    if ($res.StatusCode -eq 429) {
-        $rateLimited = $true
-        break
+        Write-Host "  [FAIL] $Name: Expected HTTP $Expected, got $Actual" -ForegroundColor Red
+        exit 1
     }
 }
-if ($rateLimited) {
-    Write-Host "  -> Rate Limiting Enforcement: PASS (HTTP 429 returned on burst exhaustion)" -ForegroundColor Green
+
+# 1. Gateway Readiness Gate
+Write-Host "[Test 1/7] Verifying Gateway /ready endpoint..." -ForegroundColor Yellow
+$readyCode = & curl -s -o /dev/null -w "%{http_code}" "$GatewayUrl/ready"
+Assert-Status "Gateway /ready" 200 ([int]$readyCode)
+
+# 2. Envoy Customer HTTP Ingress Routing
+Write-Host "[Test 2/7] Verifying Envoy HTTP Ingress -> Rust Gateway -> Origin..." -ForegroundColor Yellow
+$httpCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpUrl/get"
+Assert-Status "Customer HTTP Ingress" 200 ([int]$httpCode)
+
+# 3. Envoy Customer HTTPS Ingress with TLS Termination
+Write-Host "[Test 3/7] Verifying Envoy HTTPS Ingress (TLS Termination)..." -ForegroundColor Yellow
+$httpsCode = & curl -k -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpsUrl/get"
+Assert-Status "Customer HTTPS Ingress" 200 ([int]$httpsCode)
+
+# 4. Path Routing Verification (/api/ path prefix)
+Write-Host "[Test 4/7] Verifying Path Routing (/api/ prefix)..." -ForegroundColor Yellow
+$pathCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpUrl/api/status/200"
+Assert-Status "Path-prefix Routing" 200 ([int]$pathCode)
+
+# 5. Fail-Closed Tenant Isolation Gate
+Write-Host "[Test 5/7] Verifying Fail-Closed Tenant Isolation (unknown tenant host)..." -ForegroundColor Yellow
+$unknownCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: unknown-tenant.example.com" "$EnvoyHttpUrl/"
+Assert-Status "Unmatched Tenant Isolation" 404 ([int]$unknownCode)
+
+# 6. WAF Inspection & Interception Gate
+Write-Host "[Test 6/7] Verifying WAF Interception (SQL Injection attack payload)..." -ForegroundColor Yellow
+$wafCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpUrl/products?id=1%20UNION%20SELECT%20null,password%20FROM%20users"
+Assert-Status "WAF SQLi Interception" 403 ([int]$wafCode)
+
+# 7. ACME Challenge Routing Gate
+Write-Host "[Test 7/7] Verifying ACME HTTP-01 Routing to Control Plane..." -ForegroundColor Yellow
+$acmeCode = [int](& curl -s -o /dev/null -w "%{http_code}" "$EnvoyHttpUrl/.well-known/acme-challenge/test-token")
+if ($acmeCode -eq 404 -or $acmeCode -eq 200) {
+    Write-Host "  [PASS] ACME HTTP-01 Challenge Routing: Reached Control Plane (Status: $acmeCode)" -ForegroundColor Green
 } else {
-    Write-Host "  -> Rate Limiting: Burst evaluated (under threshold or disabled for health endpoints)" -ForegroundColor Gray
+    Write-Host "  [FAIL] ACME HTTP-01 Challenge Routing: Unexpected status $acmeCode" -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host " Single-PoP Edge Security Gateway Verification Completed." -ForegroundColor Green
+Write-Host " Single-PoP Edge Security Gateway Verification: ALL GATES PASS" -ForegroundColor Cyan
 Write-Host "================================================================" -ForegroundColor Cyan

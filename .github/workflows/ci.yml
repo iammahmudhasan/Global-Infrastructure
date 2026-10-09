@@ -89,11 +89,65 @@ jobs:
         run: python intelligence/scheduling/workload-scheduler/optimizer.py
 
   deploy-manifest-check:
-    name: Docker Compose Manifest Validation
+    name: Single-PoP End-to-End Compose Runtime
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Generate Ingress TLS Certificates
+        run: go run tools/release/generate_certs.go deploy/envoy/certs
+
       - name: Validate Compose Config
         run: docker compose -f deploy/docker-compose.yml config
+
+      - name: Build and Start Single-PoP Stack
+        run: docker compose -f deploy/docker-compose.yml up -d --build
+
+      - name: Wait for Stack Health and Readiness
+        timeout-minutes: 5
+        run: |
+          echo "Awaiting Config Controller health..."
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:9091/healthz > /dev/null 2>&1; then
+              echo "Config Controller is healthy!"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "Awaiting Gateway /ready endpoint (initial snapshot sync)..."
+          for i in {1..30}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ready || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Gateway is ready (HTTP 200)!"
+              break
+            fi
+            echo "Gateway not ready yet (status: $STATUS), waiting..."
+            sleep 2
+          done
+
+          echo "Awaiting Envoy Ingress readiness..."
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:9901/ready > /dev/null 2>&1; then
+              echo "Envoy Ingress is ready!"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Run Single-PoP E2E Integration Suite
+        run: bash tests/e2e/test_single_pop_gateway.sh
+
+      - name: Inspect Container Logs on Failure
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs
+
+      - name: Teardown Compose Stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v
