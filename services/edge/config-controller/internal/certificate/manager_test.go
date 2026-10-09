@@ -20,6 +20,8 @@ import (
 func TestCertificateManager_Workflow(t *testing.T) {
 	st := store.NewStore()
 	mgr := certificate.NewManager(st)
+	mgr.SetCertsDir(t.TempDir())
+	t.Setenv("NEXUSEDGE_CERTS_GID", "101")
 
 	domain := &model.Domain{
 		ID:        "dom-test-tls",
@@ -130,6 +132,8 @@ func TestCertificateManager_Errors(t *testing.T) {
 func TestCertificateManager_RateLimits(t *testing.T) {
 	st := store.NewStore()
 	mgr := certificate.NewManager(st)
+	mgr.SetCertsDir(t.TempDir())
+	t.Setenv("NEXUSEDGE_CERTS_GID", "101")
 
 	domain := &model.Domain{
 		ID:        "dom-ratelimit-tls",
@@ -263,14 +267,173 @@ func TestCertificateManager_ProductionGuard(t *testing.T) {
 	}
 	_ = st.SaveDomain(domain)
 
+	// In non-production, order succeeds
 	_, ch, err := mgr.OrderCertificate("dom-prod-guard")
 	if err != nil {
 		t.Fatalf("order certificate failed: %v", err)
 	}
 
+	// In production, validation must fail closed
 	t.Setenv("NEXUSEDGE_ENV", "production")
 	_, err = mgr.ValidateAndIssueCertificate(ch.Token)
 	if !errors.Is(err, certificate.ErrProductionACMENotConfigured) {
-		t.Fatalf("expected ErrProductionACMENotConfigured in production, got: %v", err)
+		t.Fatalf("expected ErrProductionACMENotConfigured in production on validation, got: %v", err)
+	}
+
+	// In production, ordering a new certificate must also fail closed immediately
+	_, _, err = mgr.OrderCertificate("dom-prod-guard")
+	if !errors.Is(err, certificate.ErrProductionACMENotConfigured) {
+		t.Fatalf("expected ErrProductionACMENotConfigured in production on order, got: %v", err)
+	}
+}
+
+func TestCertificateManager_ActiveCertificatePreservationDuringRenewal(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+	mgr.SetCertsDir(t.TempDir())
+	t.Setenv("NEXUSEDGE_CERTS_GID", "101")
+
+	domain := &model.Domain{
+		ID:        "dom-renewal-preservation",
+		ProjectID: "prj-renewal",
+		Hostname:  "renewal.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	// 1. Issue initial active certificate
+	_, ch1, err := mgr.OrderCertificate("dom-renewal-preservation")
+	if err != nil {
+		t.Fatalf("first order failed: %v", err)
+	}
+	activeCert, err := mgr.ValidateAndIssueCertificate(ch1.Token)
+	if err != nil {
+		t.Fatalf("first validate failed: %v", err)
+	}
+	if activeCert.Status != model.CertStatusActive {
+		t.Fatalf("expected active certificate, got %s", activeCert.Status)
+	}
+
+	// Verify active certificate is returned by GetCertificate
+	current := st.GetCertificate("dom-renewal-preservation")
+	if current == nil || current.Status != model.CertStatusActive || current.ID != activeCert.ID {
+		t.Fatalf("expected active certificate in store, got %+v", current)
+	}
+
+	// 2. Start a renewal order - must NOT overwrite active certificate in store with pending placeholder
+	pendingCert, ch2, err := mgr.OrderCertificate("dom-renewal-preservation")
+	if err != nil {
+		t.Fatalf("renewal order failed: %v", err)
+	}
+	if pendingCert.Status != model.CertStatusPendingChallenge {
+		t.Fatalf("expected pending status for renewal order, got %s", pendingCert.Status)
+	}
+
+	// CRITICAL ASSERTION: The active certificate must still be preserved in store
+	stillActive := st.GetCertificate("dom-renewal-preservation")
+	if stillActive == nil || stillActive.Status != model.CertStatusActive || stillActive.ID != activeCert.ID {
+		t.Fatalf("CRITICAL REGRESSION: active certificate was overwritten by pending placeholder in store: %+v", stillActive)
+	}
+
+	// The pending certificate must be retrievable via GetPendingCertificate
+	pendingInStore := st.GetPendingCertificate("dom-renewal-preservation")
+	if pendingInStore == nil || pendingInStore.ID != pendingCert.ID || pendingInStore.Status != model.CertStatusPendingChallenge {
+		t.Fatalf("expected pending certificate in store, got %+v", pendingInStore)
+	}
+
+	// 3. Complete renewal - now active certificate should transition to new version
+	renewedCert, err := mgr.ValidateAndIssueCertificate(ch2.Token)
+	if err != nil {
+		t.Fatalf("renewal validation failed: %v", err)
+	}
+	if renewedCert.Status != model.CertStatusActive || renewedCert.ID != pendingCert.ID {
+		t.Fatalf("expected renewed certificate to become active, got %+v", renewedCert)
+	}
+
+	updatedActive := st.GetCertificate("dom-renewal-preservation")
+	if updatedActive == nil || updatedActive.ID != renewedCert.ID || updatedActive.Status != model.CertStatusActive {
+		t.Fatalf("expected updated active certificate in store, got %+v", updatedActive)
+	}
+
+	// Pending certificate should now be cleared
+	if st.GetPendingCertificate("dom-renewal-preservation") != nil {
+		t.Fatalf("expected pending certificate to be cleared after activation")
+	}
+}
+
+func TestCertificateManager_KeypairMismatchRejection(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+	mgr.SetCertsDir(t.TempDir())
+
+	// Create mismatched certificate and private key
+	mismatchedCert := &model.Certificate{
+		ID:            "cert-mismatch",
+		DomainID:      "dom-mismatch",
+		Status:        model.CertStatusActive,
+		CertPEM:       "-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzinvalid\n-----END CERTIFICATE-----",
+		PrivateKeyPEM: "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIInvalidKey\n-----END EC PRIVATE KEY-----",
+	}
+
+	err := mgr.SyncSDSCertificate(mismatchedCert)
+	if err == nil {
+		t.Fatalf("expected SyncSDSCertificate to fail on mismatched/invalid keypair, got nil")
+	}
+	if !strings.Contains(err.Error(), "mismatch") && !strings.Contains(err.Error(), "failed to parse") {
+		t.Fatalf("expected keypair mismatch error message, got: %v", err)
+	}
+}
+
+func TestCertificateManager_VersionedSDSRotation(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+	tempDir := t.TempDir()
+	mgr.SetCertsDir(tempDir)
+
+	domain := &model.Domain{
+		ID:        "dom-versioned-test",
+		ProjectID: "prj-ver",
+		Hostname:  "versioned.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	gid := os.Getgid()
+	if gid < 0 {
+		gid = 101
+	}
+	t.Setenv("NEXUSEDGE_CERTS_GID", strconv.Itoa(gid))
+
+	_, ch, err := mgr.OrderCertificate("dom-versioned-test")
+	if err != nil {
+		t.Fatalf("order failed: %v", err)
+	}
+
+	cert, err := mgr.ValidateAndIssueCertificate(ch.Token)
+	if err != nil {
+		t.Fatalf("validate failed: %v", err)
+	}
+
+	// Verify versioned directory exists
+	versionDir := filepath.Join(tempDir, "versions", cert.ID)
+	verCertPath := filepath.Join(versionDir, "server.crt")
+	verKeyPath := filepath.Join(versionDir, "server.key")
+
+	if _, err := os.Stat(verCertPath); os.IsNotExist(err) {
+		t.Fatalf("expected versioned certificate file at %s", verCertPath)
+	}
+	if _, err := os.Stat(verKeyPath); os.IsNotExist(err) {
+		t.Fatalf("expected versioned private key file at %s", verKeyPath)
+	}
+
+	// Verify root backward compatible files exist
+	if _, err := os.Stat(filepath.Join(tempDir, "server.crt")); os.IsNotExist(err) {
+		t.Fatalf("expected root server.crt to exist")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "server.key")); os.IsNotExist(err) {
+		t.Fatalf("expected root server.key to exist")
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, "sds.json")); os.IsNotExist(err) {
+		t.Fatalf("expected root sds.json to exist")
 	}
 }

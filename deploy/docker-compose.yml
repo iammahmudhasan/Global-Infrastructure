@@ -9,8 +9,8 @@ services:
     environment:
       - PORT=9091
       # Development profile flags: set NEXUSEDGE_DEV_MODE=false and NEXUSEDGE_ENV=production for production deployments
-      - NEXUSEDGE_DEV_MODE=true
-      - NEXUSEDGE_ENV=development
+      - NEXUSEDGE_DEV_MODE=${NEXUSEDGE_DEV_MODE:-true}
+      - NEXUSEDGE_ENV=${NEXUSEDGE_ENV:-development}
       - NEXUSEDGE_ACME_HOST=config-controller
       - NEXUSEDGE_ACME_PORT=9091
       - NEXUSEDGE_CERTS_DIR=/etc/envoy/certs
@@ -58,8 +58,8 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       - RUST_LOG=info
-      - NEXUSEDGE_DEV_MODE=true
-      - NEXUSEDGE_ENV=development
+      - NEXUSEDGE_DEV_MODE=${NEXUSEDGE_DEV_MODE:-true}
+      - NEXUSEDGE_ENV=${NEXUSEDGE_ENV:-development}
       - NEXUSEDGE_CP_ENABLED=true
       - NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091
       - NEXUSEDGE_CP_POP_ID=singapore

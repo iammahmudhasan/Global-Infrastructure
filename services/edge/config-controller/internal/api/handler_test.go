@@ -25,10 +25,16 @@ import (
 func setupTestServer() *api.APIHandler {
 	os.Setenv("NEXUSEDGE_DEV_MODE", "true")
 	os.Setenv("NEXUSEDGE_ENV", "test")
+	os.Setenv("NEXUSEDGE_CERTS_GID", "101")
 	st := store.NewStore()
 	svc := onboarding.NewDomainService(st)
 	comp := compiler.NewCompiler(9901, 80, 443)
-	return api.NewAPIHandler(st, svc, comp)
+	h := api.NewAPIHandler(st, svc, comp)
+	tmpDir, err := os.MkdirTemp("", "nexusedge-test-certs-*")
+	if err == nil {
+		h.CertManager().SetCertsDir(tmpDir)
+	}
+	return h
 }
 
 func TestAPIWorkflow(t *testing.T) {
@@ -2957,5 +2963,38 @@ func TestPoPConfigSyncContract_GoldenFixture(t *testing.T) {
 	// Verify cache policy propagation
 	if r.Cache == nil || !r.Cache.Enabled || r.Cache.DefaultTTLSeconds != 300 {
 		t.Fatalf("expected cache policy to be propagated, got %+v", r.Cache)
+	}
+}
+
+func TestAPI_CertificateOrderProductionGuard(t *testing.T) {
+	handler := setupTestServer()
+
+	// Register tenant API key
+	handler.Authenticator().RegisterTenantWithRole("prod-test-key", "tenant-1", "prj-alpha", auth.RolePlatformOperator)
+
+	// Create test domain
+	domain := &model.Domain{
+		ID:        "dom-cert-prod-test",
+		ProjectID: "prj-alpha",
+		Hostname:  "cert.production.test",
+		Status:    model.DomainStatusActive,
+	}
+	_ = handler.Store().SaveDomain(domain)
+
+	// Set production environment
+	t.Setenv("NEXUSEDGE_ENV", "production")
+
+	// Order certificate via API endpoint: POST /v1/domains/dom-cert-prod-test/certificates/order
+	req := httptest.NewRequest(http.MethodPost, "/v1/domains/dom-cert-prod-test/certificates/order", nil)
+	req.Header.Set("X-API-Key", "prod-test-key")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Must fail with HTTP 501 Not Implemented (Rule: ErrProductionACMENotConfigured mapped to 501)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected HTTP 501 Not Implemented in production, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "production ACME issuer is not configured") {
+		t.Fatalf("expected error message explaining production ACME issuer not configured, got: %s", w.Body.String())
 	}
 }

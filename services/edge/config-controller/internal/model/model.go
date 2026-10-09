@@ -102,15 +102,16 @@ type OriginPool struct {
 }
 
 type Origin struct {
-	ID          string   `json:"id"`
-	PoolID      string   `json:"pool_id"`
-	Address     string   `json:"address"` // FQDN or IP
-	Port        int      `json:"port"`
-	Protocol    Protocol `json:"protocol"` // "HTTP" or "HTTPS"
-	SNI         string   `json:"sni,omitempty"`
-	Weight      int      `json:"weight"`
-	Healthy     bool     `json:"healthy"`
-	AllowedPoPs []string `json:"allowed_pops,omitempty"` // empty means global / all PoPs
+	ID           string   `json:"id"`
+	PoolID       string   `json:"pool_id"`
+	Address      string   `json:"address"` // FQDN or IP
+	Port         int      `json:"port"`
+	Protocol     Protocol `json:"protocol"` // "HTTP" or "HTTPS"
+	SNI          string   `json:"sni,omitempty"`
+	CABundlePath string   `json:"ca_bundle_path,omitempty"`
+	Weight       int      `json:"weight"`
+	Healthy      bool     `json:"healthy"`
+	AllowedPoPs  []string `json:"allowed_pops,omitempty"` // empty means global / all PoPs
 }
 
 type Route struct {

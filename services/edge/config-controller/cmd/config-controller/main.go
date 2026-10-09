@@ -27,8 +27,20 @@ func main() {
 
 	log.Printf("[INFO] Initializing NexusEdge Control Plane (Config Controller)...")
 
-	// 1. Initialize In-Memory Data Store (backed by Postgres in full cluster)
-	dataStore := store.NewStore()
+	// 1. Initialize Storage Repository (Durable PostgreSQL or In-Memory fallback)
+	var dataStore store.Repository
+	dbURL := strings.TrimSpace(os.Getenv("NEXUSEDGE_DATABASE_URL"))
+	if dbURL != "" {
+		pgRepo, err := store.NewPostgresRepository(dbURL)
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to initialize durable PostgreSQL storage repository: %v", err)
+		}
+		dataStore = pgRepo
+		log.Printf("[INFO] Initialized durable PostgreSQL storage repository from NEXUSEDGE_DATABASE_URL")
+	} else {
+		dataStore = store.NewStore()
+		log.Printf("[INFO] NEXUSEDGE_DATABASE_URL not set; initialized in-memory data store")
+	}
 
 	// In explicit local development mode, seed active fixture domain for PoPs
 	if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {

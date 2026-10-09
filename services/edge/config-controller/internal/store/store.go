@@ -105,31 +105,33 @@ type Store struct {
 	monitors            map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
 	healthStates        map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
 	certificates        map[string]*model.Certificate         // domain ID -> certificate
+	pendingCertificates map[string]*model.Certificate         // domain ID -> pending renewal/issuance certificate
 	challenges          map[string]*model.ACMEChallenge       // token -> ACMEChallenge
 	tlsSettings         map[string]*model.TLSSettings         // domain ID -> TLSSettings
 }
 
 func NewStore() *Store {
 	return &Store{
-		popTopologyCache:   make(map[string][]*DomainTopology),
-		domains:            make(map[string]*model.Domain),
-		hostIndex:          make(map[string]string),
-		projectQuotas:      make(map[string]ProjectQuota),
-		projectDomainCount: make(map[string]int),
-		pools:              make(map[string]*model.OriginPool),
-		origins:            make(map[string]*model.Origin),
-		routes:             make(map[string][]*model.Route),
-		security:           make(map[string]*model.SecurityPolicy),
-		wafRules:           make(map[string][]model.WAFRule),
-		rateLimits:         make(map[string][]model.RateLimitRule),
-		events:             make(map[string][]model.SecurityEvent),
-		cache:              make(map[string]*model.CachePolicy),
-		cacheRules:         make(map[string][]model.CacheRule),
-		monitors:           make(map[string]*model.HealthMonitor),
-		healthStates:       make(map[string]*model.OriginEndpointState),
-		certificates:       make(map[string]*model.Certificate),
-		challenges:         make(map[string]*model.ACMEChallenge),
-		tlsSettings:        make(map[string]*model.TLSSettings),
+		popTopologyCache:    make(map[string][]*DomainTopology),
+		domains:             make(map[string]*model.Domain),
+		hostIndex:           make(map[string]string),
+		projectQuotas:       make(map[string]ProjectQuota),
+		projectDomainCount:  make(map[string]int),
+		pools:               make(map[string]*model.OriginPool),
+		origins:             make(map[string]*model.Origin),
+		routes:              make(map[string][]*model.Route),
+		security:            make(map[string]*model.SecurityPolicy),
+		wafRules:            make(map[string][]model.WAFRule),
+		rateLimits:          make(map[string][]model.RateLimitRule),
+		events:              make(map[string][]model.SecurityEvent),
+		cache:               make(map[string]*model.CachePolicy),
+		cacheRules:          make(map[string][]model.CacheRule),
+		monitors:            make(map[string]*model.HealthMonitor),
+		healthStates:        make(map[string]*model.OriginEndpointState),
+		certificates:        make(map[string]*model.Certificate),
+		pendingCertificates: make(map[string]*model.Certificate),
+		challenges:          make(map[string]*model.ACMEChallenge),
+		tlsSettings:         make(map[string]*model.TLSSettings),
 	}
 }
 
@@ -407,6 +409,7 @@ func (s *Store) deleteDomainLocked(domainID string) error {
 	delete(s.cache, domainID)
 	delete(s.cacheRules, domainID)
 	delete(s.certificates, domainID)
+	delete(s.pendingCertificates, domainID)
 	delete(s.tlsSettings, domainID)
 
 	s.invalidateCachesLocked()
@@ -892,7 +895,12 @@ func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
 func (s *Store) SaveCertificate(cert *model.Certificate) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.certificates[cert.DomainID] = cloneCertificate(cert)
+	if cert.Status == model.CertStatusPendingChallenge {
+		s.pendingCertificates[cert.DomainID] = cloneCertificate(cert)
+	} else {
+		s.certificates[cert.DomainID] = cloneCertificate(cert)
+		delete(s.pendingCertificates, cert.DomainID)
+	}
 	s.invalidateCachesLocked()
 }
 
@@ -900,6 +908,12 @@ func (s *Store) GetCertificate(domainID string) *model.Certificate {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return cloneCertificate(s.certificates[domainID])
+}
+
+func (s *Store) GetPendingCertificate(domainID string) *model.Certificate {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return cloneCertificate(s.pendingCertificates[domainID])
 }
 
 func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {

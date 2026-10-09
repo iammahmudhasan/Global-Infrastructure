@@ -161,6 +161,8 @@ func TestChaos_TelemetryFloodMemoryBounding(t *testing.T) {
 func TestChaos_ZeroReloadCertificateRotation(t *testing.T) {
 	st := store.NewStore()
 	certMgr := certificate.NewManager(st)
+	certMgr.SetCertsDir(t.TempDir())
+	t.Setenv("NEXUSEDGE_CERTS_GID", "101")
 
 	domainID := "dom_cert_rotation"
 	st.SaveDomain(&model.Domain{

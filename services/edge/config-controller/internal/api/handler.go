@@ -32,7 +32,7 @@ import (
 )
 
 type APIHandler struct {
-	store           *store.Store
+	store           store.Repository
 	service         *onboarding.DomainService
 	compiler        *compiler.Compiler
 	wafEngine       *security.WAFEngine
@@ -48,7 +48,7 @@ type APIHandler struct {
 	mux             *http.ServeMux
 }
 
-func NewAPIHandler(s *store.Store, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
+func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
 	authenticator := auth.NewAuthenticator()
 	mux := http.NewServeMux()
 	h := &APIHandler{
@@ -127,7 +127,7 @@ func (h *APIHandler) PoPManager() *pop.Manager {
 	return h.popManager
 }
 
-func (h *APIHandler) Store() *store.Store {
+func (h *APIHandler) Store() store.Repository {
 	return h.store
 }
 
@@ -480,6 +480,9 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 		if r.Method == http.MethodGet {
 			cert := h.store.GetCertificate(domainID)
 			if cert == nil {
+				cert = h.store.GetPendingCertificate(domainID)
+			}
+			if cert == nil {
 				writeError(w, http.StatusNotFound, "no certificate found for domain")
 				return
 			}
@@ -499,6 +502,10 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 		}
 		cert, challenge, err := h.certManager.OrderCertificate(domainID)
 		if err != nil {
+			if errors.Is(err, certificate.ErrProductionACMENotConfigured) {
+				writeError(w, http.StatusNotImplemented, err.Error())
+				return
+			}
 			if errors.Is(err, certificate.ErrRateLimitExceeded) {
 				writeError(w, http.StatusTooManyRequests, err.Error())
 				return
@@ -518,7 +525,10 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 		}
 		cert := h.store.GetCertificate(domainID)
 		if cert == nil {
-			writeError(w, http.StatusNotFound, "no active certificate for domain")
+			cert = h.store.GetPendingCertificate(domainID)
+		}
+		if cert == nil {
+			writeError(w, http.StatusNotFound, "no certificate for domain")
 			return
 		}
 		daysRemaining := 0

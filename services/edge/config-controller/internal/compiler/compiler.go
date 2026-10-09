@@ -3,6 +3,7 @@ package compiler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -153,13 +154,22 @@ type DNSResolver func(ctx context.Context, host string) ([]net.IP, error)
 
 // Compiler transforms domain topologies from the control plane into Envoy v3 configuration
 type Compiler struct {
-	adminPort   int
-	httpPort    int
-	httpsPort   int
-	acmeHost    string
-	acmePort    int
-	edgeVersion string
-	resolver    DNSResolver
+	adminPort    int
+	httpPort     int
+	httpsPort    int
+	acmeHost     string
+	acmePort     int
+	edgeVersion  string
+	caBundlePath string
+	resolver     DNSResolver
+}
+
+func isProductionEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "production"
 }
 
 func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
@@ -184,6 +194,11 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 		}
 	}
 
+	caBundlePath := os.Getenv("NEXUSEDGE_UPSTREAM_CA_FILE")
+	if caBundlePath == "" {
+		caBundlePath = "/etc/ssl/certs/ca-certificates.crt"
+	}
+
 	defaultResolver := func(ctx context.Context, host string) ([]net.IP, error) {
 		resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
@@ -191,13 +206,14 @@ func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 	}
 
 	return &Compiler{
-		adminPort:   adminPort,
-		httpPort:    httpPort,
-		httpsPort:   httpsPort,
-		acmeHost:    acmeHost,
-		acmePort:    acmePort,
-		edgeVersion: "v1.0.0",
-		resolver:    defaultResolver,
+		adminPort:    adminPort,
+		httpPort:     httpPort,
+		httpsPort:    httpsPort,
+		acmeHost:     acmeHost,
+		acmePort:     acmePort,
+		edgeVersion:  "v1.0.0",
+		caBundlePath: caBundlePath,
+		resolver:     defaultResolver,
 	}
 }
 
@@ -207,6 +223,14 @@ func (c *Compiler) SetDNSResolver(r DNSResolver) {
 
 func (c *Compiler) GetDNSResolver() DNSResolver {
 	return c.resolver
+}
+
+func (c *Compiler) SetCABundlePath(path string) {
+	c.caBundlePath = path
+}
+
+func (c *Compiler) GetCABundlePath() string {
+	return c.caBundlePath
 }
 
 // Compile compiles active domain topologies into an Envoy v3 configuration
@@ -285,17 +309,45 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			})
 		}
 
-		// Per-Domain VirtualHost Rate Limit Isolation (Finding 9, 14, P1 RPM Audit)
-		if topo.Security != nil && topo.Security.RateLimitEnabled && topo.Security.RateLimitRPM > 0 {
+		// Per-Domain VirtualHost Rate Limit Isolation (Finding 8, Finding 9, 14, P1 RPM Audit)
+		if topo.Security != nil && topo.Security.RateLimitEnabled && (topo.Security.RateLimitRPM > 0 || len(topo.Security.RateLimitRules) > 0) {
 			rpm := topo.Security.RateLimitRPM
+			var maxTokens, tokensPerFill int
+			var fillInterval string
+
+			if len(topo.Security.RateLimitRules) > 0 && topo.Security.RateLimitRules[0].BurstSize > 0 {
+				rule := topo.Security.RateLimitRules[0]
+				rRPM := rule.RequestsPerMinute
+				if rRPM <= 0 {
+					rRPM = rpm
+				}
+				rps := rRPM / 60
+				if rps <= 0 {
+					rps = 1
+				}
+				tokensPerFill = rps
+				maxTokens = rule.BurstSize
+				if maxTokens < tokensPerFill {
+					maxTokens = tokensPerFill
+				}
+				fillInterval = "1s"
+			} else {
+				if rpm <= 0 {
+					rpm = 6000
+				}
+				tokensPerFill = rpm
+				maxTokens = rpm
+				fillInterval = "60s"
+			}
+
 			vh.TypedPerFilterConfig = map[string]interface{}{
 				"envoy.filters.http.local_ratelimit": map[string]interface{}{
 					"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
 					"stat_prefix": fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
 					"token_bucket": map[string]interface{}{
-						"max_tokens":      rpm,
-						"tokens_per_fill": rpm,
-						"fill_interval":   "60s",
+						"max_tokens":      maxTokens,
+						"tokens_per_fill": tokensPerFill,
+						"fill_interval":   fillInterval,
 					},
 					"filter_enabled": map[string]interface{}{
 						"runtime_key": "local_rate_limit_enabled",
@@ -397,7 +449,10 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 
 			// Add cluster to map if not already built
 			if _, alreadyExists := clustersMap[clusterName]; !alreadyExists {
-				cluster := c.buildCluster(clusterName, pool)
+				cluster, err := c.buildCluster(clusterName, pool)
+				if err != nil {
+					return nil, err
+				}
 				clustersMap[clusterName] = cluster
 			}
 		}
@@ -443,16 +498,25 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 	// If active TLS certificates exist, port 443 HTTPS listener is constructed.
 	// Port 80 HTTP listener serves redirects or direct routes depending on EnforceHTTPS policies.
 	if hasCertificates {
-		httpListener := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, anyServingDirectHTTP)
+		httpListener, err := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, anyServingDirectHTTP)
+		if err != nil {
+			return nil, err
+		}
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 
-		httpsListener := c.buildHTTPSListener(httpsVirtualHosts, orderedTopologies)
+		httpsListener, err := c.buildHTTPSListener(httpsVirtualHosts, orderedTopologies)
+		if err != nil {
+			return nil, err
+		}
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpsListener)
 		// Register SDS gRPC cluster so DownstreamTlsContext has no dangling cluster reference (P0 Finding 6B)
 		clustersMap["sds-grpc-cluster"] = c.buildSDSCluster()
 	} else {
 		// When only HTTP is available before TLS issuance, serve customer routes directly on port 80
-		httpListener := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, true)
+		httpListener, err := c.buildHTTPListener(httpVirtualHosts, orderedTopologies, true)
+		if err != nil {
+			return nil, err
+		}
 		config.StaticResources.Listeners = append(config.StaticResources.Listeners, httpListener)
 	}
 
@@ -587,7 +651,7 @@ func (c *Compiler) CompileForPoP(popID string, topologies []*store.DomainTopolog
 	return config, nil
 }
 
-func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[string]interface{} {
+func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) ([]map[string]interface{}, error) {
 	httpFilters := make([]map[string]interface{}, 0)
 
 	// 1. Check if rate limiting is enabled across any active topologies
@@ -600,6 +664,8 @@ func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[st
 	}
 
 	if hasRateLimiting {
+		// Listener-level default rate-limit filter.
+		// Enabled runtime key default is 0 so rate limiting is strictly applied per virtual host token bucket (Finding 8)
 		httpFilters = append(httpFilters, map[string]interface{}{
 			"name": "envoy.filters.http.local_ratelimit",
 			"typed_config": map[string]interface{}{
@@ -616,7 +682,7 @@ func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[st
 				"filter_enabled": map[string]interface{}{
 					"runtime_key": "local_rate_limit_enabled",
 					"default_value": map[string]interface{}{
-						"numerator":   100,
+						"numerator":   0,
 						"denominator": "HUNDRED",
 					},
 				},
@@ -659,6 +725,52 @@ func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[st
 							},
 						},
 					})
+				} else if rule.MatchType == model.WAFMatchIPCIDR {
+					// IP CIDR matching scoped to tenant authority (Finding 7)
+					rawPattern := strings.TrimSpace(rule.Pattern)
+					var ipPrefix string
+					var prefixLen int
+					if strings.Contains(rawPattern, "/") {
+						_, ipNet, err := net.ParseCIDR(rawPattern)
+						if err != nil {
+							return nil, fmt.Errorf("invalid WAF IP CIDR pattern %q for rule %q: %w", rawPattern, rule.ID, err)
+						}
+						size, _ := ipNet.Mask.Size()
+						ipPrefix = ipNet.IP.String()
+						prefixLen = size
+					} else {
+						parsedIP := net.ParseIP(rawPattern)
+						if parsedIP == nil {
+							return nil, fmt.Errorf("invalid WAF IP address pattern %q for rule %q", rawPattern, rule.ID)
+						}
+						ipPrefix = parsedIP.String()
+						if parsedIP.To4() != nil {
+							prefixLen = 32
+						} else {
+							prefixLen = 128
+						}
+					}
+
+					rbacDenyPrincipals = append(rbacDenyPrincipals, map[string]interface{}{
+						"and_ids": map[string]interface{}{
+							"ids": []map[string]interface{}{
+								{
+									"header": map[string]interface{}{
+										"name":         ":authority",
+										"string_match": map[string]interface{}{"exact": topo.Domain.Hostname},
+									},
+								},
+								{
+									"direct_remote_ip": map[string]interface{}{
+										"address_prefix": ipPrefix,
+										"prefix_len":     prefixLen,
+									},
+								},
+							},
+						},
+					})
+				} else {
+					return nil, fmt.Errorf("unsupported WAF match type %q for block rule %q", rule.MatchType, rule.ID)
 				}
 			}
 		}
@@ -714,10 +826,10 @@ func (c *Compiler) buildHTTPFilters(topologies []*store.DomainTopology) []map[st
 		},
 	})
 
-	return httpFilters
+	return httpFilters, nil
 }
 
-func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology, isServingDirect bool) Listener {
+func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology, isServingDirect bool) (Listener, error) {
 	routeConfig := map[string]interface{}{
 		"name":          "edge_http_routes",
 		"virtual_hosts": virtualHosts,
@@ -725,7 +837,11 @@ func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost, topologies []*s
 
 	var httpFilters []map[string]interface{}
 	if isServingDirect {
-		httpFilters = c.buildHTTPFilters(topologies)
+		filters, err := c.buildHTTPFilters(topologies)
+		if err != nil {
+			return Listener{}, err
+		}
+		httpFilters = filters
 	} else {
 		httpFilters = []map[string]interface{}{
 			{
@@ -763,16 +879,19 @@ func (c *Compiler) buildHTTPListener(virtualHosts []VirtualHost, topologies []*s
 				},
 			},
 		},
-	}
+	}, nil
 }
 
-func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology) Listener {
+func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*store.DomainTopology) (Listener, error) {
 	routeConfig := map[string]interface{}{
 		"name":          "edge_https_routes",
 		"virtual_hosts": virtualHosts,
 	}
 
-	httpFilters := c.buildHTTPFilters(topologies)
+	httpFilters, err := c.buildHTTPFilters(topologies)
+	if err != nil {
+		return Listener{}, err
+	}
 
 	hcmConfig := map[string]interface{}{
 		"@type":        "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
@@ -812,7 +931,7 @@ func (c *Compiler) buildHTTPSListener(virtualHosts []VirtualHost, topologies []*
 			},
 		},
 		FilterChains: filterChains,
-	}
+	}, nil
 }
 
 func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate, settings *model.TLSSettings) map[string]interface{} {
@@ -879,7 +998,7 @@ func effectiveOriginSNI(o model.Origin) string {
 // Resolves origin hostnames, validates that all resolved destination IPs are public and safe,
 // and pins them as STATIC cluster endpoints with preserved SNI, completely shielding Envoy
 // from runtime DNS rebinding to loopback, RFC1918, or cloud metadata ranges (P1 Finding).
-func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Cluster {
+func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) (Cluster, error) {
 	// Pinned STATIC endpoints shield Envoy from runtime DNS rebinding SSRF (Rule 23, Finding 1)
 	clusterType := "STATIC"
 	hasHTTPS := false
@@ -1041,68 +1160,158 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 		}
 	}
 
-	// If origin protocol is HTTPS and homogenous (no mixed plain HTTP), attach Upstream TLS context with SNI
+	// If origin protocol is HTTPS and homogenous (no mixed plain HTTP), attach Upstream TLS context with SNI and trusted CA validation
 	if hasHTTPS && !hasHTTP && len(pool.Origins) > 0 {
-		uniqueSNIs := make([]string, 0)
+		type sniInfo struct {
+			sni          string
+			caBundlePath string
+		}
+		uniqueSNIs := make([]sniInfo, 0)
 		sniSeen := make(map[string]bool)
 		for _, orig := range pool.Origins {
 			if orig.Protocol == model.ProtocolHTTPS {
 				sni := effectiveOriginSNI(orig)
-				if sni != "" {
-					lower := strings.ToLower(sni)
-					if !sniSeen[lower] {
-						sniSeen[lower] = true
-						uniqueSNIs = append(uniqueSNIs, sni)
-					}
+				caPath := orig.CABundlePath
+				key := strings.ToLower(sni) + "|" + caPath
+				if !sniSeen[key] {
+					sniSeen[key] = true
+					uniqueSNIs = append(uniqueSNIs, sniInfo{
+						sni:          sni,
+						caBundlePath: caPath,
+					})
 				}
 			}
 		}
 
 		if len(uniqueSNIs) == 1 {
+			target := uniqueSNIs[0].sni
+			if target == "" && len(pool.Origins) > 0 {
+				target = pool.Origins[0].Address
+			}
+			tlsCtx, err := c.buildValidatedUpstreamTLSContext(target, uniqueSNIs[0].caBundlePath)
+			if err != nil {
+				return Cluster{}, err
+			}
 			cluster.TransportSocket = &TransportSocket{
-				Name: "envoy.transport_sockets.tls",
-				TypedConfig: map[string]interface{}{
-					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-					"sni":   uniqueSNIs[0],
-				},
+				Name:        "envoy.transport_sockets.tls",
+				TypedConfig: tlsCtx,
 			}
 		} else if len(uniqueSNIs) > 1 {
 			// Per-origin endpoint TLS matching: prevents SNI mismatches when origins have distinct hostnames (Finding 3)
-			for _, sni := range uniqueSNIs {
+			for _, item := range uniqueSNIs {
+				target := item.sni
+				if target == "" && len(pool.Origins) > 0 {
+					target = pool.Origins[0].Address
+				}
+				tlsCtx, err := c.buildValidatedUpstreamTLSContext(target, item.caBundlePath)
+				if err != nil {
+					return Cluster{}, err
+				}
+				matchName := sanitizeName(item.sni)
+				if matchName == "" {
+					matchName = "default"
+				}
 				cluster.TransportSocketMatches = append(cluster.TransportSocketMatches, TransportSocketMatch{
-					Name: fmt.Sprintf("tls_match_%s", sanitizeName(sni)),
+					Name: fmt.Sprintf("tls_match_%s", matchName),
 					Match: map[string]interface{}{
-						"sni_host": sni,
+						"sni_host": item.sni,
 					},
 					TransportSocket: &TransportSocket{
-						Name: "envoy.transport_sockets.tls",
-						TypedConfig: map[string]interface{}{
-							"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-							"sni":   sni,
-						},
+						Name:        "envoy.transport_sockets.tls",
+						TypedConfig: tlsCtx,
 					},
 				})
 			}
 			// Cluster-level fallback TransportSocket
+			fallbackTarget := uniqueSNIs[0].sni
+			if fallbackTarget == "" && len(pool.Origins) > 0 {
+				fallbackTarget = pool.Origins[0].Address
+			}
+			fallbackCtx, err := c.buildValidatedUpstreamTLSContext(fallbackTarget, uniqueSNIs[0].caBundlePath)
+			if err != nil {
+				return Cluster{}, err
+			}
 			cluster.TransportSocket = &TransportSocket{
-				Name: "envoy.transport_sockets.tls",
-				TypedConfig: map[string]interface{}{
-					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-					"sni":   uniqueSNIs[0],
-				},
+				Name:        "envoy.transport_sockets.tls",
+				TypedConfig: fallbackCtx,
 			}
 		} else if len(uniqueSNIs) == 0 {
 			// Direct IP HTTPS upstream without SNI extension
+			defaultCA := ""
+			originTarget := ""
+			if len(pool.Origins) > 0 {
+				defaultCA = pool.Origins[0].CABundlePath
+				originTarget = pool.Origins[0].Address
+			}
+			tlsCtx, err := c.buildValidatedUpstreamTLSContext(originTarget, defaultCA)
+			if err != nil {
+				return Cluster{}, err
+			}
 			cluster.TransportSocket = &TransportSocket{
-				Name: "envoy.transport_sockets.tls",
-				TypedConfig: map[string]interface{}{
-					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-				},
+				Name:        "envoy.transport_sockets.tls",
+				TypedConfig: tlsCtx,
 			}
 		}
 	}
 
-	return cluster
+	return cluster, nil
+}
+
+// buildValidatedUpstreamTLSContext constructs a fully-validated Envoy v3 UpstreamTlsContext.
+// Configures SNI, trusted CA bundle validation, and exact Subject Alternative Name (SAN) matching
+// for DNS hostnames and IP addresses, preventing upstream TLS impersonation (P1 Finding 1).
+func (c *Compiler) buildValidatedUpstreamTLSContext(sni string, caBundlePath string) (map[string]interface{}, error) {
+	effectiveCAPath := strings.TrimSpace(caBundlePath)
+	if effectiveCAPath == "" {
+		effectiveCAPath = strings.TrimSpace(c.caBundlePath)
+	}
+	if effectiveCAPath == "" {
+		effectiveCAPath = strings.TrimSpace(os.Getenv("NEXUSEDGE_UPSTREAM_CA_FILE"))
+	}
+
+	if isProductionEnvironment() && effectiveCAPath == "" {
+		return nil, errors.New("upstream TLS validation requires trusted CA bundle in production; empty CA bundle path is rejected")
+	}
+
+	commonTLS := map[string]interface{}{}
+	if effectiveCAPath != "" {
+		validationCtx := map[string]interface{}{
+			"trusted_ca": map[string]interface{}{
+				"filename": effectiveCAPath,
+			},
+		}
+
+		cleanTarget := strings.TrimSpace(sni)
+		if cleanTarget != "" {
+			sanType := "DNS"
+			if net.ParseIP(cleanTarget) != nil {
+				sanType = "IP_ADDRESS"
+			}
+			validationCtx["match_typed_subject_alt_names"] = []map[string]interface{}{
+				{
+					"san_type": sanType,
+					"matcher": map[string]interface{}{
+						"exact": cleanTarget,
+					},
+				},
+			}
+		}
+
+		commonTLS["validation_context"] = validationCtx
+	}
+
+	tlsContext := map[string]interface{}{
+		"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+	}
+	cleanTarget := strings.TrimSpace(sni)
+	if cleanTarget != "" && net.ParseIP(cleanTarget) == nil {
+		tlsContext["sni"] = cleanTarget
+	}
+	if len(commonTLS) > 0 {
+		tlsContext["common_tls_context"] = commonTLS
+	}
+
+	return tlsContext, nil
 }
 
 func (c *Compiler) buildACMECluster() Cluster {

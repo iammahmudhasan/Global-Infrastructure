@@ -1079,3 +1079,385 @@ func TestCompiler_ExplicitOriginSNI(t *testing.T) {
 		t.Fatalf("expected UpstreamTlsContext.sni == 'origin.customer.example', got %q", sniVal)
 	}
 }
+
+func TestCompiler_UpstreamTLSValidation(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	comp.SetCABundlePath("/etc/ssl/certs/custom-ca.crt")
+	st := store.NewStore()
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	d := &model.Domain{
+		ID:        "dom-tls-val",
+		ProjectID: "prj-tls",
+		Hostname:  "secure.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(d)
+
+	pool := &model.OriginPool{
+		ID:          "pool-tls-val",
+		ProjectID:   "prj-tls",
+		Name:        "secure-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:           "orig-tls-1",
+				PoolID:       "pool-tls-val",
+				Address:      "203.0.113.50",
+				Port:         443,
+				Protocol:     model.ProtocolHTTPS,
+				SNI:          "origin-backend.internal",
+				CABundlePath: "/etc/ssl/certs/origin-specific-ca.crt",
+				Weight:       100,
+				Healthy:      true,
+			},
+		},
+	}
+	_ = st.SaveOriginPool(pool)
+
+	st.SaveRoute(&model.Route{
+		ID:         "route-tls-val",
+		DomainID:   d.ID,
+		PoolID:     pool.ID,
+		PathPrefix: "/",
+		Priority:   0,
+		TimeoutMs:  5000,
+	})
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	var targetCluster *compiler.Cluster
+	for i := range cfg.StaticResources.Clusters {
+		if cfg.StaticResources.Clusters[i].Name == "cluster_pool-tls-val" {
+			targetCluster = &cfg.StaticResources.Clusters[i]
+			break
+		}
+	}
+	if targetCluster == nil || targetCluster.TransportSocket == nil {
+		t.Fatalf("expected cluster with TransportSocket")
+	}
+
+	cfgTyped := targetCluster.TransportSocket.TypedConfig
+	if cfgTyped["sni"] != "origin-backend.internal" {
+		t.Errorf("expected SNI 'origin-backend.internal', got %v", cfgTyped["sni"])
+	}
+
+	commonTLS, ok := cfgTyped["common_tls_context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected common_tls_context in UpstreamTlsContext")
+	}
+	valCtx, ok := commonTLS["validation_context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected validation_context in common_tls_context")
+	}
+	trustedCA, ok := valCtx["trusted_ca"].(map[string]interface{})
+	if !ok || trustedCA["filename"] != "/etc/ssl/certs/origin-specific-ca.crt" {
+		t.Errorf("expected trusted_ca filename '/etc/ssl/certs/origin-specific-ca.crt', got %v", trustedCA["filename"])
+	}
+
+	sanMatches, ok := valCtx["match_typed_subject_alt_names"].([]map[string]interface{})
+	if !ok || len(sanMatches) == 0 {
+		t.Fatalf("expected match_typed_subject_alt_names")
+	}
+	if sanMatches[0]["san_type"] != "DNS" {
+		t.Errorf("expected san_type DNS, got %v", sanMatches[0]["san_type"])
+	}
+	matcher, ok := sanMatches[0]["matcher"].(map[string]interface{})
+	if !ok || matcher["exact"] != "origin-backend.internal" {
+		t.Errorf("expected exact matcher 'origin-backend.internal', got %v", matcher["exact"])
+	}
+}
+
+func TestCompiler_UpstreamTLSValidation_IPOrigin(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	comp.SetCABundlePath("/etc/ssl/certs/ca-bundle.crt")
+	st := store.NewStore()
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	d := &model.Domain{
+		ID:        "dom-ip-origin",
+		ProjectID: "prj-ip",
+		Hostname:  "ip-direct.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(d)
+
+	pool := &model.OriginPool{
+		ID:          "pool-ip-origin",
+		ProjectID:   "prj-ip",
+		Name:        "ip-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig-ip-1",
+				PoolID:   "pool-ip-origin",
+				Address:  "198.51.100.10",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Weight:   100,
+				Healthy:  true,
+			},
+		},
+	}
+	_ = st.SaveOriginPool(pool)
+
+	st.SaveRoute(&model.Route{
+		ID:         "route-ip",
+		DomainID:   d.ID,
+		PoolID:     pool.ID,
+		PathPrefix: "/",
+	})
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	var targetCluster *compiler.Cluster
+	for i := range cfg.StaticResources.Clusters {
+		if cfg.StaticResources.Clusters[i].Name == "cluster_pool-ip-origin" {
+			targetCluster = &cfg.StaticResources.Clusters[i]
+			break
+		}
+	}
+	if targetCluster == nil || targetCluster.TransportSocket == nil {
+		t.Fatalf("expected cluster with TransportSocket")
+	}
+
+	cfgTyped := targetCluster.TransportSocket.TypedConfig
+	// RFC 6066 forbids literal IP address in SNI extension
+	if _, hasSNI := cfgTyped["sni"]; hasSNI {
+		t.Errorf("expected no SNI field for raw IP origin, found %v", cfgTyped["sni"])
+	}
+
+	commonTLS := cfgTyped["common_tls_context"].(map[string]interface{})
+	valCtx := commonTLS["validation_context"].(map[string]interface{})
+	sanMatches := valCtx["match_typed_subject_alt_names"].([]map[string]interface{})
+	if len(sanMatches) == 0 || sanMatches[0]["san_type"] != "IP_ADDRESS" {
+		t.Errorf("expected san_type IP_ADDRESS, got %v", sanMatches[0]["san_type"])
+	}
+	matcher := sanMatches[0]["matcher"].(map[string]interface{})
+	if matcher["exact"] != "198.51.100.10" {
+		t.Errorf("expected exact matcher '198.51.100.10', got %v", matcher["exact"])
+	}
+}
+
+func TestCompiler_UpstreamTLSValidation_ProductionGuard(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	comp.SetCABundlePath("") // Empty CA bundle
+	st := store.NewStore()
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	t.Setenv("NEXUSEDGE_ENV", "production")
+	t.Setenv("NEXUSEDGE_UPSTREAM_CA_FILE", "")
+
+	d := &model.Domain{
+		ID:        "dom-prod-guard-compile",
+		ProjectID: "prj-prod",
+		Hostname:  "prod.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(d)
+
+	pool := &model.OriginPool{
+		ID:          "pool-prod-guard",
+		ProjectID:   "prj-prod",
+		Name:        "prod-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig-prod-1",
+				PoolID:   "pool-prod-guard",
+				Address:  "203.0.113.1",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				Weight:   100,
+				Healthy:  true,
+			},
+		},
+	}
+	_ = st.SaveOriginPool(pool)
+
+	st.SaveRoute(&model.Route{
+		ID:         "route-prod",
+		DomainID:   d.ID,
+		PoolID:     pool.ID,
+		PathPrefix: "/",
+	})
+
+	_, err := comp.Compile(st.GetActiveTopologies())
+	if err == nil {
+		t.Fatalf("expected compilation error in production mode when trusted CA bundle is missing")
+	}
+	if !strings.Contains(err.Error(), "trusted CA bundle in production") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestCompiler_WAFIPCIDRCompilation(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	d := &model.Domain{
+		ID:        "dom-waf-cidr",
+		ProjectID: "prj-waf",
+		Hostname:  "waf.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(d)
+
+	pool := &model.OriginPool{
+		ID:          "pool-waf-cidr",
+		ProjectID:   "prj-waf",
+		Name:        "pool-waf",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig-waf",
+				PoolID:   "pool-waf-cidr",
+				Address:  "203.0.113.20",
+				Port:     80,
+				Protocol: model.ProtocolHTTP,
+				Healthy:  true,
+			},
+		},
+	}
+	_ = st.SaveOriginPool(pool)
+
+	st.SaveRoute(&model.Route{
+		ID:         "route-waf",
+		DomainID:   d.ID,
+		PoolID:     pool.ID,
+		PathPrefix: "/",
+	})
+
+	secPolicy := &model.SecurityPolicy{
+		DomainID:   d.ID,
+		WAFEnabled: true,
+		WAFRules: []model.WAFRule{
+			{
+				ID:        "waf-block-cidr",
+				DomainID:  d.ID,
+				MatchType: model.WAFMatchIPCIDR,
+				Pattern:   "198.51.100.0/24",
+				Action:    model.WAFActionBlock,
+				Enabled:   true,
+			},
+			{
+				ID:        "waf-block-single-ip",
+				DomainID:  d.ID,
+				MatchType: model.WAFMatchIPCIDR,
+				Pattern:   "203.0.113.99",
+				Action:    model.WAFActionBlock,
+				Enabled:   true,
+			},
+		},
+	}
+	st.SaveSecurityPolicy(secPolicy)
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	cfgJSON, _ := cfg.ToJSON()
+	cfgStr := string(cfgJSON)
+
+	// Verify RBAC direct_remote_ip principal generation
+	if !strings.Contains(cfgStr, `"address_prefix": "198.51.100.0"`) || !strings.Contains(cfgStr, `"prefix_len": 24`) {
+		t.Errorf("expected RBAC direct_remote_ip with 198.51.100.0/24")
+	}
+	if !strings.Contains(cfgStr, `"address_prefix": "203.0.113.99"`) || !strings.Contains(cfgStr, `"prefix_len": 32`) {
+		t.Errorf("expected RBAC direct_remote_ip with 203.0.113.99/32")
+	}
+	if !strings.Contains(cfgStr, `"exact": "waf.example.com"`) || !strings.Contains(cfgStr, `":authority"`) {
+		t.Errorf("expected RBAC principal scoped to :authority waf.example.com")
+	}
+}
+
+func TestCompiler_PerDomainRateLimitIsolation(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	st := store.NewStore()
+
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	// Domain A: 6000 RPM (100 RPS), Burst 250
+	dA := &model.Domain{
+		ID:        "dom-tenant-a",
+		ProjectID: "prj-a",
+		Hostname:  "tenant-a.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(dA)
+	poolA := &model.OriginPool{
+		ID:        "pool-a",
+		ProjectID: "prj-a",
+		Origins: []model.Origin{
+			{ID: "o-a", PoolID: "pool-a", Address: "203.0.113.11", Port: 80, Protocol: model.ProtocolHTTP, Healthy: true},
+		},
+	}
+	_ = st.SaveOriginPool(poolA)
+	st.SaveRoute(&model.Route{ID: "r-a", DomainID: dA.ID, PoolID: poolA.ID, PathPrefix: "/"})
+	st.SaveSecurityPolicy(&model.SecurityPolicy{
+		DomainID:         dA.ID,
+		RateLimitEnabled: true,
+		RateLimitRPM:     6000,
+		RateLimitRules: []model.RateLimitRule{
+			{RequestsPerMinute: 6000, BurstSize: 250, Enabled: true},
+		},
+	})
+
+	// Domain B: 1200 RPM (20 RPS), Burst 50
+	dB := &model.Domain{
+		ID:        "dom-tenant-b",
+		ProjectID: "prj-b",
+		Hostname:  "tenant-b.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(dB)
+	poolB := &model.OriginPool{
+		ID:        "pool-b",
+		ProjectID: "prj-b",
+		Origins: []model.Origin{
+			{ID: "o-b", PoolID: "pool-b", Address: "203.0.113.12", Port: 80, Protocol: model.ProtocolHTTP, Healthy: true},
+		},
+	}
+	_ = st.SaveOriginPool(poolB)
+	st.SaveRoute(&model.Route{ID: "r-b", DomainID: dB.ID, PoolID: poolB.ID, PathPrefix: "/"})
+	st.SaveSecurityPolicy(&model.SecurityPolicy{
+		DomainID:         dB.ID,
+		RateLimitEnabled: true,
+		RateLimitRPM:     1200,
+		RateLimitRules: []model.RateLimitRule{
+			{RequestsPerMinute: 1200, BurstSize: 50, Enabled: true},
+		},
+	})
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compilation failed: %v", err)
+	}
+
+	cfgJSON, _ := cfg.ToJSON()
+	cfgStr := string(cfgJSON)
+
+	// Verify Tenant A has max_tokens 250, tokens_per_fill 100
+	if !strings.Contains(cfgStr, `"vh_rate_limit_tenant_a_example_com"`) {
+		t.Errorf("expected stat_prefix for tenant A")
+	}
+	// Verify Tenant B has max_tokens 50, tokens_per_fill 20
+	if !strings.Contains(cfgStr, `"vh_rate_limit_tenant_b_example_com"`) {
+		t.Errorf("expected stat_prefix for tenant B")
+	}
+}

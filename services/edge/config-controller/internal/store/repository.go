@@ -62,6 +62,7 @@ type Repository interface {
 	// Certificates & ACME
 	SaveCertificate(cert *model.Certificate)
 	GetCertificate(domainID string) *model.Certificate
+	GetPendingCertificate(domainID string) *model.Certificate
 	SaveACMEChallenge(ch *model.ACMEChallenge)
 	GetACMEChallengeByToken(token string) *model.ACMEChallenge
 	UpdateACMEChallengeStatus(token string, status model.ChallengeStatus)

@@ -5,6 +5,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
@@ -70,17 +71,18 @@ const (
 
 type Manager struct {
 	mu           sync.RWMutex
-	store        *store.Store
+	store        store.Repository
 	orderHistory map[string][]time.Time
 	valHistory   map[string][]time.Time
 	certsDir     string
 }
 
-func NewManager(s *store.Store) *Manager {
+func NewManager(s store.Repository) *Manager {
 	return &Manager{
 		store:        s,
 		orderHistory: make(map[string][]time.Time),
 		valHistory:   make(map[string][]time.Time),
+		certsDir:     os.Getenv("NEXUSEDGE_CERTS_DIR"),
 	}
 }
 
@@ -117,6 +119,10 @@ func checkAndRecordCertRate(history map[string][]time.Time, key string, limit in
 
 // OrderCertificate initiates an automated ACME HTTP-01 challenge order for a domain
 func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.ACMEChallenge, error) {
+	if isProductionEnvironment() {
+		return nil, nil, ErrProductionACMENotConfigured
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -197,7 +203,10 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 		return nil, ErrChallengeAlreadyUsed
 	}
 
-	cert := m.store.GetCertificate(challenge.DomainID)
+	cert := m.store.GetPendingCertificate(challenge.DomainID)
+	if cert == nil {
+		cert = m.store.GetCertificate(challenge.DomainID)
+	}
 	if cert == nil {
 		return nil, ErrCertNotFound
 	}
@@ -281,12 +290,44 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 
 // syncSDSCertificateLocked writes the certificate, private key, and Envoy v3 SDS Secret resource atomically.
 func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
-	if m.certsDir == "" || cert == nil || cert.CertPEM == "" || cert.PrivateKeyPEM == "" {
-		return nil
+	if m.certsDir == "" {
+		return errors.New("certs directory is not configured")
+	}
+	if cert == nil || cert.CertPEM == "" || cert.PrivateKeyPEM == "" {
+		return errors.New("invalid or empty certificate payload")
+	}
+
+	// Validate cryptographic certificate and private key consistency before disk activation
+	if _, err := tls.X509KeyPair([]byte(cert.CertPEM), []byte(cert.PrivateKeyPEM)); err != nil {
+		return fmt.Errorf("cryptographic certificate and private key mismatch: %w", err)
 	}
 
 	if err := os.MkdirAll(m.certsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create certs directory: %w", err)
+	}
+
+	// Write versioned certificate directory for atomic rotation and rollback preservation
+	versionID := cert.ID
+	if versionID == "" {
+		versionID = fmt.Sprintf("ver-%d", time.Now().UnixNano())
+	}
+	versionsDir := filepath.Join(m.certsDir, "versions", versionID)
+	if err := os.MkdirAll(versionsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create versioned cert directory: %w", err)
+	}
+
+	verCertPath := filepath.Join(versionsDir, "server.crt")
+	verKeyPath := filepath.Join(versionsDir, "server.key")
+
+	if err := os.WriteFile(verCertPath, []byte(cert.CertPEM), 0644); err != nil {
+		return fmt.Errorf("failed to write versioned cert file: %w", err)
+	}
+	if err := os.WriteFile(verKeyPath, []byte(cert.PrivateKeyPEM), 0600); err != nil {
+		return fmt.Errorf("write versioned private-key staging file: %w", err)
+	}
+	if err := preparePrivateKeyForEnvoy(verKeyPath); err != nil {
+		_ = os.Remove(verKeyPath)
+		return fmt.Errorf("prepare versioned private key: %w", err)
 	}
 
 	certPath := filepath.Join(m.certsDir, "server.crt")
@@ -299,6 +340,7 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 		return fmt.Errorf("failed to write cert tmp file: %w", err)
 	}
 	if err := os.Rename(tmpCert, certPath); err != nil {
+		_ = os.Remove(tmpCert)
 		return fmt.Errorf("failed to rename cert file: %w", err)
 	}
 
@@ -344,6 +386,7 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 		return fmt.Errorf("failed to write sds tmp file: %w", err)
 	}
 	if err := os.Rename(tmpSDS, sdsPath); err != nil {
+		_ = os.Remove(tmpSDS)
 		return fmt.Errorf("failed to rename sds file: %w", err)
 	}
 
@@ -360,6 +403,9 @@ func (m *Manager) SyncSDSCertificate(cert *model.Certificate) error {
 // RenewCertificate forces renewal of an existing domain certificate
 func (m *Manager) RenewCertificate(domainID string) (*model.Certificate, error) {
 	cert := m.store.GetCertificate(domainID)
+	if cert == nil {
+		cert = m.store.GetPendingCertificate(domainID)
+	}
 	if cert == nil {
 		return nil, ErrCertNotFound
 	}

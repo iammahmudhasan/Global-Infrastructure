@@ -158,6 +158,11 @@ impl ProxyState {
 
         if let Some(dest_addr) = key.destination_addr {
             builder = builder.resolve(&key.host, dest_addr);
+            if let Some(ref sni) = key.tls_server_name {
+                if sni != &key.host {
+                    builder = builder.resolve(sni, dest_addr);
+                }
+            }
         }
 
         let client = builder.build()?;
@@ -611,20 +616,59 @@ pub async fn handle_request(
 
     let client_key = UpstreamClientKey {
         scheme: target_uri.scheme_str().unwrap_or("http").to_string(),
-        host: target_host,
+        host: target_host.clone(),
         port: target_port,
         destination_addr: selected_upstream.destination_addr,
         tls_server_name: selected_upstream.tls_server_name.clone(),
     };
 
-    let client = state
-        .get_or_create_upstream_client(&client_key)
-        .unwrap_or_else(|_| state.http_client.clone());
+    let client = match state.get_or_create_upstream_client(&client_key) {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                upstream = %client_key.host,
+                error = %err,
+                "Failed to create destination-pinned upstream client"
+            );
+            let response = Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from(
+                    r#"{"error":"upstream connection configuration failed"}"#.to_string(),
+                )))
+                .unwrap();
+            return Ok(response);
+        }
+    };
+
+    let dispatch_url = if target_uri.scheme_str() == Some("https") {
+        if let Some(ref sni) = selected_upstream.tls_server_name {
+            if sni != &target_host {
+                let port_suffix = if target_port != 443 && target_port != 80 {
+                    format!(":{}", target_port)
+                } else {
+                    String::new()
+                };
+                let path_and_query = target_uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("");
+                format!("https://{}{}{}", sni, port_suffix, path_and_query)
+            } else {
+                forward_url.clone()
+            }
+        } else {
+            forward_url.clone()
+        }
+    } else {
+        forward_url.clone()
+    };
 
     // 9. Proxy Forwarding with Strict Header Forwarding (Finding 3)
     let mut client_req = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
-        &forward_url,
+        &dispatch_url,
     );
 
     // Forward all client application headers (Authorization, Cookie, Content-Type, Accept, etc.)

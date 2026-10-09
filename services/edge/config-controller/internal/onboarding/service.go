@@ -42,10 +42,10 @@ type OnboardResponse struct {
 }
 
 type DomainService struct {
-	store *store.Store
+	store store.Repository
 }
 
-func NewDomainService(s *store.Store) *DomainService {
+func NewDomainService(s store.Repository) *DomainService {
 	return &DomainService{store: s}
 }
 
