@@ -994,6 +994,18 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             bypass_paths: c.bypass_paths,
         });
 
+        let mut origins = Vec::new();
+        if !r.origins.is_empty() {
+            for o in &r.origins {
+                origins.push(parse_wire_origin(&norm_host, o)?);
+            }
+        } else if !r.targets.is_empty() {
+            for target in &r.targets {
+                validate_target_url(&norm_host, target)?;
+                origins.push(Router::create_node(target.clone()));
+            }
+        }
+
         if !r.path_routes.is_empty() {
             let mut domain_path_routes = Vec::new();
             for pr in r.path_routes {
@@ -1018,35 +1030,15 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
                     round_robin_index: Arc::new(AtomicUsize::new(0)),
                 });
             }
-            result.push(DomainRoute::with_paths(
-                r.host,
-                domain_path_routes,
-                sec_policy,
-                cache_policy,
-            ));
-        } else if !r.origins.is_empty() {
-            let mut origins = Vec::new();
-            for o in &r.origins {
-                origins.push(parse_wire_origin(&norm_host, o)?);
-            }
+
             result.push(DomainRoute {
                 host: r.host,
-                origins: origins.clone(),
-                path_routes: vec![PathRoute {
-                    path_prefix: "/".to_string(),
-                    priority: 0,
-                    origins,
-                    round_robin_index: Arc::new(AtomicUsize::new(0)),
-                }],
+                origins,
+                path_routes: domain_path_routes,
                 security: sec_policy,
                 cache: cache_policy,
             });
-        } else if !r.targets.is_empty() {
-            let mut origins = Vec::new();
-            for target in &r.targets {
-                validate_target_url(&norm_host, target)?;
-                origins.push(Router::create_node(target.clone()));
-            }
+        } else if !origins.is_empty() {
             result.push(DomainRoute {
                 host: r.host,
                 origins: origins.clone(),
