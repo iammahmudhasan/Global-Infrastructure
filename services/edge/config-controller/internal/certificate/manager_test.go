@@ -3,8 +3,11 @@ package certificate_test
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -178,6 +181,12 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 	}
 	_ = st.SaveDomain(domain)
 
+	gid := os.Getgid()
+	if gid < 0 {
+		gid = 101
+	}
+	t.Setenv("NEXUSEDGE_CERTS_GID", strconv.Itoa(gid))
+
 	// 1. Order and Issue Certificate - must automatically export files to tempDir
 	_, ch, err := mgr.OrderCertificate("dom-sds-test")
 	if err != nil {
@@ -196,11 +205,23 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 	if _, err := os.Stat(certPath); os.IsNotExist(err) {
 		t.Fatalf("expected %s to exist on disk", certPath)
 	}
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+	keyInfo, err := os.Stat(keyPath)
+	if os.IsNotExist(err) {
 		t.Fatalf("expected %s to exist on disk", keyPath)
 	}
 	if _, err := os.Stat(sdsPath); os.IsNotExist(err) {
 		t.Fatalf("expected %s to exist on disk", sdsPath)
+	}
+
+	// Verify private key mode enforces 0640 and does not leak permissions to others
+	if runtime.GOOS != "windows" {
+		mode := keyInfo.Mode().Perm()
+		if mode&0007 != 0 {
+			t.Fatalf("private key is accessible to others: mode=%04o", mode)
+		}
+		if mode != 0640 {
+			t.Fatalf("expected private key mode 0640, got %04o", mode)
+		}
 	}
 
 	sdsContent, err := os.ReadFile(sdsPath)
@@ -227,5 +248,29 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 	}
 	if string(updatedCertBytes) != renewed.CertPEM {
 		t.Fatalf("expected cert on disk to match renewed cert PEM")
+	}
+}
+
+func TestCertificateManager_ProductionGuard(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+
+	domain := &model.Domain{
+		ID:        "dom-prod-guard",
+		ProjectID: "prj-prod",
+		Hostname:  "api.production.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	_, ch, err := mgr.OrderCertificate("dom-prod-guard")
+	if err != nil {
+		t.Fatalf("order certificate failed: %v", err)
+	}
+
+	t.Setenv("NEXUSEDGE_ENV", "production")
+	_, err = mgr.ValidateAndIssueCertificate(ch.Token)
+	if !errors.Is(err, certificate.ErrProductionACMENotConfigured) {
+		t.Fatalf("expected ErrProductionACMENotConfigured in production, got: %v", err)
 	}
 }

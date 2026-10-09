@@ -67,11 +67,10 @@ class GlobalScheduler:
                 if node.jurisdiction != req.required_jurisdiction:
                     continue
 
-            # 3. Latency Upper Bound Check
+            # 3. Latency Upper Bound Check (Hard SLA Constraint)
             rtt = getattr(node, f"rtt_ms_from_{req.client_origin}", 100)
             if req.max_latency_p95_ms > 0 and rtt > req.max_latency_p95_ms:
-                if not req.strict_sovereignty:
-                    continue
+                continue
 
             # 4. Budget Constraint Check
             if req.max_cost_per_hour > 0 and node.cost_per_gpu_hour > req.max_cost_per_hour:
@@ -168,3 +167,32 @@ if __name__ == "__main__":
         prioritize_green_energy=True
     )
     print(scheduler.find_optimal_placement(global_ai_batch))
+
+    print("\n=== TEST 3: Impossible Latency Budget Rejection (Hard SLA) ===")
+    impossible_latency_job = WorkloadRequirement(
+        workload_id="impossible-lat-01",
+        workload_type="LOW_LATENCY_API",
+        client_origin="frankfurt",
+        required_jurisdiction=None,
+        strict_sovereignty=False,
+        max_latency_p95_ms=5,
+        max_cost_per_hour=10.0
+    )
+    res_lat = scheduler.find_optimal_placement(impossible_latency_job)
+    print(res_lat)
+    assert res_lat["status"] == "UNSCHEDULABLE", f"Expected UNSCHEDULABLE, got {res_lat['status']}"
+
+    print("\n=== TEST 4: Strict Sovereignty with Latency Bound Exceeded ===")
+    sovereign_violating_job = WorkloadRequirement(
+        workload_id="fintech-latency-violation",
+        workload_type="BANKING_API",
+        client_origin="dhaka",
+        required_jurisdiction="BD",
+        strict_sovereignty=True,
+        max_latency_p95_ms=2,  # Node has 4ms RTT from dhaka
+        max_cost_per_hour=5.0
+    )
+    res_sov = scheduler.find_optimal_placement(sovereign_violating_job)
+    print(res_sov)
+    assert res_sov["status"] == "UNSCHEDULABLE", f"Expected UNSCHEDULABLE, got {res_sov['status']}"
+    print("All Python scheduler constraint tests passed.")

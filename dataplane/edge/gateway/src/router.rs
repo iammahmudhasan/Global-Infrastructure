@@ -15,6 +15,52 @@ pub struct UpstreamNode {
     pub consecutive_failures: u32,
 }
 
+/// Selected upstream origin identity retaining generation, pinned destination SocketAddr, and TLS SNI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedUpstream {
+    pub generation: u64,
+    pub url: String,
+    pub destination_addr: Option<std::net::SocketAddr>,
+    pub tls_server_name: Option<String>,
+}
+
+impl std::ops::Deref for SelectedUpstream {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.url
+    }
+}
+
+impl AsRef<str> for SelectedUpstream {
+    fn as_ref(&self) -> &str {
+        &self.url
+    }
+}
+
+impl std::fmt::Display for SelectedUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.url)
+    }
+}
+
+impl PartialEq<&str> for SelectedUpstream {
+    fn eq(&self, other: &&str) -> bool {
+        self.url == *other
+    }
+}
+
+impl PartialEq<str> for SelectedUpstream {
+    fn eq(&self, other: &str) -> bool {
+        self.url == other
+    }
+}
+
+impl PartialEq<String> for SelectedUpstream {
+    fn eq(&self, other: &String) -> bool {
+        self.url == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterError {
     UnknownHost(String),
@@ -772,7 +818,7 @@ impl Router {
         &self,
         host: &str,
         path: &str,
-    ) -> Result<(String, u64), RoutingError> {
+    ) -> Result<SelectedUpstream, RoutingError> {
         let norm_host = normalize_host(host);
 
         if self.is_multi_tenant.load(Ordering::Relaxed) {
@@ -793,11 +839,21 @@ impl Router {
 
                 if let Some(best) = matching.first() {
                     select_from_nodes(&best.origins, &best.round_robin_index)
-                        .map(|url| (url, gen))
+                        .map(|node| SelectedUpstream {
+                            generation: gen,
+                            url: node.url.clone(),
+                            destination_addr: node.destination_addr,
+                            tls_server_name: node.sni.clone(),
+                        })
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else if !domain_route.origins.is_empty() {
                     select_from_nodes(&domain_route.origins, &domain_route.round_robin_index)
-                        .map(|url| (url, gen))
+                        .map(|node| SelectedUpstream {
+                            generation: gen,
+                            url: node.url.clone(),
+                            destination_addr: node.destination_addr,
+                            tls_server_name: node.sni.clone(),
+                        })
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else {
                     Err(RoutingError::NoMatchingPath {
@@ -812,7 +868,12 @@ impl Router {
             let snap = self.snapshot.read().unwrap();
             let gen = snap.generation;
             select_from_nodes(&snap.default_nodes, &self.default_index)
-                .map(|url| (url, gen))
+                .map(|node| SelectedUpstream {
+                    generation: gen,
+                    url: node.url.clone(),
+                    destination_addr: node.destination_addr,
+                    tls_server_name: node.sni.clone(),
+                })
                 .ok_or(RoutingError::NoHealthyUpstreams(norm_host))
         }
     }
@@ -823,15 +884,15 @@ impl Router {
         &self,
         host: &str,
         path: &str,
-    ) -> Result<String, RoutingError> {
+    ) -> Result<SelectedUpstream, RoutingError> {
         self.select_upstream_with_generation(host, path)
-            .map(|(url, _gen)| url)
     }
 
     /// Selects lowest EWMA latency healthy upstream node for the given tenant host (root path fallback)
     #[allow(dead_code)]
     pub fn select_upstream_for_host(&self, host: &str) -> Result<String, RoutingError> {
         self.select_upstream_for_host_and_path(host, "/")
+            .map(|s| s.url)
     }
 
     /// Returns tenant security and cache policy if configured for domain
@@ -851,12 +912,11 @@ impl Router {
     pub fn select_upstream(&self) -> Option<String> {
         let snap = self.snapshot.read().unwrap();
         if !snap.default_nodes.is_empty() {
-            select_from_nodes(&snap.default_nodes, &self.default_index)
+            select_from_nodes(&snap.default_nodes, &self.default_index).map(|n| n.url.clone())
         } else {
             for domain_route in snap.routes.values() {
-                if let Some(target) = select_from_nodes(&domain_route.origins, &self.default_index)
-                {
-                    return Some(target);
+                if let Some(node) = select_from_nodes(&domain_route.origins, &self.default_index) {
+                    return Some(node.url.clone());
                 }
             }
             None
@@ -1563,7 +1623,10 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
     Ok(result)
 }
 
-fn select_from_nodes(nodes: &[UpstreamNode], index_counter: &AtomicUsize) -> Option<String> {
+fn select_from_nodes<'a>(
+    nodes: &'a [UpstreamNode],
+    index_counter: &AtomicUsize,
+) -> Option<&'a UpstreamNode> {
     // Pass 1: Find minimum EWMA latency among healthy nodes
     let mut min_latency = f64::MAX;
     for node in nodes.iter() {
@@ -1594,7 +1657,7 @@ fn select_from_nodes(nodes: &[UpstreamNode], index_counter: &AtomicUsize) -> Opt
     for node in nodes.iter() {
         if node.healthy && (node.ewma_latency_ms - min_latency).abs() < 1e-6 {
             if current_idx == pick_index {
-                return Some(node.url.clone());
+                return Some(node);
             }
             current_idx += 1;
         }
@@ -2291,11 +2354,19 @@ mod tests {
         assert_eq!(router.generation(), 2);
 
         // Step 2: In-flight request begins routing under Snapshot 1
-        let (selected_upstream, route_gen) = router
+        let selected_upstream = router
             .select_upstream_with_generation("tenant-app.com", "/api/data")
             .unwrap();
-        assert_eq!(route_gen, 2);
-        assert_eq!(selected_upstream, "https://origin-v1.internal:443");
+        assert_eq!(selected_upstream.generation, 2);
+        assert_eq!(selected_upstream.url, "https://origin-v1.internal:443");
+        assert_eq!(
+            selected_upstream.destination_addr,
+            Some("93.184.216.34:443".parse().unwrap())
+        );
+        assert_eq!(
+            selected_upstream.tls_server_name,
+            Some("origin-v1.internal".to_string())
+        );
 
         // Step 3: Intentional delay/pause simulates in-flight request processing
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2307,11 +2378,19 @@ mod tests {
         assert_eq!(router.generation(), 3);
 
         // Verify new incoming requests get Generation 3 destination (origin-v2)
-        let (new_upstream, new_gen) = router
+        let new_upstream = router
             .select_upstream_with_generation("tenant-app.com", "/api/data")
             .unwrap();
-        assert_eq!(new_gen, 3);
-        assert_eq!(new_upstream, "https://origin-v2.internal:443");
+        assert_eq!(new_upstream.generation, 3);
+        assert_eq!(new_upstream.url, "https://origin-v2.internal:443");
+        assert_eq!(
+            new_upstream.destination_addr,
+            Some("93.184.216.35:443".parse().unwrap())
+        );
+        assert_eq!(
+            new_upstream.tls_server_name,
+            Some("origin-v2.internal".to_string())
+        );
 
         // Step 5: In-flight request from Generation 2 resumes and resolves DNS:
         // PinnedDnsResolver retains origin-v1.internal in the grace-period pool!

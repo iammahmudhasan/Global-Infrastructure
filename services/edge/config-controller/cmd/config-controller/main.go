@@ -167,9 +167,12 @@ func main() {
 				ExpiresAt:     time.Now().UTC().Add(90 * 24 * time.Hour),
 				AutoRenew:     true,
 			}
-			dataStore.SaveCertificate(devCert)
-			_ = handler.CertManager().SyncSDSCertificate(devCert)
-			log.Printf("[INFO] Seeded and synchronized active TLS certificate for dom-dev-api via Envoy SDS")
+			if err := handler.CertManager().SyncSDSCertificate(devCert); err != nil {
+				log.Printf("[WARN] Failed to synchronize active TLS certificate to Envoy SDS: %v", err)
+			} else {
+				dataStore.SaveCertificate(devCert)
+				log.Printf("[INFO] Seeded and synchronized active TLS certificate for dom-dev-api via Envoy SDS")
+			}
 		}
 	}
 

@@ -863,6 +863,18 @@ func (c *Compiler) buildDownstreamTLSContext(cert *model.Certificate, settings *
 	}
 }
 
+func effectiveOriginSNI(o model.Origin) string {
+	if sni := strings.TrimSpace(o.SNI); sni != "" {
+		return sni
+	}
+	// IP-literal destination has no DNS SNI name
+	// unless a hostname has been explicitly configured.
+	if net.ParseIP(strings.TrimSpace(o.Address)) != nil {
+		return ""
+	}
+	return strings.TrimSpace(o.Address)
+}
+
 // Runtime DNS Rebinding Protection (Option B: Validated IP-pinned STATIC endpoints):
 // Resolves origin hostnames, validates that all resolved destination IPs are public and safe,
 // and pins them as STATIC cluster endpoints with preserved SNI, completely shielding Envoy
@@ -890,12 +902,13 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 			hasHTTP = true
 		}
 
+		sniHost := effectiveOriginSNI(o)
 		var endpointMeta map[string]interface{}
-		if o.Protocol == model.ProtocolHTTPS {
+		if o.Protocol == model.ProtocolHTTPS && sniHost != "" {
 			endpointMeta = map[string]interface{}{
 				"filter_metadata": map[string]interface{}{
 					"envoy.transport_socket_match": map[string]interface{}{
-						"sni_host": o.Address,
+						"sni_host": sniHost,
 					},
 				},
 			}
@@ -1030,39 +1043,42 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 
 	// If origin protocol is HTTPS and homogenous (no mixed plain HTTP), attach Upstream TLS context with SNI
 	if hasHTTPS && !hasHTTP && len(pool.Origins) > 0 {
-		uniqueHosts := make([]string, 0)
-		hostSeen := make(map[string]bool)
+		uniqueSNIs := make([]string, 0)
+		sniSeen := make(map[string]bool)
 		for _, orig := range pool.Origins {
 			if orig.Protocol == model.ProtocolHTTPS {
-				lower := strings.ToLower(orig.Address)
-				if !hostSeen[lower] {
-					hostSeen[lower] = true
-					uniqueHosts = append(uniqueHosts, orig.Address)
+				sni := effectiveOriginSNI(orig)
+				if sni != "" {
+					lower := strings.ToLower(sni)
+					if !sniSeen[lower] {
+						sniSeen[lower] = true
+						uniqueSNIs = append(uniqueSNIs, sni)
+					}
 				}
 			}
 		}
 
-		if len(uniqueHosts) == 1 {
+		if len(uniqueSNIs) == 1 {
 			cluster.TransportSocket = &TransportSocket{
 				Name: "envoy.transport_sockets.tls",
 				TypedConfig: map[string]interface{}{
 					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-					"sni":   uniqueHosts[0],
+					"sni":   uniqueSNIs[0],
 				},
 			}
-		} else if len(uniqueHosts) > 1 {
+		} else if len(uniqueSNIs) > 1 {
 			// Per-origin endpoint TLS matching: prevents SNI mismatches when origins have distinct hostnames (Finding 3)
-			for _, host := range uniqueHosts {
+			for _, sni := range uniqueSNIs {
 				cluster.TransportSocketMatches = append(cluster.TransportSocketMatches, TransportSocketMatch{
-					Name: fmt.Sprintf("tls_match_%s", sanitizeName(host)),
+					Name: fmt.Sprintf("tls_match_%s", sanitizeName(sni)),
 					Match: map[string]interface{}{
-						"sni_host": host,
+						"sni_host": sni,
 					},
 					TransportSocket: &TransportSocket{
 						Name: "envoy.transport_sockets.tls",
 						TypedConfig: map[string]interface{}{
 							"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-							"sni":   host,
+							"sni":   sni,
 						},
 					},
 				})
@@ -1072,7 +1088,15 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 				Name: "envoy.transport_sockets.tls",
 				TypedConfig: map[string]interface{}{
 					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
-					"sni":   uniqueHosts[0],
+					"sni":   uniqueSNIs[0],
+				},
+			}
+		} else if len(uniqueSNIs) == 0 {
+			// Direct IP HTTPS upstream without SNI extension
+			cluster.TransportSocket = &TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				TypedConfig: map[string]interface{}{
+					"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
 				},
 			}
 		}

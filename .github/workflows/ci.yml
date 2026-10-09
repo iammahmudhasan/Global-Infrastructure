@@ -101,14 +101,24 @@ jobs:
           go-version: '1.23'
 
       - name: Generate Ingress TLS Certificates
+        env:
+          ENVOY_CERT_GID: "101"
         run: |
           go run tools/release/generate_certs.go deploy/envoy/certs
-          chmod -R a+r deploy/envoy/certs
+          sudo groupadd -g "$ENVOY_CERT_GID" envoy 2>/dev/null || true
+          sudo chgrp "$ENVOY_CERT_GID" deploy/envoy/certs/server.key 2>/dev/null || chgrp "$ENVOY_CERT_GID" deploy/envoy/certs/server.key 2>/dev/null || true
+          chmod 0755 deploy/envoy/certs
+          chmod 0644 deploy/envoy/certs/server.crt deploy/envoy/certs/sds.json
+          chmod 0640 deploy/envoy/certs/server.key
 
       - name: Validate Compose Config
+        env:
+          ENVOY_CERT_GID: "101"
         run: docker compose -f deploy/docker-compose.yml config
 
       - name: Build and Start Single-PoP Stack
+        env:
+          ENVOY_CERT_GID: "101"
         run: |
           sudo systemctl stop nginx apache2 2>/dev/null || true
           docker compose -f deploy/docker-compose.yml build --progress=plain
@@ -150,19 +160,15 @@ jobs:
           fi
 
           echo "Awaiting Envoy Ingress readiness..."
-          ENVOY_READY=0
           for i in {1..30}; do
-            if curl -fsS http://127.0.0.1:9901/ready > /dev/null 2>&1; then
-              echo "Envoy Ingress is ready!"
-              ENVOY_READY=1
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' nexusedge-envoy-ingress 2>/dev/null || true)
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Envoy Ingress is healthy!"
               break
             fi
             sleep 2
           done
-          if [ "$ENVOY_READY" -ne 1 ]; then
-            echo "ERROR: Envoy failed to become ready within timeout!"
-            exit 1
-          fi
+          [ "${STATUS:-}" = "healthy" ] || { echo "ERROR: Envoy failed to become healthy within timeout!"; exit 1; }
 
       - name: Run Single-PoP E2E Integration Suite
         run: bash tests/e2e/test_single_pop_gateway.sh

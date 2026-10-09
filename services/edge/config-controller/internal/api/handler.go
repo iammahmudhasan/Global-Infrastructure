@@ -538,6 +538,10 @@ func (h *APIHandler) handleCertificatesRoute(w http.ResponseWriter, r *http.Requ
 		}
 		renewedCert, err := h.certManager.RenewCertificate(domainID)
 		if err != nil {
+			if errors.Is(err, certificate.ErrProductionACMENotConfigured) {
+				writeError(w, http.StatusNotImplemented, err.Error())
+				return
+			}
 			writeError(w, http.StatusBadRequest, "failed to renew certificate: "+err.Error())
 			return
 		}
@@ -616,6 +620,10 @@ func (h *APIHandler) handleACMEValidate(w http.ResponseWriter, r *http.Request) 
 
 	cert, err := h.certManager.ValidateAndIssueCertificate(req.Token)
 	if err != nil {
+		if errors.Is(err, certificate.ErrProductionACMENotConfigured) {
+			writeError(w, http.StatusNotImplemented, err.Error())
+			return
+		}
 		if errors.Is(err, certificate.ErrRateLimitExceeded) {
 			writeError(w, http.StatusTooManyRequests, err.Error())
 			return

@@ -304,16 +304,22 @@ go test -bench="." -benchmem ./test/...
 
 ---
 
-## Commercial Tiering ($1M ARR Framework)
+## Commercial Tiering (Target Revenue Model)
 
-NexusEdge's business model targets high-margin, recurring infrastructure revenue:
+> **Commercial Projections & Methodology Disclaimer:** The figures below represent prospective unit-economics modeling and target customer distribution arithmetic. They do not represent realized historical revenue.
+>
+> **Target ARR Arithmetic:**
+> - **Developer Tier:** $200 \times \$29 \times 12 = \$69,600$
+> - **Business Tier:** $150 \times \$299 \times 12 = \$538,200$
+> - **Enterprise Tier:** $20 \times \$2,499 \times 12 = \$599,760$
+> - **Total Projected ARR Target:** $\$1,207,560$
 
 ```
-                              ANNUAL REVENUE TARGET: $1,000,000 ARR
+                              TARGET REVENUE MODEL: $1,207,560 ARR
                              
        Developer Tier                 Business Tier                Enterprise Tier
       [ 200 Customers ]              [ 150 Customers ]             [ 20 Customers ]
-      $29 / mo ($69.6k/yr)          $299 / mo ($538.2k/yr)      $2,499 / mo ($599.7k/yr)
+      $29 / mo ($69.6k/yr)          $299 / mo ($538.2k/yr)      $2,499 / mo ($599.76k/yr)
 ```
 
 | Dimension | Developer Tier | Business Tier | Enterprise Tier |

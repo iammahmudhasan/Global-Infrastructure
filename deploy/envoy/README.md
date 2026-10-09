@@ -22,8 +22,9 @@ Envoy operates as the outer L7 ingress proxy for the NexusEdge Single-PoP Edge S
   ```
 - Checked-in development certificates allow `docker compose up -d` to boot immediately on fresh repository clones without configuration failure.
 
-### 2. Production Deployments (External Secret Management)
-- In production Kubernetes or VPS environments, TLS certificates are provisioned externally:
-  - **Kubernetes / Cert-Manager:** Secrets are mounted read-only into `/etc/envoy/certs/` containing valid Let's Encrypt or CA-signed certificates (`tls.crt` as `server.crt`, `tls.key` as `server.key`).
-  - **ACME HTTP-01:** ACME challenges received on HTTP port 80 are routed to the NexusEdge Control Plane (`config-controller:9091`), which handles ACME validation and stores issued certificates in the cluster secret store.
-- **SDS (Secret Discovery Service) Road-map:** As multi-tenant custom domain certificates expand beyond static mounting, Envoy will integrate with a dynamic SDS endpoint served by the Control Plane.
+### 2. TLS Architecture & Production Readiness Status
+- **Local Fixture Rotation Prototype:** Tested locally. Rotates single-fixture certificates (`server.crt` / `server.key`) with atomic rename and verifies served serial change.
+- **Production ACME (RFC 8555):** `INCOMPLETE`. Real ACME client and WebPKI CA validation are not yet implemented. In production environments (`ENVIRONMENT=production` or `APP_ENV=production`), the Control Plane returns `501 Not Implemented` (`ErrProductionACMENotConfigured`).
+- **Per-Domain TLS:** `INCOMPLETE`. Multi-domain certificate isolation and individual per-tenant Envoy filter chains are scheduled for V1.
+- **gRPC SDS (Secret Discovery Service):** `INCOMPLETE`. Live dynamic gRPC SDS daemon streaming is planned for V1; current single-PoP deployment uses file-based secret rotation.
+- **External Secret Management (Target Production Design):** In Kubernetes or VPS production clusters, secrets are provisioned externally via Cert-Manager or KMS mounts read-only into `/etc/envoy/certs/`.

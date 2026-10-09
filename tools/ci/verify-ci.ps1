@@ -95,7 +95,28 @@ Write-Host " -> Rust check and tests verified." -ForegroundColor Green
 # 6. Python Intelligence Optimizer Gate
 Write-Host "[6/7] Verifying Python Intelligence scheduler..." -ForegroundColor Yellow
 $OptimizerScript = Join-Path $RepoRoot "intelligence/scheduling/workload-scheduler/optimizer.py"
-& python $OptimizerScript
+$PythonExe = $null
+
+$candidates = @()
+if ($env:LOCALAPPDATA) {
+    $candidates += (Join-Path $env:LOCALAPPDATA "Python\bin\python.exe")
+}
+$candidates += (Get-Command python, py, python3 -ErrorAction SilentlyContinue |
+    Where-Object { $_.Source -notlike "*WindowsApps*" } |
+    Select-Object -ExpandProperty Source)
+
+foreach ($c in $candidates) {
+    if ($c -and (Test-Path $c)) {
+        $PythonExe = $c
+        break
+    }
+}
+
+if (-not $PythonExe) {
+    $PythonExe = "python"
+}
+
+& $PythonExe $OptimizerScript
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Python optimizer verification failed." -ForegroundColor Red
     exit 1

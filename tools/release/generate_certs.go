@@ -74,21 +74,28 @@ func main() {
 	}
 
 	keyPath := filepath.Join(outDir, "server.key")
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open %s for writing: %v\n", keyPath, err)
 		os.Exit(1)
 	}
-	defer keyOut.Close()
 
 	privBytes, err := x509.MarshalECPrivateKey(priv)
 	if err != nil {
+		keyOut.Close()
 		fmt.Fprintf(os.Stderr, "failed to marshal private key: %v\n", err)
 		os.Exit(1)
 	}
 
 	if err := pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes}); err != nil {
+		keyOut.Close()
 		fmt.Fprintf(os.Stderr, "failed to write key PEM: %v\n", err)
+		os.Exit(1)
+	}
+	keyOut.Close()
+
+	if err := os.Chmod(keyPath, 0600); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to restrict private-key permissions: %v\n", err)
 		os.Exit(1)
 	}
 

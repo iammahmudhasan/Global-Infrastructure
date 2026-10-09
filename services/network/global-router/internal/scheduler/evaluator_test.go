@@ -298,39 +298,60 @@ func TestCandidateReservationFallback(t *testing.T) {
 	}
 }
 
-func TestDeterministicFallbackOrdering(t *testing.T) {
-	// Verify that when no eligible candidate satisfies custom strict constraints (without sovereignty),
-	// fallback selection is 100% deterministic and reproducible across multiple evaluations.
-	var assignedIDs []string
+func TestHardCostAndLatencyConstraintsEnforced(t *testing.T) {
+	reg := registry.NewRegistry()
+	eval := scheduler.NewEvaluator(reg)
 
-	for i := 0; i < 5; i++ {
-		reg := registry.NewRegistry()
-		eval := scheduler.NewEvaluator(reg)
-
-		policy := scheduler.DispatchPolicy{
-			WorkloadID:        fmt.Sprintf("workload-fallback-%d", i),
-			TenantID:          "tenant-test",
-			GPUsRequested:     1,
-			MaxCostRate:       0.01, // Intentionally impossible budget -> triggers fallback
-			StrictSovereignty: false,
-			Objective:         scheduler.ObjectiveCost,
-		}
-
-		decision, err := eval.Evaluate(policy)
-		if err != nil {
-			t.Fatalf("run %d: expected fallback placement, got error: %v", i, err)
-		}
-		if !decision.FallbackUsed {
-			t.Fatalf("run %d: expected FallbackUsed to be true", i)
-		}
-		assignedIDs = append(assignedIDs, decision.AssignedBackend.ID)
+	// 1. Max cost lower than all available backends must reject with ErrNoEligibleBackends
+	impossibleCostPolicy := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-cost-tight",
+		TenantID:          "tenant-test",
+		GPUsRequested:     1,
+		MaxCostRate:       0.01, // Impossible budget: cheapest backend is > $1.00
+		StrictSovereignty: false,
+		Objective:         scheduler.ObjectiveCost,
+	}
+	_, err := eval.Evaluate(impossibleCostPolicy)
+	if err != scheduler.ErrNoEligibleBackends {
+		t.Fatalf("expected ErrNoEligibleBackends for impossible cost budget, got: %v", err)
 	}
 
-	for i := 1; i < len(assignedIDs); i++ {
-		if assignedIDs[i] != assignedIDs[0] {
-			t.Fatalf("non-deterministic fallback: run 0 selected %s, run %d selected %s",
-				assignedIDs[0], i, assignedIDs[i])
-		}
+	// 2. Max latency lower than all available backends must reject with ErrNoEligibleBackends
+	impossibleLatencyPolicy := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-latency-tight",
+		TenantID:          "tenant-test",
+		GPUsRequested:     1,
+		MaxLatencyMs:      1, // Impossible latency: lowest backend latency is 4ms
+		StrictSovereignty: false,
+		Objective:         scheduler.ObjectiveLatency,
+	}
+	_, err = eval.Evaluate(impossibleLatencyPolicy)
+	if err != scheduler.ErrNoEligibleBackends {
+		t.Fatalf("expected ErrNoEligibleBackends for impossible latency threshold, got: %v", err)
+	}
+
+	// 3. Realistic policy where constraints are satisfiable selects an eligible candidate
+	validPolicy := scheduler.DispatchPolicy{
+		WorkloadID:        "workload-valid",
+		TenantID:          "tenant-test",
+		GPUsRequested:     1,
+		MaxCostRate:       5.00,
+		MaxLatencyMs:      100,
+		StrictSovereignty: false,
+		Objective:         scheduler.ObjectiveCost,
+	}
+	decision, err := eval.Evaluate(validPolicy)
+	if err != nil {
+		t.Fatalf("expected valid scheduling decision, got error: %v", err)
+	}
+	if decision.AssignedBackend == nil {
+		t.Fatalf("expected assigned backend, got nil")
+	}
+	if decision.AssignedBackend.HourlyCost > 5.00 {
+		t.Errorf("expected cost <= 5.00, got: %.2f", decision.AssignedBackend.HourlyCost)
+	}
+	if decision.AssignedBackend.LatencyP95Ms > 100 {
+		t.Errorf("expected latency <= 100, got: %d", decision.AssignedBackend.LatencyP95Ms)
 	}
 }
 

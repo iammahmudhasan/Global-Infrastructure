@@ -919,6 +919,7 @@ async fn test_e2e_readiness_and_liveness_probes() {
         ),
         router: Router::new(vec![], 5000),
         http_client: HttpClient::new(),
+        client_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         inflight_buffer_semaphore: Arc::new(tokio::sync::Semaphore::new(100)),
         aggregate_buffered_bytes: Arc::new(AtomicUsize::new(0)),
         aggregate_buffered_request_bytes: Arc::new(AtomicUsize::new(0)),

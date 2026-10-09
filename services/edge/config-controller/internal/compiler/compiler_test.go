@@ -916,6 +916,7 @@ func TestCompiler_MultiOriginHTTPSPerEndpointSNI(t *testing.T) {
 				ID:       "orig_1",
 				PoolID:   "pool_multi_sni",
 				Address:  "192.0.2.10",
+				SNI:      "orig1.example.com",
 				Port:     443,
 				Protocol: model.ProtocolHTTPS,
 				Healthy:  true,
@@ -924,6 +925,7 @@ func TestCompiler_MultiOriginHTTPSPerEndpointSNI(t *testing.T) {
 				ID:       "orig_2",
 				PoolID:   "pool_multi_sni",
 				Address:  "192.0.2.20",
+				SNI:      "orig2.example.com",
 				Port:     443,
 				Protocol: model.ProtocolHTTPS,
 				Healthy:  true,
@@ -987,5 +989,93 @@ func TestCompiler_MultiOriginHTTPSPerEndpointSNI(t *testing.T) {
 		if !ok || sniHost == "" {
 			t.Fatalf("expected non-empty sni_host in endpoint metadata")
 		}
+	}
+}
+
+func TestCompiler_ExplicitOriginSNI(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	origin := model.Origin{
+		ID:       "orig_ip_sni",
+		PoolID:   "pool_ip_sni",
+		Address:  "93.184.216.34",
+		SNI:      "origin.customer.example",
+		Port:     443,
+		Protocol: model.ProtocolHTTPS,
+		Healthy:  true,
+		Weight:   100,
+	}
+
+	pool := &model.OriginPool{
+		ID:          "pool_ip_sni",
+		ProjectID:   "prj_test",
+		Name:        "ip-sni-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins:     []model.Origin{origin},
+	}
+
+	topo := &store.DomainTopology{
+		Domain: &model.Domain{
+			ID:        "dom_ip_sni",
+			Hostname:  "api.customer.example",
+			ProjectID: "prj_test",
+			Status:    model.DomainStatusActive,
+		},
+		Routes: []*model.Route{
+			{
+				ID:         "r_ip_sni",
+				DomainID:   "dom_ip_sni",
+				PoolID:     pool.ID,
+				PathPrefix: "/",
+				Priority:   1,
+			},
+		},
+		Pools: map[string]*model.OriginPool{
+			pool.ID: pool,
+		},
+	}
+
+	cfg, err := comp.Compile([]*store.DomainTopology{topo})
+	if err != nil {
+		t.Fatalf("failed to compile: %v", err)
+	}
+
+	var targetCluster *compiler.Cluster
+	for i := range cfg.StaticResources.Clusters {
+		if cfg.StaticResources.Clusters[i].Name == "cluster_pool_ip_sni" {
+			targetCluster = &cfg.StaticResources.Clusters[i]
+			break
+		}
+	}
+
+	if targetCluster == nil {
+		t.Fatalf("expected cluster_pool_ip_sni to exist")
+	}
+
+	// Verify endpoint metadata has sni_host == origin.customer.example
+	if len(targetCluster.LoadAssignment.Endpoints) == 0 || len(targetCluster.LoadAssignment.Endpoints[0].LbEndpoints) == 0 {
+		t.Fatalf("expected at least 1 lbEndpoint")
+	}
+	ep := targetCluster.LoadAssignment.Endpoints[0].LbEndpoints[0]
+	meta, ok := ep.Metadata["filter_metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected filter_metadata on lbEndpoint")
+	}
+	match, ok := meta["envoy.transport_socket_match"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected envoy.transport_socket_match in filter_metadata")
+	}
+	sniHost, ok := match["sni_host"].(string)
+	if !ok || sniHost != "origin.customer.example" {
+		t.Fatalf("expected endpoint metadata sni_host == 'origin.customer.example', got %q", sniHost)
+	}
+
+	// Verify UpstreamTlsContext.sni == origin.customer.example
+	if targetCluster.TransportSocket == nil {
+		t.Fatalf("expected cluster TransportSocket to be configured for HTTPS")
+	}
+	sniVal, ok := targetCluster.TransportSocket.TypedConfig["sni"].(string)
+	if !ok || sniVal != "origin.customer.example" {
+		t.Fatalf("expected UpstreamTlsContext.sni == 'origin.customer.example', got %q", sniVal)
 	}
 }

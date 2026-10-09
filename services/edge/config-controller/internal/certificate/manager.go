@@ -15,6 +15,8 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,13 +26,42 @@ import (
 )
 
 var (
-	ErrDomainNotFound       = errors.New("domain not found in store")
-	ErrChallengeExpired     = errors.New("acme challenge has expired")
-	ErrChallengeNotFound    = errors.New("acme challenge not found")
-	ErrChallengeAlreadyUsed = errors.New("acme challenge has already been consumed")
-	ErrCertNotFound         = errors.New("certificate not found for domain")
-	ErrRateLimitExceeded    = errors.New("certificate operation rate limit exceeded")
+	ErrDomainNotFound              = errors.New("domain not found in store")
+	ErrChallengeExpired            = errors.New("acme challenge has expired")
+	ErrChallengeNotFound           = errors.New("acme challenge not found")
+	ErrChallengeAlreadyUsed        = errors.New("acme challenge has already been consumed")
+	ErrCertNotFound                = errors.New("certificate not found for domain")
+	ErrRateLimitExceeded           = errors.New("certificate operation rate limit exceeded")
+	ErrProductionACMENotConfigured = errors.New("production ACME issuer is not configured; local self-signed issuance is dev/test only")
 )
+
+func isProductionEnvironment() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return env == "production"
+}
+
+func preparePrivateKeyForEnvoy(path string) error {
+	rawGID := strings.TrimSpace(os.Getenv("NEXUSEDGE_CERTS_GID"))
+	if rawGID == "" {
+		return errors.New("NEXUSEDGE_CERTS_GID must be configured; refusing to export a private key without an explicit reader group")
+	}
+	gid, err := strconv.Atoi(rawGID)
+	if err != nil || gid < 0 {
+		return fmt.Errorf("invalid NEXUSEDGE_CERTS_GID %q", rawGID)
+	}
+	if runtime.GOOS != "windows" && runtime.GOOS != "plan9" {
+		if err := os.Chown(path, -1, gid); err != nil {
+			return fmt.Errorf("set Envoy key-reader group: %w", err)
+		}
+	}
+	if err := os.Chmod(path, 0640); err != nil {
+		return fmt.Errorf("set private-key mode 0640: %w", err)
+	}
+	return nil
+}
 
 const (
 	MaxOrdersPerHourPerDomain      = 5
@@ -139,6 +170,10 @@ func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.
 
 // ValidateAndIssueCertificate verifies the HTTP-01 challenge and issues signed x509 leaf + chain
 func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate, error) {
+	if isProductionEnvironment() {
+		return nil, ErrProductionACMENotConfigured
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -235,9 +270,11 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 	cert.IssuedAt = now
 	cert.ExpiresAt = expiresAt
 
+	if err := m.syncSDSCertificateLocked(cert); err != nil {
+		return nil, fmt.Errorf("certificate created but Envoy SDS activation failed: %w", err)
+	}
 	m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusValidated)
 	m.store.SaveCertificate(cert)
-	_ = m.syncSDSCertificateLocked(cert)
 
 	return cert, nil
 }
@@ -265,13 +302,18 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 		return fmt.Errorf("failed to rename cert file: %w", err)
 	}
 
-	// 2. Write server.key atomically (0644 so Envoy proxy UID can read key from shared volume)
+	// 2. Write server.key atomically (0640 with Envoy reader group)
 	tmpKey := keyPath + ".tmp"
-	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0644); err != nil {
-		return fmt.Errorf("failed to write key tmp file: %w", err)
+	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0600); err != nil {
+		return fmt.Errorf("write private-key staging file: %w", err)
+	}
+	if err := preparePrivateKeyForEnvoy(tmpKey); err != nil {
+		_ = os.Remove(tmpKey)
+		return err
 	}
 	if err := os.Rename(tmpKey, keyPath); err != nil {
-		return fmt.Errorf("failed to rename key file: %w", err)
+		_ = os.Remove(tmpKey)
+		return fmt.Errorf("activate private-key file: %w", err)
 	}
 
 	// 3. Write Envoy v3 SDS Secret resource file atomically

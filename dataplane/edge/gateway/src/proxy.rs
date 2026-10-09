@@ -99,6 +99,16 @@ impl Drop for BufferBudgetGuard {
     }
 }
 
+/// Connection key for pooling destination-aware and IP-pinned HTTP clients per upstream endpoint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UpstreamClientKey {
+    pub scheme: String,
+    pub host: String,
+    pub port: u16,
+    pub destination_addr: Option<std::net::SocketAddr>,
+    pub tls_server_name: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: GatewayConfig,
@@ -108,10 +118,52 @@ pub struct ProxyState {
     pub cache: EdgeCache,
     pub router: Router,
     pub http_client: HttpClient,
+    pub client_cache:
+        Arc<std::sync::RwLock<std::collections::HashMap<UpstreamClientKey, HttpClient>>>,
     pub inflight_buffer_semaphore: Arc<tokio::sync::Semaphore>,
     pub aggregate_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub aggregate_buffered_request_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProxyState {
+    /// Retrieves or lazily creates a destination-pinned HTTP client.
+    /// Ensures that requests to pinned origins connect directly to the selected SocketAddr
+    /// while validating the origin hostname for TLS SNI and certificate validation.
+    pub fn get_or_create_upstream_client(
+        &self,
+        key: &UpstreamClientKey,
+    ) -> Result<HttpClient, reqwest::Error> {
+        if key.destination_addr.is_none() {
+            return Ok(self.http_client.clone());
+        }
+
+        {
+            let cache = self.client_cache.read().unwrap();
+            if let Some(client) = cache.get(key) {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut cache = self.client_cache.write().unwrap();
+        if let Some(client) = cache.get(key) {
+            return Ok(client.clone());
+        }
+
+        let mut builder = HttpClient::builder()
+            .timeout(Duration::from_millis(self.config.upstream.timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(256)
+            .tcp_nodelay(true);
+
+        if let Some(dest_addr) = key.destination_addr {
+            builder = builder.resolve(&key.host, dest_addr);
+        }
+
+        let client = builder.build()?;
+        cache.insert(key.clone(), client.clone());
+        Ok(client)
+    }
 }
 
 pub async fn handle_request(
@@ -471,8 +523,8 @@ pub async fn handle_request(
         }
     }
 
-    // 8. Multi-Tenant Path-Based Upstream Selection (P1 Finding 3)
-    let upstream_base = match state.router.select_upstream_for_host_and_path(&host, &path) {
+    // 8. Multi-Tenant Path-Based Upstream Selection (P1 Finding 3, Item 6)
+    let selected_upstream = match state.router.select_upstream_for_host_and_path(&host, &path) {
         Ok(target) => target,
         Err(crate::router::RoutingError::UnknownHost(h)) => {
             warn!(host = %h, uri = %uri_string, "Unknown host: no tenant domain route configured");
@@ -537,10 +589,40 @@ pub async fn handle_request(
         }
     };
 
-    let forward_url = format!("{}{}", upstream_base.trim_end_matches('/'), uri_string);
+    let forward_url = format!(
+        "{}{}",
+        selected_upstream.url.trim_end_matches('/'),
+        uri_string
+    );
+
+    // Extract target host, port, and scheme to select or construct a destination-pinned HTTP client
+    let target_uri = forward_url
+        .parse::<hyper::Uri>()
+        .unwrap_or_else(|_| hyper::Uri::from_static("http://localhost"));
+    let target_host = target_uri.host().unwrap_or(&host).to_string();
+    let target_port =
+        target_uri
+            .port_u16()
+            .unwrap_or(if target_uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
+
+    let client_key = UpstreamClientKey {
+        scheme: target_uri.scheme_str().unwrap_or("http").to_string(),
+        host: target_host,
+        port: target_port,
+        destination_addr: selected_upstream.destination_addr,
+        tls_server_name: selected_upstream.tls_server_name.clone(),
+    };
+
+    let client = state
+        .get_or_create_upstream_client(&client_key)
+        .unwrap_or_else(|_| state.http_client.clone());
 
     // 9. Proxy Forwarding with Strict Header Forwarding (Finding 3)
-    let mut client_req = state.http_client.request(
+    let mut client_req = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
         &forward_url,
     );

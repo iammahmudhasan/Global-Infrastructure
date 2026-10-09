@@ -115,24 +115,65 @@ PUBLIC_RESP_2=$(curl -s -D - -H "Host: api.nexusedge.io" "${ENVOY_HTTP_URL}/cach
 assert_contains "public Second Request Cache HIT" "X-Cache: HIT" "$PUBLIC_RESP_2"
 
 # 9. Dynamic Envoy SDS Zero-Reload Certificate Rotation & ACME Validation Gate
-echo "[Test 9/9] Verifying Dynamic Envoy SDS Zero-Reload Certificate Rotation & ACME Validation..."
+echo "[Test 9/10] Verifying Dynamic Envoy SDS Zero-Reload Certificate Rotation & ACME Validation..."
 # 9a. Verify initial HTTPS request operates cleanly via Envoy Dynamic SDS
 HTTPS_INITIAL_RESP=$(curl -k -s -D - -H "Host: api.nexusedge.io" "${ENVOY_HTTPS_URL}/get" || true)
 HTTPS_INITIAL_CODE=$(echo "$HTTPS_INITIAL_RESP" | grep -i "^HTTP/" | head -n 1 | awk '{print $2}')
 assert_status "Initial SDS HTTPS Ingress Status" "200" "$HTTPS_INITIAL_CODE"
 assert_contains "Initial SDS HTTPS Origin Marker" "ORIGIN_DEFAULT_A" "$HTTPS_INITIAL_RESP"
 
+tls_serial() {
+    openssl s_client \
+        -connect 127.0.0.1:443 \
+        -servername api.nexusedge.io \
+        </dev/null 2>/dev/null \
+        | openssl x509 -noout -serial \
+        | sed 's/^serial=//'
+}
+
+BEFORE_SERIAL=$(tls_serial)
+
 # 9b. Trigger zero-downtime certificate renewal via Control Plane
 RENEW_RESP=$(curl -s -X POST -H "X-API-Key: dev-fixture-key-01" "${CONTROL_PLANE_URL}/v1/domains/dom-dev-api/certificates/renew" || true)
 assert_contains "Certificate Renewal Serial Marker" "serial_number" "$RENEW_RESP"
 
-# 9c. Verify Envoy serves traffic on HTTPS immediately with zero proxy reload
+# Poll for Envoy to serve the newly rotated certificate serial
+AFTER_SERIAL=""
+for i in {1..15}; do
+    CURRENT_SERIAL=$(tls_serial)
+    if [ -n "$CURRENT_SERIAL" ] && [ "$CURRENT_SERIAL" != "$BEFORE_SERIAL" ]; then
+        AFTER_SERIAL="$CURRENT_SERIAL"
+        break
+    fi
+    sleep 1
+done
+
+if [ -z "$BEFORE_SERIAL" ] || [ -z "$AFTER_SERIAL" ]; then
+    echo "  [FAIL] Could not read certificate serial presented by Envoy (before='$BEFORE_SERIAL', after='$AFTER_SERIAL')"
+    exit 1
+fi
+if [ "$BEFORE_SERIAL" = "$AFTER_SERIAL" ]; then
+    echo "  [FAIL] Envoy is still serving the previous certificate serial ($BEFORE_SERIAL)"
+    exit 1
+fi
+echo "  [PASS] Certificate Serial Rotated ($BEFORE_SERIAL -> $AFTER_SERIAL)"
+
+# 9c. Verify Subject Alternative Name (SAN) includes DNS:api.nexusedge.io
+if openssl s_client -connect 127.0.0.1:443 -servername api.nexusedge.io </dev/null 2>/dev/null \
+    | openssl x509 -noout -ext subjectAltName | grep -Fq "DNS:api.nexusedge.io"; then
+    echo "  [PASS] Certificate SAN Verified (DNS:api.nexusedge.io present)"
+else
+    echo "  [FAIL] Certificate SAN missing DNS:api.nexusedge.io"
+    exit 1
+fi
+
+# 9d. Verify Envoy serves traffic on HTTPS immediately with zero proxy reload
 HTTPS_AFTER_RENEW=$(curl -k -s -D - -H "Host: api.nexusedge.io" "${ENVOY_HTTPS_URL}/get" || true)
 HTTPS_AFTER_CODE=$(echo "$HTTPS_AFTER_RENEW" | grep -i "^HTTP/" | head -n 1 | awk '{print $2}')
 assert_status "Post-Renewal SDS HTTPS Ingress Status" "200" "$HTTPS_AFTER_CODE"
 assert_contains "Post-Renewal Origin Marker" "ORIGIN_DEFAULT_A" "$HTTPS_AFTER_RENEW"
 
-# 9d. Trigger new automated ACME order and challenge validation cycle
+# 9e. Trigger new automated ACME order and challenge validation cycle
 ORDER_RESP=$(curl -s -X POST -H "X-API-Key: dev-fixture-key-01" "${CONTROL_PLANE_URL}/v1/domains/dom-dev-api/certificates/order" || true)
 assert_contains "ACME Order Challenge Status" "PENDING" "$ORDER_RESP"
 NEW_TOKEN=$(echo "$ORDER_RESP" | grep -o '"token":"[^"]*"' | head -n 1 | cut -d'"' -f4)
@@ -144,6 +185,16 @@ assert_contains "ACME Live Challenge Retrieval" "${NEW_TOKEN}." "$CHALLENGE_RESP
 # Complete challenge validation
 VALIDATE_RESP=$(curl -s -X POST -H "Content-Type: application/json" "${CONTROL_PLANE_URL}/v1/edge/acme/validate" -d "{\"token\":\"${NEW_TOKEN}\"}" || true)
 assert_contains "ACME Challenge Validation Completion" "VALIDATED" "$VALIDATE_RESP"
+
+# 10. Envoy Admin Security Boundary Gate (Loopback Isolation)
+echo "[Test 10/10] Verifying Envoy Admin Interface Host Inaccessibility..."
+ADMIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9901/ready || true)
+if [ "$ADMIN_CODE" = "000" ]; then
+    echo "  [PASS] Envoy Admin Port 9901 not exposed to host (Connection Refused, status 000)"
+else
+    echo "  [FAIL] Envoy Admin Port 9901 is unexpectedly accessible from host! (Status: $ADMIN_CODE)"
+    exit 1
+fi
 
 echo "================================================================"
 echo " Single-PoP Edge Security Gateway Verification: ALL GATES PASS"

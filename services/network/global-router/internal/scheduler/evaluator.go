@@ -160,56 +160,8 @@ func (e *Evaluator) Evaluate(policy DispatchPolicy) (*DispatchDecision, error) {
 		wLat, wCost, wCarb = 1.5, 25.0, 0.5
 	}
 
-	// 4. Deterministic Fallback if Candidates Empty (Rule 30)
+	// 4. Strict Constraint Enforcement: If no backend satisfies hard constraints, reject (Rule 28, 30)
 	if len(eligible) == 0 {
-		// If strict sovereignty was requested, never violate the law (Rule 28)
-		if policy.StrictSovereignty {
-			return nil, ErrNoEligibleBackends
-		}
-
-		// Collect healthy candidate fallback nodes with capacity and score them deterministically
-		type fallbackCandidate struct {
-			backend *registry.ComputeBackend
-			score   float64
-		}
-		var fallbackList []fallbackCandidate
-		for _, b := range candidates {
-			if b.Healthy && b.CircuitState != circuitbreaker.StateOpen && b.AvailableGPUs >= gpusReq {
-				score := (float64(b.LatencyP95Ms) * wLat) + (b.HourlyCost * wCost) + (b.CarbonIntensity * wCarb)
-				fallbackList = append(fallbackList, fallbackCandidate{backend: b, score: score})
-			}
-		}
-		sort.Slice(fallbackList, func(i, j int) bool {
-			if fallbackList[i].score != fallbackList[j].score {
-				return fallbackList[i].score < fallbackList[j].score
-			}
-			return fallbackList[i].backend.ID < fallbackList[j].backend.ID
-		})
-
-		for _, item := range fallbackList {
-			b := item.backend
-			// Atomically check circuit breaker admission and reserve capacity
-			if err := e.reg.AdmitAndReserve(policy.WorkloadID, policy.TenantID, policy.ProjectID, b.ID, gpusReq, registry.DefaultLeaseDuration); err == nil {
-				decision := &DispatchDecision{
-					WorkloadID:      policy.WorkloadID,
-					TenantID:        policy.TenantID,
-					ProjectID:       policy.ProjectID,
-					Status:          "SCHEDULED",
-					AssignedBackend: b,
-					GPUsAllocated:   gpusReq,
-					CompositeScore:  item.score,
-					Reason:          "Deterministic fallback: placed on lowest-score healthy node with capacity",
-					ReasonCodes:     []string{"DETERMINISTIC_FALLBACK_ACTIVE", "HEALTHY_TARGET", "CAPACITY_RESERVED"},
-					FallbackUsed:    true,
-					CalculatedAt:    time.Now().UTC(),
-				}
-				e.recordIdempotencyLocked(idempotencyKey, decision)
-				return decision, nil
-			} else if errors.Is(err, registry.ErrTenantQuotaExceeded) {
-				return nil, err
-			}
-		}
-
 		return nil, ErrNoEligibleBackends
 	}
 

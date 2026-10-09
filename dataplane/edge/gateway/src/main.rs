@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Configured trusted reverse proxy CIDRs"
     );
 
+    let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {
         config: config.clone(),
         trusted_proxies,
@@ -139,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         cache,
         router: router.clone(),
         http_client: http_client.clone(),
+        client_cache,
         inflight_buffer_semaphore,
         aggregate_buffered_bytes,
         aggregate_buffered_request_bytes,
