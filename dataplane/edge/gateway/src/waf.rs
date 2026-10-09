@@ -91,8 +91,13 @@ impl WafEngine {
             return WafResult::Allowed;
         }
 
+        let decoded_uri = url_decode(uri_str);
+
         // 3. Inspect URI / Path Traversal
-        if block_traversal && self.path_traversal_regex.is_match(uri_str) {
+        if block_traversal
+            && (self.path_traversal_regex.is_match(uri_str)
+                || self.path_traversal_regex.is_match(&decoded_uri))
+        {
             return WafResult::Blocked {
                 rule: "PATH_TRAVERSAL_DETECTED",
                 pattern: uri_str.to_string(),
@@ -100,7 +105,9 @@ impl WafEngine {
         }
 
         // 4. Inspect SQL Injection in URI
-        if block_sqli && self.sqli_regex.is_match(uri_str) {
+        if block_sqli
+            && (self.sqli_regex.is_match(uri_str) || self.sqli_regex.is_match(&decoded_uri))
+        {
             return WafResult::Blocked {
                 rule: "SQLI_IN_URI",
                 pattern: uri_str.to_string(),
@@ -108,7 +115,8 @@ impl WafEngine {
         }
 
         // 5. Inspect XSS in URI
-        if block_xss && self.xss_regex.is_match(uri_str) {
+        if block_xss && (self.xss_regex.is_match(uri_str) || self.xss_regex.is_match(&decoded_uri))
+        {
             return WafResult::Blocked {
                 rule: "XSS_IN_URI",
                 pattern: uri_str.to_string(),
@@ -117,14 +125,19 @@ impl WafEngine {
 
         // 6. Inspect Request Body sample if available
         if let Some(body) = body_sample {
-            if block_sqli && self.sqli_regex.is_match(body) {
+            let decoded_body = url_decode(body);
+            if block_sqli
+                && (self.sqli_regex.is_match(body) || self.sqli_regex.is_match(&decoded_body))
+            {
                 return WafResult::Blocked {
                     rule: "SQLI_IN_BODY",
                     pattern: body.chars().take(80).collect(),
                 };
             }
 
-            if block_xss && self.xss_regex.is_match(body) {
+            if block_xss
+                && (self.xss_regex.is_match(body) || self.xss_regex.is_match(&decoded_body))
+            {
                 return WafResult::Blocked {
                     rule: "XSS_IN_BODY",
                     pattern: body.chars().take(80).collect(),
@@ -133,6 +146,39 @@ impl WafEngine {
         }
 
         WafResult::Allowed
+    }
+}
+
+fn url_decode(input: &str) -> String {
+    let mut decoded = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h1), Some(h2)) =
+                (from_hex_digit(bytes[i + 1]), from_hex_digit(bytes[i + 2]))
+            {
+                decoded.push((h1 << 4) | h2);
+                i += 3;
+                continue;
+            }
+        } else if bytes[i] == b'+' {
+            decoded.push(b' ');
+            i += 1;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn from_hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -303,6 +349,35 @@ mod tests {
             res_lossy,
             WafResult::Blocked {
                 rule: "SQLI_IN_BODY",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_waf_sqli_percent_encoded_uri() {
+        let waf = test_waf();
+        let active_policy = DomainSecurityPolicy {
+            waf_enabled: true,
+            block_sqli: true,
+            block_xss: true,
+            block_path_traversal: true,
+            blocked_paths: vec![],
+            rate_limit_enabled: false,
+            requests_per_second: 0,
+            burst_capacity: 0,
+        };
+
+        let res = waf.inspect_with_tenant_policy(
+            "/products?id=1%20UNION%20SELECT%20null,password%20FROM%20users",
+            Some("curl/7.68.0"),
+            None,
+            Some(&active_policy),
+        );
+        assert!(matches!(
+            res,
+            WafResult::Blocked {
+                rule: "SQLI_IN_URI",
                 ..
             }
         ));
