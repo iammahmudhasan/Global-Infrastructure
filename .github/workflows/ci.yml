@@ -169,15 +169,17 @@ jobs:
           fi
 
           echo "Awaiting Envoy Ingress readiness..."
+          ENVOY_READY=0
           for i in {1..30}; do
-            STATUS=$(docker inspect --format='{{.State.Health.Status}}' nexusedge-envoy-ingress 2>/dev/null || true)
-            if [ "$STATUS" = "healthy" ]; then
-              echo "Envoy Ingress is healthy!"
+            STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" http://127.0.0.1:80/get || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Envoy Ingress is ready (HTTP 200)!"
+              ENVOY_READY=1
               break
             fi
             sleep 2
           done
-          [ "${STATUS:-}" = "healthy" ] || { echo "ERROR: Envoy failed to become healthy within timeout!"; exit 1; }
+          [ "$ENVOY_READY" -eq 1 ] || { echo "ERROR: Envoy failed to reach readiness (HTTP 200) within timeout!"; exit 1; }
 
       - name: Run Single-PoP E2E Integration Suite
         run: bash tests/e2e/test_single_pop_gateway.sh
