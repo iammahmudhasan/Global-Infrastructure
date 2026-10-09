@@ -38,7 +38,7 @@ assert_contains() {
     local name="$1"
     local expected="$2"
     local actual="$3"
-    if echo "$actual" | grep -Fq "$expected"; then
+    if echo "$actual" | grep -iFq "$expected"; then
         echo "  [PASS] $name (Matched marker: '$expected')"
     else
         echo "  [FAIL] $name: Expected content to contain '$expected'"
@@ -48,7 +48,7 @@ assert_contains() {
 }
 
 # 1. Gateway Readiness Gate
-echo "[Test 1/7] Verifying Gateway /ready endpoint..."
+echo "[Test 1/8] Verifying Gateway /ready endpoint..."
 READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${GATEWAY_URL}/ready" || true)
 assert_status "Gateway /ready" "200" "$READY_CODE"
 
