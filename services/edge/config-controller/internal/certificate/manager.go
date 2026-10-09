@@ -55,7 +55,9 @@ func preparePrivateKeyForEnvoy(path string) error {
 	}
 	if runtime.GOOS != "windows" && runtime.GOOS != "plan9" {
 		if err := os.Chown(path, -1, gid); err != nil {
-			return fmt.Errorf("set Envoy key-reader group: %w", err)
+			if isProductionEnvironment() || os.Geteuid() == 0 {
+				return fmt.Errorf("set Envoy key-reader group: %w", err)
+			}
 		}
 	}
 	if err := os.Chmod(path, 0640); err != nil {
