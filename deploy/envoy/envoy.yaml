@@ -7,6 +7,10 @@
 # - Control Plane management APIs are decoupled and NOT exposed on public customer ingress
 # - ACME challenges (prefix: "/.well-known/acme-challenge/") route to config-controller:9091
 
+node:
+  id: nexusedge-envoy-ingress
+  cluster: nexusedge-edge-cluster
+
 static_resources:
   listeners:
   # Listener 1: HTTP Ingress (Port 10000 -> Public 80)

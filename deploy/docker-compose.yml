@@ -35,7 +35,7 @@ services:
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
       - ./envoy/certs:/etc/envoy/certs:ro
-    command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
+    command: ["envoy", "-c", "/etc/envoy/envoy.yaml", "--service-node", "nexusedge-envoy-ingress", "--service-cluster", "nexusedge-edge-cluster"]
     depends_on:
       config-controller:
         condition: service_started
