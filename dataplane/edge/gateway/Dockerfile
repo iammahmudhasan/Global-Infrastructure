@@ -1,5 +1,8 @@
 # Build Stage
-FROM rust:1-bookworm AS builder
+ARG RUST_IMAGE=public.ecr.aws/docker/library/rust:1-bookworm
+ARG RUNTIME_IMAGE=public.ecr.aws/docker/library/debian:bookworm-slim
+
+FROM ${RUST_IMAGE} AS builder
 
 WORKDIR /usr/src/nexusedge
 
@@ -14,7 +17,7 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime Stage
-FROM debian:bookworm-slim
+FROM ${RUNTIME_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
