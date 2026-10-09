@@ -48,6 +48,17 @@ pub struct BufferBudgetGuard {
     limit: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetExceeded;
+
+impl std::fmt::Display for BudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Gateway buffer memory budget exceeded")
+    }
+}
+
+impl std::error::Error for BudgetExceeded {}
+
 impl BufferBudgetGuard {
     pub fn new(tracker: Arc<std::sync::atomic::AtomicUsize>, limit: usize) -> Self {
         Self {
@@ -57,11 +68,11 @@ impl BufferBudgetGuard {
         }
     }
 
-    pub fn try_allocate(&mut self, bytes: usize) -> Result<(), ()> {
+    pub fn try_allocate(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
         let mut current = self.tracker.load(std::sync::atomic::Ordering::Acquire);
         loop {
             if current.saturating_add(bytes) > self.limit {
-                return Err(());
+                return Err(BudgetExceeded);
             }
             match self.tracker.compare_exchange_weak(
                 current,
@@ -245,33 +256,44 @@ pub async fn handle_request(
         }
     };
 
-    let limited_body = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
-    let body_bytes = match limited_body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            warn!("Failed to read bounded request body: {:?}", e);
-            let resp = Response::builder()
-                .status(StatusCode::PAYLOAD_TOO_LARGE)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(
-                    r#"{"error":"Payload Too Large: request body exceeds 10 MB limit or is malformed"}"#,
-                )))
-                .unwrap();
-            return Ok(resp);
-        }
-    };
-
     let mut req_body_guard = BufferBudgetGuard::new(
         Arc::clone(&state.aggregate_buffered_request_bytes),
         MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
     );
-    if !body_bytes.is_empty() && req_body_guard.try_allocate(body_bytes.len()).is_err() {
-        warn!(
-            bytes = body_bytes.len(),
-            limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
-            "Gateway aggregate request body buffer limit saturated"
-        );
+
+    let mut limited_body = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
+    let mut body_buf = Vec::new();
+    let mut budget_exceeded = false;
+    let mut payload_too_large = false;
+
+    while let Some(frame_res) = limited_body.frame().await {
+        match frame_res {
+            Ok(frame) => {
+                if let Ok(data) = frame.into_data() {
+                    if !data.is_empty() {
+                        // Atomic budget reservation occurs BEFORE allocating buffer space for the chunk
+                        if req_body_guard.try_allocate(data.len()).is_err() {
+                            warn!(
+                                bytes = data.len(),
+                                limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
+                                "Gateway aggregate request body buffer limit saturated during streaming"
+                            );
+                            budget_exceeded = true;
+                            break;
+                        }
+                        body_buf.extend_from_slice(&data);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Request body stream error or exceeded 10 MB limit: {:?}", e);
+                payload_too_large = true;
+                break;
+            }
+        }
+    }
+
+    if budget_exceeded {
         let resp = Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("Content-Type", "application/json")
@@ -284,10 +306,54 @@ pub async fn handle_request(
         return Ok(resp);
     }
 
-    let body_lossy = if !body_bytes.is_empty() {
-        Some(String::from_utf8_lossy(&body_bytes))
+    if payload_too_large {
+        let resp = Response::builder()
+            .status(StatusCode::PAYLOAD_TOO_LARGE)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge/0.1.0")
+            .body(Full::new(Bytes::from(
+                r#"{"error":"Payload Too Large: request body exceeds 10 MB limit or is malformed"}"#,
+            )))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    let body_bytes = Bytes::from(body_buf);
+
+    let (body_lossy, _lossy_guard) = if !body_bytes.is_empty() {
+        match std::str::from_utf8(&body_bytes) {
+            Ok(valid_str) => (Some(std::borrow::Cow::Borrowed(valid_str)), None),
+            Err(_) => {
+                // For invalid UTF-8, reserve additional memory budget for the lossy allocated string
+                let mut lossy_guard = BufferBudgetGuard::new(
+                    Arc::clone(&state.aggregate_buffered_request_bytes),
+                    MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
+                );
+                if lossy_guard.try_allocate(body_bytes.len()).is_err() {
+                    warn!(
+                        bytes = body_bytes.len(),
+                        limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
+                        "Gateway aggregate request buffer budget saturated for lossy string conversion"
+                    );
+                    let resp = Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .header("Content-Type", "application/json")
+                        .header("Server", "NexusEdge/0.1.0")
+                        .header("Retry-After", "1")
+                        .body(Full::new(Bytes::from(
+                            r#"{"error":"Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure","status":503}"#,
+                        )))
+                        .unwrap();
+                    return Ok(resp);
+                }
+                (
+                    Some(String::from_utf8_lossy(&body_bytes)),
+                    Some(lossy_guard),
+                )
+            }
+        }
     } else {
-        None
+        (None, None)
     };
 
     // 6. Tenant & Global WAF Inspection (Finding 7 & P1 Finding 3)
@@ -1048,5 +1114,35 @@ mod tests {
 
         drop(guards);
         assert_eq!(tracker.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn test_lossy_utf8_budget_guard_behavior() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tracker = Arc::new(AtomicUsize::new(0));
+        let limit = 1000;
+
+        // Valid UTF-8: zero extra memory allocation needed (Cow::Borrowed)
+        let valid_bytes = b"Hello NexusEdge Gateway valid UTF-8";
+        assert!(std::str::from_utf8(valid_bytes).is_ok());
+
+        // Invalid UTF-8: requires allocation and CAS budget check
+        let invalid_bytes = vec![0xFF, 0xFE, 0xFD, 0x80, 0x81];
+        assert!(std::str::from_utf8(&invalid_bytes).is_err());
+
+        {
+            let mut lossy_guard = BufferBudgetGuard::new(Arc::clone(&tracker), limit);
+            assert!(lossy_guard.try_allocate(invalid_bytes.len()).is_ok());
+            assert_eq!(tracker.load(Ordering::Relaxed), 5);
+
+            // Exceeding limit fails CAS
+            let mut second_guard = BufferBudgetGuard::new(Arc::clone(&tracker), limit);
+            assert!(second_guard.try_allocate(1000).is_err());
+            assert_eq!(tracker.load(Ordering::Relaxed), 5);
+        }
+
+        // Drop releases all bytes
+        assert_eq!(tracker.load(Ordering::Relaxed), 0);
     }
 }

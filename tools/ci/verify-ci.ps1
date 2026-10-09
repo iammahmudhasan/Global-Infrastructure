@@ -83,14 +83,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host " -> Rust clippy passed with zero warnings." -ForegroundColor Green
 
-# 5. Rust Compiler Check
-Write-Host "[5/7] Running Rust check (cargo check)..." -ForegroundColor Yellow
-& cargo check --manifest-path $GatewayCargo
+# 5. Rust Compiler & Tests Check
+Write-Host "[5/7] Running Rust check (cargo check --tests)..." -ForegroundColor Yellow
+& cargo check --manifest-path $GatewayCargo --tests
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: 'cargo check' failed." -ForegroundColor Red
+    Write-Host "ERROR: 'cargo check --tests' failed." -ForegroundColor Red
     exit 1
 }
-Write-Host " -> Rust check passed." -ForegroundColor Green
+Write-Host " -> Rust check and tests verified." -ForegroundColor Green
 
 # 6. Python Intelligence Optimizer Gate
 Write-Host "[6/7] Verifying Python Intelligence scheduler..." -ForegroundColor Yellow

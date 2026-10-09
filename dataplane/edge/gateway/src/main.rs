@@ -4,6 +4,7 @@ mod dns;
 mod proxy;
 mod rate_limit;
 mod router;
+mod sync;
 mod waf;
 
 use crate::cache::EdgeCache;
@@ -12,13 +13,13 @@ use crate::dns::PinnedDnsResolver;
 use crate::proxy::{handle_request, ProxyState, DEFAULT_MAX_INFLIGHT_BUFFERED_REQUESTS};
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
+use crate::sync::fetch_and_apply_control_plane_snapshot;
 use crate::waf::WafEngine;
 
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use reqwest::Client as HttpClient;
-use sha2::Digest;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -185,85 +186,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                 // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config (P1 Integrity & SSRF Hardening)
                 if cp_cfg.enabled {
-                    if let Err(err_msg) =
-                        validate_control_plane_endpoint(&cp_cfg.endpoint, &cp_cfg.auth_token)
+                    match fetch_and_apply_control_plane_snapshot(
+                        &cp_cfg.endpoint,
+                        &cp_cfg.pop_id,
+                        &cp_cfg.auth_token,
+                        &sync_client,
+                        &sync_router,
+                        &sync_dns,
+                    )
+                    .await
                     {
-                        tracing::error!(
-                            endpoint = %cp_cfg.endpoint,
-                            error = %err_msg,
-                            "Control Plane endpoint rejected; skipping sync cycle"
-                        );
-                        continue;
-                    }
-
-                    let url = format!(
-                        "{}/v1/edge/pops/{}/config",
-                        cp_cfg.endpoint.trim_end_matches('/'),
-                        cp_cfg.pop_id
-                    );
-                    let mut req_builder = sync_client.get(&url);
-                    if !cp_cfg.auth_token.is_empty() {
-                        req_builder = req_builder
-                            .header("Authorization", format!("Bearer {}", cp_cfg.auth_token));
-                    }
-                    match req_builder.send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            let header_checksum = resp
-                                .headers()
-                                .get("x-snapshot-checksum")
-                                .and_then(|v| v.to_str().ok())
-                                .map(|s| s.trim().to_string());
-
-                            let Some(expected_checksum) = header_checksum else {
-                                tracing::error!("Missing mandatory X-Snapshot-Checksum header from Control Plane response; rejecting unauthenticated snapshot update");
-                                continue;
-                            };
-
-                            if expected_checksum.is_empty() {
-                                tracing::error!("Empty X-Snapshot-Checksum header from Control Plane response; rejecting snapshot update");
-                                continue;
-                            }
-
-                            if let Ok(body_str) = resp.text().await {
-                                let computed_hash =
-                                    format!("{:x}", sha2::Sha256::digest(body_str.as_bytes()));
-                                if !expected_checksum.eq_ignore_ascii_case(&computed_hash) {
-                                    tracing::error!(
-                                        expected = %expected_checksum,
-                                        computed = %computed_hash,
-                                        "Snapshot SHA-256 checksum mismatch, rejecting corrupted or tampered route update"
-                                    );
-                                    continue;
-                                }
-
-                                match router::parse_pop_config_routes(&body_str) {
-                                    Ok(new_routes) => {
-                                        if let Err(e) =
-                                            sync_router.update_routes(new_routes, vec![])
-                                        {
-                                            tracing::warn!(
-                                                "Failed to apply routes from control plane: {}",
-                                                e
-                                            );
-                                        } else {
-                                            sync_router.sync_dns_resolver(&sync_dns);
-                                            tracing::info!(pop_id = %cp_cfg.pop_id, "Atomically refreshed PoP routes from Control Plane");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to parse Control Plane PoP routes payload: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Ok(resp) => {
-                            tracing::warn!(status = %resp.status(), "Control Plane config endpoint returned non-success");
+                        Ok(stats) => {
+                            tracing::info!(
+                                pop_id = %cp_cfg.pop_id,
+                                routes = stats.routes_applied,
+                                checksum = %stats.checksum,
+                                "Atomically refreshed PoP routes from Control Plane"
+                            );
                         }
                         Err(e) => {
-                            tracing::debug!("Control Plane sync probe idle: {:?}", e);
+                            tracing::warn!(
+                                pop_id = %cp_cfg.pop_id,
+                                error = %e,
+                                "Control Plane sync cycle skipped or failed"
+                            );
                         }
                     }
                 }
@@ -345,101 +291,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 tracing::debug!("Connection terminated: {:?}", err);
             }
         });
-    }
-}
-
-/// Validates Control Plane sync endpoint for transport security and credential safety.
-/// Requires HTTPS for all remote endpoints and mandates authentication token for remote transports.
-pub fn validate_control_plane_endpoint(
-    endpoint: &str,
-    auth_token: &str,
-) -> Result<reqwest::Url, String> {
-    let trimmed = endpoint.trim();
-    if trimmed.is_empty() {
-        return Err("Control Plane endpoint cannot be empty".to_string());
-    }
-
-    let parsed = reqwest::Url::parse(trimmed)
-        .map_err(|e| format!("Malformed Control Plane endpoint URL: {}", e))?;
-
-    let scheme = parsed.scheme();
-    let host_str = match parsed.host_str() {
-        Some(h) if !h.is_empty() => h.trim().to_ascii_lowercase(),
-        _ => return Err("Control Plane endpoint must include a valid host".to_string()),
-    };
-
-    let unbracketed_host = host_str.trim_start_matches('[').trim_end_matches(']');
-    let is_trusted_internal = unbracketed_host == "127.0.0.1"
-        || unbracketed_host == "localhost"
-        || unbracketed_host == "::1"
-        || unbracketed_host == "config-controller";
-
-    match scheme {
-        "http" => {
-            if !is_trusted_internal {
-                return Err(format!(
-                    "Insecure HTTP forbidden for remote Control Plane endpoint '{}'; HTTPS is strictly required",
-                    endpoint
-                ));
-            }
-        }
-        "https" => {
-            if !is_trusted_internal && auth_token.trim().is_empty() {
-                return Err(format!(
-                    "Remote Control Plane endpoint '{}' requires non-empty authentication token",
-                    endpoint
-                ));
-            }
-        }
-        _ => {
-            return Err(format!(
-                "Invalid scheme '{}' for Control Plane endpoint; must be http or https",
-                scheme
-            ));
-        }
-    }
-
-    Ok(parsed)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_validate_control_plane_endpoint_security() {
-        // Trusted internal / loopback HTTP endpoints allowed
-        assert!(validate_control_plane_endpoint("http://127.0.0.1:9091", "").is_ok());
-        assert!(validate_control_plane_endpoint("http://localhost:9091", "").is_ok());
-        assert!(validate_control_plane_endpoint("http://[::1]:9091", "").is_ok());
-        assert!(validate_control_plane_endpoint("http://config-controller:9091", "").is_ok());
-
-        // Subdomain / prefix attack vectors on trusted hosts rejected
-        let err =
-            validate_control_plane_endpoint("http://127.0.0.1.attacker.example:9091", "token")
-                .unwrap_err();
-        assert!(err.contains("HTTPS is strictly required"));
-
-        let err = validate_control_plane_endpoint("http://config-controller.attacker.com", "token")
-            .unwrap_err();
-        assert!(err.contains("HTTPS is strictly required"));
-
-        // Remote plain HTTP forbidden even if auth_token is present or empty
-        let err = validate_control_plane_endpoint("http://cp.remote.infra:9091", "secret-token")
-            .unwrap_err();
-        assert!(err.contains("HTTPS is strictly required"));
-
-        // Remote HTTPS requires non-empty auth token
-        let err =
-            validate_control_plane_endpoint("https://cp.remote.infra:9091", "   ").unwrap_err();
-        assert!(err.contains("requires non-empty authentication token"));
-
-        assert!(
-            validate_control_plane_endpoint("https://cp.remote.infra:9091", "valid-token").is_ok()
-        );
-
-        // Invalid scheme rejected
-        let err = validate_control_plane_endpoint("ftp://cp.remote.infra", "token").unwrap_err();
-        assert!(err.contains("must be http or https"));
     }
 }
