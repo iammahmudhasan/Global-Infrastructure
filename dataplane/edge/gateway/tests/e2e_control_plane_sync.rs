@@ -923,6 +923,7 @@ async fn test_e2e_readiness_and_liveness_probes() {
         aggregate_buffered_bytes: Arc::new(AtomicUsize::new(0)),
         aggregate_buffered_request_bytes: Arc::new(AtomicUsize::new(0)),
         is_ready: Arc::clone(&is_ready),
+        trusted_proxies: config.parsed_trusted_proxies(),
         config,
     });
 

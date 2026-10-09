@@ -124,9 +124,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let requires_dynamic_sync =
         config.control_plane.enabled || config.control_plane.snapshot_file.is_some();
     let is_ready = Arc::new(AtomicBool::new(!requires_dynamic_sync));
+    let trusted_proxies = config.parsed_trusted_proxies();
+    info!(
+        trusted_proxies = ?config.server.trusted_proxies,
+        parsed_count = trusted_proxies.len(),
+        "Configured trusted reverse proxy CIDRs"
+    );
 
     let state = Arc::new(ProxyState {
         config: config.clone(),
+        trusted_proxies,
         rate_limiter: rate_limiter.clone(),
         waf,
         cache,

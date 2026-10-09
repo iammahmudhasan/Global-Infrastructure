@@ -2,6 +2,11 @@ server:
   listen_addr: "0.0.0.0:8080"
   node_id: "pop-sin-01"
   region: "ap-southeast-1"
+  trusted_proxies:
+    - "127.0.0.1/32"
+    - "::1/128"
+    - "172.16.0.0/12"
+    - "10.0.0.0/8"
 
 upstream:
   origins:

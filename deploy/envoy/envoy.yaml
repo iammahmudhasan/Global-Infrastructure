@@ -22,6 +22,8 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_http
           codec_type: AUTO
+          use_remote_address: true
+          xff_num_trusted_hops: 0
           route_config:
             name: customer_http_route
             virtual_hosts:
@@ -68,6 +70,8 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_https
           codec_type: AUTO
+          use_remote_address: true
+          xff_num_trusted_hops: 0
           route_config:
             name: customer_https_route
             virtual_hosts:

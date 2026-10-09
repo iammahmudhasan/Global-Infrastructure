@@ -102,6 +102,7 @@ impl Drop for BufferBudgetGuard {
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: GatewayConfig,
+    pub trusted_proxies: Vec<crate::config::IpCidr>,
     pub rate_limiter: RateLimiter,
     pub waf: WafEngine,
     pub cache: EdgeCache,
@@ -160,7 +161,7 @@ pub async fn handle_request(
 
     // 1. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();
-    let effective_client_ip = extract_client_ip(&req_headers, client_ip);
+    let effective_client_ip = extract_client_ip(&req_headers, client_ip, &state.trusted_proxies);
 
     let host = match resolve_host(&req_headers, req.uri()) {
         Ok(h) => h,
@@ -794,21 +795,40 @@ pub async fn handle_request(
     }
 }
 
-/// Extracts original client IP, trusting forwarding headers only from private/loopback peer (Envoy / local gateway proxy, P1/P2 Finding 7)
-pub fn extract_client_ip(headers: &hyper::HeaderMap, peer_ip: IpAddr) -> IpAddr {
-    let is_trusted_proxy = match peer_ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
-    };
-    if is_trusted_proxy {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            if let Some(first_ip_str) = xff.split(',').next() {
-                if let Ok(ip) = first_ip_str.trim().parse::<IpAddr>() {
-                    return ip;
-                }
+/// Extracts original client IP according to RFC 7239 / Envoy trusted proxy forwarding semantics.
+///
+/// Invariants:
+/// 1. Untrusted peer: If peer_ip does not match any entry in trusted_proxies, peer_ip is strictly returned.
+///    Any client-supplied X-Forwarded-For header is untrusted and ignored to prevent rate-limit bypass and IP spoofing.
+/// 2. Trusted proxy peer: If peer_ip is in trusted_proxies (e.g. Envoy L7 ingress),
+///    we inspect the X-Forwarded-For header chain from right to left.
+///    The rightmost entry was appended by the trusted proxy and represents the verified downstream client address.
+///    Any attacker-forged entries prefixed on the left are discarded.
+pub fn extract_client_ip(
+    headers: &hyper::HeaderMap,
+    peer_ip: IpAddr,
+    trusted_proxies: &[crate::config::IpCidr],
+) -> IpAddr {
+    let is_trusted = trusted_proxies.iter().any(|cidr| cidr.contains(peer_ip));
+    if !is_trusted {
+        return peer_ip;
+    }
+
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        let ips: Vec<IpAddr> = xff
+            .split(',')
+            .filter_map(|s| s.trim().parse::<IpAddr>().ok())
+            .collect();
+
+        // Right-to-left traversal: find the first IP that is NOT one of our trusted proxies.
+        // This is the authentic downstream client address.
+        for ip in ips.into_iter().rev() {
+            if !trusted_proxies.iter().any(|cidr| cidr.contains(ip)) {
+                return ip;
             }
         }
     }
+
     peer_ip
 }
 
@@ -1067,30 +1087,85 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_client_ip_trusted_proxy() {
+    fn test_extract_client_ip_trusted_proxy_single_hop() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+        ];
         let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "198.51.100.42, 172.18.0.2".parse().unwrap(),
-        );
+        headers.insert("x-forwarded-for", "198.51.100.42".parse().unwrap());
 
         let peer_docker: IpAddr = "172.18.0.2".parse().unwrap();
-        let client_ip = extract_client_ip(&headers, peer_docker);
+        let client_ip = extract_client_ip(&headers, peer_docker, &trusted);
         assert_eq!(client_ip, "198.51.100.42".parse::<IpAddr>().unwrap());
-
-        let peer_loopback: IpAddr = "127.0.0.1".parse().unwrap();
-        let client_ip2 = extract_client_ip(&headers, peer_loopback);
-        assert_eq!(client_ip2, "198.51.100.42".parse::<IpAddr>().unwrap());
     }
 
     #[test]
-    fn test_extract_client_ip_untrusted_direct() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+    fn test_extract_client_ip_spoofed_xff_prevented() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+        ];
 
-        let public_peer: IpAddr = "203.0.113.50".parse().unwrap();
-        let client_ip = extract_client_ip(&headers, public_peer);
-        assert_eq!(client_ip, public_peer);
+        // Scenario A: Attacker attempts to spoof XFF via trusted Envoy reverse proxy
+        // Attacker (203.0.113.195) sends "X-Forwarded-For: 8.8.8.8".
+        // Envoy (use_remote_address: true, xff_num_trusted_hops: 0) appends the true remote address:
+        // "X-Forwarded-For: 8.8.8.8, 203.0.113.195".
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "8.8.8.8, 203.0.113.195".parse().unwrap());
+
+        let envoy_peer: IpAddr = "172.18.0.2".parse().unwrap();
+        let client_ip = extract_client_ip(&headers, envoy_peer, &trusted);
+        // Gateway must extract genuine client IP (203.0.113.195), discarding forged 8.8.8.8
+        assert_eq!(client_ip, "203.0.113.195".parse::<IpAddr>().unwrap());
+
+        // Scenario B: Untrusted public peer connects directly with forged XFF
+        let public_peer: IpAddr = "198.51.100.99".parse().unwrap();
+        let client_ip_direct = extract_client_ip(&headers, public_peer, &trusted);
+        // Must return public peer address, ignoring header completely
+        assert_eq!(client_ip_direct, public_peer);
+    }
+
+    #[test]
+    fn test_extract_client_ip_multi_hop_trusted_chain() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+            crate::config::IpCidr::parse("10.0.0.0/8").unwrap(),
+        ];
+        let mut headers = hyper::HeaderMap::new();
+        // Client (203.0.113.50) -> CDN (10.0.5.1) -> Envoy (172.18.0.2)
+        // With attacker spoof attempt: "8.8.8.8, 203.0.113.50, 10.0.5.1"
+        headers.insert(
+            "x-forwarded-for",
+            "8.8.8.8, 203.0.113.50, 10.0.5.1".parse().unwrap(),
+        );
+
+        let envoy_peer: IpAddr = "172.18.0.2".parse().unwrap();
+        let client_ip = extract_client_ip(&headers, envoy_peer, &trusted);
+        assert_eq!(client_ip, "203.0.113.50".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_extract_client_ip_fallback_on_all_trusted_or_malformed() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+        ];
+
+        // All trusted IPs in chain
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", "127.0.0.1, 172.18.0.1".parse().unwrap());
+        let peer: IpAddr = "172.18.0.2".parse().unwrap();
+        assert_eq!(extract_client_ip(&headers, peer, &trusted), peer);
+
+        // Malformed XFF
+        let mut headers_malformed = hyper::HeaderMap::new();
+        headers_malformed.insert(
+            "x-forwarded-for",
+            "not-an-ip, %%%, 999.999.999".parse().unwrap(),
+        );
+        assert_eq!(extract_client_ip(&headers_malformed, peer, &trusted), peer);
     }
 
     #[test]
