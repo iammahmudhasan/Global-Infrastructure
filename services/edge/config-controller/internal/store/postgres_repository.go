@@ -520,6 +520,13 @@ func (r *PostgresRepository) GetProjectQuota(projectID string) ProjectQuota {
 	return r.cache.GetProjectQuota(projectID)
 }
 
+func pqStringArray(arr []string) interface{} {
+	if arr == nil {
+		return pq.Array([]string{})
+	}
+	return pq.Array(arr)
+}
+
 // -------------------------------------------------------------------------
 // Domains
 // -------------------------------------------------------------------------
@@ -565,7 +572,7 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 		   allowed_pops = EXCLUDED.allowed_pops,
 		   updated_at = EXCLUDED.updated_at`,
 		d.ID, d.ProjectID, d.Hostname, string(d.Status), d.OnboardingType, d.CNAMETarget,
-		pq.Array(d.AllowedPoPs), createdAt, now,
+		pqStringArray(d.AllowedPoPs), createdAt, now,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert domain: %w", err)
@@ -697,7 +704,7 @@ func (r *PostgresRepository) SaveOriginPool(p *model.OriginPool) error {
 		   name = EXCLUDED.name,
 		   lb_algorithm = EXCLUDED.lb_algorithm,
 		   allowed_pops = EXCLUDED.allowed_pops`,
-		p.ID, p.ProjectID, p.Name, string(p.LBAlgorithm), pq.Array(p.AllowedPoPs),
+		p.ID, p.ProjectID, p.Name, string(p.LBAlgorithm), pqStringArray(p.AllowedPoPs),
 	)
 	if err != nil {
 		return fmt.Errorf("upsert origin pool: %w", err)
@@ -712,7 +719,7 @@ func (r *PostgresRepository) SaveOriginPool(p *model.OriginPool) error {
 			`INSERT INTO origins (id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 			o.ID, p.ID, o.Address, o.Port, string(o.Protocol), o.Weight, o.Healthy,
-			pq.Array(o.AllowedPoPs), o.SNI, o.CABundlePath,
+			pqStringArray(o.AllowedPoPs), o.SNI, o.CABundlePath,
 		)
 		if err != nil {
 			return fmt.Errorf("insert origin in tx: %w", err)
@@ -747,7 +754,7 @@ func (r *PostgresRepository) AddOrigin(o *model.Origin) error {
 		   sni = EXCLUDED.sni,
 		   ca_bundle_path = EXCLUDED.ca_bundle_path`,
 		o.ID, o.PoolID, o.Address, o.Port, string(o.Protocol), o.Weight, o.Healthy,
-		pq.Array(o.AllowedPoPs), o.SNI, o.CABundlePath,
+		pqStringArray(o.AllowedPoPs), o.SNI, o.CABundlePath,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert origin: %w", err)
@@ -1024,7 +1031,7 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 		   expires_at = EXCLUDED.expires_at`,
 		cert.ID, cert.DomainID, string(cert.Status), cert.Issuer, cert.SerialNumber,
 		cert.CertPEM, cert.PrivateKeyPEM, cert.FingerprintSHA256, string(cert.KeyType),
-		pq.Array(cert.Domains), cert.AutoRenew, issuedAt, expiresAt,
+		pqStringArray(cert.Domains), cert.AutoRenew, issuedAt, expiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert certificate: %w", err)
