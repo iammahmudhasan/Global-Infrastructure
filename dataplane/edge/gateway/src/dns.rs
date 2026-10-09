@@ -1,7 +1,6 @@
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Thread-safe DNS resolver supporting pinned IP destinations.
@@ -11,7 +10,6 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub struct PinnedDnsResolver {
     pinned: Arc<RwLock<HashMap<String, Vec<SocketAddr>>>>,
-    version: Arc<AtomicU64>,
 }
 
 impl Default for PinnedDnsResolver {
@@ -26,13 +24,7 @@ impl PinnedDnsResolver {
     pub fn new() -> Self {
         Self {
             pinned: Arc::new(RwLock::new(HashMap::new())),
-            version: Arc::new(AtomicU64::new(0)),
         }
-    }
-
-    /// Increments and returns the next epoch version for staged DNS atomic updates.
-    pub fn next_version(&self) -> u64 {
-        self.version.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Replaces all domain mappings atomically.
@@ -53,23 +45,6 @@ impl PinnedDnsResolver {
                 }
             }
         }
-    }
-
-    /// Conditionally prunes retired mappings to match the target set only if the version
-    /// has not been superseded by a newer route update.
-    pub fn prune_if_version(
-        &self,
-        mappings: HashMap<String, Vec<SocketAddr>>,
-        expected_version: u64,
-    ) -> bool {
-        if self.version.load(Ordering::SeqCst) == expected_version {
-            let mut map = self.pinned.write().unwrap();
-            if self.version.load(Ordering::SeqCst) == expected_version {
-                *map = mappings;
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -137,29 +112,5 @@ mod tests {
 
         let name_b: Name = "b.com".parse().unwrap();
         assert_eq!(resolver.resolve(name_b).await.unwrap().next(), Some(addr2));
-    }
-
-    #[tokio::test]
-    async fn test_pinned_dns_prune_if_version() {
-        let resolver = PinnedDnsResolver::new();
-        let v1 = resolver.next_version();
-        let addr1: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let mut map1 = HashMap::new();
-        map1.insert("old.com".to_string(), vec![addr1]);
-        resolver.set_all(map1);
-
-        let v2 = resolver.next_version();
-        let addr2: SocketAddr = "93.184.216.35:443".parse().unwrap();
-        let mut map2 = HashMap::new();
-        map2.insert("new.com".to_string(), vec![addr2]);
-
-        // Attempting to prune with outdated version v1 should fail and preserve map1
-        assert!(!resolver.prune_if_version(map2.clone(), v1));
-        assert!(resolver.resolve("old.com".parse().unwrap()).await.is_ok());
-
-        // Pruning with current version v2 succeeds and updates mappings
-        assert!(resolver.prune_if_version(map2, v2));
-        assert!(resolver.resolve("new.com".parse().unwrap()).await.is_ok());
-        assert!(resolver.resolve("old.com".parse().unwrap()).await.is_err());
     }
 }

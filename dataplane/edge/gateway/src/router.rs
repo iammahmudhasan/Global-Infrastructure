@@ -562,7 +562,6 @@ impl Router {
         // Retains active route pins while ensuring new route pins are immediately present
         // for any request evaluated right at the transition boundary.
         dns_resolver.merge_mappings(&candidate_dns);
-        let version = dns_resolver.next_version();
 
         // 5. Atomically swap routes in memory under exclusive write lock
         {
@@ -573,19 +572,8 @@ impl Router {
             *defaults_guard = default_nodes;
         }
 
-        // 6. Graceful DNS Pruning:
-        // In asynchronous runtime, defer eviction of retired pins by a grace period
-        // so in-flight requests that resolved before the route swap do not suffer
-        // transient DNS resolution failure. If superseded by a newer version, the older task aborts.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let resolver = dns_resolver.clone();
-            handle.spawn(async move {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                resolver.prune_if_version(candidate_dns, version);
-            });
-        } else {
-            dns_resolver.prune_if_version(candidate_dns, version);
-        }
+        // 6. Prune DNS mappings to exact active candidate set after the route swap
+        dns_resolver.set_all(candidate_dns);
 
         self.is_multi_tenant.store(true, Ordering::SeqCst);
         Ok(())
