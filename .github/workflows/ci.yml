@@ -131,7 +131,28 @@ jobs:
             sleep 10
           done
           [ "${BUILD_SUCCESS:-0}" -eq 1 ] || { echo "ERROR: Docker build failed after 3 attempts"; exit 1; }
-          docker compose -f deploy/docker-compose.yml up -d
+
+          for i in 1 2 3 4 5; do
+            echo "Pulling Envoy ingress image (attempt $i/5)..."
+            if docker pull envoyproxy/envoy:v1.31-latest; then
+              PULL_SUCCESS=1
+              break
+            fi
+            echo "Envoy pull timed out or failed. Retrying in 10s..."
+            sleep 10
+          done
+          [ "${PULL_SUCCESS:-0}" -eq 1 ] || { echo "ERROR: Failed to pull envoyproxy/envoy:v1.31-latest"; exit 1; }
+
+          for i in 1 2 3; do
+            echo "Starting compose stack (attempt $i/3)..."
+            if docker compose -f deploy/docker-compose.yml up -d; then
+              UP_SUCCESS=1
+              break
+            fi
+            echo "Compose up failed. Retrying in 5s..."
+            sleep 5
+          done
+          [ "${UP_SUCCESS:-0}" -eq 1 ] || { echo "ERROR: Failed to start compose stack"; exit 1; }
 
       - name: Wait for Stack Health and Readiness
         timeout-minutes: 5
