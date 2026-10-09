@@ -5,6 +5,14 @@ edition = "2021"
 authors = ["Mahmud Hasan <iammahmudhasanofficial@gmail.com>"]
 description = "NexusEdge Next-Gen L7 Edge Proxy, WAF, and DDoS Mitigation Gateway"
 
+[lib]
+name = "nexusedge_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nexusedge-gateway"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 hyper = { version = "1.4", features = ["full"] }

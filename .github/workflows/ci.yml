@@ -107,7 +107,9 @@ jobs:
         run: docker compose -f deploy/docker-compose.yml config
 
       - name: Build and Start Single-PoP Stack
-        run: docker compose -f deploy/docker-compose.yml up -d --build
+        run: |
+          sudo systemctl stop nginx apache2 2>/dev/null || true
+          docker compose -f deploy/docker-compose.yml up -d --build
 
       - name: Wait for Stack Health and Readiness
         timeout-minutes: 5

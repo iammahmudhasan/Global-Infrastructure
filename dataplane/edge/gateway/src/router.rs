@@ -391,9 +391,10 @@ impl Router {
             std::net::IpAddr::V4(v4) => v4.to_string(),
         };
 
-        let (url, sni, destination_addr) = match sni_trimmed {
-            Some(sni_host) if sni_host != clean_addr => {
-                let target_url = format!("{}://{}:{}", proto, sni_host, origin.port);
+        let is_https = proto == "https";
+        let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
+            (true, Some(sni_host)) if sni_host != clean_addr => {
+                let target_url = format!("https://{}:{}", sni_host, origin.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
             _ => {
@@ -1357,9 +1358,10 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             std::net::IpAddr::V4(v4) => v4.to_string(),
         };
 
-        let (url, sni, destination_addr) = match sni_trimmed {
-            Some(sni_host) if sni_host != clean_addr => {
-                let target_url = format!("{}://{}:{}", proto, sni_host, o.port);
+        let is_https = proto == "https";
+        let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
+            (true, Some(sni_host)) if sni_host != clean_addr => {
+                let target_url = format!("https://{}:{}", sni_host, o.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
             _ => {

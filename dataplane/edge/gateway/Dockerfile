@@ -3,10 +3,10 @@ FROM rust:1.85-bullseye AS builder
 
 WORKDIR /usr/src/nexusedge
 COPY Cargo.toml Cargo.lock ./
-# Create dummy main to cache dependencies
-RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release || true
+# Create dummy lib and main to cache dependencies
+RUN mkdir src && echo "pub fn dummy() {}" > src/lib.rs && echo "fn main() {}" > src/main.rs && cargo build --release || true
 COPY src ./src
-RUN cargo build --release
+RUN touch src/lib.rs src/main.rs && cargo build --release
 
 # Runtime Stage
 FROM debian:bullseye-slim
