@@ -1,5 +1,5 @@
 # Build Stage
-FROM rust:1.85-bullseye AS builder
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /usr/src/nexusedge
 
@@ -14,9 +14,9 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime Stage
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl libssl1.1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=builder /usr/src/nexusedge/target/release/nexusedge-gateway /app/nexusedge-gateway
