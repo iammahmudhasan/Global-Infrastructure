@@ -195,10 +195,17 @@ impl DomainRoute {
     }
 }
 
+/// Atomic, versioned routing table snapshot representing a single generation of routes and default upstreams.
+#[derive(Clone, Debug)]
+pub struct RouteSnapshot {
+    pub generation: u64,
+    pub routes: HashMap<String, DomainRoute>,
+    pub default_nodes: Vec<UpstreamNode>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Router {
-    default_nodes: Arc<RwLock<Vec<UpstreamNode>>>,
-    routes: Arc<RwLock<HashMap<String, DomainRoute>>>,
+    snapshot: Arc<RwLock<RouteSnapshot>>,
     health_states: Arc<RwLock<HashMap<String, OriginHealthState>>>,
     default_index: Arc<AtomicUsize>,
     #[allow(dead_code)]
@@ -268,8 +275,11 @@ impl Router {
     /// Creates a single-tenant router with pre-built upstream nodes
     pub fn new_with_nodes(nodes: Vec<UpstreamNode>, timeout_ms: u64) -> Self {
         Self {
-            default_nodes: Arc::new(RwLock::new(nodes)),
-            routes: Arc::new(RwLock::new(HashMap::new())),
+            snapshot: Arc::new(RwLock::new(RouteSnapshot {
+                generation: 1,
+                routes: HashMap::new(),
+                default_nodes: nodes,
+            })),
             health_states: Arc::new(RwLock::new(HashMap::new())),
             default_index: Arc::new(AtomicUsize::new(0)),
             timeout: Duration::from_millis(timeout_ms),
@@ -332,8 +342,11 @@ impl Router {
         }
 
         Ok(Self {
-            default_nodes: Arc::new(RwLock::new(default_nodes)),
-            routes: Arc::new(RwLock::new(routes_map)),
+            snapshot: Arc::new(RwLock::new(RouteSnapshot {
+                generation: 1,
+                routes: routes_map,
+                default_nodes,
+            })),
             health_states: Arc::new(RwLock::new(HashMap::new())),
             default_index: Arc::new(AtomicUsize::new(0)),
             timeout: Duration::from_millis(timeout_ms),
@@ -608,13 +621,12 @@ impl Router {
             .map(|u| Self::create_node_with_health(u, &health_states))
             .collect();
 
-        // 3. Atomically swap routes in memory
+        // 3. Atomically swap routes in memory with monotonic generation increment
         {
-            let mut routes_guard = self.routes.write().unwrap();
-            let mut defaults_guard = self.default_nodes.write().unwrap();
-
-            *routes_guard = final_routes_map;
-            *defaults_guard = default_nodes;
+            let mut snap = self.snapshot.write().unwrap();
+            snap.generation = snap.generation.wrapping_add(1);
+            snap.routes = final_routes_map;
+            snap.default_nodes = default_nodes;
         }
 
         self.is_multi_tenant.store(true, Ordering::SeqCst);
@@ -728,34 +740,45 @@ impl Router {
         // for any request evaluated right at the transition boundary.
         dns_resolver.merge_mappings(&candidate_dns);
 
-        // 5. Atomically swap routes in memory under exclusive write lock
-        {
-            let mut routes_guard = self.routes.write().unwrap();
-            let mut defaults_guard = self.default_nodes.write().unwrap();
+        // 5. Atomically update routing snapshot and generation under single write lock
+        let new_gen = {
+            let mut snap = self.snapshot.write().unwrap();
+            snap.generation = snap.generation.wrapping_add(1);
+            snap.routes = final_routes_map;
+            snap.default_nodes = default_nodes;
+            snap.generation
+        };
 
-            *routes_guard = final_routes_map;
-            *defaults_guard = default_nodes;
-        }
-
-        // 6. Prune DNS mappings to exact active candidate set after the route swap
-        dns_resolver.set_all(candidate_dns);
+        // 6. Transition DNS resolver to candidate mappings with generational grace-period retention.
+        // Old generation mappings are NOT abruptly dropped; they are retained until grace period expires.
+        dns_resolver.update_generation(new_gen, candidate_dns);
 
         self.is_multi_tenant.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Selects lowest EWMA latency healthy upstream node for the given tenant host and request path.
-    /// Fast-path invariant: longest-prefix & highest-priority match within tenant's routes (P1 Path Routing).
-    pub fn select_upstream_for_host_and_path(
+    /// Returns the current route generation ID.
+    pub fn generation(&self) -> u64 {
+        self.snapshot.read().unwrap().generation
+    }
+
+    /// Returns a point-in-time clone of the active RouteSnapshot.
+    pub fn snapshot(&self) -> RouteSnapshot {
+        self.snapshot.read().unwrap().clone()
+    }
+
+    /// Selects lowest EWMA latency healthy upstream node with generation ID metadata.
+    pub fn select_upstream_with_generation(
         &self,
         host: &str,
         path: &str,
-    ) -> Result<String, RoutingError> {
+    ) -> Result<(String, u64), RoutingError> {
         let norm_host = normalize_host(host);
 
         if self.is_multi_tenant.load(Ordering::Relaxed) {
-            let routes = self.routes.read().unwrap();
-            if let Some(domain_route) = routes.get(&norm_host) {
+            let snap = self.snapshot.read().unwrap();
+            let gen = snap.generation;
+            if let Some(domain_route) = snap.routes.get(&norm_host) {
                 let mut matching: Vec<&PathRoute> = domain_route
                     .path_routes
                     .iter()
@@ -770,9 +793,11 @@ impl Router {
 
                 if let Some(best) = matching.first() {
                     select_from_nodes(&best.origins, &best.round_robin_index)
+                        .map(|url| (url, gen))
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else if !domain_route.origins.is_empty() {
                     select_from_nodes(&domain_route.origins, &domain_route.round_robin_index)
+                        .map(|url| (url, gen))
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else {
                     Err(RoutingError::NoMatchingPath {
@@ -784,10 +809,23 @@ impl Router {
                 Err(RoutingError::UnknownHost(norm_host))
             }
         } else {
-            let default_nodes = self.default_nodes.read().unwrap();
-            select_from_nodes(&default_nodes, &self.default_index)
+            let snap = self.snapshot.read().unwrap();
+            let gen = snap.generation;
+            select_from_nodes(&snap.default_nodes, &self.default_index)
+                .map(|url| (url, gen))
                 .ok_or(RoutingError::NoHealthyUpstreams(norm_host))
         }
+    }
+
+    /// Selects lowest EWMA latency healthy upstream node for the given tenant host and request path.
+    /// Fast-path invariant: longest-prefix & highest-priority match within tenant's routes (P1 Path Routing).
+    pub fn select_upstream_for_host_and_path(
+        &self,
+        host: &str,
+        path: &str,
+    ) -> Result<String, RoutingError> {
+        self.select_upstream_with_generation(host, path)
+            .map(|(url, _gen)| url)
     }
 
     /// Selects lowest EWMA latency healthy upstream node for the given tenant host (root path fallback)
@@ -802,8 +840,8 @@ impl Router {
         host: &str,
     ) -> Option<(Option<DomainSecurityPolicy>, Option<DomainCachePolicy>)> {
         let norm_host = normalize_host(host);
-        let routes = self.routes.read().unwrap();
-        routes
+        let snap = self.snapshot.read().unwrap();
+        snap.routes
             .get(&norm_host)
             .map(|dr| (dr.security.clone(), dr.cache.clone()))
     }
@@ -811,12 +849,11 @@ impl Router {
     /// Selects an upstream from the default pool or first configured route (legacy/fallback)
     #[allow(dead_code)]
     pub fn select_upstream(&self) -> Option<String> {
-        let default_nodes = self.default_nodes.read().unwrap();
-        if !default_nodes.is_empty() {
-            select_from_nodes(&default_nodes, &self.default_index)
+        let snap = self.snapshot.read().unwrap();
+        if !snap.default_nodes.is_empty() {
+            select_from_nodes(&snap.default_nodes, &self.default_index)
         } else {
-            let routes = self.routes.read().unwrap();
-            for domain_route in routes.values() {
+            for domain_route in snap.routes.values() {
                 if let Some(target) = select_from_nodes(&domain_route.origins, &self.default_index)
                 {
                     return Some(target);
@@ -858,20 +895,15 @@ impl Router {
             }
         }
 
-        // 2. Update live nodes in default pool
+        // 2. Update live nodes in default pool and routes under snapshot write lock
         {
-            let mut nodes = self.default_nodes.write().unwrap();
-            for node in nodes.iter_mut() {
+            let mut snap = self.snapshot.write().unwrap();
+            for node in snap.default_nodes.iter_mut() {
                 if node.url == url {
                     update_node_health(node, healthy, latency_ms);
                 }
             }
-        }
-
-        // 3. Update live nodes across all tenant routes and path routes
-        {
-            let mut routes = self.routes.write().unwrap();
-            for domain_route in routes.values_mut() {
+            for domain_route in snap.routes.values_mut() {
                 for node in domain_route.origins.iter_mut() {
                     if node.url == url {
                         update_node_health(node, healthy, latency_ms);
@@ -891,24 +923,19 @@ impl Router {
     /// Returns all unique upstream target URLs for health probing
     pub fn all_targets(&self) -> Vec<String> {
         let mut set = HashSet::new();
+        let snap = self.snapshot.read().unwrap();
 
-        {
-            let nodes = self.default_nodes.read().unwrap();
-            for n in nodes.iter() {
-                set.insert(n.url.clone());
-            }
+        for n in snap.default_nodes.iter() {
+            set.insert(n.url.clone());
         }
 
-        {
-            let routes = self.routes.read().unwrap();
-            for dr in routes.values() {
-                for n in &dr.origins {
+        for dr in snap.routes.values() {
+            for n in &dr.origins {
+                set.insert(n.url.clone());
+            }
+            for pr in &dr.path_routes {
+                for n in &pr.origins {
                     set.insert(n.url.clone());
-                }
-                for pr in &dr.path_routes {
-                    for n in &pr.origins {
-                        set.insert(n.url.clone());
-                    }
                 }
             }
         }
@@ -921,8 +948,15 @@ impl Router {
         self.timeout
     }
 
-    /// Returns all DNS domain -> pinned SocketAddr mappings across all active routes (deduplicated)
+    /// Returns all DNS domain -> pinned SocketAddr mappings across all active routes in snapshot (deduplicated)
     pub fn dns_mappings(&self) -> HashMap<String, Vec<std::net::SocketAddr>> {
+        let snap = self.snapshot.read().unwrap();
+        Self::dns_mappings_from_snapshot(&snap)
+    }
+
+    fn dns_mappings_from_snapshot(
+        snap: &RouteSnapshot,
+    ) -> HashMap<String, Vec<std::net::SocketAddr>> {
         let mut map: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
         let mut insert_node = |n: &UpstreamNode| {
             if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
@@ -933,22 +967,16 @@ impl Router {
             }
         };
 
-        {
-            let default_nodes = self.default_nodes.read().unwrap();
-            for n in default_nodes.iter() {
+        for n in snap.default_nodes.iter() {
+            insert_node(n);
+        }
+        for dr in snap.routes.values() {
+            for n in &dr.origins {
                 insert_node(n);
             }
-        }
-        {
-            let routes = self.routes.read().unwrap();
-            for dr in routes.values() {
-                for n in &dr.origins {
+            for pr in &dr.path_routes {
+                for n in &pr.origins {
                     insert_node(n);
-                }
-                for pr in &dr.path_routes {
-                    for n in &pr.origins {
-                        insert_node(n);
-                    }
                 }
             }
         }
@@ -957,7 +985,11 @@ impl Router {
 
     /// Synchronizes current route DNS mappings into the given PinnedDnsResolver
     pub fn sync_dns_resolver(&self, resolver: &crate::dns::PinnedDnsResolver) {
-        resolver.set_all(self.dns_mappings());
+        let (gen, mappings) = {
+            let snap = self.snapshot.read().unwrap();
+            (snap.generation, Self::dns_mappings_from_snapshot(&snap))
+        };
+        resolver.update_generation(gen, mappings);
     }
 }
 
@@ -1557,8 +1589,9 @@ mod tests {
         router.mark_health("https://origin-1.example.com", false, 999);
         router.mark_health("https://origin-1.example.com", false, 999);
         {
-            let nodes = router.default_nodes.read().unwrap();
-            let n1 = nodes
+            let snap = router.snapshot.read().unwrap();
+            let n1 = snap
+                .default_nodes
                 .iter()
                 .find(|n| n.url == "https://origin-1.example.com")
                 .unwrap();
@@ -1571,8 +1604,9 @@ mod tests {
         // Probe 3 failure on origin-1: now trips to unhealthy
         router.mark_health("https://origin-1.example.com", false, 999);
         {
-            let nodes = router.default_nodes.read().unwrap();
-            let n1 = nodes
+            let snap = router.snapshot.read().unwrap();
+            let n1 = snap
+                .default_nodes
                 .iter()
                 .find(|n| n.url == "https://origin-1.example.com")
                 .unwrap();
@@ -1598,8 +1632,9 @@ mod tests {
         // Recovery hysteresis: Probe 1 success -> should STILL be unhealthy (needs 2 passes)
         router.mark_health("https://origin-1.example.com", true, 12);
         {
-            let nodes = router.default_nodes.read().unwrap();
-            let n1 = nodes
+            let snap = router.snapshot.read().unwrap();
+            let n1 = snap
+                .default_nodes
                 .iter()
                 .find(|n| n.url == "https://origin-1.example.com")
                 .unwrap();
@@ -2080,17 +2115,22 @@ mod tests {
         let routes_v1 = parse_pop_config_routes(snapshot_v1).unwrap();
         let routes_v2 = parse_pop_config_routes(snapshot_v2).unwrap();
 
-        let dns_resolver = Arc::new(crate::dns::PinnedDnsResolver::new());
+        let dns_resolver = Arc::new(crate::dns::PinnedDnsResolver::new_with_grace_period(
+            Duration::from_millis(50),
+        ));
         let router = Router::new(vec![], 5000);
 
-        // Apply snapshot 1
+        // Apply snapshot 1 (generation 2)
         router
             .update_routes_with_dns(routes_v1, vec![], &dns_resolver)
             .unwrap();
+        assert_eq!(router.generation(), 2);
 
         // Origin A is resolvable
-        let name_a: reqwest::dns::Name = "origin-a.example.com".parse().unwrap();
-        let mut addrs_a = dns_resolver.resolve(name_a).await.unwrap();
+        let mut addrs_a = dns_resolver
+            .resolve("origin-a.example.com".parse().unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             addrs_a.next().unwrap(),
             "93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap()
@@ -2106,23 +2146,128 @@ mod tests {
             .to_string()
             .contains("Strict DNS"));
 
-        // Apply snapshot 2 (staged update: merges B, swaps routes, prunes A)
+        // Apply snapshot 2 (staged update: merges B, swaps routes to gen 3, retains A during grace period)
         router
             .update_routes_with_dns(routes_v2, vec![], &dns_resolver)
             .unwrap();
+        assert_eq!(router.generation(), 3);
 
-        // Origin B is now resolvable
-        let name_b: reqwest::dns::Name = "origin-b.example.com".parse().unwrap();
-        let mut addrs_b = dns_resolver.resolve(name_b).await.unwrap();
+        // Origin B is now active and resolvable
+        let mut addrs_b = dns_resolver
+            .resolve("origin-b.example.com".parse().unwrap())
+            .await
+            .unwrap();
         assert_eq!(
             addrs_b.next().unwrap(),
             "93.184.216.35:443".parse::<std::net::SocketAddr>().unwrap()
         );
 
-        // Origin A was pruned after swap; in strict mode it MUST fail closed, NEVER falling back to unpinned DNS
-        let name_a_after: reqwest::dns::Name = "origin-a.example.com".parse().unwrap();
-        let res_a = dns_resolver.resolve(name_a_after).await;
+        // Origin A was retired, but during grace period it MUST STILL resolve via retained pool (no in-flight drop)
+        let mut addrs_a_grace = dns_resolver
+            .resolve("origin-a.example.com".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            addrs_a_grace.next().unwrap(),
+            "93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap()
+        );
+
+        // After grace period expires, Origin A is purged and fails closed
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        dns_resolver.prune_expired();
+
+        let res_a = dns_resolver
+            .resolve("origin-a.example.com".parse().unwrap())
+            .await;
         assert!(res_a.is_err());
         assert!(res_a.err().unwrap().to_string().contains("Strict DNS"));
+    }
+
+    #[tokio::test]
+    async fn test_inflight_request_survives_concurrent_route_and_dns_swap() {
+        use reqwest::dns::Resolve;
+
+        let snapshot_v1 = r#"{
+            "routes": [{
+                "host": "tenant-app.com",
+                "origins": [{
+                    "address": "93.184.216.34",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "sni": "origin-v1.internal"
+                }]
+            }]
+        }"#;
+
+        let snapshot_v2 = r#"{
+            "routes": [{
+                "host": "tenant-app.com",
+                "origins": [{
+                    "address": "93.184.216.35",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "sni": "origin-v2.internal"
+                }]
+            }]
+        }"#;
+
+        let routes_v1 = parse_pop_config_routes(snapshot_v1).unwrap();
+        let routes_v2 = parse_pop_config_routes(snapshot_v2).unwrap();
+
+        let dns_resolver = Arc::new(crate::dns::PinnedDnsResolver::new_with_grace_period(
+            Duration::from_millis(100),
+        ));
+        let router = Router::new(vec![], 5000);
+
+        // Step 1: Initial Snapshot 1 applied
+        router
+            .update_routes_with_dns(routes_v1, vec![], &dns_resolver)
+            .unwrap();
+        assert_eq!(router.generation(), 2);
+
+        // Step 2: In-flight request begins routing under Snapshot 1
+        let (selected_upstream, route_gen) = router
+            .select_upstream_with_generation("tenant-app.com", "/api/data")
+            .unwrap();
+        assert_eq!(route_gen, 2);
+        assert_eq!(selected_upstream, "https://origin-v1.internal:443");
+
+        // Step 3: Intentional delay/pause simulates in-flight request processing
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Step 4: Concurrently, Snapshot 2 is applied, swapping routes to v2
+        router
+            .update_routes_with_dns(routes_v2, vec![], &dns_resolver)
+            .unwrap();
+        assert_eq!(router.generation(), 3);
+
+        // Verify new incoming requests get Generation 3 destination (origin-v2)
+        let (new_upstream, new_gen) = router
+            .select_upstream_with_generation("tenant-app.com", "/api/data")
+            .unwrap();
+        assert_eq!(new_gen, 3);
+        assert_eq!(new_upstream, "https://origin-v2.internal:443");
+
+        // Step 5: In-flight request from Generation 2 resumes and resolves DNS:
+        // PinnedDnsResolver retains origin-v1.internal in the grace-period pool!
+        let mut v1_addrs = dns_resolver
+            .resolve("origin-v1.internal".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            v1_addrs.next().unwrap(),
+            "93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap(),
+            "In-flight request MUST resolve to origin-v1 pinned IP via retained generation pool"
+        );
+
+        // Step 6: Verify after grace period expires, origin-v1.internal is purged and fails closed
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        dns_resolver.prune_expired();
+
+        let v1_expired = dns_resolver
+            .resolve("origin-v1.internal".parse().unwrap())
+            .await;
+        assert!(v1_expired.is_err());
+        assert!(v1_expired.err().unwrap().to_string().contains("Strict DNS"));
     }
 }
