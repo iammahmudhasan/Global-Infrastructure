@@ -93,6 +93,64 @@ impl CacheStore {
     }
 }
 
+/// Parsed representation of RFC 9111 Cache-Control directives
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CacheControlDirectives {
+    pub no_cache: bool,
+    pub no_store: bool,
+    pub private: bool,
+    pub public: bool,
+    pub max_age: Option<u64>,
+    pub s_maxage: Option<u64>,
+}
+
+/// Parses comma-separated and multi-line RFC 9111 Cache-Control directives in a structured manner.
+/// Handles standalone tokens (e.g. `no-cache`, `no-store`) and parameterized tokens (e.g. `max-age=3600`, `no-cache="set-cookie"`).
+pub fn parse_cache_control<I, S>(header_values: I) -> CacheControlDirectives
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut directives = CacheControlDirectives::default();
+
+    for line in header_values {
+        for part in line.as_ref().split(',') {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let mut kv = trimmed.splitn(2, '=');
+            let name = kv.next().unwrap_or("").trim().to_ascii_lowercase();
+            let val = kv.next().map(|v| v.trim().trim_matches('"'));
+
+            match name.as_str() {
+                "no-cache" => directives.no_cache = true,
+                "no-store" => directives.no_store = true,
+                "private" => directives.private = true,
+                "public" => directives.public = true,
+                "max-age" => {
+                    if let Some(v_str) = val {
+                        if let Ok(secs) = v_str.parse::<u64>() {
+                            directives.max_age = Some(secs);
+                        }
+                    }
+                }
+                "s-maxage" => {
+                    if let Some(v_str) = val {
+                        if let Ok(secs) = v_str.parse::<u64>() {
+                            directives.s_maxage = Some(secs);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    directives
+}
+
 /// Bounded earliest-expiry eviction cache with RFC 9111 Vary header and byte limit support.
 #[derive(Clone)]
 pub struct EdgeCache {
@@ -122,6 +180,19 @@ impl EdgeCache {
     pub fn get(&self, key: &str, req_headers: Option<&HeaderMap>) -> Option<CachedResponse> {
         if !self.enabled {
             return None;
+        }
+
+        // RFC 9111 Section 5.2.1.4 / 5.2.1.5: If incoming request specifies no-cache or no-store,
+        // do not serve from cache without origin validation
+        if let Some(h) = req_headers {
+            let req_cc_lines = h
+                .get_all("cache-control")
+                .iter()
+                .filter_map(|v| v.to_str().ok());
+            let req_cc = parse_cache_control(req_cc_lines);
+            if req_cc.no_cache || req_cc.no_store {
+                return None;
+            }
         }
 
         let store = self.store.read().unwrap();
@@ -162,6 +233,29 @@ impl EdgeCache {
     ) {
         if !self.enabled || self.max_entries == 0 || self.max_bytes == 0 || !status.is_success() {
             return;
+        }
+
+        // RFC 9111 Section 5.2.2.4 / 5.2.2.5 / 5.2.2.7:
+        // Reject responses marked no-store, private, or no-cache (unvalidated reuse is forbidden)
+        let resp_cc_lines = headers
+            .get_all("cache-control")
+            .iter()
+            .filter_map(|v| v.to_str().ok());
+        let resp_cc = parse_cache_control(resp_cc_lines);
+        if resp_cc.no_store || resp_cc.private || resp_cc.no_cache {
+            return;
+        }
+
+        // Reject storing if request specified no-store
+        if let Some(req_h) = req_headers {
+            let req_cc_lines = req_h
+                .get_all("cache-control")
+                .iter()
+                .filter_map(|v| v.to_str().ok());
+            let req_cc = parse_cache_control(req_cc_lines);
+            if req_cc.no_store {
+                return;
+            }
         }
 
         // RFC 9111 Section 4.1: Reject Vary: * responses across all Vary header lines
@@ -630,5 +724,135 @@ mod tests {
         let hit = cache.get("key-huge-ttl", None);
         assert!(hit.is_some());
         assert_eq!(hit.unwrap().body, Bytes::from_static(b"data"));
+    }
+
+    #[test]
+    fn test_parse_cache_control_structured() {
+        let lines = vec![
+            "public, max-age=3600",
+            "s-maxage=7200, no-cache=\"Set-Cookie\"",
+        ];
+        let cc = parse_cache_control(&lines);
+        assert!(cc.public);
+        assert!(cc.no_cache);
+        assert!(!cc.no_store);
+        assert!(!cc.private);
+        assert_eq!(cc.max_age, Some(3600));
+        assert_eq!(cc.s_maxage, Some(7200));
+    }
+
+    #[test]
+    fn test_rfc9111_no_cache_response_never_stored() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut headers = HeaderMap::new();
+        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+
+        cache.put(
+            "http://example.com/live".to_string(),
+            StatusCode::OK,
+            headers,
+            Bytes::from_static(b"unvalidated-data"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "RFC 9111 response with no-cache must not be stored"
+        );
+        assert!(cache.get("http://example.com/live", None).is_none());
+    }
+
+    #[test]
+    fn test_rfc9111_no_cache_qualified_and_multiline_never_stored() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+        headers.append(
+            "cache-control",
+            HeaderValue::from_static("no-cache=\"set-cookie\""),
+        );
+
+        cache.put(
+            "http://example.com/dynamic".to_string(),
+            StatusCode::OK,
+            headers,
+            Bytes::from_static(b"data"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        assert_eq!(
+            cache.len(),
+            0,
+            "Qualified no-cache directive must not be stored"
+        );
+        assert!(cache.get("http://example.com/dynamic", None).is_none());
+    }
+
+    #[test]
+    fn test_rfc9111_no_store_and_private_never_stored() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut h1 = HeaderMap::new();
+        h1.insert("cache-control", HeaderValue::from_static("no-store"));
+        cache.put(
+            "http://example.com/secret1".to_string(),
+            StatusCode::OK,
+            h1,
+            Bytes::from_static(b"secret"),
+            None,
+            None,
+        );
+        assert_eq!(cache.len(), 0);
+
+        let mut h2 = HeaderMap::new();
+        h2.insert("cache-control", HeaderValue::from_static("private"));
+        cache.put(
+            "http://example.com/secret2".to_string(),
+            StatusCode::OK,
+            h2,
+            Bytes::from_static(b"secret"),
+            None,
+            None,
+        );
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_rfc9111_request_no_cache_bypasses_cached_response() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+
+        cache.put(
+            "http://example.com/asset".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"cached-asset"),
+            Some(Duration::from_secs(60)),
+            None,
+        );
+
+        assert_eq!(cache.len(), 1);
+
+        // Standard request hits
+        let hit = cache.get("http://example.com/asset", None);
+        assert!(hit.is_some());
+
+        // Request with Cache-Control: no-cache must bypass cached response
+        let mut req_no_cache = HeaderMap::new();
+        req_no_cache.insert("cache-control", HeaderValue::from_static("no-cache"));
+        let bypass = cache.get("http://example.com/asset", Some(&req_no_cache));
+        assert!(
+            bypass.is_none(),
+            "Request Cache-Control: no-cache must bypass cache"
+        );
     }
 }

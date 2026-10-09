@@ -29,6 +29,11 @@ static_resources:
             virtual_hosts:
             - name: customer_http_vhost
               domains: ["*"]
+              request_headers_to_add:
+              - header:
+                  key: "x-forwarded-proto"
+                  value: "http"
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
               routes:
               # ACME HTTP-01 Challenge Validation route to Control Plane
               - match:
@@ -77,6 +82,11 @@ static_resources:
             virtual_hosts:
             - name: customer_https_vhost
               domains: ["*"]
+              request_headers_to_add:
+              - header:
+                  key: "x-forwarded-proto"
+                  value: "https"
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
               routes:
               # All customer HTTPS traffic routes directly to Rust Data Plane Gateway
               - match:

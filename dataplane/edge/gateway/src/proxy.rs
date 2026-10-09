@@ -1,4 +1,4 @@
-use crate::cache::EdgeCache;
+use crate::cache::{parse_cache_control, EdgeCache};
 use crate::config::GatewayConfig;
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
@@ -252,7 +252,11 @@ pub async fn handle_request(
         .map(|s| s.to_string());
 
     let auth_header_present = req_headers.contains_key("authorization");
-    let req_cc = joined_header_values(&req_headers, "cache-control").to_ascii_lowercase();
+    let req_cc_lines = req_headers
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let req_cc = parse_cache_control(req_cc_lines);
 
     // Fast-path payload size check from Content-Length header
     if let Some(cl) = req_headers.get("content-length") {
@@ -425,8 +429,8 @@ pub async fn handle_request(
         WafResult::Allowed => {}
     }
 
-    // 7. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111, P1 Finding 4)
-    let scheme = "http";
+    // 7. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111, P1 Finding 4, P2 Milestone 4)
+    let scheme = extract_downstream_scheme(&req_headers, client_ip, &state.trusted_proxies);
     let raw_ae = req_headers
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
@@ -445,8 +449,8 @@ pub async fn handle_request(
         && !has_cookie
         && !has_auth
         && !bypass_cache
-        && !req_cc.contains("no-cache")
-        && !req_cc.contains("no-store")
+        && !req_cc.no_cache
+        && !req_cc.no_store
     {
         if let Some(cached) = state.cache.get(&cache_key, Some(&req_headers)) {
             let latency_us = start_time.elapsed().as_micros();
@@ -606,9 +610,13 @@ pub async fn handle_request(
                 .header("X-Cache", "MISS")
                 .header("Server", "NexusEdge/0.1.0");
 
-            // Multi-value Cache-Control parsing (P1 Finding 6)
-            let resp_cc = joined_reqwest_header_values(upstream_resp.headers(), "cache-control")
-                .to_ascii_lowercase();
+            // Multi-value Cache-Control parsing (P1 Finding 6, RFC 9111 structured parsing)
+            let resp_cc_lines = upstream_resp
+                .headers()
+                .get_all("cache-control")
+                .iter()
+                .filter_map(|v| v.to_str().ok());
+            let resp_cc = parse_cache_control(resp_cc_lines);
             let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
 
             let resp_connection_tokens =
@@ -736,19 +744,21 @@ pub async fn handle_request(
                 && !has_cookie
                 && !has_auth
                 && !bypass_cache
-                && !req_cc.contains("no-store")
-                && (!auth_header_present
-                    || resp_cc.contains("public")
-                    || resp_cc.contains("s-maxage"))
-                && !resp_cc.contains("no-store")
-                && !resp_cc.contains("private")
+                && !req_cc.no_store
+                && !req_cc.no_cache
+                && (!auth_header_present || resp_cc.public || resp_cc.s_maxage.is_some())
+                && !resp_cc.no_store
+                && !resp_cc.no_cache
+                && !resp_cc.private
                 && !has_set_cookie
                 && !is_vary_star
                 && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
 
             if can_cache {
                 // Parse s-maxage or max-age for custom TTL if specified, or domain policy fallback bounded to 7 days
-                let custom_ttl = parse_max_age(&resp_cc)
+                let custom_ttl = resp_cc
+                    .s_maxage
+                    .or(resp_cc.max_age)
                     .map(Duration::from_secs)
                     .or_else(|| {
                         domain_cache_policy
@@ -830,6 +840,42 @@ pub fn extract_client_ip(
     }
 
     peer_ip
+}
+
+/// Extracts the authentic downstream scheme according to trusted proxy forwarding rules.
+///
+/// Invariants:
+/// 1. Untrusted peer: If peer_ip does not match any CIDR in trusted_proxies,
+///    the connection scheme defaults strictly to "http". Any client-supplied
+///    X-Forwarded-Proto header is untrusted and ignored to prevent scheme spoofing.
+/// 2. Trusted proxy peer: If peer_ip is in trusted_proxies (e.g. Envoy L7 ingress),
+///    we inspect the X-Forwarded-Proto header forwarded by Envoy.
+///    If it equals "https" (case-insensitive), "https" is returned; otherwise "http".
+pub fn extract_downstream_scheme(
+    headers: &hyper::HeaderMap,
+    peer_ip: IpAddr,
+    trusted_proxies: &[crate::config::IpCidr],
+) -> &'static str {
+    let is_trusted = trusted_proxies.iter().any(|cidr| cidr.contains(peer_ip));
+    if !is_trusted {
+        return "http";
+    }
+
+    if let Some(proto) = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        for part in proto.split(',').rev() {
+            let trimmed = part.trim();
+            if trimmed.eq_ignore_ascii_case("https") {
+                return "https";
+            } else if trimmed.eq_ignore_ascii_case("http") {
+                return "http";
+            }
+        }
+    }
+
+    "http"
 }
 
 /// Joins all comma-separated header values for a named header from hyper::HeaderMap (P1 Finding 6)
@@ -916,17 +962,9 @@ pub fn normalize_accept_encoding(value: &str) -> String {
     encs.join(",")
 }
 
-fn parse_max_age(cc: &str) -> Option<u64> {
-    for directive in ["s-maxage=", "max-age="] {
-        if let Some(idx) = cc.find(directive) {
-            let sub = &cc[idx + directive.len()..];
-            let end = sub.find([',', ' ', ';']).unwrap_or(sub.len());
-            if let Ok(secs) = sub[..end].trim().parse::<u64>() {
-                return Some(secs);
-            }
-        }
-    }
-    None
+pub fn parse_max_age(cc: &str) -> Option<u64> {
+    let directives = parse_cache_control([cc]);
+    directives.s_maxage.or(directives.max_age)
 }
 
 #[cfg(test)]
@@ -1258,5 +1296,62 @@ mod tests {
 
         // Drop releases all bytes
         assert_eq!(tracker.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_extract_downstream_scheme_untrusted_peer_spoof_prevented() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+        ];
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+
+        // Untrusted public client peer IP
+        let untrusted_peer: IpAddr = "203.0.113.50".parse().unwrap();
+        let scheme = extract_downstream_scheme(&headers, untrusted_peer, &trusted);
+        assert_eq!(scheme, "http", "Untrusted peer cannot spoof https scheme");
+    }
+
+    #[test]
+    fn test_extract_downstream_scheme_trusted_envoy_peer() {
+        let trusted = vec![
+            crate::config::IpCidr::parse("127.0.0.1/32").unwrap(),
+            crate::config::IpCidr::parse("172.16.0.0/12").unwrap(),
+        ];
+        let envoy_peer: IpAddr = "172.18.0.2".parse().unwrap();
+
+        let mut headers_https = hyper::HeaderMap::new();
+        headers_https.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            extract_downstream_scheme(&headers_https, envoy_peer, &trusted),
+            "https"
+        );
+
+        let mut headers_http = hyper::HeaderMap::new();
+        headers_http.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            extract_downstream_scheme(&headers_http, envoy_peer, &trusted),
+            "http"
+        );
+
+        let headers_empty = hyper::HeaderMap::new();
+        assert_eq!(
+            extract_downstream_scheme(&headers_empty, envoy_peer, &trusted),
+            "http"
+        );
+    }
+
+    #[test]
+    fn test_cache_key_scheme_isolation() {
+        let host = "api.nexusedge.io";
+        let uri = "/data";
+        let norm_ae = "gzip";
+        let http_key = format!("{}://{}{}#ae={}", "http", host, uri, norm_ae);
+        let https_key = format!("{}://{}{}#ae={}", "https", host, uri, norm_ae);
+
+        assert_ne!(http_key, https_key);
+        assert_eq!(http_key, "http://api.nexusedge.io/data#ae=gzip");
+        assert_eq!(https_key, "https://api.nexusedge.io/data#ae=gzip");
     }
 }

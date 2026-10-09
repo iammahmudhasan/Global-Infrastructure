@@ -29,6 +29,13 @@ func newOriginHandler(originID string) http.Handler {
 
 	// Universal handler returning the explicit origin marker
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Conditional Cache-Control simulation for RFC 9111 testing
+		if r.URL.Path == "/cache/no-cache" {
+			w.Header().Set("Cache-Control", "no-cache, max-age=3600")
+		} else if r.URL.Path == "/cache/public" {
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+		}
+
 		w.Header().Set("X-Origin-Id", originID)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
