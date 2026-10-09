@@ -207,5 +207,10 @@ impl GatewayConfig {
         if let Ok(v) = std::env::var("NEXUSEDGE_CP_AUTH_TOKEN") {
             self.control_plane.auth_token = v;
         }
+        if let Ok(v) = std::env::var("NEXUSEDGE_CP_SNAPSHOT_FILE") {
+            if !v.trim().is_empty() {
+                self.control_plane.snapshot_file = Some(v.trim().to_string());
+            }
+        }
     }
 }

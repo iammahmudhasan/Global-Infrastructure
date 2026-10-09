@@ -128,7 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
     let aggregate_buffered_bytes = Arc::new(AtomicUsize::new(0));
     let aggregate_buffered_request_bytes = Arc::new(AtomicUsize::new(0));
-    let is_ready = Arc::new(AtomicBool::new(!config.control_plane.enabled));
+    let requires_dynamic_sync =
+        config.control_plane.enabled || config.control_plane.snapshot_file.is_some();
+    let is_ready = Arc::new(AtomicBool::new(!requires_dynamic_sync));
 
     let state = Arc::new(ProxyState {
         config: config.clone(),

@@ -1,9 +1,16 @@
 # NexusEdge Envoy Edge Proxy Configuration
-# Battle-tested L7 Ingress Gateway fronting the custom Rust fast-path and origins
+# Industrial L7 Ingress Gateway fronting the custom Rust Data Plane and Origins
+# Architecture:
+# - Ingress Listener 1: Port 10000 (HTTP / ACME HTTP-01 challenge)
+# - Ingress Listener 2: Port 10443 (HTTPS / TLS termination)
+# - All customer traffic (prefix: "/") routes directly to Rust Data Plane (nexusedge-gateway:8080)
+# - Control Plane management APIs are decoupled and NOT exposed on public customer ingress
+# - ACME challenges (prefix: "/.well-known/acme-challenge/") route to config-controller:9091
 
 static_resources:
   listeners:
-  - name: edge_ingress_listener
+  # Listener 1: HTTP Ingress (Port 10000 -> Public 80)
+  - name: edge_http_ingress_listener
     address:
       socket_address:
         address: 0.0.0.0
@@ -16,23 +23,63 @@ static_resources:
           stat_prefix: ingress_http
           codec_type: AUTO
           route_config:
-            name: local_route
+            name: customer_http_route
             virtual_hosts:
-            - name: global_edge_vhost
+            - name: customer_http_vhost
               domains: ["*"]
               routes:
-              # Fast-path Route: Dynamic Edge Function / Wasm Execution
+              # ACME HTTP-01 Challenge Validation route to Control Plane
               - match:
-                  prefix: "/edge/"
+                  prefix: "/.well-known/acme-challenge/"
                 route:
-                  cluster: rust_fast_path_cluster
-                  timeout: 2s
-              # Default Ingress Route: Workload Traffic Controller
+                  cluster: control_plane_cluster
+                  timeout: 5s
+              # All customer traffic routes directly to Rust Data Plane Gateway
               - match:
                   prefix: "/"
                 route:
-                  cluster: control_plane_cluster
-                  timeout: 10s
+                  cluster: rust_fast_path_cluster
+                  timeout: 30s
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  # Listener 2: HTTPS Ingress (Port 10443 -> Public 443 with TLS termination)
+  - name: edge_https_ingress_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10443
+    filter_chains:
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          common_tls_context:
+            tls_certificates:
+            - certificate_chain:
+                filename: "/etc/envoy/certs/server.crt"
+              private_key:
+                filename: "/etc/envoy/certs/server.key"
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: ingress_https
+          codec_type: AUTO
+          route_config:
+            name: customer_https_route
+            virtual_hosts:
+            - name: customer_https_vhost
+              domains: ["*"]
+              routes:
+              # All customer HTTPS traffic routes directly to Rust Data Plane Gateway
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: rust_fast_path_cluster
+                  timeout: 30s
           http_filters:
           - name: envoy.filters.http.router
             typed_config:
@@ -54,7 +101,7 @@ static_resources:
                 address: nexusedge-gateway
                 port_value: 8080
 
-  # Upstream Cluster 2: NexusEdge Go Control Plane & Workload Dispatcher
+  # Upstream Cluster 2: NexusEdge Go Control Plane (ACME HTTP-01 and Control API internal)
   - name: control_plane_cluster
     connect_timeout: 0.5s
     type: STRICT_DNS

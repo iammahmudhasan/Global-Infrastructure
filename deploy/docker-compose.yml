@@ -13,6 +13,11 @@ services:
       - NEXUSEDGE_ENV=development
       - NEXUSEDGE_ACME_HOST=config-controller
       - NEXUSEDGE_ACME_PORT=9091
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
   envoy:
@@ -20,13 +25,20 @@ services:
     container_name: nexusedge-envoy-ingress
     ports:
       - "10000:10000"
+      - "10443:10443"
       - "9901:9901"
     volumes:
       - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+      - ./envoy/certs:/etc/envoy/certs:ro
     command: ["envoy", "-c", "/etc/envoy/envoy.yaml"]
     depends_on:
       - config-controller
       - nexusedge-gateway
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9901/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
   nexusedge-gateway:
@@ -34,16 +46,22 @@ services:
       context: ../dataplane/edge/gateway
       dockerfile: Dockerfile
     container_name: nexusedge-pop-01
-    expose:
-      - "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
     environment:
       - RUST_LOG=info
       - NEXUSEDGE_CP_ENABLED=true
       - NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091
       - NEXUSEDGE_CP_POP_ID=singapore
       - NEXUSEDGE_CP_POLL_INTERVAL_SECS=10
+      - NEXUSEDGE_CP_AUTH_TOKEN=dev-fixture-key-01
     volumes:
       - ../dataplane/edge/gateway/gateway.yaml:/app/gateway.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
     restart: unless-stopped
 
   mock-origin:
