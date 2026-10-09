@@ -3,6 +3,9 @@ package certificate_test
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -153,5 +156,76 @@ func TestCertificateManager_RateLimits(t *testing.T) {
 	_, err = mgr.ValidateAndIssueCertificate(lastChallenge.Token)
 	if err != nil {
 		t.Fatalf("validation failed unexpectedly: %v", err)
+	}
+}
+
+func TestCertificateManager_SyncSDS(t *testing.T) {
+	st := store.NewStore()
+	mgr := certificate.NewManager(st)
+
+	tempDir := t.TempDir()
+	mgr.SetCertsDir(tempDir)
+
+	if mgr.GetCertsDir() != tempDir {
+		t.Fatalf("expected certs dir %s, got %s", tempDir, mgr.GetCertsDir())
+	}
+
+	domain := &model.Domain{
+		ID:        "dom-sds-test",
+		ProjectID: "prj-sds",
+		Hostname:  "sds.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(domain)
+
+	// 1. Order and Issue Certificate - must automatically export files to tempDir
+	_, ch, err := mgr.OrderCertificate("dom-sds-test")
+	if err != nil {
+		t.Fatalf("order certificate failed: %v", err)
+	}
+
+	cert, err := mgr.ValidateAndIssueCertificate(ch.Token)
+	if err != nil {
+		t.Fatalf("validate and issue failed: %v", err)
+	}
+
+	certPath := filepath.Join(tempDir, "server.crt")
+	keyPath := filepath.Join(tempDir, "server.key")
+	sdsPath := filepath.Join(tempDir, "sds.json")
+
+	if _, err := os.Stat(certPath); os.IsNotExist(err) {
+		t.Fatalf("expected %s to exist on disk", certPath)
+	}
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		t.Fatalf("expected %s to exist on disk", keyPath)
+	}
+	if _, err := os.Stat(sdsPath); os.IsNotExist(err) {
+		t.Fatalf("expected %s to exist on disk", sdsPath)
+	}
+
+	sdsContent, err := os.ReadFile(sdsPath)
+	if err != nil {
+		t.Fatalf("failed to read sds.json: %v", err)
+	}
+	if !strings.Contains(string(sdsContent), "dynamic_server_cert") {
+		t.Fatalf("expected sds.json to contain dynamic_server_cert, got %s", string(sdsContent))
+	}
+
+	// 2. Renew Certificate - must update files atomically
+	initialSerial := cert.SerialNumber
+	renewed, err := mgr.RenewCertificate("dom-sds-test")
+	if err != nil {
+		t.Fatalf("renewal failed: %v", err)
+	}
+	if renewed.SerialNumber == initialSerial {
+		t.Fatalf("expected new serial number on renewal")
+	}
+
+	updatedCertBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("failed to read updated cert: %v", err)
+	}
+	if string(updatedCertBytes) != renewed.CertPEM {
+		t.Fatalf("expected cert on disk to match renewed cert PEM")
 	}
 }

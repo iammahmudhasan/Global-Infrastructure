@@ -17,7 +17,7 @@ GO_SERVICES=(
 )
 
 # 1. Go Format Gate
-echo "[1/6] Running Go format check (gofmt -l)..."
+echo "[1/7] Running Go format check (gofmt -l)..."
 for svc in "${GO_SERVICES[@]}"; do
   if [ -d "${REPO_ROOT}/${svc}" ]; then
     pushd "${REPO_ROOT}/${svc}" > /dev/null
@@ -34,7 +34,7 @@ done
 echo " -> Go format check passed."
 
 # 2. Go Vet and Tests Gate
-echo "[2/6] Running Go vet and unit tests..."
+echo "[2/7] Running Go vet and unit tests..."
 for svc in "${GO_SERVICES[@]}"; do
   if [ -d "${REPO_ROOT}/${svc}" ]; then
     pushd "${REPO_ROOT}/${svc}" > /dev/null

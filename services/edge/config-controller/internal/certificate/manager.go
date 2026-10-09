@@ -8,10 +8,13 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,6 +42,7 @@ type Manager struct {
 	store        *store.Store
 	orderHistory map[string][]time.Time
 	valHistory   map[string][]time.Time
+	certsDir     string
 }
 
 func NewManager(s *store.Store) *Manager {
@@ -47,6 +51,20 @@ func NewManager(s *store.Store) *Manager {
 		orderHistory: make(map[string][]time.Time),
 		valHistory:   make(map[string][]time.Time),
 	}
+}
+
+// SetCertsDir sets the target directory for exporting Envoy SDS resources and certificates.
+func (m *Manager) SetCertsDir(dir string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.certsDir = dir
+}
+
+// GetCertsDir returns the configured certificate export directory.
+func (m *Manager) GetCertsDir() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.certsDir
 }
 
 func checkAndRecordCertRate(history map[string][]time.Time, key string, limit int, window time.Duration, now time.Time) error {
@@ -219,8 +237,82 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 
 	m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusValidated)
 	m.store.SaveCertificate(cert)
+	_ = m.syncSDSCertificateLocked(cert)
 
 	return cert, nil
+}
+
+// syncSDSCertificateLocked writes the certificate, private key, and Envoy v3 SDS Secret resource atomically.
+func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
+	if m.certsDir == "" || cert == nil || cert.CertPEM == "" || cert.PrivateKeyPEM == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(m.certsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create certs directory: %w", err)
+	}
+
+	certPath := filepath.Join(m.certsDir, "server.crt")
+	keyPath := filepath.Join(m.certsDir, "server.key")
+	sdsPath := filepath.Join(m.certsDir, "sds.json")
+
+	// 1. Write server.crt atomically
+	tmpCert := certPath + ".tmp"
+	if err := os.WriteFile(tmpCert, []byte(cert.CertPEM), 0644); err != nil {
+		return fmt.Errorf("failed to write cert tmp file: %w", err)
+	}
+	if err := os.Rename(tmpCert, certPath); err != nil {
+		return fmt.Errorf("failed to rename cert file: %w", err)
+	}
+
+	// 2. Write server.key atomically with strict permissions (0600)
+	tmpKey := keyPath + ".tmp"
+	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0600); err != nil {
+		return fmt.Errorf("failed to write key tmp file: %w", err)
+	}
+	if err := os.Rename(tmpKey, keyPath); err != nil {
+		return fmt.Errorf("failed to rename key file: %w", err)
+	}
+
+	// 3. Write Envoy v3 SDS Secret resource file atomically
+	sdsPayload := map[string]interface{}{
+		"resources": []map[string]interface{}{
+			{
+				"@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+				"name":  "dynamic_server_cert",
+				"tls_certificate": map[string]interface{}{
+					"certificate_chain": map[string]string{
+						"filename": "/etc/envoy/certs/server.crt",
+					},
+					"private_key": map[string]string{
+						"filename": "/etc/envoy/certs/server.key",
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(sdsPayload, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal sds payload: %w", err)
+	}
+
+	tmpSDS := sdsPath + ".tmp"
+	if err := os.WriteFile(tmpSDS, data, 0644); err != nil {
+		return fmt.Errorf("failed to write sds tmp file: %w", err)
+	}
+	if err := os.Rename(tmpSDS, sdsPath); err != nil {
+		return fmt.Errorf("failed to rename sds file: %w", err)
+	}
+
+	return nil
+}
+
+// SyncSDSCertificate exports the certificate and updates the Envoy SDS resource file atomically.
+func (m *Manager) SyncSDSCertificate(cert *model.Certificate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.syncSDSCertificateLocked(cert)
 }
 
 // RenewCertificate forces renewal of an existing domain certificate

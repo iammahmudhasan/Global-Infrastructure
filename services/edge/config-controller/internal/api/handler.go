@@ -131,6 +131,10 @@ func (h *APIHandler) Store() *store.Store {
 	return h.store
 }
 
+func (h *APIHandler) CertManager() *certificate.Manager {
+	return h.certManager
+}
+
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Global 1 MiB body size cap prevents unbounded memory exhaustion across all control plane JSON endpoints
 	const maxControlPlaneBody = 1 << 20 // 1 MiB

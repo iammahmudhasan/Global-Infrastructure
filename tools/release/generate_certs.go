@@ -92,5 +92,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Generated staging TLS certificates:\n  - %s\n  - %s\n", certPath, keyPath)
+	sdsPath := filepath.Join(outDir, "sds.json")
+	sdsContent := `{
+  "resources": [
+    {
+      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+      "name": "dynamic_server_cert",
+      "tls_certificate": {
+        "certificate_chain": {
+          "filename": "/etc/envoy/certs/server.crt"
+        },
+        "private_key": {
+          "filename": "/etc/envoy/certs/server.key"
+        }
+      }
+    }
+  ]
+}
+`
+	if err := os.WriteFile(sdsPath, []byte(sdsContent), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write sds.json: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Generated staging TLS certificates:\n  - %s\n  - %s\n  - %s (Envoy v3 SDS Secret)\n", certPath, keyPath, sdsPath)
 }

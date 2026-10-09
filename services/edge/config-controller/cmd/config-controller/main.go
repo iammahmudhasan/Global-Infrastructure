@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -142,6 +143,35 @@ func main() {
 
 	// 4. Initialize HTTP API Server
 	handler := api.NewAPIHandler(dataStore, domainSvc, envoyCompiler)
+
+	certsDir := os.Getenv("NEXUSEDGE_CERTS_DIR")
+	if certsDir != "" {
+		handler.CertManager().SetCertsDir(certsDir)
+		log.Printf("[INFO] Configured Dynamic Envoy SDS Certificate directory: %s", certsDir)
+
+		// If server.crt and server.key exist, sync active certificate for dev fixture domain
+		certBytes, errCert := os.ReadFile(filepath.Join(certsDir, "server.crt"))
+		keyBytes, errKey := os.ReadFile(filepath.Join(certsDir, "server.key"))
+		if errCert == nil && errKey == nil && len(certBytes) > 0 && len(keyBytes) > 0 {
+			devCert := &model.Certificate{
+				ID:            "cert-dev-api-01",
+				DomainID:      "dom-dev-api",
+				Domains:       []string{"api.nexusedge.io"},
+				Status:        model.CertStatusActive,
+				KeyType:       model.KeyTypeECDSA,
+				CertPEM:       string(certBytes),
+				PrivateKeyPEM: string(keyBytes),
+				Issuer:        "NexusEdge Staging Ingress",
+				SerialNumber:  "100001",
+				IssuedAt:      time.Now().UTC(),
+				ExpiresAt:     time.Now().UTC().Add(90 * 24 * time.Hour),
+				AutoRenew:     true,
+			}
+			dataStore.SaveCertificate(devCert)
+			_ = handler.CertManager().SyncSDSCertificate(devCert)
+			log.Printf("[INFO] Seeded and synchronized active TLS certificate for dom-dev-api via Envoy SDS")
+		}
+	}
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%s", port),

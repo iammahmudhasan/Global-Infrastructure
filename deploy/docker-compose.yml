@@ -13,6 +13,9 @@ services:
       - NEXUSEDGE_ENV=development
       - NEXUSEDGE_ACME_HOST=config-controller
       - NEXUSEDGE_ACME_PORT=9091
+      - NEXUSEDGE_CERTS_DIR=/etc/envoy/certs
+    volumes:
+      - ./envoy/certs:/etc/envoy/certs:rw
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/healthz || wget -qO- http://127.0.0.1:9091/healthz || exit 1"]
       interval: 5s

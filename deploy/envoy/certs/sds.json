@@ -1,0 +1,16 @@
+{
+  "resources": [
+    {
+      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+      "name": "dynamic_server_cert",
+      "tls_certificate": {
+        "certificate_chain": {
+          "filename": "/etc/envoy/certs/server.crt"
+        },
+        "private_key": {
+          "filename": "/etc/envoy/certs/server.key"
+        }
+      }
+    }
+  ]
+}
