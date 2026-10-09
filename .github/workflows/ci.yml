@@ -14,6 +14,20 @@ jobs:
   go-control-plane:
     name: Go Verification (${{ matrix.service }})
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nexusedge
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: nexusedge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +59,8 @@ jobs:
           go vet ./...
 
       - name: Run Go Tests
+        env:
+          NEXUSEDGE_TEST_DATABASE_URL: postgres://nexusedge:testpassword@localhost:5432/nexusedge_test?sslmode=disable
         run: |
           cd ${{ matrix.service }}
           go test -v -race ./...

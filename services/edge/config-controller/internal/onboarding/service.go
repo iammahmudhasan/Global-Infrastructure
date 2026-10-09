@@ -312,26 +312,32 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 		Priority:   0,
 		TimeoutMs:  10000,
 	}
-	s.store.SaveRoute(route)
+	if err := s.store.SaveRoute(route); err != nil {
+		return nil, fmt.Errorf("save default route: %w", err)
+	}
 
 	// 4. Create Default Security Policy (OWASP WAF + Rate Limit 1000 RPM)
-	s.store.SaveSecurityPolicy(&model.SecurityPolicy{
+	if err := s.store.SaveSecurityPolicy(&model.SecurityPolicy{
 		ID:               generateID("sec"),
 		DomainID:         domainID,
 		WAFEnabled:       true,
 		WAFMode:          "BLOCK",
 		RateLimitEnabled: true,
 		RateLimitRPM:     1000,
-	})
+	}); err != nil {
+		return nil, fmt.Errorf("save default security policy: %w", err)
+	}
 
 	// 5. Create Default Cache Policy
-	s.store.SaveCachePolicy(&model.CachePolicy{
+	if err := s.store.SaveCachePolicy(&model.CachePolicy{
 		ID:                   generateID("cache"),
 		DomainID:             domainID,
 		CacheEnabled:         true,
 		DefaultTTLSeconds:    3600,
 		RespectOriginHeaders: true,
-	})
+	}); err != nil {
+		return nil, fmt.Errorf("save default cache policy: %w", err)
+	}
 
 	return &OnboardResponse{
 		DomainID:          domainID,

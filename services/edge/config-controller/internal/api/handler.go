@@ -583,7 +583,10 @@ func (h *APIHandler) handleTLSSettingsRoute(w http.ResponseWriter, r *http.Reque
 		if settings.MinTLSVersion == "" {
 			settings.MinTLSVersion = "TLSv1.2"
 		}
-		h.store.SaveTLSSettings(domainID, &settings)
+		if err := h.store.SaveTLSSettings(domainID, &settings); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to persist tls settings: "+err.Error())
+			return
+		}
 		writeJSON(w, http.StatusOK, settings)
 
 	default:
@@ -1228,7 +1231,10 @@ func (h *APIHandler) handleUpdateCachePolicy(w http.ResponseWriter, r *http.Requ
 		cp.StripCookies = *update.StripCookies
 	}
 
-	h.store.SaveCachePolicy(cp)
+	if err := h.store.SaveCachePolicy(cp); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to persist cache policy: "+err.Error())
+		return
+	}
 	cp.CacheRules = h.store.GetCacheRules(domainID)
 	writeJSON(w, http.StatusOK, cp)
 }

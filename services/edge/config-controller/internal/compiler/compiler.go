@@ -172,6 +172,14 @@ func isProductionEnvironment() bool {
 	return env == "production"
 }
 
+func allowsUnvalidatedDevTLS() bool {
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "" {
+		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	}
+	return os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && (env == "development" || env == "test")
+}
+
 func NewCompiler(adminPort, httpPort, httpsPort int) *Compiler {
 	if adminPort == 0 {
 		adminPort = 9901
@@ -231,6 +239,64 @@ func (c *Compiler) SetCABundlePath(path string) {
 
 func (c *Compiler) GetCABundlePath() string {
 	return c.caBundlePath
+}
+
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+func calculateTokenBucket(rpm int, burstSize int) (maxTokens int, tokensPerFill int, fillInterval string) {
+	if rpm <= 0 {
+		rpm = 6000
+	}
+	g := gcd(rpm, 60)
+	tokensPerFill = rpm / g
+	fillSeconds := 60 / g
+	fillInterval = fmt.Sprintf("%ds", fillSeconds)
+
+	maxTokens = burstSize
+	if maxTokens <= 0 {
+		maxTokens = rpm
+	}
+	if maxTokens < tokensPerFill {
+		maxTokens = tokensPerFill
+	}
+	return maxTokens, tokensPerFill, fillInterval
+}
+
+// CalculateTokenBucket exposes token bucket calculations for rate limit rules
+func CalculateTokenBucket(rpm int, burstSize int) (maxTokens int, tokensPerFill int, fillInterval string) {
+	return calculateTokenBucket(rpm, burstSize)
+}
+
+func buildLocalRateLimitConfig(statPrefix string, rpm int, burstSize int) map[string]interface{} {
+	maxTokens, tokensPerFill, fillInterval := calculateTokenBucket(rpm, burstSize)
+	return map[string]interface{}{
+		"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+		"stat_prefix": statPrefix,
+		"token_bucket": map[string]interface{}{
+			"max_tokens":      maxTokens,
+			"tokens_per_fill": tokensPerFill,
+			"fill_interval":   fillInterval,
+		},
+		"filter_enabled": map[string]interface{}{
+			"runtime_key": "local_rate_limit_enabled",
+			"default_value": map[string]interface{}{
+				"numerator":   100,
+				"denominator": "HUNDRED",
+			},
+		},
+		"filter_enforced": map[string]interface{}{
+			"runtime_key": "local_rate_limit_enforced",
+			"default_value": map[string]interface{}{
+				"numerator":   100,
+				"denominator": "HUNDRED",
+			},
+		},
+	}
 }
 
 // Compile compiles active domain topologies into an Envoy v3 configuration
@@ -309,61 +375,61 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 			})
 		}
 
-		// Per-Domain VirtualHost Rate Limit Isolation (Finding 8, Finding 9, 14, P1 RPM Audit)
-		if topo.Security != nil && topo.Security.RateLimitEnabled && (topo.Security.RateLimitRPM > 0 || len(topo.Security.RateLimitRules) > 0) {
-			rpm := topo.Security.RateLimitRPM
-			var maxTokens, tokensPerFill int
-			var fillInterval string
+		// Per-Domain & Per-Route Rate Limit Policy (Finding 6 & Finding 8)
+		pathRules := make(map[string]model.RateLimitRule)
+		var domainWideRule *model.RateLimitRule
 
-			if len(topo.Security.RateLimitRules) > 0 && topo.Security.RateLimitRules[0].BurstSize > 0 {
-				rule := topo.Security.RateLimitRules[0]
-				rRPM := rule.RequestsPerMinute
-				if rRPM <= 0 {
-					rRPM = rpm
+		if topo.Security != nil && topo.Security.RateLimitEnabled {
+			for _, rlRule := range topo.Security.RateLimitRules {
+				pfx := strings.TrimSpace(rlRule.PathPrefix)
+				if pfx != "" && pfx != "/" {
+					pathRules[pfx] = rlRule
+				} else if domainWideRule == nil {
+					copyRule := rlRule
+					domainWideRule = &copyRule
 				}
-				rps := rRPM / 60
-				if rps <= 0 {
-					rps = 1
-				}
-				tokensPerFill = rps
-				maxTokens = rule.BurstSize
-				if maxTokens < tokensPerFill {
-					maxTokens = tokensPerFill
-				}
-				fillInterval = "1s"
-			} else {
-				if rpm <= 0 {
-					rpm = 6000
-				}
-				tokensPerFill = rpm
-				maxTokens = rpm
-				fillInterval = "60s"
 			}
 
-			vh.TypedPerFilterConfig = map[string]interface{}{
-				"envoy.filters.http.local_ratelimit": map[string]interface{}{
-					"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
-					"stat_prefix": fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
-					"token_bucket": map[string]interface{}{
-						"max_tokens":      maxTokens,
-						"tokens_per_fill": tokensPerFill,
-						"fill_interval":   fillInterval,
-					},
-					"filter_enabled": map[string]interface{}{
-						"runtime_key": "local_rate_limit_enabled",
-						"default_value": map[string]interface{}{
-							"numerator":   100,
-							"denominator": "HUNDRED",
+			// Domain-wide rate limit configuration on VirtualHost
+			if domainWideRule != nil {
+				rpm := domainWideRule.RequestsPerMinute
+				if rpm <= 0 {
+					rpm = topo.Security.RateLimitRPM
+				}
+				vh.TypedPerFilterConfig = map[string]interface{}{
+					"envoy.filters.http.local_ratelimit": buildLocalRateLimitConfig(
+						fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
+						rpm,
+						domainWideRule.BurstSize,
+					),
+				}
+			} else if len(pathRules) == 0 && topo.Security.RateLimitRPM > 0 {
+				rpm := topo.Security.RateLimitRPM
+				vh.TypedPerFilterConfig = map[string]interface{}{
+					"envoy.filters.http.local_ratelimit": map[string]interface{}{
+						"@type":       "type.googleapis.com/envoy.extensions.filters.http.local_ratelimit.v3.LocalRateLimit",
+						"stat_prefix": fmt.Sprintf("vh_rate_limit_%s", sanitizeName(hostname)),
+						"token_bucket": map[string]interface{}{
+							"max_tokens":      rpm,
+							"tokens_per_fill": rpm,
+							"fill_interval":   "60s",
+						},
+						"filter_enabled": map[string]interface{}{
+							"runtime_key": "local_rate_limit_enabled",
+							"default_value": map[string]interface{}{
+								"numerator":   100,
+								"denominator": "HUNDRED",
+							},
+						},
+						"filter_enforced": map[string]interface{}{
+							"runtime_key": "local_rate_limit_enforced",
+							"default_value": map[string]interface{}{
+								"numerator":   100,
+								"denominator": "HUNDRED",
+							},
 						},
 					},
-					"filter_enforced": map[string]interface{}{
-						"runtime_key": "local_rate_limit_enforced",
-						"default_value": map[string]interface{}{
-							"numerator":   100,
-							"denominator": "HUNDRED",
-						},
-					},
-				},
+				}
 			}
 		}
 
@@ -444,6 +510,35 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 					},
 				},
 			}
+
+			// Apply path-specific rate limiting to matching route (Finding 6)
+			if topo.Security != nil && topo.Security.RateLimitEnabled && len(pathRules) > 0 {
+				var matchedRule *model.RateLimitRule
+				if rule, ok := pathRules[r.PathPrefix]; ok {
+					matchedRule = &rule
+				} else {
+					for pfx, rule := range pathRules {
+						if strings.HasPrefix(r.PathPrefix, pfx) {
+							if matchedRule == nil || len(pfx) > len(matchedRule.PathPrefix) {
+								copyR := rule
+								matchedRule = &copyR
+							}
+						}
+					}
+				}
+
+				if matchedRule != nil {
+					rRPM := matchedRule.RequestsPerMinute
+					if rRPM <= 0 {
+						rRPM = topo.Security.RateLimitRPM
+					}
+					routeStat := fmt.Sprintf("route_rate_limit_%s_%s", sanitizeName(hostname), sanitizeName(r.PathPrefix))
+					routeObj.TypedPerFilterConfig = map[string]interface{}{
+						"envoy.filters.http.local_ratelimit": buildLocalRateLimitConfig(routeStat, rRPM, matchedRule.BurstSize),
+					}
+				}
+			}
+
 			customerRoutes = append(customerRoutes, routeObj)
 			vh.Routes = append(vh.Routes, routeObj)
 
@@ -1257,6 +1352,11 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) (Clu
 	return cluster, nil
 }
 
+// BuildValidatedUpstreamTLSContext exposes upstream TLS context construction for verification
+func (c *Compiler) BuildValidatedUpstreamTLSContext(sni string, caBundlePath string) (map[string]interface{}, error) {
+	return c.buildValidatedUpstreamTLSContext(sni, caBundlePath)
+}
+
 // buildValidatedUpstreamTLSContext constructs a fully-validated Envoy v3 UpstreamTlsContext.
 // Configures SNI, trusted CA bundle validation, and exact Subject Alternative Name (SAN) matching
 // for DNS hostnames and IP addresses, preventing upstream TLS impersonation (P1 Finding 1).
@@ -1271,6 +1371,9 @@ func (c *Compiler) buildValidatedUpstreamTLSContext(sni string, caBundlePath str
 
 	if isProductionEnvironment() && effectiveCAPath == "" {
 		return nil, errors.New("upstream TLS validation requires trusted CA bundle in production; empty CA bundle path is rejected")
+	}
+	if effectiveCAPath == "" && !allowsUnvalidatedDevTLS() {
+		return nil, errors.New("upstream TLS validation requires trusted CA bundle; unvalidated upstream TLS is forbidden outside explicit development/test mode")
 	}
 
 	commonTLS := map[string]interface{}{}
@@ -1380,8 +1483,8 @@ func (c *Compiler) buildSDSCluster() Cluster {
 }
 
 func sanitizeName(s string) string {
-	r := strings.NewReplacer(".", "_", "-", "_", ":", "_")
-	return r.Replace(s)
+	r := strings.NewReplacer(".", "_", "-", "_", ":", "_", "/", "_")
+	return strings.Trim(r.Replace(s), "_")
 }
 
 func (c *Compiler) buildAccessLogConfig() []map[string]interface{} {

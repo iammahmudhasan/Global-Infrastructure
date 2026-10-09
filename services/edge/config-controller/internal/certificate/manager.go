@@ -170,8 +170,12 @@ func (m *Manager) OrderCertificate(domainID string) (*model.Certificate, *model.
 		AutoRenew: true,
 	}
 
-	m.store.SaveACMEChallenge(challenge)
-	m.store.SaveCertificate(cert)
+	if err := m.store.SaveACMEChallenge(challenge); err != nil {
+		return nil, nil, fmt.Errorf("persist acme challenge: %w", err)
+	}
+	if err := m.store.SaveCertificate(cert); err != nil {
+		return nil, nil, fmt.Errorf("persist pending certificate: %w", err)
+	}
 
 	return cert, challenge, nil
 }
@@ -196,7 +200,7 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 	}
 
 	if now.After(challenge.ExpiresAt) {
-		m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusFailed)
+		_ = m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusFailed)
 		return nil, ErrChallengeExpired
 	}
 
@@ -284,8 +288,12 @@ func (m *Manager) ValidateAndIssueCertificate(token string) (*model.Certificate,
 	if err := m.syncSDSCertificateLocked(cert); err != nil {
 		return nil, fmt.Errorf("certificate created but Envoy SDS activation failed: %w", err)
 	}
-	m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusValidated)
-	m.store.SaveCertificate(cert)
+	if err := m.store.UpdateACMEChallengeStatus(token, model.ChallengeStatusValidated); err != nil {
+		return nil, fmt.Errorf("update acme challenge status: %w", err)
+	}
+	if err := m.store.SaveCertificate(cert); err != nil {
+		return nil, fmt.Errorf("persist active certificate: %w", err)
+	}
 
 	return cert, nil
 }
@@ -332,35 +340,13 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 		return fmt.Errorf("prepare versioned private key: %w", err)
 	}
 
-	certPath := filepath.Join(m.certsDir, "server.crt")
-	keyPath := filepath.Join(m.certsDir, "server.key")
 	sdsPath := filepath.Join(m.certsDir, "sds.json")
 
-	// 1. Write server.crt atomically
-	tmpCert := certPath + ".tmp"
-	if err := os.WriteFile(tmpCert, []byte(cert.CertPEM), 0644); err != nil {
-		return fmt.Errorf("failed to write cert tmp file: %w", err)
-	}
-	if err := os.Rename(tmpCert, certPath); err != nil {
-		_ = os.Remove(tmpCert)
-		return fmt.Errorf("failed to rename cert file: %w", err)
-	}
+	// Point Envoy v3 SDS Secret resource directly to the consistent versioned pair
+	// to prevent any race condition or mismatched pair during live zero-reload rotation.
+	envoyCertPath := fmt.Sprintf("/etc/envoy/certs/versions/%s/server.crt", versionID)
+	envoyKeyPath := fmt.Sprintf("/etc/envoy/certs/versions/%s/server.key", versionID)
 
-	// 2. Write server.key atomically (0640 with Envoy reader group)
-	tmpKey := keyPath + ".tmp"
-	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0600); err != nil {
-		return fmt.Errorf("write private-key staging file: %w", err)
-	}
-	if err := preparePrivateKeyForEnvoy(tmpKey); err != nil {
-		_ = os.Remove(tmpKey)
-		return err
-	}
-	if err := os.Rename(tmpKey, keyPath); err != nil {
-		_ = os.Remove(tmpKey)
-		return fmt.Errorf("activate private-key file: %w", err)
-	}
-
-	// 3. Write Envoy v3 SDS Secret resource file atomically
 	sdsPayload := map[string]interface{}{
 		"resources": []map[string]interface{}{
 			{
@@ -368,10 +354,10 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 				"name":  "dynamic_server_cert",
 				"tls_certificate": map[string]interface{}{
 					"certificate_chain": map[string]string{
-						"filename": "/etc/envoy/certs/server.crt",
+						"filename": envoyCertPath,
 					},
 					"private_key": map[string]string{
-						"filename": "/etc/envoy/certs/server.key",
+						"filename": envoyKeyPath,
 					},
 				},
 			},

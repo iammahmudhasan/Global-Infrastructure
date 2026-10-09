@@ -28,8 +28,16 @@ func main() {
 	log.Printf("[INFO] Initializing NexusEdge Control Plane (Config Controller)...")
 
 	// 1. Initialize Storage Repository (Durable PostgreSQL or In-Memory fallback)
-	var dataStore store.Repository
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
 	dbURL := strings.TrimSpace(os.Getenv("NEXUSEDGE_DATABASE_URL"))
+	if env == "production" && dbURL == "" {
+		log.Fatal("[FATAL] NEXUSEDGE_DATABASE_URL is required in production")
+	}
+	if env == "production" && os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+		log.Fatal("[FATAL] NEXUSEDGE_DEV_MODE must be disabled in production")
+	}
+
+	var dataStore store.Repository
 	if dbURL != "" {
 		pgRepo, err := store.NewPostgresRepository(dbURL)
 		if err != nil {

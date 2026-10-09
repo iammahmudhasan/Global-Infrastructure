@@ -80,7 +80,9 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		Priority:   10,
 		TimeoutMs:  5000,
 	}
-	repo1.SaveRoute(rt)
+	if err := repo1.SaveRoute(rt); err != nil {
+		t.Fatalf("failed to save route: %v", err)
+	}
 
 	cert := &model.Certificate{
 		ID:                "cert-recovery-" + testDomainID,
@@ -88,6 +90,7 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		Domains:           []string{dom.Hostname},
 		Status:            model.CertStatusActive,
 		KeyType:           model.KeyTypeECDSA,
+		SerialNumber:      "1122334455",
 		CertPEM:           "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----",
 		PrivateKeyPEM:     "-----BEGIN EC PRIVATE KEY-----\nMHc...\n-----END EC PRIVATE KEY-----",
 		FingerprintSHA256: "AA:BB:CC:DD",
@@ -96,7 +99,30 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		ExpiresAt:         time.Now().UTC().Add(90 * 24 * time.Hour),
 		AutoRenew:         true,
 	}
-	repo1.SaveCertificate(cert)
+	if err := repo1.SaveCertificate(cert); err != nil {
+		t.Fatalf("failed to save initial certificate: %v", err)
+	}
+
+	// Finding 3: Simulate certificate renewal with new certificate ID & updated serial number.
+	// Saving this active certificate must supersede the previous active certificate in DB.
+	renewedCert := &model.Certificate{
+		ID:                "cert-renewed-" + testDomainID,
+		DomainID:          dom.ID,
+		Domains:           []string{dom.Hostname},
+		Status:            model.CertStatusActive,
+		KeyType:           model.KeyTypeECDSA,
+		SerialNumber:      "9988776655",
+		CertPEM:           "-----BEGIN CERTIFICATE-----\nMIIB-RENEWED...\n-----END CERTIFICATE-----",
+		PrivateKeyPEM:     "-----BEGIN EC PRIVATE KEY-----\nMHc-RENEWED...\n-----END EC PRIVATE KEY-----",
+		FingerprintSHA256: "EE:FF:00:11",
+		Issuer:            "Let's Encrypt Authority",
+		IssuedAt:          time.Now().UTC().Add(10 * time.Second),
+		ExpiresAt:         time.Now().UTC().Add(90 * 24 * time.Hour),
+		AutoRenew:         true,
+	}
+	if err := repo1.SaveCertificate(renewedCert); err != nil {
+		t.Fatalf("failed to save renewed certificate: %v", err)
+	}
 
 	_ = repo1.Close()
 
@@ -133,8 +159,11 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	}
 
 	recoveredCert := repo2.GetCertificate(dom.ID)
-	if recoveredCert == nil || recoveredCert.Status != model.CertStatusActive || recoveredCert.ID != cert.ID {
-		t.Fatalf("certificate not recovered correctly: %+v", recoveredCert)
+	if recoveredCert == nil || recoveredCert.Status != model.CertStatusActive || recoveredCert.ID != renewedCert.ID {
+		t.Fatalf("certificate not recovered correctly: expected renewed ID %s, got %+v", renewedCert.ID, recoveredCert)
+	}
+	if recoveredCert.SerialNumber != renewedCert.SerialNumber {
+		t.Fatalf("expected renewed serial number %s, got %s", renewedCert.SerialNumber, recoveredCert.SerialNumber)
 	}
 
 	// 4. Verify compiled topology generation across restart

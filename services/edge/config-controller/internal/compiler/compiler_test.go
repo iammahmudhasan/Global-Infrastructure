@@ -1461,3 +1461,131 @@ func TestCompiler_PerDomainRateLimitIsolation(t *testing.T) {
 		t.Errorf("expected stat_prefix for tenant B")
 	}
 }
+
+func TestRateLimit_ExactRPMRefillRatios(t *testing.T) {
+	testCases := []struct {
+		rpm              int
+		burst            int
+		expectedMax      int
+		expectedFill     int
+		expectedInterval string
+	}{
+		{rpm: 30, burst: 0, expectedMax: 30, expectedFill: 1, expectedInterval: "2s"},
+		{rpm: 30, burst: 15, expectedMax: 15, expectedFill: 1, expectedInterval: "2s"},
+		{rpm: 100, burst: 0, expectedMax: 100, expectedFill: 5, expectedInterval: "3s"},
+		{rpm: 100, burst: 50, expectedMax: 50, expectedFill: 5, expectedInterval: "3s"},
+		{rpm: 500, burst: 0, expectedMax: 500, expectedFill: 25, expectedInterval: "3s"},
+		{rpm: 500, burst: 100, expectedMax: 100, expectedFill: 25, expectedInterval: "3s"},
+	}
+
+	for _, tc := range testCases {
+		maxT, fillT, interval := compiler.CalculateTokenBucket(tc.rpm, tc.burst)
+		if maxT != tc.expectedMax {
+			t.Errorf("rpm=%d burst=%d: expected max_tokens %d, got %d", tc.rpm, tc.burst, tc.expectedMax, maxT)
+		}
+		if fillT != tc.expectedFill {
+			t.Errorf("rpm=%d: expected tokens_per_fill %d, got %d", tc.rpm, tc.expectedFill, fillT)
+		}
+		if interval != tc.expectedInterval {
+			t.Errorf("rpm=%d: expected fill_interval %s, got %s", tc.rpm, tc.expectedInterval, interval)
+		}
+	}
+}
+
+func TestRateLimit_PathScopedRateLimiting(t *testing.T) {
+	st := store.NewStore()
+	comp := compiler.NewCompiler(9901, 80, 443)
+	comp.SetCABundlePath("/etc/ssl/certs/ca-certificates.crt")
+
+	dom := &model.Domain{
+		ID:        "dom-path-rl",
+		ProjectID: "prj-path",
+		Hostname:  "api-scoped.example.com",
+		Status:    model.DomainStatusActive,
+	}
+	_ = st.SaveDomain(dom)
+
+	pool := &model.OriginPool{
+		ID:        "pool-path",
+		ProjectID: "prj-path",
+		Origins: []model.Origin{
+			{ID: "o-path", PoolID: "pool-path", Address: "10.0.0.1", Port: 80, Protocol: model.ProtocolHTTP, Healthy: true},
+		},
+	}
+	_ = st.SaveOriginPool(pool)
+
+	_ = st.SaveRoute(&model.Route{ID: "r-api", DomainID: dom.ID, PoolID: pool.ID, PathPrefix: "/api"})
+	_ = st.SaveRoute(&model.Route{ID: "r-pub", DomainID: dom.ID, PoolID: pool.ID, PathPrefix: "/public"})
+
+	// Configure path-specific rate limit ONLY for /api (100 RPM, burst 20)
+	_ = st.SaveSecurityPolicy(&model.SecurityPolicy{
+		DomainID:         dom.ID,
+		RateLimitEnabled: true,
+		RateLimitRPM:     0,
+		RateLimitRules: []model.RateLimitRule{
+			{PathPrefix: "/api", RequestsPerMinute: 100, BurstSize: 20, Enabled: true},
+		},
+	})
+
+	cfg, err := comp.Compile(st.GetActiveTopologies())
+	if err != nil {
+		t.Fatalf("compile failed: %v", err)
+	}
+
+	cfgBytes, _ := cfg.ToJSON()
+	cfgStr := string(cfgBytes)
+
+	// VirtualHost level should NOT contain local rate limit filter
+	if strings.Contains(cfgStr, `"vh_rate_limit_api_scoped_example_com"`) {
+		t.Errorf("virtual host should NOT have rate limit when only path-specific rule is configured")
+	}
+
+	// Route /api MUST have route-scoped rate limit
+	if !strings.Contains(cfgStr, `"route_rate_limit_api_scoped_example_com_api"`) {
+		t.Errorf("expected route-scoped rate limiter for /api")
+	}
+
+	// Route /public must NOT have rate limit
+	if strings.Contains(cfgStr, `"route_rate_limit_api_scoped_example_com_public"`) {
+		t.Errorf("/public route should not have rate limit applied")
+	}
+}
+
+func TestUpstreamTLS_StagingRequiresCABundle(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+	comp.SetCABundlePath("")
+
+	// 1. In staging, empty CA bundle must be rejected
+	t.Setenv("NEXUSEDGE_ENV", "staging")
+	t.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	t.Setenv("NEXUSEDGE_UPSTREAM_CA_FILE", "")
+
+	_, err := comp.BuildValidatedUpstreamTLSContext("origin.internal", "")
+	if err == nil {
+		t.Fatalf("expected error in staging when CA bundle is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "upstream TLS validation requires trusted CA bundle") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+
+	// 2. When trusted CA bundle is supplied in staging, it must succeed
+	tlsCtx, err := comp.BuildValidatedUpstreamTLSContext("origin.internal", "/etc/ssl/certs/ca.pem")
+	if err != nil {
+		t.Fatalf("expected success with valid CA bundle in staging, got: %v", err)
+	}
+	if tlsCtx == nil {
+		t.Fatalf("expected non-nil TLS context")
+	}
+
+	// 3. In explicit dev mode (test/development), unvalidated dev TLS is permitted
+	t.Setenv("NEXUSEDGE_ENV", "test")
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+
+	devCtx, err := comp.BuildValidatedUpstreamTLSContext("origin.internal", "")
+	if err != nil {
+		t.Fatalf("expected dev mode to allow empty CA bundle, got: %v", err)
+	}
+	if devCtx == nil {
+		t.Fatalf("expected non-nil dev TLS context")
+	}
+}

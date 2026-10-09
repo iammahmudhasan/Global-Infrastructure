@@ -141,11 +141,12 @@ func (s *Store) invalidateCachesLocked() {
 	s.activeTopologyCache = nil
 }
 
-func (s *Store) SetProjectQuota(projectID string, quota ProjectQuota) {
+func (s *Store) SetProjectQuota(projectID string, quota ProjectQuota) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.projectQuotas[projectID] = quota
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetProjectQuota(projectID string) ProjectQuota {
@@ -466,11 +467,12 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 }
 
 // SaveOriginPoolBypass saves an origin pool directly without validation (used in test fixtures)
-func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) {
+func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pools[p.ID] = cloneOriginPool(p)
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) AddOrigin(o *model.Origin) error {
@@ -518,7 +520,7 @@ func (s *Store) GetOriginPool(poolID string) (*model.OriginPool, error) {
 	return cp, nil
 }
 
-func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
+func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cloned := cloneHealthMonitor(hm)
@@ -527,6 +529,7 @@ func (s *Store) SaveHealthMonitor(hm *model.HealthMonitor) {
 		pool.HealthMonitor = cloneHealthMonitor(cloned)
 	}
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
@@ -535,7 +538,7 @@ func (s *Store) GetHealthMonitor(poolID string) *model.HealthMonitor {
 	return cloneHealthMonitor(s.monitors[poolID])
 }
 
-func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
+func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cloned := cloneOriginEndpointState(st)
@@ -553,6 +556,7 @@ func (s *Store) SaveOriginHealthState(st *model.OriginEndpointState) {
 		}
 	}
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetOriginHealthState(originID string) *model.OriginEndpointState {
@@ -588,7 +592,7 @@ func (s *Store) ListPoolHealthStates(poolID string) []*model.OriginEndpointState
 	return states
 }
 
-func (s *Store) UpdateOriginHealthy(originID string, healthy bool) {
+func (s *Store) UpdateOriginHealthy(originID string, healthy bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -606,13 +610,15 @@ func (s *Store) UpdateOriginHealthy(originID string, healthy bool) {
 		st.Healthy = healthy
 	}
 	s.invalidateCachesLocked()
+	return nil
 }
 
-func (s *Store) SaveRoute(r *model.Route) {
+func (s *Store) SaveRoute(r *model.Route) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.routes[r.DomainID] = append(s.routes[r.DomainID], cloneRoute(r))
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetRoutes(domainID string) []*model.Route {
@@ -627,11 +633,12 @@ func (s *Store) GetRoutes(domainID string) []*model.Route {
 	return list
 }
 
-func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) {
+func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.security[sp.DomainID] = cloneSecurityPolicy(sp)
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
@@ -733,7 +740,7 @@ func securityEventSize(ev model.SecurityEvent) int {
 		len(ev.Path) + len(ev.UserAgent) + len(ev.RuleTriggered) + len(ev.Action) + len(ev.Details) + 64
 }
 
-func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) {
+func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -764,6 +771,7 @@ func (s *Store) RecordSecurityEvent(ev model.SecurityEvent) {
 	}
 
 	s.events[ev.DomainID] = events
+	return nil
 }
 
 func (s *Store) GetSecurityEvents(domainID string, limit int) []model.SecurityEvent {
@@ -783,7 +791,7 @@ func (s *Store) GetSecurityEvents(domainID string, limit int) []model.SecurityEv
 	return result
 }
 
-func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
+func (s *Store) SaveCachePolicy(cp *model.CachePolicy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cloned := cloneCachePolicy(cp)
@@ -796,6 +804,7 @@ func (s *Store) SaveCachePolicy(cp *model.CachePolicy) {
 	}
 	s.cache[cp.DomainID] = cloned
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetCachePolicy(domainID string) *model.CachePolicy {
@@ -892,7 +901,7 @@ func (s *Store) DeleteCacheRule(domainID string, ruleID string) error {
 	return nil
 }
 
-func (s *Store) SaveCertificate(cert *model.Certificate) {
+func (s *Store) SaveCertificate(cert *model.Certificate) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cert.Status == model.CertStatusPendingChallenge {
@@ -902,6 +911,7 @@ func (s *Store) SaveCertificate(cert *model.Certificate) {
 		delete(s.pendingCertificates, cert.DomainID)
 	}
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetCertificate(domainID string) *model.Certificate {
@@ -916,11 +926,12 @@ func (s *Store) GetPendingCertificate(domainID string) *model.Certificate {
 	return cloneCertificate(s.pendingCertificates[domainID])
 }
 
-func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) {
+func (s *Store) SaveACMEChallenge(ch *model.ACMEChallenge) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.challenges[ch.Token] = cloneACMEChallenge(ch)
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
@@ -929,20 +940,22 @@ func (s *Store) GetACMEChallengeByToken(token string) *model.ACMEChallenge {
 	return cloneACMEChallenge(s.challenges[token])
 }
 
-func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeStatus) {
+func (s *Store) UpdateACMEChallengeStatus(token string, status model.ChallengeStatus) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if ch, exists := s.challenges[token]; exists {
 		ch.Status = status
 	}
 	s.invalidateCachesLocked()
+	return nil
 }
 
-func (s *Store) SaveTLSSettings(domainID string, settings *model.TLSSettings) {
+func (s *Store) SaveTLSSettings(domainID string, settings *model.TLSSettings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tlsSettings[domainID] = cloneTLSSettings(settings)
 	s.invalidateCachesLocked()
+	return nil
 }
 
 func (s *Store) GetTLSSettings(domainID string) *model.TLSSettings {

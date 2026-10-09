@@ -11,12 +11,16 @@ services:
       # Development profile flags: set NEXUSEDGE_DEV_MODE=false and NEXUSEDGE_ENV=production for production deployments
       - NEXUSEDGE_DEV_MODE=${NEXUSEDGE_DEV_MODE:-true}
       - NEXUSEDGE_ENV=${NEXUSEDGE_ENV:-development}
+      - NEXUSEDGE_DATABASE_URL=${NEXUSEDGE_DATABASE_URL:-postgres://nexusedge:nexusedge_dev_pw@postgres:5432/nexusedge_edge?sslmode=disable}
       - NEXUSEDGE_ACME_HOST=config-controller
       - NEXUSEDGE_ACME_PORT=9091
       - NEXUSEDGE_CERTS_DIR=/etc/envoy/certs
       - NEXUSEDGE_CERTS_GID=${ENVOY_CERT_GID:-101}
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9091/healthz || wget -qO- http://127.0.0.1:9091/healthz || exit 1"]
       interval: 5s
@@ -91,9 +95,34 @@ services:
         ipv4_address: 172.28.0.10
     restart: unless-stopped
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexusedge-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-nexusedge}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-nexusedge_dev_pw}
+      - POSTGRES_DB=${POSTGRES_DB:-nexusedge_edge}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../migrations/postgres/edge/0001_initial_edge_schema.sql:/docker-entrypoint-initdb.d/0001_initial_edge_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-nexusedge} -d $${POSTGRES_DB:-nexusedge_edge}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      nexusedge-net:
+        ipv4_address: 172.28.0.5
+    restart: unless-stopped
+
 networks:
   nexusedge-net:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.0.0/16
+
+volumes:
+  postgres-data:

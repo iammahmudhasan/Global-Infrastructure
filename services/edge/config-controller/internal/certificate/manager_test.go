@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -202,8 +203,8 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 		t.Fatalf("validate and issue failed: %v", err)
 	}
 
-	certPath := filepath.Join(tempDir, "server.crt")
-	keyPath := filepath.Join(tempDir, "server.key")
+	certPath := filepath.Join(tempDir, "versions", cert.ID, "server.crt")
+	keyPath := filepath.Join(tempDir, "versions", cert.ID, "server.key")
 	sdsPath := filepath.Join(tempDir, "sds.json")
 
 	if _, err := os.Stat(certPath); os.IsNotExist(err) {
@@ -235,6 +236,9 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 	if !strings.Contains(string(sdsContent), "dynamic_server_cert") {
 		t.Fatalf("expected sds.json to contain dynamic_server_cert, got %s", string(sdsContent))
 	}
+	if !strings.Contains(string(sdsContent), cert.ID) {
+		t.Fatalf("expected sds.json to reference versioned cert %s, got %s", cert.ID, string(sdsContent))
+	}
 
 	// 2. Renew Certificate - must update files atomically
 	initialSerial := cert.SerialNumber
@@ -246,12 +250,21 @@ func TestCertificateManager_SyncSDS(t *testing.T) {
 		t.Fatalf("expected new serial number on renewal")
 	}
 
-	updatedCertBytes, err := os.ReadFile(certPath)
+	renewedCertPath := filepath.Join(tempDir, "versions", renewed.ID, "server.crt")
+	updatedCertBytes, err := os.ReadFile(renewedCertPath)
 	if err != nil {
 		t.Fatalf("failed to read updated cert: %v", err)
 	}
 	if string(updatedCertBytes) != renewed.CertPEM {
 		t.Fatalf("expected cert on disk to match renewed cert PEM")
+	}
+
+	renewedSDSBytes, err := os.ReadFile(sdsPath)
+	if err != nil {
+		t.Fatalf("failed to read renewed sds.json: %v", err)
+	}
+	if !strings.Contains(string(renewedSDSBytes), renewed.ID) {
+		t.Fatalf("expected renewed sds.json to reference renewed version %s, got %s", renewed.ID, string(renewedSDSBytes))
 	}
 }
 
@@ -426,14 +439,21 @@ func TestCertificateManager_VersionedSDSRotation(t *testing.T) {
 		t.Fatalf("expected versioned private key file at %s", verKeyPath)
 	}
 
-	// Verify root backward compatible files exist
-	if _, err := os.Stat(filepath.Join(tempDir, "server.crt")); os.IsNotExist(err) {
-		t.Fatalf("expected root server.crt to exist")
+	// Verify sds.json references the versioned files directly
+	sdsPath := filepath.Join(tempDir, "sds.json")
+	if _, err := os.Stat(sdsPath); os.IsNotExist(err) {
+		t.Fatalf("expected sds.json to exist at %s", sdsPath)
 	}
-	if _, err := os.Stat(filepath.Join(tempDir, "server.key")); os.IsNotExist(err) {
-		t.Fatalf("expected root server.key to exist")
+	sdsData, err := os.ReadFile(sdsPath)
+	if err != nil {
+		t.Fatalf("failed to read sds.json: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(tempDir, "sds.json")); os.IsNotExist(err) {
-		t.Fatalf("expected root sds.json to exist")
+	expectedCertRef := fmt.Sprintf("/etc/envoy/certs/versions/%s/server.crt", cert.ID)
+	expectedKeyRef := fmt.Sprintf("/etc/envoy/certs/versions/%s/server.key", cert.ID)
+	if !strings.Contains(string(sdsData), expectedCertRef) {
+		t.Fatalf("expected sds.json to reference %s, got %s", expectedCertRef, string(sdsData))
+	}
+	if !strings.Contains(string(sdsData), expectedKeyRef) {
+		t.Fatalf("expected sds.json to reference %s, got %s", expectedKeyRef, string(sdsData))
 	}
 }
