@@ -350,12 +350,17 @@ func (s *DomainService) OnboardDomain(req OnboardRequest) (*OnboardResponse, err
 	}, nil
 }
 
-func isExplicitDevEnvironment() bool {
+// IsExplicitDevEnvironment returns true only if NEXUSEDGE_ENV or ENV is set to "development" or "test".
+func IsExplicitDevEnvironment() bool {
 	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
 	if env == "" {
 		env = strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
 	}
 	return env == "development" || env == "test"
+}
+
+func isExplicitDevEnvironment() bool {
+	return IsExplicitDevEnvironment()
 }
 
 // VerifyDomain verifies customer DNS CNAME pointing or TXT challenge and activates the edge route (Finding 10)

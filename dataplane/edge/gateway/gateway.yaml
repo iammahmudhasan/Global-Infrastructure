@@ -10,40 +10,35 @@ server:
 
 upstream:
   origins:
-    - address: "54.159.186.149"
-      port: 443
-      protocol: "HTTPS"
-      sni: "httpbin.org"
+    - address: "172.28.0.10"
+      port: 8081
+      protocol: "HTTP"
   routes:
     - host: "api.nexusedge.io"
       path_routes:
         - path_prefix: "/status/"
           priority: 10
           origins:
-            - address: "54.159.186.149"
-              port: 443
-              protocol: "HTTPS"
-              sni: "httpbin.org"
+            - address: "172.28.0.10"
+              port: 8082
+              protocol: "HTTP"
         - path_prefix: "/"
           priority: 0
           origins:
-            - address: "54.159.186.149"
-              port: 443
-              protocol: "HTTPS"
-              sni: "httpbin.org"
+            - address: "172.28.0.10"
+              port: 8081
+              protocol: "HTTP"
     - host: "app.nexusedge.io"
       origins:
-        - address: "54.159.186.149"
-          port: 443
-          protocol: "HTTPS"
-          sni: "httpbin.org"
+        - address: "172.28.0.10"
+          port: 8081
+          protocol: "HTTP"
     - host: "customer-a.example.com"
       origins:
-        - address: "54.159.186.149"
-          port: 443
-          protocol: "HTTPS"
-          sni: "httpbin.org"
-  health_check_path: "/status/200"
+        - address: "172.28.0.10"
+          port: 8081
+          protocol: "HTTP"
+  health_check_path: "/healthz"
   timeout_ms: 5000
 
 control_plane:

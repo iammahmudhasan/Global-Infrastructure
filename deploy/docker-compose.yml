@@ -18,6 +18,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - nexusedge-net
     restart: unless-stopped
 
   envoy:
@@ -41,6 +43,8 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - nexusedge-net
     restart: unless-stopped
 
   nexusedge-gateway:
@@ -52,6 +56,8 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       - RUST_LOG=info
+      - NEXUSEDGE_DEV_MODE=true
+      - NEXUSEDGE_ENV=development
       - NEXUSEDGE_CP_ENABLED=true
       - NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091
       - NEXUSEDGE_CP_POP_ID=singapore
@@ -65,11 +71,26 @@ services:
       timeout: 3s
       retries: 5
       start_period: 3s
+    networks:
+      - nexusedge-net
     restart: unless-stopped
 
   mock-origin:
-    image: kennethreitz/httpbin
+    build:
+      context: ./mock-origin
+      dockerfile: Dockerfile
     container_name: mock-origin-app
     ports:
-      - "8081:80"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:8082:8082"
+    networks:
+      nexusedge-net:
+        ipv4_address: 172.28.0.10
     restart: unless-stopped
+
+networks:
+  nexusedge-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

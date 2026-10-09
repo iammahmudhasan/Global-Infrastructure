@@ -2231,7 +2231,11 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 			parsedIP := net.ParseIP(o.Address)
 			if parsedIP != nil {
 				if onboarding.IsPrivateOrReservedIP(parsedIP) {
-					continue
+					if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment() {
+						// Permitted in isolated development/test profile for mock origins
+					} else {
+						continue
+					}
 				}
 				sniHost := o.SNI
 				if sniHost == "" {

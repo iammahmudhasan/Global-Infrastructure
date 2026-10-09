@@ -46,31 +46,50 @@ func main() {
 			}
 			_ = dataStore.SaveDomain(devDomain)
 
-			devPool := &model.OriginPool{
-				ID:          "pool-dev-httpbin",
+			devPoolDefault := &model.OriginPool{
+				ID:          "pool-dev-default",
 				ProjectID:   "proj-core",
-				Name:        "httpbin-origin-pool",
+				Name:        "mock-origin-default-pool",
 				LBAlgorithm: model.LBAlgorithmRoundRobin,
 				Origins: []model.Origin{
 					{
-						ID:          "orig-dev-httpbin",
-						PoolID:      "pool-dev-httpbin",
-						Address:     "54.159.186.149",
-						Port:        443,
-						Protocol:    model.ProtocolHTTPS,
-						SNI:         "httpbin.org",
+						ID:          "orig-dev-default",
+						PoolID:      "pool-dev-default",
+						Address:     "172.28.0.10",
+						Port:        8081,
+						Protocol:    model.ProtocolHTTP,
 						Weight:      100,
 						Healthy:     true,
 						AllowedPoPs: []string{"singapore", "dhaka"},
 					},
 				},
 			}
-			_ = dataStore.SaveOriginPool(devPool)
+			_ = dataStore.SaveOriginPool(devPoolDefault)
+
+			devPoolStatus := &model.OriginPool{
+				ID:          "pool-dev-status",
+				ProjectID:   "proj-core",
+				Name:        "mock-origin-status-pool",
+				LBAlgorithm: model.LBAlgorithmRoundRobin,
+				Origins: []model.Origin{
+					{
+						ID:          "orig-dev-status",
+						PoolID:      "pool-dev-status",
+						Address:     "172.28.0.10",
+						Port:        8082,
+						Protocol:    model.ProtocolHTTP,
+						Weight:      100,
+						Healthy:     true,
+						AllowedPoPs: []string{"singapore", "dhaka"},
+					},
+				},
+			}
+			_ = dataStore.SaveOriginPool(devPoolStatus)
 
 			devRouteRoot := &model.Route{
 				ID:         "route-dev-root",
 				DomainID:   devDomain.ID,
-				PoolID:     devPool.ID,
+				PoolID:     devPoolDefault.ID,
 				PathPrefix: "/",
 				Priority:   0,
 				TimeoutMs:  5000,
@@ -80,7 +99,7 @@ func main() {
 			devRouteStatus := &model.Route{
 				ID:         "route-dev-status",
 				DomainID:   devDomain.ID,
-				PoolID:     devPool.ID,
+				PoolID:     devPoolStatus.ID,
 				PathPrefix: "/status/",
 				Priority:   10,
 				TimeoutMs:  5000,
@@ -98,7 +117,20 @@ func main() {
 			}
 			dataStore.SaveSecurityPolicy(devSec)
 
-			log.Printf("[INFO] Seeded development fixture domain: %s (status=%s, origin=54.159.186.149:443)", devDomain.Hostname, devDomain.Status)
+			devChallenge := &model.ACMEChallenge{
+				ID:               "chal-dev-01",
+				DomainID:         devDomain.ID,
+				Hostname:         devDomain.Hostname,
+				Type:             "HTTP-01",
+				Token:            "test-token",
+				KeyAuthorization: "test-token.mock_key_auth_marker",
+				Status:           model.ChallengeStatusPending,
+				CreatedAt:        time.Now().UTC(),
+				ExpiresAt:        time.Now().UTC().Add(24 * time.Hour),
+			}
+			dataStore.SaveACMEChallenge(devChallenge)
+
+			log.Printf("[INFO] Seeded development fixture domain: %s (status=%s, default_origin=172.28.0.10:8081, status_origin=172.28.0.10:8082)", devDomain.Hostname, devDomain.Status)
 		}
 	}
 

@@ -116,33 +116,51 @@ jobs:
         timeout-minutes: 5
         run: |
           echo "Awaiting Config Controller health..."
+          CC_READY=0
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:9091/healthz > /dev/null 2>&1; then
               echo "Config Controller is healthy!"
+              CC_READY=1
               break
             fi
             sleep 2
           done
+          if [ "$CC_READY" -ne 1 ]; then
+            echo "ERROR: Config Controller failed to become healthy within timeout!"
+            exit 1
+          fi
 
           echo "Awaiting Gateway /ready endpoint (initial snapshot sync)..."
+          GW_READY=0
           for i in {1..30}; do
             STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080/ready || true)
             if [ "$STATUS" = "200" ]; then
               echo "Gateway is ready (HTTP 200)!"
+              GW_READY=1
               break
             fi
             echo "Gateway not ready yet (status: $STATUS), waiting..."
             sleep 2
           done
+          if [ "$GW_READY" -ne 1 ]; then
+            echo "ERROR: Gateway failed to reach readiness (HTTP 200) within timeout!"
+            exit 1
+          fi
 
           echo "Awaiting Envoy Ingress readiness..."
+          ENVOY_READY=0
           for i in {1..30}; do
             if curl -fsS http://127.0.0.1:9901/ready > /dev/null 2>&1; then
               echo "Envoy Ingress is ready!"
+              ENVOY_READY=1
               break
             fi
             sleep 2
           done
+          if [ "$ENVOY_READY" -ne 1 ]; then
+            echo "ERROR: Envoy failed to become ready within timeout!"
+            exit 1
+          fi
 
       - name: Run Single-PoP E2E Integration Suite
         run: bash tests/e2e/test_single_pop_gateway.sh

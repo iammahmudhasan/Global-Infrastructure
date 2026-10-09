@@ -389,7 +389,7 @@ impl Router {
             RouterError::InvalidPayload("Static origin address must be a pinned IP".to_string())
         })?;
 
-        if is_private_or_reserved_ip(ip) {
+        if is_unsafe_origin_destination(ip) {
             return Err(RouterError::UnsafeTargetUrl {
                 host: norm_host.to_string(),
                 url: origin.address.clone(),
@@ -444,7 +444,7 @@ impl Router {
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            if is_private_or_reserved_ip(ip) {
+            if is_unsafe_origin_destination(ip) {
                 return Err(RouterError::UnsafeTargetUrl {
                     host: norm_host.to_string(),
                     url: target_str.to_string(),
@@ -465,7 +465,7 @@ impl Router {
         use std::net::ToSocketAddrs;
         if let Ok(resolved_addrs) = lookup_target.to_socket_addrs() {
             for addr in resolved_addrs {
-                if !is_private_or_reserved_ip(addr.ip()) {
+                if !is_unsafe_origin_destination(addr.ip()) {
                     let target_url = format!("{}://{}:{}", scheme, host, port);
                     return Ok(Router::create_node_full(
                         target_url,
@@ -1176,6 +1176,69 @@ pub fn is_private_or_reserved_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Returns true only if NEXUSEDGE_DEV_MODE=true AND NEXUSEDGE_ENV is development or test.
+/// Follows strict parity with Go Control Plane's isExplicitDevEnvironment().
+pub fn is_test_profile_active() -> bool {
+    let dev = std::env::var("NEXUSEDGE_DEV_MODE")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true");
+    if !dev {
+        return false;
+    }
+    let env = std::env::var("NEXUSEDGE_ENV")
+        .or_else(|_| std::env::var("ENV"))
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    env == "development" || env == "test"
+}
+
+/// Evaluates whether an origin destination IP is unsafe.
+/// In production, all RFC 1918, loopback, cloud metadata, and reserved ranges are strictly blocked.
+/// Under an active isolated test profile (NEXUSEDGE_DEV_MODE=true + NEXUSEDGE_ENV=development|test),
+/// local loopback and internal container networks (172.16.0.0/12, 10.0.0.0/8) are permitted for mock origins,
+/// while cloud metadata, link-local, multicast, and documentation networks remain strictly blocked.
+pub fn is_unsafe_origin_destination(ip: std::net::IpAddr) -> bool {
+    if !is_private_or_reserved_ip(ip) {
+        return false;
+    }
+    if !is_test_profile_active() {
+        return true;
+    }
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // 127.0.0.0/8 (Loopback for local integration harness)
+            if octets[0] == 127 {
+                return false;
+            }
+            // 10.0.0.0/8 (Container network)
+            if octets[0] == 10 {
+                return false;
+            }
+            // 172.16.0.0/12 (Docker bridge network)
+            if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                return false;
+            }
+            // 192.168.0.0/16 (Private LAN testbed)
+            if octets[0] == 192 && octets[1] == 168 {
+                return false;
+            }
+            true
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() {
+                return false;
+            }
+            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                return is_unsafe_origin_destination(std::net::IpAddr::V4(ipv4));
+            }
+            true
+        }
+    }
+}
+
 pub fn is_forbidden_destination(host: &str) -> bool {
     let lower = host.trim().to_ascii_lowercase();
     let unbracketed = lower.trim_start_matches('[').trim_end_matches(']');
@@ -1184,12 +1247,14 @@ pub fn is_forbidden_destination(host: &str) -> bool {
         || unbracketed == "metadata.titus.internal"
         || unbracketed == "instance-data"
         || unbracketed == "100.100.100.200"
-        || unbracketed == "localhost"
     {
         return true;
     }
+    if unbracketed == "localhost" {
+        return !is_test_profile_active();
+    }
     if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
-        return is_private_or_reserved_ip(ip);
+        return is_unsafe_origin_destination(ip);
     }
     false
 }
@@ -1375,7 +1440,7 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             )
         })?;
 
-        if is_private_or_reserved_ip(ip) {
+        if is_unsafe_origin_destination(ip) {
             return Err(RouterError::UnsafeTargetUrl {
                 host: norm_host.to_string(),
                 url: o.address.clone(),
@@ -2269,5 +2334,49 @@ mod tests {
             .await;
         assert!(v1_expired.is_err());
         assert!(v1_expired.err().unwrap().to_string().contains("Strict DNS"));
+    }
+
+    #[test]
+    fn test_isolated_test_profile_and_mock_origins() {
+        use std::net::IpAddr;
+
+        // Step 1: In production mode (dev mode inactive), all private destinations are strictly blocked
+        std::env::remove_var("NEXUSEDGE_DEV_MODE");
+        std::env::remove_var("NEXUSEDGE_ENV");
+        assert!(!is_test_profile_active());
+
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let docker_ip: IpAddr = "172.28.0.10".parse().unwrap();
+        let metadata_ip: IpAddr = "169.254.169.254".parse().unwrap();
+        let doc_ip: IpAddr = "198.51.100.1".parse().unwrap();
+
+        assert!(is_unsafe_origin_destination(loopback));
+        assert!(is_unsafe_origin_destination(docker_ip));
+        assert!(is_unsafe_origin_destination(metadata_ip));
+        assert!(is_unsafe_origin_destination(doc_ip));
+
+        // Step 2: Under isolated dev/test profile, local loopback and Docker origins are permitted
+        std::env::set_var("NEXUSEDGE_DEV_MODE", "true");
+        std::env::set_var("NEXUSEDGE_ENV", "development");
+        assert!(is_test_profile_active());
+
+        assert!(!is_unsafe_origin_destination(loopback));
+        assert!(!is_unsafe_origin_destination(docker_ip));
+
+        // Critical Invariant: Cloud metadata and documentation networks MUST STILL be blocked
+        assert!(is_unsafe_origin_destination(metadata_ip));
+        assert!(is_unsafe_origin_destination(doc_ip));
+        assert!(is_forbidden_destination("169.254.169.254"));
+        assert!(is_forbidden_destination("metadata.google.internal"));
+
+        // Verify validate_target_url permits mock origin but rejects metadata
+        assert!(validate_target_url("api.nexusedge.io", "http://172.28.0.10:8081").is_ok());
+        assert!(validate_target_url("api.nexusedge.io", "http://172.28.0.10:8082").is_ok());
+        assert!(validate_target_url("api.nexusedge.io", "http://169.254.169.254/latest").is_err());
+
+        // Step 3: Cleanup environment variables
+        std::env::remove_var("NEXUSEDGE_DEV_MODE");
+        std::env::remove_var("NEXUSEDGE_ENV");
+        assert!(!is_test_profile_active());
     }
 }

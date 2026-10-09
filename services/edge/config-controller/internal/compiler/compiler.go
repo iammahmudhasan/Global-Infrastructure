@@ -905,7 +905,11 @@ func (c *Compiler) buildCluster(clusterName string, pool *model.OriginPool) Clus
 		if parsedIP != nil {
 			// Direct IP destination: validate against SSRF private/reserved ranges
 			if onboarding.IsPrivateOrReservedIP(parsedIP) {
-				continue // Exclude unsafe private IP destination
+				if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment() {
+					// Permitted in isolated development/test profile for mock origins
+				} else {
+					continue // Exclude unsafe private IP destination
+				}
 			}
 			lbEndpoints = append(lbEndpoints, LbEndpoint{
 				Endpoint: Endpoint{
