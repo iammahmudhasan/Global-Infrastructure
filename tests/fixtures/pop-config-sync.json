@@ -1,7 +1,7 @@
 {
   "pop_id": "singapore",
   "config_version": "v1.0.0-prod",
-  "checksum_sha256": "43924f71a942ca96bdfdb86c8a77d1ceb2ee4c6e94ef3be0bdfeb5ae72f23b20",
+  "checksum_sha256": "68312d12967ba4dfe664e09c607a74ea97dd745d1fd76cfe37bd62ca4641d832",
   "compiled_at": "2026-10-09T00:00:00Z",
   "topologies_count": 1,
   "envoy_config": {},
@@ -14,7 +14,7 @@
           "priority": 10,
           "origins": [
             {
-              "address": "198.51.100.10",
+              "address": "93.184.216.34",
               "port": 443,
               "protocol": "HTTPS",
               "sni": "api-origin.example",
@@ -22,7 +22,7 @@
             }
           ],
           "targets": [
-            "https://198.51.100.10:443"
+            "https://93.184.216.34:443"
           ]
         },
         {
@@ -30,7 +30,7 @@
           "priority": 20,
           "origins": [
             {
-              "address": "198.51.100.20",
+              "address": "93.184.216.35",
               "port": 443,
               "protocol": "HTTPS",
               "sni": "admin-origin.example",
@@ -38,13 +38,13 @@
             }
           ],
           "targets": [
-            "https://198.51.100.20:443"
+            "https://93.184.216.35:443"
           ]
         }
       ],
       "targets": [
-        "https://198.51.100.10:443",
-        "https://198.51.100.20:443"
+        "https://93.184.216.34:443",
+        "https://93.184.216.35:443"
       ],
       "security": {
         "waf_enabled": true,

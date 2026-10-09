@@ -117,7 +117,10 @@ func ValidateOriginAddress(addr string) error {
 
 // IsPrivateOrReservedIP checks whether an IP address belongs to loopback, private (RFC 1918),
 // link-local, cloud metadata (169.254.169.254), carrier-grade NAT (100.64.0.0/10),
-// broadcast, multicast, or IPv6 ULA/link-local ranges (Anti-SSRF Protection).
+// IETF protocol assignments (192.0.0.0/24), documentation TEST-NET-1/2/3 (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24),
+// benchmarking (198.18.0.0/15, 2001:2::/48), multicast, broadcast/reserved,
+// IPv6 ULA (fc00::/7), IPv6 documentation (2001:db8::/32), discard-only (100::/64),
+// or IPv4-mapped IPv6 encoding private/reserved destinations (Anti-SSRF Parity with Rust Data Plane).
 func IsPrivateOrReservedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -126,33 +129,87 @@ func IsPrivateOrReservedIP(ip net.IP) bool {
 		return true
 	}
 
+	// ip.To4() extracts IPv4 address for standard IPv4 and IPv4-mapped IPv6 (::ffff:x.x.x.x)
 	if ipv4 := ip.To4(); ipv4 != nil {
+		// 0.0.0.0/8 (Unspecified / Local identification - RFC 1122)
 		if ipv4[0] == 0 {
 			return true
 		}
+		// 10.0.0.0/8 (Private-Use - RFC 1918)
 		if ipv4[0] == 10 {
 			return true
 		}
-		if ipv4[0] == 172 && (ipv4[1] >= 16 && ipv4[1] <= 31) {
-			return true
-		}
-		if ipv4[0] == 192 && ipv4[1] == 168 {
-			return true
-		}
+		// 100.64.0.0/10 (Shared Address Space / CGNAT - RFC 6598)
 		if ipv4[0] == 100 && (ipv4[1] >= 64 && ipv4[1] <= 127) {
 			return true
 		}
+		// 127.0.0.0/8 (Loopback - RFC 1122)
+		if ipv4[0] == 127 {
+			return true
+		}
+		// 169.254.0.0/16 (Link-local - RFC 3927)
 		if ipv4[0] == 169 && ipv4[1] == 254 {
 			return true
 		}
+		// 172.16.0.0/12 (Private-Use - RFC 1918)
+		if ipv4[0] == 172 && (ipv4[1] >= 16 && ipv4[1] <= 31) {
+			return true
+		}
+		// 192.0.0.0/24 (IETF Protocol Assignments - RFC 6890)
+		if ipv4[0] == 192 && ipv4[1] == 0 && ipv4[2] == 0 {
+			return true
+		}
+		// 192.0.2.0/24 (TEST-NET-1 Documentation - RFC 5737)
+		if ipv4[0] == 192 && ipv4[1] == 0 && ipv4[2] == 2 {
+			return true
+		}
+		// 192.168.0.0/16 (Private-Use - RFC 1918)
+		if ipv4[0] == 192 && ipv4[1] == 168 {
+			return true
+		}
+		// 198.18.0.0/15 (Benchmarking - RFC 2544)
+		if ipv4[0] == 198 && (ipv4[1] == 18 || ipv4[1] == 19) {
+			return true
+		}
+		// 198.51.100.0/24 (TEST-NET-2 Documentation - RFC 5737)
+		if ipv4[0] == 198 && ipv4[1] == 51 && ipv4[2] == 100 {
+			return true
+		}
+		// 203.0.113.0/24 (TEST-NET-3 Documentation - RFC 5737)
+		if ipv4[0] == 203 && ipv4[1] == 0 && ipv4[2] == 113 {
+			return true
+		}
+		// 224.0.0.0/4 (Multicast - RFC 5771) and 240.0.0.0/4 (Reserved / Broadcast - RFC 1112)
 		if ipv4[0] >= 224 {
 			return true
 		}
-		if ipv4[0] == 255 && ipv4[1] == 255 && ipv4[2] == 255 && ipv4[3] == 255 {
+		return false
+	}
+
+	// IPv6 checks (len(ip) == 16)
+	if len(ip) == net.IPv6len {
+		// fc00::/7 (Unique Local Address - ULA - RFC 4193)
+		if (ip[0] & 0xfe) == 0xfc {
 			return true
 		}
-	} else {
-		if len(ip) == net.IPv6len && (ip[0]&0xfe) == 0xfc {
+		// fe80::/10 (Link-local unicast - RFC 4291)
+		if ip[0] == 0xfe && (ip[1]&0xc0) == 0x80 {
+			return true
+		}
+		// ff00::/8 (Multicast - RFC 4291)
+		if ip[0] == 0xff {
+			return true
+		}
+		// 2001:db8::/32 (Documentation - RFC 3849)
+		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 {
+			return true
+		}
+		// 2001:2::/48 (Benchmarking - RFC 5180)
+		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x02 && ip[4] == 0x00 && ip[5] == 0x00 {
+			return true
+		}
+		// 100::/64 (Discard-Only - RFC 6666)
+		if ip[0] == 0x01 && ip[1] == 0x00 && ip[2] == 0 && ip[3] == 0 && ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 {
 			return true
 		}
 	}

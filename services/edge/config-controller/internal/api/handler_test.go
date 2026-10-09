@@ -1009,7 +1009,7 @@ func TestControlPlane_RoutingSteerTenantAuthorization(t *testing.T) {
 	// Setup domain and origin pool under prj-alpha via API
 	body, _ := json.Marshal(map[string]interface{}{
 		"hostname":        "alpha.example.com",
-		"origin_address":  "198.51.100.20",
+		"origin_address":  "93.184.216.34",
 		"origin_port":     443,
 		"origin_protocol": "HTTPS",
 	})
@@ -2264,7 +2264,7 @@ func TestHandler_PoPConfigIsolationScope(t *testing.T) {
 	resDhaka, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "proj-infra",
 		Hostname:       "dhaka.example.com",
-		OriginAddress:  "203.0.113.10",
+		OriginAddress:  "93.184.216.10",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 		AllowedPoPs:    []string{"dhaka"},
@@ -2278,7 +2278,7 @@ func TestHandler_PoPConfigIsolationScope(t *testing.T) {
 	resSingapore, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "proj-infra",
 		Hostname:       "singapore.example.com",
-		OriginAddress:  "203.0.113.20",
+		OriginAddress:  "93.184.216.20",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 		AllowedPoPs:    []string{"singapore"},
@@ -2292,7 +2292,7 @@ func TestHandler_PoPConfigIsolationScope(t *testing.T) {
 	resGlobal, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "proj-infra",
 		Hostname:       "global.example.com",
-		OriginAddress:  "203.0.113.30",
+		OriginAddress:  "93.184.216.30",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 		AllowedPoPs:    []string{}, // Global domain
@@ -2314,7 +2314,7 @@ func TestHandler_PoPConfigIsolationScope(t *testing.T) {
 	frankfurtOrig := &model.Origin{
 		ID:          "orig-frankfurt",
 		PoolID:      routes[0].PoolID,
-		Address:     "198.51.100.99",
+		Address:     "93.184.216.99",
 		Port:        443,
 		Protocol:    model.ProtocolHTTPS,
 		Weight:      100,
@@ -2350,14 +2350,14 @@ func TestHandler_PoPConfigIsolationScope(t *testing.T) {
 		t.Errorf("LEAK DETECTED: dhaka pop config contains singapore-only domain singapore.example.com!")
 	}
 
-	// MUST contain dhaka origin address (203.0.113.30 or 203.0.113.10)
-	if !strings.Contains(cfgStr, "203.0.113.30") && !strings.Contains(cfgStr, "203.0.113.10") {
+	// MUST contain dhaka origin address (93.184.216.30 or 93.184.216.10)
+	if !strings.Contains(cfgStr, "93.184.216.30") && !strings.Contains(cfgStr, "93.184.216.10") {
 		t.Errorf("expected dhaka pop config to contain dhaka origin")
 	}
 
-	// MUST NOT contain frankfurt-only origin (198.51.100.99) (P1 Origin Leak Prevention)
-	if strings.Contains(cfgStr, "198.51.100.99") {
-		t.Errorf("LEAK DETECTED: dhaka pop config contains frankfurt-only origin 198.51.100.99!")
+	// MUST NOT contain frankfurt-only origin (93.184.216.99) (P1 Origin Leak Prevention)
+	if strings.Contains(cfgStr, "93.184.216.99") {
+		t.Errorf("LEAK DETECTED: dhaka pop config contains frankfurt-only origin 93.184.216.99!")
 	}
 
 	// 5. Node bound to Singapore requests /v1/edge/pops/singapore/config
@@ -2655,7 +2655,7 @@ func TestPoP_EmptyOriginOmissionPreventsBlackhole(t *testing.T) {
 			{
 				ID:          "orig-sin",
 				PoolID:      poolID,
-				Address:     "203.0.113.15",
+				Address:     "93.184.216.15",
 				Port:        443,
 				Protocol:    "HTTPS",
 				Healthy:     true,
@@ -2779,7 +2779,7 @@ func TestPoP_SnapshotChecksumMatchesResponseBody(t *testing.T) {
 			{
 				ID:          "orig-cs",
 				PoolID:      "pool-checksum-test",
-				Address:     "203.0.113.88",
+				Address:     "93.184.216.88",
 				Port:        443,
 				Protocol:    "HTTPS",
 				Healthy:     true,
@@ -2851,7 +2851,7 @@ func TestPoPConfigSyncContract_GoldenFixture(t *testing.T) {
 			{
 				ID:          "orig-api",
 				PoolID:      apiPoolID,
-				Address:     "198.51.100.10",
+				Address:     "93.184.216.34",
 				Port:        443,
 				Protocol:    "HTTPS",
 				Healthy:     true,
@@ -2870,7 +2870,7 @@ func TestPoPConfigSyncContract_GoldenFixture(t *testing.T) {
 			{
 				ID:          "orig-admin",
 				PoolID:      adminPoolID,
-				Address:     "198.51.100.20",
+				Address:     "93.184.216.35",
 				Port:        443,
 				Protocol:    "HTTPS",
 				Healthy:     true,

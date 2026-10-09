@@ -110,6 +110,7 @@ pub struct ProxyState {
     pub inflight_buffer_semaphore: Arc<tokio::sync::Semaphore>,
     pub aggregate_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub aggregate_buffered_request_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    pub is_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub async fn handle_request(
@@ -121,6 +122,41 @@ pub async fn handle_request(
     let method = req.method().clone();
     let uri_string = req.uri().to_string();
     let path = req.uri().path().to_string();
+
+    // Operational Health & Readiness Endpoints (Deployment Orchestration Gate)
+    if path == "/healthz" || path == "/live" {
+        let body = serde_json::json!({
+            "status": "healthy",
+            "uptime_secs": start_time.elapsed().as_secs(),
+        });
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge/0.1.0")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    if path == "/ready" {
+        let is_ready = state.is_ready.load(std::sync::atomic::Ordering::Acquire);
+        let status = if is_ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        };
+        let body = serde_json::json!({
+            "status": if is_ready { "ready" } else { "unready" },
+            "control_plane_synced": is_ready,
+        });
+        let resp = Response::builder()
+            .status(status)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge/0.1.0")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        return Ok(resp);
+    }
 
     // 1. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();

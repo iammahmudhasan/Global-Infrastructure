@@ -727,10 +727,10 @@ func TestCompiler_RuntimeDNSRebindingSSRF(t *testing.T) {
 
 	topologies := st.GetActiveTopologies()
 
-	// 1. Initial Resolution: Safe public IP (203.0.113.10)
+	// 1. Initial Resolution: Safe public IP (93.184.216.34)
 	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
 		if host == "customer-origin.example.com" {
-			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
 		}
 		return nil, net.UnknownNetworkError("nxdomain")
 	})
@@ -757,8 +757,8 @@ func TestCompiler_RuntimeDNSRebindingSSRF(t *testing.T) {
 		t.Fatalf("expected 1 lb endpoint, got %d", len(originCluster1.LoadAssignment.Endpoints[0].LbEndpoints))
 	}
 	epAddr := originCluster1.LoadAssignment.Endpoints[0].LbEndpoints[0].Endpoint.Address.SocketAddress.Address
-	if epAddr != "203.0.113.10" {
-		t.Fatalf("expected pinned endpoint 203.0.113.10, got %s", epAddr)
+	if epAddr != "93.184.216.34" {
+		t.Fatalf("expected pinned endpoint 93.184.216.34, got %s", epAddr)
 	}
 
 	// 2. DNS Rebinding / SSRF attack: DNS changes and resolves to 127.0.0.1 (loopback)
@@ -819,7 +819,7 @@ func TestCompiler_RuntimeDNSRebindingSSRF(t *testing.T) {
 	// 4. Mixed resolution containing safe + RFC1918 private IP (10.0.0.1) -> Must reject completely
 	comp.SetDNSResolver(func(ctx context.Context, host string) ([]net.IP, error) {
 		if host == "customer-origin.example.com" {
-			return []net.IP{net.ParseIP("203.0.113.10"), net.ParseIP("10.0.0.1")}, nil
+			return []net.IP{net.ParseIP("93.184.216.34"), net.ParseIP("10.0.0.1")}, nil
 		}
 		return nil, net.UnknownNetworkError("nxdomain")
 	})

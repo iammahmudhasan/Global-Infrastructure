@@ -4,15 +4,22 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use nexusedge_gateway::cache::EdgeCache;
+use nexusedge_gateway::config::GatewayConfig;
 use nexusedge_gateway::dns::PinnedDnsResolver;
+use nexusedge_gateway::proxy::{handle_request, ProxyState};
+use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{parse_pop_config_routes, Router, RouterError, RoutingError};
 use nexusedge_gateway::sync::{
     fetch_and_apply_control_plane_snapshot, validate_control_plane_endpoint, SyncError,
+    MAX_CONTROL_PLANE_SNAPSHOT_BYTES,
 };
+use nexusedge_gateway::waf::WafEngine;
 use reqwest::dns::Resolve;
 use reqwest::Client as HttpClient;
 use sha2::Digest;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -76,6 +83,43 @@ async fn spawn_mock_control_plane(
     (addr, shutdown_tx)
 }
 
+/// Helper that spawns a gateway HTTP server to verify readiness and liveness endpoints.
+async fn spawn_mock_gateway(
+    state: Arc<ProxyState>,
+) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let server_builder = ConnBuilder::new(hyper_util::rt::TokioExecutor::new());
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept_res = listener.accept() => {
+                    let (stream, remote_addr) = match accept_res {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    };
+                    let io = TokioIo::new(stream);
+                    let state_clone = Arc::clone(&state);
+                    let builder = server_builder.clone();
+
+                    tokio::spawn(async move {
+                        let service = service_fn(move |req| {
+                            let s = Arc::clone(&state_clone);
+                            async move { handle_request(req, remote_addr.ip(), s).await }
+                        });
+                        let _ = builder.serve_connection(io, service).await;
+                    });
+                }
+            }
+        }
+    });
+
+    (addr, shutdown_tx)
+}
+
 #[tokio::test]
 async fn test_e2e_snapshot_sync_and_route_application() {
     let snapshot_json = r#"{
@@ -85,7 +129,7 @@ async fn test_e2e_snapshot_sync_and_route_application() {
                 "host": "api.nexusedge.io",
                 "origins": [
                     {
-                        "address": "198.51.100.10",
+                        "address": "93.184.216.34",
                         "port": 8080,
                         "protocol": "HTTP",
                         "sni": "api.nexusedge.io"
@@ -97,7 +141,7 @@ async fn test_e2e_snapshot_sync_and_route_application() {
                         "priority": 100,
                         "origins": [
                             {
-                                "address": "198.51.100.20",
+                                "address": "93.184.216.35",
                                 "port": 8080,
                                 "protocol": "HTTP",
                                 "sni": "auth.nexusedge.io"
@@ -138,13 +182,13 @@ async fn test_e2e_snapshot_sync_and_route_application() {
     let upstream = router
         .select_upstream_for_host_and_path("api.nexusedge.io", "/")
         .unwrap();
-    assert_eq!(upstream, "http://198.51.100.10:8080");
+    assert_eq!(upstream, "http://93.184.216.34:8080");
 
     // Verify sub-path routes to priority path origin
     let auth_upstream = router
         .select_upstream_for_host_and_path("api.nexusedge.io", "/v1/auth/login")
         .unwrap();
-    assert_eq!(auth_upstream, "http://198.51.100.20:8080");
+    assert_eq!(auth_upstream, "http://93.184.216.35:8080");
 }
 
 #[tokio::test]
@@ -156,7 +200,7 @@ async fn test_e2e_ipv6_origin_pinning_and_dns_resolution() {
                 "host": "ipv6.nexusedge.io",
                 "origins": [
                     {
-                        "address": "2001:db8::1",
+                        "address": "2606:2800:220:1:248:1893:25c8:1946",
                         "port": 443,
                         "protocol": "HTTPS",
                         "sni": "secure.ipv6.origin.net"
@@ -196,7 +240,7 @@ async fn test_e2e_ipv6_origin_pinning_and_dns_resolution() {
     assert!(first_addr.is_ipv6());
     assert_eq!(
         first_addr,
-        SocketAddr::new("2001:db8::1".parse().unwrap(), 443)
+        SocketAddr::new("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap(), 443)
     );
 }
 
@@ -209,7 +253,7 @@ async fn test_e2e_tampered_checksum_fails_closed() {
                 "host": "critical.nexusedge.io",
                 "origins": [
                     {
-                        "address": "198.51.100.99",
+                        "address": "93.184.216.34",
                         "port": 8080,
                         "protocol": "HTTP",
                         "sni": "critical.nexusedge.io"
@@ -267,7 +311,7 @@ async fn test_e2e_missing_checksum_header_fails_closed() {
                 "host": "unauthenticated.nexusedge.io",
                 "origins": [
                     {
-                        "address": "198.51.100.88",
+                        "address": "93.184.216.34",
                         "port": 8080,
                         "protocol": "HTTP",
                         "sni": "unauthenticated.nexusedge.io"
@@ -405,7 +449,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
         "routes": [{
             "host": "test.example.com",
             "origins": [{
-                "address": "203.0.113.10",
+                "address": "93.184.216.34",
                 "port": 443,
                 "protocol": "HTTPS",
                 "sni": "origin.example.com"
@@ -419,7 +463,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
         "routes": [{
             "host": "test.example.com",
             "origins": [{
-                "address": "2001:db8::1",
+                "address": "2606:2800:220:1:248:1893:25c8:1946",
                 "port": 443,
                 "protocol": "HTTPS",
                 "sni": "origin.example.com"
@@ -428,7 +472,143 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
     }"#;
     assert!(parse_pop_config_routes(public_v6_json).is_ok());
 
-    // 3. 10.0.0.8 + public-looking SNI -> Reject
+    // 3. Documentation IPv4 TEST-NET-1 (192.0.2.1) -> Reject
+    let testnet1_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "192.0.2.1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.example.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(testnet1_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 4. Documentation IPv4 TEST-NET-2 (198.51.100.1) -> Reject
+    let testnet2_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "198.51.100.1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.example.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(testnet2_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 5. Documentation IPv4 TEST-NET-3 (203.0.113.1) -> Reject
+    let testnet3_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "203.0.113.1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.example.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(testnet3_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 6. Documentation IPv6 (2001:db8::1) -> Reject
+    let doc_v6_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "2001:db8::1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.example.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(doc_v6_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 7. IPv4-mapped IPv6 Loopback (::ffff:127.0.0.1) -> Reject
+    let mapped_loopback_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "::ffff:127.0.0.1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.customer.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(mapped_loopback_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 8. IPv4-mapped IPv6 RFC 1918 Private (::ffff:10.0.0.1) -> Reject
+    let mapped_private_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "::ffff:10.0.0.1",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.customer.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(mapped_private_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 9. IPv4-mapped IPv6 Cloud Metadata (::ffff:169.254.169.254) -> Reject
+    let mapped_metadata_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "::ffff:169.254.169.254",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.customer.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(mapped_metadata_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 10. IPv4-mapped IPv6 TEST-NET (::ffff:198.51.100.5) -> Reject
+    let mapped_testnet_json = r#"{
+        "routes": [{
+            "host": "test.example.com",
+            "origins": [{
+                "address": "::ffff:198.51.100.5",
+                "port": 443,
+                "protocol": "HTTPS",
+                "sni": "origin.customer.com"
+            }]
+        }]
+    }"#;
+    assert!(matches!(
+        parse_pop_config_routes(mapped_testnet_json).unwrap_err(),
+        RouterError::UnsafeTargetUrl { .. }
+    ));
+
+    // 11. 10.0.0.8 + public-looking SNI -> Reject
     let private_v4_json = r#"{
         "routes": [{
             "host": "test.example.com",
@@ -443,7 +623,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
     let err = parse_pop_config_routes(private_v4_json).unwrap_err();
     assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
-    // 4. 127.0.0.1 + SNI -> Reject
+    // 12. 127.0.0.1 + SNI -> Reject
     let loopback_json = r#"{
         "routes": [{
             "host": "test.example.com",
@@ -458,7 +638,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
     let err = parse_pop_config_routes(loopback_json).unwrap_err();
     assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
-    // 5. 169.254.169.254 + SNI -> Reject
+    // 13. 169.254.169.254 + SNI -> Reject
     let metadata_json = r#"{
         "routes": [{
             "host": "test.example.com",
@@ -473,7 +653,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
     let err = parse_pop_config_routes(metadata_json).unwrap_err();
     assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
-    // 6. IPv6 fc00::/7 ULA + SNI -> Reject
+    // 14. IPv6 fc00::/7 ULA + SNI -> Reject
     let ula_json = r#"{
         "routes": [{
             "host": "test.example.com",
@@ -488,7 +668,7 @@ async fn test_e2e_ssrf_sni_bypass_rejection() {
     let err = parse_pop_config_routes(ula_json).unwrap_err();
     assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
-    // 7. Hostname address without pinned IP -> Reject
+    // 15. Hostname address without pinned IP -> Reject
     let unpinned_json = r#"{
         "routes": [{
             "host": "test.example.com",
@@ -510,7 +690,7 @@ async fn test_e2e_atomic_dns_and_route_consistency() {
         "routes": [{
             "host": "tenant-initial.com",
             "origins": [{
-                "address": "203.0.113.50",
+                "address": "93.184.216.34",
                 "port": 443,
                 "protocol": "HTTPS",
                 "sni": "initial-origin.tenant.com"
@@ -554,6 +734,221 @@ async fn test_e2e_atomic_dns_and_route_consistency() {
     let mut resolved_addrs = dns_resolver.resolve(resolved_name).await.unwrap();
     assert_eq!(
         resolved_addrs.next().unwrap(),
-        SocketAddr::new("203.0.113.50".parse().unwrap(), 443)
+        SocketAddr::new("93.184.216.34".parse().unwrap(), 443)
     );
+}
+
+#[tokio::test]
+async fn test_e2e_snapshot_content_length_budget_exceeded() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let server_builder = ConnBuilder::new(hyper_util::rt::TokioExecutor::new());
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept_res = listener.accept() => {
+                    let (stream, _) = match accept_res {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    };
+                    let io = TokioIo::new(stream);
+                    let builder = server_builder.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("Content-Length", (MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024).to_string())
+                                .header("X-Snapshot-Checksum", "deadbeef")
+                                .body(Full::new(Bytes::from_static(b"{}")))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        });
+                        let _ = builder.serve_connection(io, service).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let dns_resolver = Arc::new(PinnedDnsResolver::new());
+    let router = Router::new(vec![], 5000);
+    let client = HttpClient::new();
+
+    let err = fetch_and_apply_control_plane_snapshot(
+        &endpoint,
+        "dhaka-edge-01",
+        "",
+        &client,
+        &router,
+        &dns_resolver,
+    )
+    .await
+    .expect_err("Oversized content-length must fail immediately");
+
+    match err {
+        SyncError::SnapshotTooLarge { size, limit } => {
+            assert_eq!(size, MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024);
+            assert_eq!(limit, MAX_CONTROL_PLANE_SNAPSHOT_BYTES);
+        }
+        other => panic!("Expected SnapshotTooLarge, got: {:?}", other),
+    }
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_e2e_snapshot_streaming_chunk_overflow() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let server_builder = ConnBuilder::new(hyper_util::rt::TokioExecutor::new());
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accept_res = listener.accept() => {
+                    let (stream, _) = match accept_res {
+                        Ok(conn) => conn,
+                        Err(_) => break,
+                    };
+                    let io = TokioIo::new(stream);
+                    let builder = server_builder.clone();
+                    tokio::spawn(async move {
+                        let service = service_fn(|_req: Request<hyper::body::Incoming>| async {
+                            // Produce a payload of 16 MiB + 1024 bytes without Content-Length
+                            let big_chunk = vec![b' '; MAX_CONTROL_PLANE_SNAPSHOT_BYTES + 1024];
+                            let resp = Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Snapshot-Checksum", "deadbeef")
+                                .body(Full::new(Bytes::from(big_chunk)))
+                                .unwrap();
+                            Ok::<_, hyper::Error>(resp)
+                        });
+                        let _ = builder.serve_connection(io, service).await;
+                    });
+                }
+            }
+        }
+    });
+
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let dns_resolver = Arc::new(PinnedDnsResolver::new());
+    let router = Router::new(vec![], 5000);
+    let client = HttpClient::new();
+
+    let err = fetch_and_apply_control_plane_snapshot(
+        &endpoint,
+        "dhaka-edge-01",
+        "",
+        &client,
+        &router,
+        &dns_resolver,
+    )
+    .await
+    .expect_err("Streaming snapshot exceeding budget must be rejected");
+
+    match err {
+        SyncError::SnapshotTooLarge { size, limit } => {
+            assert!(size > MAX_CONTROL_PLANE_SNAPSHOT_BYTES);
+            assert_eq!(limit, MAX_CONTROL_PLANE_SNAPSHOT_BYTES);
+        }
+        other => panic!("Expected SnapshotTooLarge, got: {:?}", other),
+    }
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_e2e_readiness_and_liveness_probes() {
+    let config = GatewayConfig::default();
+    let is_ready = Arc::new(AtomicBool::new(false));
+    let state = Arc::new(ProxyState {
+        rate_limiter: RateLimiter::new(
+            config.rate_limit.enabled,
+            config.rate_limit.requests_per_second,
+            config.rate_limit.burst_capacity,
+        ),
+        waf: WafEngine::new(&config.waf),
+        cache: EdgeCache::new(
+            config.cache.enabled,
+            config.cache.default_ttl_seconds,
+            config.cache.max_entries,
+            config.cache.max_bytes,
+        ),
+        router: Router::new(vec![], 5000),
+        http_client: HttpClient::new(),
+        inflight_buffer_semaphore: Arc::new(tokio::sync::Semaphore::new(100)),
+        aggregate_buffered_bytes: Arc::new(AtomicUsize::new(0)),
+        aggregate_buffered_request_bytes: Arc::new(AtomicUsize::new(0)),
+        is_ready: Arc::clone(&is_ready),
+        config,
+    });
+
+    let (addr, shutdown_tx) = spawn_mock_gateway(state).await;
+    let client = HttpClient::new();
+
+    // 1. /healthz must always return 200 OK (liveness probe)
+    let health_resp = client
+        .get(format!("http://127.0.0.1:{}/healthz", addr.port()))
+        .send()
+        .await
+        .expect("Healthz probe request must succeed");
+    assert_eq!(health_resp.status(), reqwest::StatusCode::OK);
+
+    // 2. /ready must return 503 SERVICE_UNAVAILABLE when not ready
+    let unready_resp = client
+        .get(format!("http://127.0.0.1:{}/ready", addr.port()))
+        .send()
+        .await
+        .expect("Ready probe request must succeed");
+    assert_eq!(
+        unready_resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    // 3. Flip readiness flag to true (simulating successful initial control plane sync)
+    is_ready.store(true, Ordering::Release);
+
+    // 4. /ready must now return 200 OK
+    let ready_resp = client
+        .get(format!("http://127.0.0.1:{}/ready", addr.port()))
+        .send()
+        .await
+        .expect("Ready probe request must succeed");
+    assert_eq!(ready_resp.status(), reqwest::StatusCode::OK);
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_e2e_strict_dns_fails_closed_on_unpinned_host() {
+    let resolver = PinnedDnsResolver::new();
+    let mut mappings = std::collections::HashMap::new();
+    mappings.insert(
+        "pinned.example.com".to_string(),
+        vec!["93.184.216.34:443".parse().unwrap()],
+    );
+    resolver.set_all(mappings);
+
+    // Pinned hostname resolves
+    let host: reqwest::dns::Name = "pinned.example.com".parse().unwrap();
+    let mut resolved = resolver
+        .resolve(host)
+        .await
+        .expect("Pinned host must resolve");
+    assert_eq!(resolved.next(), Some("93.184.216.34:443".parse().unwrap()));
+
+    // Unpinned hostname fails closed with PermissionDenied (never falls back to ambient DNS)
+    let unpinned: reqwest::dns::Name = "unpinned.malicious.internal".parse().unwrap();
+    let res = resolver.resolve(unpinned).await;
+    assert!(res.is_err(), "Unpinned host must fail closed");
+    let err = res.err().unwrap();
+    assert!(err.to_string().contains("Strict DNS"));
 }

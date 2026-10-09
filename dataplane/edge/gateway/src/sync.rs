@@ -4,6 +4,10 @@ use reqwest::Client as HttpClient;
 use sha2::Digest;
 use std::fmt;
 
+/// Maximum permissible payload budget for Control Plane dynamic configuration snapshots.
+/// Enforces bounded memory allocation on edge nodes to defeat snapshot memory-bomb attacks (P2 Finding).
+pub const MAX_CONTROL_PLANE_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncStats {
     pub routes_applied: usize,
@@ -17,6 +21,7 @@ pub enum SyncError {
     BadStatus(u16),
     MissingChecksumHeader,
     EmptyChecksumHeader,
+    SnapshotTooLarge { size: usize, limit: usize },
     ChecksumMismatch { expected: String, computed: String },
     ParseError(String),
     RouteApplyError(String),
@@ -39,6 +44,11 @@ impl fmt::Display for SyncError {
                 "Mandatory X-Snapshot-Checksum header missing from response"
             ),
             SyncError::EmptyChecksumHeader => write!(f, "X-Snapshot-Checksum header is empty"),
+            SyncError::SnapshotTooLarge { size, limit } => write!(
+                f,
+                "Control plane snapshot payload too large ({} bytes exceeds limit of {} bytes)",
+                size, limit
+            ),
             SyncError::ChecksumMismatch { expected, computed } => {
                 write!(
                     f,
@@ -172,12 +182,32 @@ pub async fn fetch_and_apply_control_plane_snapshot(
         return Err(SyncError::EmptyChecksumHeader);
     }
 
-    let body_str = resp
-        .text()
-        .await
-        .map_err(|e| SyncError::NetworkError(format!("Failed to read response body: {}", e)))?;
+    // Fast-fail check on Content-Length header if present
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_CONTROL_PLANE_SNAPSHOT_BYTES as u64 {
+            return Err(SyncError::SnapshotTooLarge {
+                size: content_length as usize,
+                limit: MAX_CONTROL_PLANE_SNAPSHOT_BYTES,
+            });
+        }
+    }
 
-    let computed_hash = format!("{:x}", sha2::Sha256::digest(body_str.as_bytes()));
+    // Stream response chunks up to MAX_CONTROL_PLANE_SNAPSHOT_BYTES (bounded memory guarantee)
+    let mut body_bytes = Vec::new();
+    let mut resp_stream = resp;
+    while let Some(chunk) = resp_stream.chunk().await.map_err(|e| {
+        SyncError::NetworkError(format!("Failed to read snapshot response chunk: {}", e))
+    })? {
+        if body_bytes.len().saturating_add(chunk.len()) > MAX_CONTROL_PLANE_SNAPSHOT_BYTES {
+            return Err(SyncError::SnapshotTooLarge {
+                size: body_bytes.len().saturating_add(chunk.len()),
+                limit: MAX_CONTROL_PLANE_SNAPSHOT_BYTES,
+            });
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    let computed_hash = format!("{:x}", sha2::Sha256::digest(&body_bytes));
     if !expected_checksum.eq_ignore_ascii_case(&computed_hash) {
         return Err(SyncError::ChecksumMismatch {
             expected: expected_checksum,
@@ -185,7 +215,11 @@ pub async fn fetch_and_apply_control_plane_snapshot(
         });
     }
 
-    let new_routes = router::parse_pop_config_routes(&body_str)
+    let body_str = std::str::from_utf8(&body_bytes).map_err(|e| {
+        SyncError::ParseError(format!("Snapshot payload is not valid UTF-8: {}", e))
+    })?;
+
+    let new_routes = router::parse_pop_config_routes(body_str)
         .map_err(|e| SyncError::ParseError(e.to_string()))?;
 
     let routes_count = new_routes.len();

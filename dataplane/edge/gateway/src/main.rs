@@ -21,7 +21,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use reqwest::Client as HttpClient;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -128,6 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ));
     let aggregate_buffered_bytes = Arc::new(AtomicUsize::new(0));
     let aggregate_buffered_request_bytes = Arc::new(AtomicUsize::new(0));
+    let is_ready = Arc::new(AtomicBool::new(!config.control_plane.enabled));
 
     let state = Arc::new(ProxyState {
         config: config.clone(),
@@ -139,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         inflight_buffer_semaphore,
         aggregate_buffered_bytes,
         aggregate_buffered_request_bytes,
+        is_ready: Arc::clone(&is_ready),
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
@@ -151,12 +153,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
-    // 5. Control Plane Dynamic Snapshot Synchronizer (P1 Consistency Bridge)
+    // 5. Control Plane Dynamic Snapshot Synchronizer (P1 Consistency Bridge & Readiness Gate)
     if config.control_plane.enabled || config.control_plane.snapshot_file.is_some() {
         let sync_router = router.clone();
         let sync_dns = Arc::clone(&dns_resolver);
+        let sync_is_ready = Arc::clone(&is_ready);
         let cp_cfg = config.control_plane.clone();
-        let sync_client = http_client.clone();
+
+        // Control Plane HTTP client uses standard host DNS resolution (completely decoupled from origin DNS pinning)
+        let sync_client = HttpClient::builder()
+            .timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
 
         tokio::spawn(async move {
             let interval_secs = cp_cfg.poll_interval_secs.max(5);
@@ -176,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     e
                                 );
                             } else {
+                                sync_is_ready.store(true, Ordering::SeqCst);
                                 tracing::info!(
                                     "Atomically synchronized edge routes from snapshot file: {}",
                                     snapshot_path
@@ -198,6 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     .await
                     {
                         Ok(stats) => {
+                            sync_is_ready.store(true, Ordering::SeqCst);
                             tracing::info!(
                                 pop_id = %cp_cfg.pop_id,
                                 routes = stats.routes_applied,
@@ -206,11 +216,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                pop_id = %cp_cfg.pop_id,
-                                error = %e,
-                                "Control Plane sync cycle skipped or failed"
-                            );
+                            if sync_is_ready.load(Ordering::SeqCst) {
+                                tracing::warn!(
+                                    pop_id = %cp_cfg.pop_id,
+                                    error = %e,
+                                    "Control Plane sync cycle failed; continuing with stale last-known-good configuration"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    pop_id = %cp_cfg.pop_id,
+                                    error = %e,
+                                    "Initial Control Plane sync pending or failed; edge gateway remains unready"
+                                );
+                            }
                         }
                     }
                 }

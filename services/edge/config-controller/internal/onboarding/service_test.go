@@ -97,8 +97,18 @@ func TestValidateOriginAddress_SSRFProtection(t *testing.T) {
 		"10.0.0.1",
 		"172.16.0.5",
 		"192.168.1.1",
-		"169.254.169.254", // Cloud metadata
-		"100.64.0.1",      // CGNAT
+		"169.254.169.254",        // Cloud metadata
+		"100.64.0.1",             // CGNAT
+		"192.0.2.1",              // TEST-NET-1 (RFC 5737)
+		"198.51.100.20",          // TEST-NET-2 (RFC 5737)
+		"203.0.113.15",           // TEST-NET-3 (RFC 5737)
+		"198.18.0.1",             // Benchmarking (RFC 2544)
+		"::ffff:127.0.0.1",       // IPv4-mapped loopback (SSRF P1 bypass attempt)
+		"::ffff:10.0.0.1",        // IPv4-mapped private
+		"::ffff:169.254.169.254", // IPv4-mapped metadata
+		"::ffff:203.0.113.15",    // IPv4-mapped documentation
+		"2001:db8::1",            // IPv6 documentation (RFC 3849)
+		"2001:2::1",              // IPv6 benchmarking (RFC 5180)
 		"localhost",
 		"backend.internal",
 		"app.local",
@@ -115,8 +125,11 @@ func TestValidateOriginAddress_SSRFProtection(t *testing.T) {
 
 	validOrigins := []string{
 		"origin.customer.com",
-		"203.0.113.15",
-		"198.51.100.20",
+		"93.184.216.34",
+		"93.184.216.35",
+		"142.250.190.46",
+		"2606:2800:220:1:248:1893:25c8:1946",
+		"::ffff:93.184.216.34",
 		"api.upstream-partner.io",
 	}
 
@@ -178,7 +191,7 @@ func TestVerifyDomain_DoesNotBypassDNSVerification(t *testing.T) {
 	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj-test",
 		Hostname:       "unverified-random-12345.example.com",
-		OriginAddress:  "198.51.100.20",
+		OriginAddress:  "93.184.216.34",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -202,7 +215,7 @@ func TestVerifyDomain_DefaultEnvironmentMustNotAutoActivate(t *testing.T) {
 	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj-test",
 		Hostname:       "unverified-default-env-999.example.com",
-		OriginAddress:  "198.51.100.20",
+		OriginAddress:  "93.184.216.34",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -223,7 +236,7 @@ func TestVerifyDomain_PositiveAllowlistDevGate(t *testing.T) {
 	resp, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj-test",
 		Hostname:       "dev-gate-check.example.com",
-		OriginAddress:  "198.51.100.30",
+		OriginAddress:  "93.184.216.34",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -261,7 +274,7 @@ func TestOnboardDomain_ProjectQuotaEnforcement(t *testing.T) {
 	_, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      projectID,
 		Hostname:       "d1.quota.example.com",
-		OriginAddress:  "198.51.100.1",
+		OriginAddress:  "93.184.216.34",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -273,7 +286,7 @@ func TestOnboardDomain_ProjectQuotaEnforcement(t *testing.T) {
 	_, err = svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      projectID,
 		Hostname:       "d2.quota.example.com",
-		OriginAddress:  "198.51.100.2",
+		OriginAddress:  "93.184.216.35",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -285,7 +298,7 @@ func TestOnboardDomain_ProjectQuotaEnforcement(t *testing.T) {
 	_, err = svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      projectID,
 		Hostname:       "d3.quota.example.com",
-		OriginAddress:  "198.51.100.3",
+		OriginAddress:  "93.184.216.36",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})
@@ -301,7 +314,7 @@ func TestOnboardDomain_SweepExpiredPendingDomains(t *testing.T) {
 	res, err := svc.OnboardDomain(onboarding.OnboardRequest{
 		ProjectID:      "prj-sweep-test",
 		Hostname:       "sweep-target.example.com",
-		OriginAddress:  "198.51.100.10",
+		OriginAddress:  "93.184.216.34",
 		OriginPort:     443,
 		OriginProtocol: "HTTPS",
 	})

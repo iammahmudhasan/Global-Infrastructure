@@ -37,6 +37,11 @@ pub enum RouterError {
         reason: String,
     },
     InvalidPayload(String),
+    InvalidPathPrefix {
+        host: String,
+        prefix: String,
+        reason: String,
+    },
 }
 
 pub type RoutingError = RouterError;
@@ -86,6 +91,17 @@ impl std::fmt::Display for RouterError {
             }
             RouterError::InvalidPayload(reason) => {
                 write!(f, "Invalid configuration payload: {}", reason)
+            }
+            RouterError::InvalidPathPrefix {
+                host,
+                prefix,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Invalid path prefix '{}' for host '{}': {}",
+                    prefix, host, reason
+                )
             }
         }
     }
@@ -315,16 +331,16 @@ impl Router {
             let mut domain_routes = Vec::new();
             for r in &cfg.routes {
                 if !r.path_routes.is_empty() {
-                    let path_routes = r
-                        .path_routes
-                        .iter()
-                        .map(|pr| PathRoute {
+                    let mut path_routes = Vec::new();
+                    for pr in &r.path_routes {
+                        validate_path_prefix(&r.host, &pr.path_prefix)?;
+                        path_routes.push(PathRoute {
                             path_prefix: pr.path_prefix.clone(),
                             priority: pr.priority,
                             origins: pr.targets.iter().cloned().map(Self::create_node).collect(),
                             round_robin_index: Arc::new(AtomicUsize::new(0)),
-                        })
-                        .collect();
+                        });
+                    }
                     domain_routes.push(DomainRoute::with_paths(
                         r.host.clone(),
                         path_routes,
@@ -379,6 +395,7 @@ impl Router {
                 validate_target_url(&norm_host, &node.url)?;
             }
             for pr in &route.path_routes {
+                validate_path_prefix(&norm_host, &pr.path_prefix)?;
                 for node in &pr.origins {
                     validate_target_url(&norm_host, &node.url)?;
                 }
@@ -471,6 +488,7 @@ impl Router {
                 validate_target_url(&norm_host, &node.url)?;
             }
             for pr in &route.path_routes {
+                validate_path_prefix(&norm_host, &pr.path_prefix)?;
                 for node in &pr.origins {
                     validate_target_url(&norm_host, &node.url)?;
                 }
@@ -540,10 +558,12 @@ impl Router {
             .map(|u| Self::create_node_with_health(u, &health_states))
             .collect();
 
-        // 4. Pre-publish validated DNS mappings so new routes never observe unpinned resolution
-        dns_resolver.set_all(candidate_dns);
+        // 4. Staged DNS Pre-publish (merge candidate mappings):
+        // Retains active route pins while ensuring new route pins are immediately present
+        // for any request evaluated right at the transition boundary.
+        dns_resolver.merge_mappings(&candidate_dns);
 
-        // 5. Atomically swap routes in memory
+        // 5. Atomically swap routes in memory under exclusive write lock
         {
             let mut routes_guard = self.routes.write().unwrap();
             let mut defaults_guard = self.default_nodes.write().unwrap();
@@ -551,6 +571,9 @@ impl Router {
             *routes_guard = final_routes_map;
             *defaults_guard = default_nodes;
         }
+
+        // 6. Prune DNS mappings to exact active candidate set after the route swap
+        dns_resolver.set_all(candidate_dns);
 
         self.is_multi_tenant.store(true, Ordering::SeqCst);
         Ok(())
@@ -823,61 +846,132 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
+/// Validates route path_prefix ensuring non-empty and leading slash.
+/// Strict industrial contract: '/' is explicit catch-all root.
+/// Empty strings, relative prefixes without leading slash, and whitespace are strictly rejected.
+pub fn validate_path_prefix(host: &str, prefix: &str) -> Result<(), RouterError> {
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Err(RouterError::InvalidPathPrefix {
+            host: host.to_string(),
+            prefix: prefix.to_string(),
+            reason: "Path prefix cannot be empty".to_string(),
+        });
+    }
+    if !trimmed.starts_with('/') {
+        return Err(RouterError::InvalidPathPrefix {
+            host: host.to_string(),
+            prefix: prefix.to_string(),
+            reason: "Path prefix must start with leading '/'".to_string(),
+        });
+    }
+    if prefix.contains(' ')
+        || prefix.contains('\r')
+        || prefix.contains('\n')
+        || prefix.contains('\t')
+    {
+        return Err(RouterError::InvalidPathPrefix {
+            host: host.to_string(),
+            prefix: prefix.to_string(),
+            reason: "Path prefix must not contain whitespace characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Identifies private RFC 1918, loopback, link-local, carrier-grade NAT, multicast,
-/// broadcast, and IPv6 ULA / link-local destinations (Anti-SSRF Parity with Control Plane).
+/// broadcast, special-purpose protocol, documentation, benchmarking, and IPv6 ULA / link-local destinations.
+/// Fully handles IPv4-mapped IPv6 (::ffff:x.x.x.x) by extracting the mapped IPv4 and applying IPv4 policy (Anti-SSRF Parity).
 pub fn is_private_or_reserved_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
-            // 0.0.0.0/8 (Unspecified)
+            // 0.0.0.0/8 (Unspecified / Local identification - RFC 1122)
             if octets[0] == 0 {
                 return true;
             }
-            // 10.0.0.0/8 (RFC 1918)
+            // 10.0.0.0/8 (Private-Use - RFC 1918)
             if octets[0] == 10 {
                 return true;
             }
-            // 100.64.0.0/10 (CGNAT / Shared Address Space)
+            // 100.64.0.0/10 (Shared Address Space / CGNAT - RFC 6598)
             if octets[0] == 100 && (64..=127).contains(&octets[1]) {
                 return true;
             }
-            // 127.0.0.0/8 (Loopback)
+            // 127.0.0.0/8 (Loopback - RFC 1122)
             if octets[0] == 127 {
                 return true;
             }
-            // 169.254.0.0/16 (Link-local)
+            // 169.254.0.0/16 (Link-local - RFC 3927)
             if octets[0] == 169 && octets[1] == 254 {
                 return true;
             }
-            // 172.16.0.0/12 (RFC 1918)
+            // 172.16.0.0/12 (Private-Use - RFC 1918)
             if octets[0] == 172 && (16..=31).contains(&octets[1]) {
                 return true;
             }
-            // 192.168.0.0/16 (RFC 1918)
+            // 192.0.0.0/24 (IETF Protocol Assignments - RFC 6890)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 0 {
+                return true;
+            }
+            // 192.0.2.0/24 (TEST-NET-1 Documentation - RFC 5737)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+                return true;
+            }
+            // 192.168.0.0/16 (Private-Use - RFC 1918)
             if octets[0] == 192 && octets[1] == 168 {
                 return true;
             }
-            // 224.0.0.0/4 (Multicast) and 240.0.0.0/4 (Reserved / Broadcast)
+            // 198.18.0.0/15 (Benchmarking - RFC 2544)
+            if octets[0] == 198 && (18..=19).contains(&octets[1]) {
+                return true;
+            }
+            // 198.51.100.0/24 (TEST-NET-2 Documentation - RFC 5737)
+            if octets[0] == 198 && octets[1] == 51 && octets[2] == 100 {
+                return true;
+            }
+            // 203.0.113.0/24 (TEST-NET-3 Documentation - RFC 5737)
+            if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+                return true;
+            }
+            // 224.0.0.0/4 (Multicast - RFC 5771) and 240.0.0.0/4 (Reserved / Broadcast - RFC 1112)
             if octets[0] >= 224 {
                 return true;
             }
             false
         }
         std::net::IpAddr::V6(ipv6) => {
+            // First check if IPv6 is an IPv4-mapped address (::ffff:a.b.c.d)
+            if let Some(ipv4) = ipv6.to_ipv4_mapped() {
+                return is_private_or_reserved_ip(std::net::IpAddr::V4(ipv4));
+            }
+
             if ipv6.is_loopback() || ipv6.is_unspecified() {
                 return true;
             }
             let segments = ipv6.segments();
-            // fe80::/10 (Link-local unicast)
+            // fe80::/10 (Link-local unicast - RFC 4291)
             if (segments[0] & 0xffc0) == 0xfe80 {
                 return true;
             }
-            // fc00::/7 (Unique Local Address - ULA)
+            // fc00::/7 (Unique Local Address - ULA - RFC 4193)
             if (segments[0] & 0xfe00) == 0xfc00 {
                 return true;
             }
-            // ff00::/8 (Multicast)
+            // ff00::/8 (Multicast - RFC 4291)
             if (segments[0] & 0xff00) == 0xff00 {
+                return true;
+            }
+            // 2001:db8::/32 (Documentation - RFC 3849)
+            if segments[0] == 0x2001 && segments[1] == 0x0db8 {
+                return true;
+            }
+            // 2001:2::/48 (Benchmarking - RFC 5180)
+            if segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0 {
+                return true;
+            }
+            // 100::/64 (Discard-Only - RFC 6666)
+            if segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0 {
                 return true;
             }
             false
@@ -1155,6 +1249,7 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
         if !r.path_routes.is_empty() {
             let mut domain_path_routes = Vec::new();
             for pr in r.path_routes {
+                validate_path_prefix(&norm_host, &pr.path_prefix)?;
                 let mut path_origins = Vec::new();
                 if !pr.origins.is_empty() {
                     for o in &pr.origins {
@@ -1499,7 +1594,39 @@ mod tests {
     fn test_target_url_ssrf_and_schema_validation() {
         // Finding 7 & P2 Finding 8: Validate scheme, credentials, and cloud metadata / private SSRF destinations
         assert!(validate_target_url("cust", "https://origin.example.com:443").is_ok());
-        assert!(validate_target_url("cust", "https://203.0.113.20:443").is_ok());
+        // Genuine global unicast addresses (IPv4 and IPv6) are accepted
+        assert!(validate_target_url("cust", "https://93.184.216.34:443").is_ok());
+        assert!(
+            validate_target_url("cust", "https://[2606:2800:220:1:248:1893:25c8:1946]:443").is_ok()
+        );
+
+        // Documentation ranges (RFC 5737 TEST-NET-1/2/3, RFC 3849 2001:db8::/32) rejected
+        let err = validate_target_url("cust", "https://192.0.2.1:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "https://198.51.100.1:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "https://203.0.113.20:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "https://[2001:db8::1]:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+
+        // Benchmarking ranges (RFC 2544, RFC 5180) rejected
+        let err = validate_target_url("cust", "https://198.18.0.1:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "https://[2001:2::1]:443").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+
+        // IPv4-mapped IPv6 encoding private/loopback/metadata addresses rejected (Anti-SSRF P1)
+        let err = validate_target_url("cust", "http://[::ffff:127.0.0.1]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://[::ffff:10.0.0.8]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://[::ffff:192.168.1.1]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://[::ffff:169.254.169.254]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
+        let err = validate_target_url("cust", "http://[::ffff:203.0.113.20]:8080").unwrap_err();
+        assert!(matches!(err, RouterError::UnsafeTargetUrl { .. }));
 
         // RFC 1918 private IPv4 destinations rejected
         let err = validate_target_url("cust", "http://10.0.0.1:8080").unwrap_err();
@@ -1598,7 +1725,7 @@ mod tests {
                     "host": "customer.example.com",
                     "origins": [
                         {
-                            "address": "203.0.113.20",
+                            "address": "93.184.216.34",
                             "port": 443,
                             "protocol": "HTTPS",
                             "sni": "origin.customer.com"
@@ -1613,7 +1740,7 @@ mod tests {
         let node = &parsed_routes[0].origins[0];
         assert_eq!(node.url, "https://origin.customer.com:443");
         assert_eq!(node.sni, Some("origin.customer.com".to_string()));
-        let expected_addr: std::net::SocketAddr = "203.0.113.20:443".parse().unwrap();
+        let expected_addr: std::net::SocketAddr = "93.184.216.34:443".parse().unwrap();
         assert_eq!(node.destination_addr, Some(expected_addr));
 
         let router = Router::new_multi_tenant(parsed_routes, vec![], 5000).unwrap();
@@ -1729,5 +1856,108 @@ mod tests {
         // Root prefix matches everything starting with /
         assert!(path_matches_prefix("/", "/"));
         assert!(path_matches_prefix("/api/v1", "/"));
+    }
+
+    #[test]
+    fn test_path_prefix_syntax_validation() {
+        // P2 Finding: Path prefix must be non-empty and start with leading '/'
+        assert!(validate_path_prefix("example.com", "/").is_ok());
+        assert!(validate_path_prefix("example.com", "/api").is_ok());
+        assert!(validate_path_prefix("example.com", "/api/v1/").is_ok());
+
+        // Empty prefix rejected
+        let err = validate_path_prefix("example.com", "").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidPathPrefix { .. }));
+        let err = validate_path_prefix("example.com", "   ").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidPathPrefix { .. }));
+
+        // Relative prefix without leading '/' rejected
+        let err = validate_path_prefix("example.com", "api").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidPathPrefix { .. }));
+        let err = validate_path_prefix("example.com", "admin/dashboard").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidPathPrefix { .. }));
+
+        // Malformed prefix with whitespace characters rejected
+        let err = validate_path_prefix("example.com", "/api /test").unwrap_err();
+        assert!(matches!(err, RouterError::InvalidPathPrefix { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_staged_dns_update_race_elimination() {
+        use reqwest::dns::Resolve;
+
+        // Route A with pinned origin A
+        let snapshot_v1 = r#"{
+            "routes": [{
+                "host": "app.example.com",
+                "origins": [{
+                    "address": "93.184.216.34",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "sni": "origin-a.example.com"
+                }]
+            }]
+        }"#;
+
+        // Route B with pinned origin B (origin A removed)
+        let snapshot_v2 = r#"{
+            "routes": [{
+                "host": "app.example.com",
+                "origins": [{
+                    "address": "93.184.216.35",
+                    "port": 443,
+                    "protocol": "HTTPS",
+                    "sni": "origin-b.example.com"
+                }]
+            }]
+        }"#;
+
+        let routes_v1 = parse_pop_config_routes(snapshot_v1).unwrap();
+        let routes_v2 = parse_pop_config_routes(snapshot_v2).unwrap();
+
+        let dns_resolver = Arc::new(crate::dns::PinnedDnsResolver::new());
+        let router = Router::new(vec![], 5000);
+
+        // Apply snapshot 1
+        router
+            .update_routes_with_dns(routes_v1, vec![], &dns_resolver)
+            .unwrap();
+
+        // Origin A is resolvable
+        let name_a: reqwest::dns::Name = "origin-a.example.com".parse().unwrap();
+        let mut addrs_a = dns_resolver.resolve(name_a).await.unwrap();
+        assert_eq!(
+            addrs_a.next().unwrap(),
+            "93.184.216.34:443".parse::<std::net::SocketAddr>().unwrap()
+        );
+
+        // In strict mode, an unpinned origin domain fails closed immediately with error
+        let unpinned: reqwest::dns::Name = "unpinned.example.com".parse().unwrap();
+        let unpinned_res = dns_resolver.resolve(unpinned).await;
+        assert!(unpinned_res.is_err());
+        assert!(unpinned_res
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("Strict DNS"));
+
+        // Apply snapshot 2 (staged update: merges B, swaps routes, prunes A)
+        router
+            .update_routes_with_dns(routes_v2, vec![], &dns_resolver)
+            .unwrap();
+
+        // Origin B is now resolvable
+        let name_b: reqwest::dns::Name = "origin-b.example.com".parse().unwrap();
+        let mut addrs_b = dns_resolver.resolve(name_b).await.unwrap();
+        assert_eq!(
+            addrs_b.next().unwrap(),
+            "93.184.216.35:443".parse::<std::net::SocketAddr>().unwrap()
+        );
+
+        // Origin A was pruned after swap; in strict mode it MUST fail closed, NEVER falling back to unpinned DNS
+        let name_a_after: reqwest::dns::Name = "origin-a.example.com".parse().unwrap();
+        let res_a = dns_resolver.resolve(name_a_after).await;
+        assert!(res_a.is_err());
+        assert!(res_a.err().unwrap().to_string().contains("Strict DNS"));
     }
 }
