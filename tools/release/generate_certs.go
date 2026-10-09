@@ -74,7 +74,7 @@ func main() {
 	}
 
 	keyPath := filepath.Join(outDir, "server.key")
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open %s for writing: %v\n", keyPath, err)
 		os.Exit(1)

@@ -265,9 +265,9 @@ func (m *Manager) syncSDSCertificateLocked(cert *model.Certificate) error {
 		return fmt.Errorf("failed to rename cert file: %w", err)
 	}
 
-	// 2. Write server.key atomically with strict permissions (0600)
+	// 2. Write server.key atomically (0644 so Envoy proxy UID can read key from shared volume)
 	tmpKey := keyPath + ".tmp"
-	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0600); err != nil {
+	if err := os.WriteFile(tmpKey, []byte(cert.PrivateKeyPEM), 0644); err != nil {
 		return fmt.Errorf("failed to write key tmp file: %w", err)
 	}
 	if err := os.Rename(tmpKey, keyPath); err != nil {

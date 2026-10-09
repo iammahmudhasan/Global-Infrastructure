@@ -101,7 +101,9 @@ jobs:
           go-version: '1.23'
 
       - name: Generate Ingress TLS Certificates
-        run: go run tools/release/generate_certs.go deploy/envoy/certs
+        run: |
+          go run tools/release/generate_certs.go deploy/envoy/certs
+          chmod -R a+r deploy/envoy/certs
 
       - name: Validate Compose Config
         run: docker compose -f deploy/docker-compose.yml config
