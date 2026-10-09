@@ -168,13 +168,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Some(ref snapshot_path) = cp_cfg.snapshot_file {
                     if let Ok(content) = tokio::fs::read_to_string(snapshot_path).await {
                         if let Ok(new_routes) = router::parse_pop_config_routes(&content) {
-                            if let Err(e) = sync_router.update_routes(new_routes, vec![]) {
+                            if let Err(e) =
+                                sync_router.update_routes_with_dns(new_routes, vec![], &sync_dns)
+                            {
                                 tracing::warn!(
                                     "Failed to atomically swap routes from snapshot file: {}",
                                     e
                                 );
                             } else {
-                                sync_router.sync_dns_resolver(&sync_dns);
                                 tracing::info!(
                                     "Atomically synchronized edge routes from snapshot file: {}",
                                     snapshot_path

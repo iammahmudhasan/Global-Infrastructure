@@ -324,14 +324,16 @@ pub async fn handle_request(
         match std::str::from_utf8(&body_bytes) {
             Ok(valid_str) => (Some(std::borrow::Cow::Borrowed(valid_str)), None),
             Err(_) => {
-                // For invalid UTF-8, reserve additional memory budget for the lossy allocated string
+                // For invalid UTF-8, reserve additional memory budget for the lossy allocated string.
+                // In UTF-8, each invalid byte can be replaced by '\u{FFFD}' (3 bytes), causing worst-case 3x expansion.
+                let required_lossy_bytes = body_bytes.len().saturating_mul(3);
                 let mut lossy_guard = BufferBudgetGuard::new(
                     Arc::clone(&state.aggregate_buffered_request_bytes),
                     MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
                 );
-                if lossy_guard.try_allocate(body_bytes.len()).is_err() {
+                if lossy_guard.try_allocate(required_lossy_bytes).is_err() {
                     warn!(
-                        bytes = body_bytes.len(),
+                        bytes = required_lossy_bytes,
                         limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
                         "Gateway aggregate request buffer budget saturated for lossy string conversion"
                     );
@@ -553,7 +555,7 @@ pub async fn handle_request(
                             .header("Content-Type", "application/json")
                             .header("Server", "NexusEdge/0.1.0")
                             .body(Full::new(Bytes::from(
-                                r#"{"error":"Bad Gateway: Upstream response exceeds maximum allowed 50 MiB limit"}"#,
+                                r#"{"error":"Bad Gateway: Upstream response exceeds maximum allowed 10 MiB limit"}"#,
                             )))
                             .unwrap();
                         return Ok(resp);
@@ -1133,13 +1135,14 @@ mod tests {
 
         {
             let mut lossy_guard = BufferBudgetGuard::new(Arc::clone(&tracker), limit);
-            assert!(lossy_guard.try_allocate(invalid_bytes.len()).is_ok());
-            assert_eq!(tracker.load(Ordering::Relaxed), 5);
+            let required_lossy = invalid_bytes.len().saturating_mul(3);
+            assert!(lossy_guard.try_allocate(required_lossy).is_ok());
+            assert_eq!(tracker.load(Ordering::Relaxed), 15);
 
             // Exceeding limit fails CAS
             let mut second_guard = BufferBudgetGuard::new(Arc::clone(&tracker), limit);
             assert!(second_guard.try_allocate(1000).is_err());
-            assert_eq!(tracker.load(Ordering::Relaxed), 5);
+            assert_eq!(tracker.load(Ordering::Relaxed), 15);
         }
 
         // Drop releases all bytes

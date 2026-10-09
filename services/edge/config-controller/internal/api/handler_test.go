@@ -2825,3 +2825,137 @@ func TestPoP_SnapshotChecksumMatchesResponseBody(t *testing.T) {
 		t.Fatalf("tampered body unexpectedly matched original checksum")
 	}
 }
+
+func TestPoPConfigSyncContract_GoldenFixture(t *testing.T) {
+	handler := setupTestServer()
+	st := handler.Store()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterTenantWithRole("key-ops-contract", "tenant-ops", "prj-contract", auth.RolePlatformOperator, "*")
+
+	domainID := "dom-contract-test"
+	_ = st.SaveDomain(&model.Domain{
+		ID:          domainID,
+		ProjectID:   "prj-contract",
+		Hostname:    "customer.example.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"singapore"},
+	})
+
+	apiPoolID := "pool-api-test"
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          apiPoolID,
+		ProjectID:   "prj-contract",
+		AllowedPoPs: []string{"singapore"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-api",
+				PoolID:      apiPoolID,
+				Address:     "198.51.100.10",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				Weight:      100,
+				AllowedPoPs: []string{"singapore"},
+			},
+		},
+	})
+
+	adminPoolID := "pool-admin-test"
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          adminPoolID,
+		ProjectID:   "prj-contract",
+		AllowedPoPs: []string{"singapore"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-admin",
+				PoolID:      adminPoolID,
+				Address:     "198.51.100.20",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				Weight:      100,
+				AllowedPoPs: []string{"singapore"},
+			},
+		},
+	})
+
+	st.SaveRoute(&model.Route{
+		ID:         "rt-api",
+		DomainID:   domainID,
+		PoolID:     apiPoolID,
+		PathPrefix: "/api/",
+		Priority:   10,
+	})
+
+	st.SaveRoute(&model.Route{
+		ID:         "rt-admin",
+		DomainID:   domainID,
+		PoolID:     adminPoolID,
+		PathPrefix: "/admin/",
+		Priority:   20,
+	})
+
+	st.SaveSecurityPolicy(&model.SecurityPolicy{
+		ID:               "sec-contract",
+		DomainID:         domainID,
+		WAFEnabled:       true,
+		WAFMode:          "BLOCK",
+		OWASPProtection:  true,
+		RateLimitEnabled: true,
+		RateLimitRPM:     600,
+	})
+
+	st.SaveCachePolicy(&model.CachePolicy{
+		ID:                "cache-contract",
+		DomainID:          domainID,
+		CacheEnabled:      true,
+		DefaultTTLSeconds: 300,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req.Header.Set("X-API-Key", "key-ops-contract")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var popSync model.PoPConfigSync
+	if err := json.Unmarshal(w.Body.Bytes(), &popSync); err != nil {
+		t.Fatalf("failed to decode PoP config sync response: %v", err)
+	}
+
+	if len(popSync.Routes) != 1 {
+		t.Fatalf("expected exactly 1 route in sync, got %d", len(popSync.Routes))
+	}
+
+	r := popSync.Routes[0]
+	if r.Host != "customer.example.com" {
+		t.Fatalf("expected host customer.example.com, got %s", r.Host)
+	}
+
+	if len(r.PathRoutes) != 2 {
+		t.Fatalf("expected exactly 2 path routes, got %d", len(r.PathRoutes))
+	}
+
+	// Top-level Targets must contain aggregated union of path targets
+	if len(r.Targets) != 2 {
+		t.Fatalf("expected 2 aggregated targets, got %d", len(r.Targets))
+	}
+
+	// Verify security policy propagation
+	if r.Security == nil || !r.Security.WAFEnabled || !r.Security.RateLimitEnabled {
+		t.Fatalf("expected security policy to be propagated to gateway route sync, got %+v", r.Security)
+	}
+	if r.Security.RequestsPerSecond != 10 {
+		t.Fatalf("expected 10 RPS (from 600 RPM), got %d", r.Security.RequestsPerSecond)
+	}
+
+	// Verify cache policy propagation
+	if r.Cache == nil || !r.Cache.Enabled || r.Cache.DefaultTTLSeconds != 300 {
+		t.Fatalf("expected cache policy to be propagated, got %+v", r.Cache)
+	}
+}

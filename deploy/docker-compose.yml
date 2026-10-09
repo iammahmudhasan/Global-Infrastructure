@@ -8,6 +8,7 @@ services:
       - "127.0.0.1:9091:9091"
     environment:
       - PORT=9091
+      # Development profile flags: set NEXUSEDGE_DEV_MODE=false and NEXUSEDGE_ENV=production for production deployments
       - NEXUSEDGE_DEV_MODE=true
       - NEXUSEDGE_ENV=development
       - NEXUSEDGE_ACME_HOST=config-controller

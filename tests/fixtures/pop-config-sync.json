@@ -1,0 +1,64 @@
+{
+  "pop_id": "singapore",
+  "config_version": "v1.0.0-prod",
+  "checksum_sha256": "43924f71a942ca96bdfdb86c8a77d1ceb2ee4c6e94ef3be0bdfeb5ae72f23b20",
+  "compiled_at": "2026-10-09T00:00:00Z",
+  "topologies_count": 1,
+  "envoy_config": {},
+  "routes": [
+    {
+      "host": "customer.example.com",
+      "path_routes": [
+        {
+          "path_prefix": "/api/",
+          "priority": 10,
+          "origins": [
+            {
+              "address": "198.51.100.10",
+              "port": 443,
+              "protocol": "HTTPS",
+              "sni": "api-origin.example",
+              "weight": 100
+            }
+          ],
+          "targets": [
+            "https://198.51.100.10:443"
+          ]
+        },
+        {
+          "path_prefix": "/admin/",
+          "priority": 20,
+          "origins": [
+            {
+              "address": "198.51.100.20",
+              "port": 443,
+              "protocol": "HTTPS",
+              "sni": "admin-origin.example",
+              "weight": 100
+            }
+          ],
+          "targets": [
+            "https://198.51.100.20:443"
+          ]
+        }
+      ],
+      "targets": [
+        "https://198.51.100.10:443",
+        "https://198.51.100.20:443"
+      ],
+      "security": {
+        "waf_enabled": true,
+        "block_sqli": true,
+        "block_xss": true,
+        "block_path_traversal": true,
+        "rate_limit_enabled": true,
+        "requests_per_second": 10,
+        "burst_capacity": 20
+      },
+      "cache": {
+        "enabled": true,
+        "default_ttl_seconds": 300
+      }
+    }
+  ]
+}

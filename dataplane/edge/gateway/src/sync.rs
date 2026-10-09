@@ -190,10 +190,8 @@ pub async fn fetch_and_apply_control_plane_snapshot(
 
     let routes_count = new_routes.len();
     router
-        .update_routes(new_routes, vec![])
+        .update_routes_with_dns(new_routes, vec![], dns_resolver)
         .map_err(|e| SyncError::RouteApplyError(e.to_string()))?;
-
-    router.sync_dns_resolver(dns_resolver);
 
     Ok(SyncStats {
         routes_applied: routes_count,

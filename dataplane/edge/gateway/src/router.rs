@@ -137,6 +137,7 @@ pub struct DomainRoute {
     pub path_routes: Vec<PathRoute>,
     pub security: Option<DomainSecurityPolicy>,
     pub cache: Option<DomainCachePolicy>,
+    pub round_robin_index: Arc<AtomicUsize>,
 }
 
 impl DomainRoute {
@@ -157,6 +158,7 @@ impl DomainRoute {
             path_routes,
             security: None,
             cache: None,
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -172,6 +174,7 @@ impl DomainRoute {
             path_routes,
             security,
             cache,
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -346,6 +349,7 @@ impl Router {
 
     /// Atomically updates routing tables from new domain routes (Control Plane dynamic reconfiguration)
     /// Preserves existing node health states across route updates (P1 Finding 2)
+    #[allow(dead_code)]
     pub fn update_routes(
         &self,
         mut new_routes: Vec<DomainRoute>,
@@ -435,6 +439,123 @@ impl Router {
         Ok(())
     }
 
+    /// Atomically updates routing tables and pre-publishes DNS pinning mappings into PinnedDnsResolver.
+    /// Guarantees that if route validation fails, neither active routes nor DNS mappings are modified.
+    pub fn update_routes_with_dns(
+        &self,
+        mut new_routes: Vec<DomainRoute>,
+        new_defaults: Vec<String>,
+        dns_resolver: &crate::dns::PinnedDnsResolver,
+    ) -> Result<(), RouterError> {
+        let mut routes_map = HashMap::new();
+
+        // 1. Validate candidate routes before touching any state
+        for route in &new_routes {
+            let norm_host = normalize_host(&route.host);
+            if norm_host.is_empty() {
+                return Err(RouterError::EmptyHost);
+            }
+            if routes_map.contains_key(&norm_host) {
+                return Err(RouterError::DuplicateHost(norm_host));
+            }
+            let total_targets = route.origins.len()
+                + route
+                    .path_routes
+                    .iter()
+                    .map(|pr| pr.origins.len())
+                    .sum::<usize>();
+            if total_targets == 0 {
+                return Err(RouterError::EmptyTargets(norm_host));
+            }
+            for node in &route.origins {
+                validate_target_url(&norm_host, &node.url)?;
+            }
+            for pr in &route.path_routes {
+                for node in &pr.origins {
+                    validate_target_url(&norm_host, &node.url)?;
+                }
+            }
+            routes_map.insert(norm_host, ());
+        }
+
+        for target in &new_defaults {
+            validate_target_url("default", target)?;
+        }
+
+        // 2. Prepare candidate DNS mappings from validated candidate routes
+        let mut candidate_dns: HashMap<String, Vec<std::net::SocketAddr>> = HashMap::new();
+        let mut insert_node = |n: &UpstreamNode| {
+            if let (Some(sni), Some(addr)) = (&n.sni, n.destination_addr) {
+                let addrs = candidate_dns.entry(sni.to_ascii_lowercase()).or_default();
+                if !addrs.contains(&addr) {
+                    addrs.push(addr);
+                }
+            }
+        };
+
+        for route in &new_routes {
+            for n in &route.origins {
+                insert_node(n);
+            }
+            for pr in &route.path_routes {
+                for n in &pr.origins {
+                    insert_node(n);
+                }
+            }
+        }
+
+        // 3. Refresh health states into new nodes
+        let health_states = self.health_states.read().unwrap();
+        for route in &mut new_routes {
+            for node in &mut route.origins {
+                if let Some(h) = health_states.get(&node.url) {
+                    node.healthy = h.healthy;
+                    node.latency_ms = h.latency_ms;
+                    node.ewma_latency_ms = h.ewma_latency_ms;
+                    node.consecutive_passes = h.consecutive_passes;
+                    node.consecutive_failures = h.consecutive_failures;
+                }
+            }
+            for pr in &mut route.path_routes {
+                for node in &mut pr.origins {
+                    if let Some(h) = health_states.get(&node.url) {
+                        node.healthy = h.healthy;
+                        node.latency_ms = h.latency_ms;
+                        node.ewma_latency_ms = h.ewma_latency_ms;
+                        node.consecutive_passes = h.consecutive_passes;
+                        node.consecutive_failures = h.consecutive_failures;
+                    }
+                }
+            }
+        }
+
+        let mut final_routes_map = HashMap::new();
+        for route in new_routes {
+            let norm_host = normalize_host(&route.host);
+            final_routes_map.insert(norm_host, route);
+        }
+
+        let default_nodes: Vec<UpstreamNode> = new_defaults
+            .into_iter()
+            .map(|u| Self::create_node_with_health(u, &health_states))
+            .collect();
+
+        // 4. Pre-publish validated DNS mappings so new routes never observe unpinned resolution
+        dns_resolver.set_all(candidate_dns);
+
+        // 5. Atomically swap routes in memory
+        {
+            let mut routes_guard = self.routes.write().unwrap();
+            let mut defaults_guard = self.default_nodes.write().unwrap();
+
+            *routes_guard = final_routes_map;
+            *defaults_guard = default_nodes;
+        }
+
+        self.is_multi_tenant.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
     /// Selects lowest EWMA latency healthy upstream node for the given tenant host and request path.
     /// Fast-path invariant: longest-prefix & highest-priority match within tenant's routes (P1 Path Routing).
     pub fn select_upstream_for_host_and_path(
@@ -463,8 +584,7 @@ impl Router {
                     select_from_nodes(&best.origins, &best.round_robin_index)
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else if !domain_route.origins.is_empty() {
-                    let counter = Arc::new(AtomicUsize::new(0));
-                    select_from_nodes(&domain_route.origins, &counter)
+                    select_from_nodes(&domain_route.origins, &domain_route.round_robin_index)
                         .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else {
                     Err(RoutingError::NoMatchingPath {
@@ -937,6 +1057,20 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
 
     fn parse_wire_origin(norm_host: &str, o: &WireOrigin) -> Result<UpstreamNode, RouterError> {
         let proto = o.protocol.to_lowercase();
+        if proto != "http" && proto != "https" {
+            return Err(RouterError::InvalidTargetUrl {
+                host: norm_host.to_string(),
+                url: o.address.clone(),
+                reason: format!("Protocol must be http or https, got '{}'", o.protocol),
+            });
+        }
+        if o.port == 0 {
+            return Err(RouterError::InvalidTargetUrl {
+                host: norm_host.to_string(),
+                url: o.address.clone(),
+                reason: "Origin port cannot be 0".to_string(),
+            });
+        }
         let is_https = proto == "https";
         let sni_trimmed = o.sni.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty());
         let clean_addr = o
@@ -944,15 +1078,26 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             .trim()
             .trim_start_matches('[')
             .trim_end_matches(']');
-        let dest_addr = clean_addr
-            .parse::<std::net::IpAddr>()
-            .ok()
-            .map(|ip| std::net::SocketAddr::new(ip, o.port));
 
-        let host_for_url = if clean_addr.contains(':') && !clean_addr.starts_with('[') {
-            format!("[{}]", clean_addr)
-        } else {
-            clean_addr.to_string()
+        let ip = clean_addr.parse::<std::net::IpAddr>().map_err(|_| {
+            RouterError::InvalidPayload(
+                "Control Plane origin address must be a pinned IP".to_string(),
+            )
+        })?;
+
+        if is_private_or_reserved_ip(ip) {
+            return Err(RouterError::UnsafeTargetUrl {
+                host: norm_host.to_string(),
+                url: o.address.clone(),
+                reason: "Origin IP is private or reserved".to_string(),
+            });
+        }
+
+        let dest_addr = Some(std::net::SocketAddr::new(ip, o.port));
+
+        let host_for_url = match ip {
+            std::net::IpAddr::V6(v6) => format!("[{}]", v6),
+            std::net::IpAddr::V4(v4) => v4.to_string(),
         };
 
         let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
@@ -994,12 +1139,13 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
             bypass_paths: c.bypass_paths,
         });
 
+        let has_path_routes = !r.path_routes.is_empty();
         let mut origins = Vec::new();
         if !r.origins.is_empty() {
             for o in &r.origins {
                 origins.push(parse_wire_origin(&norm_host, o)?);
             }
-        } else if !r.targets.is_empty() {
+        } else if !has_path_routes && !r.targets.is_empty() {
             for target in &r.targets {
                 validate_target_url(&norm_host, target)?;
                 origins.push(Router::create_node(target.clone()));
@@ -1037,6 +1183,7 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
                 path_routes: domain_path_routes,
                 security: sec_policy,
                 cache: cache_policy,
+                round_robin_index: Arc::new(AtomicUsize::new(0)),
             });
         } else if !origins.is_empty() {
             result.push(DomainRoute {
@@ -1050,6 +1197,7 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
                 }],
                 security: sec_policy,
                 cache: cache_policy,
+                round_robin_index: Arc::new(AtomicUsize::new(0)),
             });
         } else {
             return Err(RouterError::EmptyTargets(norm_host));
