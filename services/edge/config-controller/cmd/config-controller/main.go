@@ -77,15 +77,15 @@ func main() {
 			}
 			dataStore.SaveRoute(devRouteRoot)
 
-			devRouteApi := &model.Route{
-				ID:         "route-dev-api",
+			devRouteStatus := &model.Route{
+				ID:         "route-dev-status",
 				DomainID:   devDomain.ID,
 				PoolID:     devPool.ID,
-				PathPrefix: "/api/",
+				PathPrefix: "/status/",
 				Priority:   10,
 				TimeoutMs:  5000,
 			}
-			dataStore.SaveRoute(devRouteApi)
+			dataStore.SaveRoute(devRouteStatus)
 
 			devSec := &model.SecurityPolicy{
 				ID:               "sec-dev-01",

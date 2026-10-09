@@ -12,7 +12,7 @@ upstream:
   routes:
     - host: "api.nexusedge.io"
       path_routes:
-        - path_prefix: "/api/"
+        - path_prefix: "/status/"
           priority: 10
           origins:
             - address: "54.159.186.149"

@@ -41,9 +41,9 @@ Write-Host "[Test 3/7] Verifying Envoy HTTPS Ingress (TLS Termination)..." -Fore
 $httpsCode = & curl -k -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpsUrl/get"
 Assert-Status "Customer HTTPS Ingress" 200 ([int]$httpsCode)
 
-# 4. Path Routing Verification (/api/ path prefix)
-Write-Host "[Test 4/7] Verifying Path Routing (/api/ prefix)..." -ForegroundColor Yellow
-$pathCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpUrl/api/status/200"
+# 4. Path Routing Verification (/status/ path prefix)
+Write-Host "[Test 4/7] Verifying Path Routing (/status/ prefix)..." -ForegroundColor Yellow
+$pathCode = & curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "$EnvoyHttpUrl/status/200"
 Assert-Status "Path-prefix Routing" 200 ([int]$pathCode)
 
 # 5. Fail-Closed Tenant Isolation Gate

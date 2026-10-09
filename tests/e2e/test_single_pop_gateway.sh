@@ -48,9 +48,9 @@ echo "[Test 3/7] Verifying Envoy HTTPS Ingress (TLS Termination)..."
 HTTPS_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "${ENVOY_HTTPS_URL}/get" || true)
 assert_status "Customer HTTPS Ingress" "200" "$HTTPS_CODE"
 
-# 4. Path Routing Verification (/api/ path prefix)
-echo "[Test 4/7] Verifying Path Routing (/api/ prefix)..."
-PATH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "${ENVOY_HTTP_URL}/api/status/200" || true)
+# 4. Path Routing Verification (/status/ path prefix)
+echo "[Test 4/7] Verifying Path Routing (/status/ prefix)..."
+PATH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -H "Host: api.nexusedge.io" "${ENVOY_HTTP_URL}/status/200" || true)
 assert_status "Path-prefix Routing" "200" "$PATH_CODE"
 
 # 5. Fail-Closed Tenant Isolation Gate
