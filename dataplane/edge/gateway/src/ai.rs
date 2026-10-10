@@ -16,9 +16,37 @@ pub const AI_COMPLETIONS_PATH: &str = "/v1/completions";
 pub const AI_EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub const AI_MODELS_PATH: &str = "/v1/models";
 
+pub const AI_ANALYTICS_PATH: &str = "/v1/nexusedge/ai/analytics";
+pub const AI_METRICS_PATH: &str = "/v1/nexusedge/ai/metrics";
+
+/// Multi-objective routing strategy supported by the AI Traffic Director.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStrategy {
+    #[default]
+    Cost, // Lowest spot cost per 1M tokens
+    Latency,  // Lowest EWMA TTFT / response latency
+    Balanced, // Multi-objective Pareto optimization (cost + TTFT)
+    Priority, // Strict priority tiers with cost tie-break
+}
+
+impl RoutingStrategy {
+    pub fn parse(s: &str) -> Self {
+        match s.to_lowercase().trim() {
+            "cost" | "lowest_cost" | "cheapest" | "spot" => RoutingStrategy::Cost,
+            "latency" | "lowest_latency" | "fastest" | "speed" => RoutingStrategy::Latency,
+            "balanced" | "optimal" | "pareto" => RoutingStrategy::Balanced,
+            "priority" | "tier" => RoutingStrategy::Priority,
+            _ => RoutingStrategy::Cost,
+        }
+    }
+}
+
 /// Returns true if the path and method correspond to an OpenAI/vLLM AI inference endpoint.
 pub fn is_ai_inference_request(path: &str, method: &Method) -> bool {
-    if method == Method::GET && (path == AI_MODELS_PATH || path == "/v1/nexusedge/ai/metrics") {
+    if method == Method::GET
+        && (path == AI_MODELS_PATH || path == AI_METRICS_PATH || path == AI_ANALYTICS_PATH)
+    {
         return true;
     }
     if method == Method::POST {
@@ -40,6 +68,8 @@ pub struct AiRequestMetadata {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub requested_jurisdiction: Option<String>,
+    #[serde(default)]
+    pub routing_strategy: RoutingStrategy,
 }
 
 /// Extracted candidate AI upstream compute provider.
@@ -126,6 +156,11 @@ impl ProviderRuntimeState {
 #[derive(Clone)]
 pub struct AiTrafficDirector {
     providers: Arc<RwLock<Vec<Arc<ProviderRuntimeState>>>>,
+    total_prompt_tokens: Arc<AtomicU64>,
+    total_completion_tokens: Arc<AtomicU64>,
+    total_tokens_routed: Arc<AtomicU64>,
+    total_cost_spent_micros: Arc<AtomicU64>,
+    total_cost_saved_micros: Arc<AtomicU64>,
 }
 
 impl AiTrafficDirector {
@@ -136,6 +171,11 @@ impl AiTrafficDirector {
             .collect();
         Self {
             providers: Arc::new(RwLock::new(runtime_states)),
+            total_prompt_tokens: Arc::new(AtomicU64::new(0)),
+            total_completion_tokens: Arc::new(AtomicU64::new(0)),
+            total_tokens_routed: Arc::new(AtomicU64::new(0)),
+            total_cost_spent_micros: Arc::new(AtomicU64::new(0)),
+            total_cost_saved_micros: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -182,12 +222,56 @@ impl AiTrafficDirector {
         *guard = updated_states;
     }
 
-    /// Selects ordered candidate providers matching request constraints.
-    /// Strictly filters by data sovereignty if requested, then sorts by availability,
-    /// priority tier, and cost factor.
+    /// Returns the baseline cost per 1M tokens (the maximum cost among active providers or $2.50 hyperscaler default)
+    pub fn get_baseline_cost_per_m(&self) -> f64 {
+        let guard = self.providers.read().unwrap();
+        guard
+            .iter()
+            .map(|s| s.provider.cost_per_m_tokens)
+            .fold(2.50f64, f64::max)
+    }
+
+    /// Records token consumption economics, updating cumulative tokens routed, spent USD, and saved USD.
+    pub fn record_token_usage(
+        &self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        actual_cost_per_m: f64,
+        baseline_cost_per_m: f64,
+    ) -> (u64, f64) {
+        let total = prompt_tokens.saturating_add(completion_tokens);
+        self.total_prompt_tokens
+            .fetch_add(prompt_tokens, Ordering::Relaxed);
+        self.total_completion_tokens
+            .fetch_add(completion_tokens, Ordering::Relaxed);
+        self.total_tokens_routed.fetch_add(total, Ordering::Relaxed);
+
+        let actual_micros = (actual_cost_per_m * total as f64) as u64;
+        self.total_cost_spent_micros
+            .fetch_add(actual_micros, Ordering::Relaxed);
+
+        let baseline_micros = (baseline_cost_per_m * total as f64) as u64;
+        let savings_micros = baseline_micros.saturating_sub(actual_micros);
+        self.total_cost_saved_micros
+            .fetch_add(savings_micros, Ordering::Relaxed);
+
+        (total, savings_micros as f64 / 1_000_000.0)
+    }
+
+    /// Selects ordered candidate providers matching request constraints using default strategy.
     pub fn select_candidates(
         &self,
         requested_jurisdiction: Option<&str>,
+    ) -> Vec<Arc<ProviderRuntimeState>> {
+        self.select_candidates_with_strategy(requested_jurisdiction, RoutingStrategy::Cost)
+    }
+
+    /// Multi-objective candidate selection: filters strictly by data sovereignty,
+    /// then ranks providers based on the requested optimization strategy.
+    pub fn select_candidates_with_strategy(
+        &self,
+        requested_jurisdiction: Option<&str>,
+        strategy: RoutingStrategy,
     ) -> Vec<Arc<ProviderRuntimeState>> {
         let guard = self.providers.read().unwrap();
         let mut candidates: Vec<Arc<ProviderRuntimeState>> = guard
@@ -205,27 +289,144 @@ impl AiTrafficDirector {
             .cloned()
             .collect();
 
-        // Sort: available first, then lower priority tier, then cheaper cost
-        candidates.sort_by(|a, b| {
-            let a_avail = a.is_available();
-            let b_avail = b.is_available();
-            if a_avail != b_avail {
-                return b_avail.cmp(&a_avail); // available first
+        match strategy {
+            RoutingStrategy::Cost => {
+                // Cost-optimized: Available first, then cheapest cost per 1M tokens, then priority, then TTFT
+                candidates.sort_by(|a, b| {
+                    let a_avail = a.is_available();
+                    let b_avail = b.is_available();
+                    if a_avail != b_avail {
+                        return b_avail.cmp(&a_avail);
+                    }
+                    if a.provider.cost_per_m_tokens != b.provider.cost_per_m_tokens {
+                        return a
+                            .provider
+                            .cost_per_m_tokens
+                            .partial_cmp(&b.provider.cost_per_m_tokens)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                    }
+                    if a.provider.priority != b.provider.priority {
+                        return a.provider.priority.cmp(&b.provider.priority);
+                    }
+                    a.avg_ttft_ms()
+                        .partial_cmp(&b.avg_ttft_ms())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
-            if a.provider.priority != b.provider.priority {
-                return a.provider.priority.cmp(&b.provider.priority);
+            RoutingStrategy::Latency => {
+                // Latency-optimized: Available first, then lowest EWMA TTFT, then priority, then cost
+                candidates.sort_by(|a, b| {
+                    let a_avail = a.is_available();
+                    let b_avail = b.is_available();
+                    if a_avail != b_avail {
+                        return b_avail.cmp(&a_avail);
+                    }
+                    let a_ttft = a.avg_ttft_ms();
+                    let b_ttft = b.avg_ttft_ms();
+                    if (a_ttft > 0.0 || b_ttft > 0.0) && (a_ttft - b_ttft).abs() > 0.1 {
+                        if a_ttft == 0.0 {
+                            return std::cmp::Ordering::Less; // Optimistic exploration probe
+                        }
+                        if b_ttft == 0.0 {
+                            return std::cmp::Ordering::Greater;
+                        }
+                        return a_ttft
+                            .partial_cmp(&b_ttft)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                    }
+                    if a.provider.priority != b.provider.priority {
+                        return a.provider.priority.cmp(&b.provider.priority);
+                    }
+                    a.provider
+                        .cost_per_m_tokens
+                        .partial_cmp(&b.provider.cost_per_m_tokens)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             }
-            a.provider
-                .cost_per_m_tokens
-                .partial_cmp(&b.provider.cost_per_m_tokens)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+            RoutingStrategy::Balanced => {
+                // Multi-objective Pareto optimization (50% Cost, 50% TTFT)
+                let max_cost = candidates
+                    .iter()
+                    .map(|c| c.provider.cost_per_m_tokens)
+                    .fold(0.01f64, f64::max);
+                let max_ttft = candidates
+                    .iter()
+                    .map(|c| c.avg_ttft_ms())
+                    .fold(1.0f64, f64::max);
+
+                candidates.sort_by(|a, b| {
+                    let a_avail = a.is_available();
+                    let b_avail = b.is_available();
+                    if a_avail != b_avail {
+                        return b_avail.cmp(&a_avail);
+                    }
+                    let a_cost_norm = a.provider.cost_per_m_tokens / max_cost;
+                    let b_cost_norm = b.provider.cost_per_m_tokens / max_cost;
+                    let a_ttft_norm = if a.avg_ttft_ms() == 0.0 {
+                        0.5
+                    } else {
+                        a.avg_ttft_ms() / max_ttft
+                    };
+                    let b_ttft_norm = if b.avg_ttft_ms() == 0.0 {
+                        0.5
+                    } else {
+                        b.avg_ttft_ms() / max_ttft
+                    };
+
+                    let a_score = 0.5 * a_cost_norm + 0.5 * a_ttft_norm;
+                    let b_score = 0.5 * b_cost_norm + 0.5 * b_ttft_norm;
+
+                    if (a_score - b_score).abs() > 0.01 {
+                        return a_score
+                            .partial_cmp(&b_score)
+                            .unwrap_or(std::cmp::Ordering::Equal);
+                    }
+                    a.provider.priority.cmp(&b.provider.priority)
+                });
+            }
+            RoutingStrategy::Priority => {
+                // Strict priority tiers with cost tie-break
+                candidates.sort_by(|a, b| {
+                    let a_avail = a.is_available();
+                    let b_avail = b.is_available();
+                    if a_avail != b_avail {
+                        return b_avail.cmp(&a_avail);
+                    }
+                    if a.provider.priority != b.provider.priority {
+                        return a.provider.priority.cmp(&b.provider.priority);
+                    }
+                    a.provider
+                        .cost_per_m_tokens
+                        .partial_cmp(&b.provider.cost_per_m_tokens)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
 
         candidates
     }
 
     pub fn get_metrics_summary(&self) -> serde_json::Value {
+        self.get_analytics_summary()
+    }
+
+    /// Full enterprise economics, real-time token tracking, and per-provider telemetry.
+    pub fn get_analytics_summary(&self) -> serde_json::Value {
         let guard = self.providers.read().unwrap();
+        let total_tokens = self.total_tokens_routed.load(Ordering::Relaxed);
+        let prompt_tokens = self.total_prompt_tokens.load(Ordering::Relaxed);
+        let completion_tokens = self.total_completion_tokens.load(Ordering::Relaxed);
+        let spent_micros = self.total_cost_spent_micros.load(Ordering::Relaxed);
+        let saved_micros = self.total_cost_saved_micros.load(Ordering::Relaxed);
+        let spent_usd = spent_micros as f64 / 1_000_000.0;
+        let saved_usd = saved_micros as f64 / 1_000_000.0;
+        let baseline_usd = spent_usd + saved_usd;
+        let savings_pct = if baseline_usd > 0.0 {
+            (saved_usd / baseline_usd) * 100.0
+        } else {
+            0.0
+        };
+
         let summary: Vec<serde_json::Value> = guard
             .iter()
             .map(|state| {
@@ -240,7 +441,7 @@ impl AiTrafficDirector {
                     "successful_requests": state.successful_requests.load(Ordering::Relaxed),
                     "rate_limited_429": state.rate_limited_429_count.load(Ordering::Relaxed),
                     "failovers_triggered": state.failovers_triggered.load(Ordering::Relaxed),
-                    "avg_ttft_ms": state.avg_ttft_ms(),
+                    "avg_ttft_ms": (state.avg_ttft_ms() * 10.0).round() / 10.0,
                     "cost_per_m_tokens": state.provider.cost_per_m_tokens,
                 })
             })
@@ -250,10 +451,95 @@ impl AiTrafficDirector {
             "status": "active",
             "engine": "NexusEdge Universal Compute Director",
             "timestamp": Utc::now().to_rfc3339(),
+            "routing_strategies_supported": ["cost", "latency", "balanced", "priority"],
+            "economics": {
+                "total_tokens_routed": total_tokens,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cost_spent_usd": spent_usd,
+                "cost_saved_usd": saved_usd,
+                "savings_percentage": (savings_pct * 10.0).round() / 10.0,
+            },
             "providers_count": guard.len(),
             "providers": summary,
         })
     }
+}
+
+/// Extracted token usage from an upstream inference response payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtractedTokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+pub fn extract_token_usage(body: &[u8]) -> Option<ExtractedTokenUsage> {
+    if body.is_empty() {
+        return None;
+    }
+    // 1. Try standard JSON payload
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if let Some(usage) = v.get("usage") {
+            let p = usage
+                .get("prompt_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let c = usage
+                .get("completion_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let total = usage
+                .get("total_tokens")
+                .and_then(|t| t.as_u64())
+                .unwrap_or_else(|| p.saturating_add(c));
+            if total > 0 {
+                return Some(ExtractedTokenUsage {
+                    prompt_tokens: p,
+                    completion_tokens: c,
+                    total_tokens: total,
+                });
+            }
+        }
+    }
+    // 2. Try SSE chunks if payload is streaming SSE
+    if let Ok(s) = std::str::from_utf8(body) {
+        if s.contains("data:") {
+            for line in s.lines().rev() {
+                let trimmed = line.trim();
+                if let Some(json_str) = trimmed.strip_prefix("data:") {
+                    let json_str = json_str.trim();
+                    if json_str.is_empty() || json_str == "[DONE]" {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(usage) = v.get("usage") {
+                            let p = usage
+                                .get("prompt_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let c = usage
+                                .get("completion_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let total = usage
+                                .get("total_tokens")
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or_else(|| p.saturating_add(c));
+                            if total > 0 {
+                                return Some(ExtractedTokenUsage {
+                                    prompt_tokens: p,
+                                    completion_tokens: c,
+                                    total_tokens: total,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parses high-level metadata from an incoming AI inference payload.
@@ -266,6 +552,11 @@ pub fn parse_ai_request_metadata(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let header_strategy = req_headers
+        .get("x-nexusedge-routing-strategy")
+        .and_then(|v| v.to_str().ok())
+        .map(RoutingStrategy::parse);
+
     if body.is_empty() {
         return Ok(AiRequestMetadata {
             model: "default".to_string(),
@@ -273,6 +564,7 @@ pub fn parse_ai_request_metadata(
             max_tokens: None,
             temperature: None,
             requested_jurisdiction: jurisdiction_header,
+            routing_strategy: header_strategy.unwrap_or_default(),
         });
     }
 
@@ -300,12 +592,20 @@ pub fn parse_ai_request_metadata(
         .and_then(|t| t.as_f64())
         .map(|t| t as f32);
 
+    let body_strategy = json_val
+        .get("routing_strategy")
+        .and_then(|s| s.as_str())
+        .map(RoutingStrategy::parse);
+
+    let routing_strategy = header_strategy.or(body_strategy).unwrap_or_default();
+
     Ok(AiRequestMetadata {
         model,
         stream,
         max_tokens,
         temperature,
         requested_jurisdiction: jurisdiction_header,
+        routing_strategy,
     })
 }
 
@@ -321,9 +621,9 @@ pub async fn dispatch_ai_request_with_failover(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let start_time = Instant::now();
 
-    // Check for metrics endpoint
-    if path == "/v1/nexusedge/ai/metrics" {
-        let metrics_json = director.get_metrics_summary();
+    // Check for metrics or analytics endpoint
+    if path == AI_METRICS_PATH || path == AI_ANALYTICS_PATH {
+        let metrics_json = director.get_analytics_summary();
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
@@ -353,7 +653,10 @@ pub async fn dispatch_ai_request_with_failover(
         }
     };
 
-    let candidates = director.select_candidates(metadata.requested_jurisdiction.as_deref());
+    let candidates = director.select_candidates_with_strategy(
+        metadata.requested_jurisdiction.as_deref(),
+        metadata.routing_strategy,
+    );
     if candidates.is_empty() {
         warn!(
             jurisdiction = ?metadata.requested_jurisdiction,
@@ -481,6 +784,14 @@ pub async fn dispatch_ai_request_with_failover(
                     .header(
                         "X-NexusEdge-Total-Duration-Ms",
                         start_time.elapsed().as_millis().to_string(),
+                    )
+                    .header(
+                        "X-NexusEdge-Routing-Strategy",
+                        format!("{:?}", metadata.routing_strategy).to_lowercase(),
+                    )
+                    .header(
+                        "X-NexusEdge-Cost-Per-MTokens",
+                        format!("{:.2}", provider.cost_per_m_tokens),
                     );
 
                 for (k, v) in upstream_resp.headers().iter() {
@@ -500,6 +811,30 @@ pub async fn dispatch_ai_request_with_failover(
                 }
 
                 let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+
+                // Calculate real-time token economics & dollar savings
+                let baseline_cost = director.get_baseline_cost_per_m();
+                let usage_opt = extract_token_usage(&resp_bytes);
+                let (tokens_total, savings_usd) = if let Some(ref usage) = usage_opt {
+                    director.record_token_usage(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        provider.cost_per_m_tokens,
+                        baseline_cost,
+                    )
+                } else {
+                    (0, 0.0)
+                };
+
+                if tokens_total > 0 {
+                    builder = builder
+                        .header("X-NexusEdge-Tokens-Total", tokens_total.to_string())
+                        .header(
+                            "X-NexusEdge-Estimated-Savings-USD",
+                            format!("{:.6}", savings_usd),
+                        );
+                }
+
                 let resp = builder.body(Full::new(resp_bytes)).unwrap();
                 return Ok(resp);
             }
