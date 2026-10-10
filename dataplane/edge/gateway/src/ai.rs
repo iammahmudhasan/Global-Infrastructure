@@ -24,10 +24,10 @@ pub const AI_METRICS_PATH: &str = "/v1/nexusedge/ai/metrics";
 #[serde(rename_all = "snake_case")]
 pub enum RoutingStrategy {
     #[default]
-    Cost, // Lowest spot cost per 1M tokens
+    Priority, // Tiered priority order with cost tie-break (Default baseline)
+    Cost,     // Lowest spot cost per 1M tokens
     Latency,  // Lowest EWMA TTFT / response latency
     Balanced, // Multi-objective Pareto optimization (cost + TTFT)
-    Priority, // Strict priority tiers with cost tie-break
 }
 
 impl RoutingStrategy {
@@ -37,7 +37,7 @@ impl RoutingStrategy {
             "latency" | "lowest_latency" | "fastest" | "speed" => RoutingStrategy::Latency,
             "balanced" | "optimal" | "pareto" => RoutingStrategy::Balanced,
             "priority" | "tier" => RoutingStrategy::Priority,
-            _ => RoutingStrategy::Cost,
+            _ => RoutingStrategy::Priority,
         }
     }
 }
@@ -263,7 +263,7 @@ impl AiTrafficDirector {
         &self,
         requested_jurisdiction: Option<&str>,
     ) -> Vec<Arc<ProviderRuntimeState>> {
-        self.select_candidates_with_strategy(requested_jurisdiction, RoutingStrategy::Cost)
+        self.select_candidates_with_strategy(requested_jurisdiction, RoutingStrategy::Priority)
     }
 
     /// Multi-objective candidate selection: filters strictly by data sovereignty,
