@@ -124,6 +124,7 @@ pub struct ProxyState {
     pub aggregate_buffered_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub aggregate_buffered_request_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
+    pub ai_director: Option<Arc<crate::ai::AiTrafficDirector>>,
 }
 
 impl ProxyState {
@@ -484,6 +485,27 @@ pub async fn handle_request(
             return Ok(resp);
         }
         WafResult::Allowed => {}
+    }
+
+    // 6.5. Universal AI & Compute Inference Traffic Director (Phase 1)
+    if let Some(ref director) = state.ai_director {
+        if crate::ai::is_ai_inference_request(&path, &method) {
+            info!(
+                path = %path,
+                ip = %effective_client_ip,
+                "Routing request to NexusEdge Universal AI & Compute Director"
+            );
+            return crate::ai::dispatch_ai_request_with_failover(
+                &state.http_client,
+                director,
+                &path,
+                &method,
+                &req_headers,
+                body_bytes,
+                effective_client_ip,
+            )
+            .await;
+        }
     }
 
     // 7. Tenant-Isolated Edge Cache Check (Finding 5, 12, RFC 9111, P1 Finding 4, P2 Milestone 4)

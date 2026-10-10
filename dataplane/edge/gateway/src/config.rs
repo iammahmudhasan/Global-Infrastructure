@@ -77,6 +77,8 @@ pub struct GatewayConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub control_plane: ControlPlaneConfig,
+    #[serde(default)]
+    pub ai: Option<AiGatewayConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +219,20 @@ impl Default for ControlPlaneConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AiGatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ai_prefix")]
+    pub route_prefix: String,
+    #[serde(default)]
+    pub providers: Vec<crate::ai::AiProvider>,
+}
+
+fn default_ai_prefix() -> String {
+    "/v1".to_string()
+}
+
 fn default_max_cache_bytes() -> usize {
     100 * 1024 * 1024 // 100 MB hard ceiling
 }
@@ -255,6 +271,7 @@ impl Default for GatewayConfig {
                 max_bytes: 100 * 1024 * 1024,
             },
             control_plane: ControlPlaneConfig::default(),
+            ai: None,
         }
     }
 }
@@ -336,6 +353,19 @@ impl GatewayConfig {
         if let Ok(v) = std::env::var("NEXUSEDGE_CP_SNAPSHOT_FILE") {
             if !v.trim().is_empty() {
                 self.control_plane.snapshot_file = Some(v.trim().to_string());
+            }
+        }
+        if let Ok(v) = std::env::var("NEXUSEDGE_AI_ENABLED") {
+            let lower = v.trim().to_ascii_lowercase();
+            let enabled = lower == "true" || lower == "1";
+            if let Some(ref mut ai_cfg) = self.ai {
+                ai_cfg.enabled = enabled;
+            } else if enabled {
+                self.ai = Some(AiGatewayConfig {
+                    enabled: true,
+                    route_prefix: default_ai_prefix(),
+                    providers: vec![],
+                });
             }
         }
     }

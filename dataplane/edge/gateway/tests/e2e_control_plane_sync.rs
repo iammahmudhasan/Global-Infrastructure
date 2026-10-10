@@ -926,6 +926,7 @@ async fn test_e2e_readiness_and_liveness_probes() {
         is_ready: Arc::clone(&is_ready),
         trusted_proxies: config.parsed_trusted_proxies(),
         config,
+        ai_director: None,
     });
 
     let (addr, shutdown_tx) = spawn_mock_gateway(state).await;

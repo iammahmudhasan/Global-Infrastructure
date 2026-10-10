@@ -131,6 +131,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Configured trusted reverse proxy CIDRs"
     );
 
+    let ai_director = config.ai.as_ref().and_then(|ai_cfg| {
+        if ai_cfg.enabled {
+            info!(
+                providers = ai_cfg.providers.len(),
+                "NexusEdge Universal AI & Compute Director: ACTIVE"
+            );
+            Some(Arc::new(nexusedge_gateway::ai::AiTrafficDirector::new(
+                ai_cfg.providers.clone(),
+            )))
+        } else {
+            None
+        }
+    });
+
     let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {
         config: config.clone(),
@@ -145,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         aggregate_buffered_bytes,
         aggregate_buffered_request_bytes,
         is_ready: Arc::clone(&is_ready),
+        ai_director,
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
