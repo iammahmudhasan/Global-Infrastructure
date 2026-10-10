@@ -34,6 +34,7 @@ jobs:
         service:
           - services/edge/config-controller
           - services/network/global-router
+          - apps/cli
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

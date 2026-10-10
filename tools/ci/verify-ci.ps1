@@ -16,7 +16,8 @@ if (-not $RepoRoot) {
 Write-Host "[1/7] Running Go format check (gofmt -l)..." -ForegroundColor Yellow
 $GoServices = @(
     "services/edge/config-controller",
-    "services/network/global-router"
+    "services/network/global-router",
+    "apps/cli"
 )
 
 foreach ($svc in $GoServices) {

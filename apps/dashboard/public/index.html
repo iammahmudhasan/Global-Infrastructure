@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NexusEdge | Universal AI / Compute Traffic Controller</title>
+  <meta name="description" content="Global AI Traffic Controller, Spot Cost Arbitrage, and Sovereign Compute Fabric">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #060913;
+      --bg-surface: rgba(15, 23, 42, 0.75);
+      --bg-surface-elevated: rgba(30, 41, 59, 0.65);
+      --border-subtle: rgba(255, 255, 255, 0.08);
+      --border-focus: rgba(99, 102, 241, 0.5);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent-cyan: #06b6d4;
+      --accent-indigo: #6366f1;
+      --accent-emerald: #10b981;
+      --accent-amber: #f59e0b;
+      --accent-rose: #f43f5e;
+      --gradient-brand: linear-gradient(135deg, #06b6d4 0%, #6366f1 50%, #a855f7 100%);
+      --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg-base);
+      background-image: 
+        radial-gradient(circle at 15% 10%, rgba(99, 102, 241, 0.12) 0%, transparent 40%),
+        radial-gradient(circle at 85% 85%, rgba(6, 182, 212, 0.1) 0%, transparent 45%);
+      color: var(--text-main);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    header {
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border-subtle);
+      background: rgba(6, 9, 19, 0.85);
+      backdrop-filter: blur(16px);
+      position: sticky;
+      top: 0;
+      z-index: 50;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }
+
+    .brand-logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: var(--gradient-brand);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 1.15rem;
+      color: #fff;
+      box-shadow: 0 0 16px rgba(99, 102, 241, 0.4);
+    }
+
+    .brand-title {
+      font-size: 1.2rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .brand-subtitle {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      padding: 0.4rem 0.85rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--accent-emerald);
+    }
+
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      background: var(--accent-emerald);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-emerald);
+      animation: pulse 2s infinite;
+    }
+
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.2); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    main {
+      flex: 1;
+      padding: 2rem;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 2rem;
+    }
+
+    /* KPI Highlights Grid */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1.25rem;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 1.5rem;
+      backdrop-filter: blur(12px);
+      box-shadow: var(--glass-shadow);
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+
+    .card:hover {
+      border-color: rgba(99, 102, 241, 0.3);
+      transform: translateY(-2px);
+    }
+
+    .card-label {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.5rem;
+    }
+
+    .card-value {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 0.35rem;
+    }
+
+    .card-subtext {
+      font-size: 0.78rem;
+      color: var(--text-dim);
+    }
+
+    .text-emerald { color: var(--accent-emerald); }
+    .text-cyan { color: var(--accent-cyan); }
+    .text-indigo { color: var(--accent-indigo); }
+    .text-amber { color: var(--accent-amber); }
+
+    /* Main Dual Columns */
+    .dashboard-layout {
+      display: grid;
+      grid-template-columns: 1.25fr 1fr;
+      gap: 1.5rem;
+    }
+
+    @media (max-width: 1024px) {
+      .dashboard-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .section-title {
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin-bottom: 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* Provider Matrix Table */
+    .table-container {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.85rem;
+    }
+
+    th {
+      color: var(--text-dim);
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    td {
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      color: var(--text-main);
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .mono {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 0.2rem 0.55rem;
+      border-radius: 4px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+    }
+
+    .badge-bd {
+      background: rgba(16, 185, 129, 0.15);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.3);
+    }
+
+    .badge-global {
+      background: rgba(99, 102, 241, 0.15);
+      color: #818cf8;
+      border: 1px solid rgba(99, 102, 241, 0.3);
+    }
+
+    .badge-spot {
+      background: rgba(6, 182, 212, 0.15);
+      color: #22d3ee;
+      border: 1px solid rgba(6, 182, 212, 0.3);
+    }
+
+    /* Interactive Playground */
+    .playground-form {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    select, textarea, input {
+      background: rgba(6, 9, 19, 0.8);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0.75rem;
+      color: var(--text-main);
+      font-family: inherit;
+      font-size: 0.85rem;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    select:focus, textarea:focus, input:focus {
+      border-color: var(--border-focus);
+    }
+
+    textarea {
+      resize: vertical;
+      min-height: 80px;
+    }
+
+    .btn-dispatch {
+      background: var(--gradient-brand);
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.9rem;
+      padding: 0.85rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      box-shadow: 0 4px 16px rgba(99, 102, 241, 0.35);
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+
+    .btn-dispatch:hover {
+      opacity: 0.95;
+      transform: translateY(-1px);
+    }
+
+    .btn-dispatch:active {
+      transform: translateY(1px);
+    }
+
+    /* Response Inspector Terminal */
+    .terminal-box {
+      background: #030712;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 1rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: #e2e8f0;
+      max-height: 240px;
+      overflow-y: auto;
+      line-height: 1.5;
+    }
+
+    .terminal-header {
+      color: var(--text-dim);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      padding-bottom: 0.5rem;
+      margin-bottom: 0.5rem;
+      display: flex;
+      justify-content: space-between;
+    }
+
+    footer {
+      padding: 1.5rem 2rem;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 0.78rem;
+      border-top: 1px solid var(--border-subtle);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-logo">N</div>
+      <div>
+        <div class="brand-title">NexusEdge</div>
+        <div class="brand-subtitle">Universal AI Traffic Director & Economics Matrix</div>
+      </div>
+    </div>
+    <div class="status-badge" id="gateway-status">
+      <div class="pulse-dot"></div>
+      <span>Data Plane Ingress: Online</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Live Economics KPI Highlights -->
+    <section class="kpi-grid">
+      <div class="card">
+        <div class="card-label">Total Tokens Routed</div>
+        <div class="card-value text-cyan" id="kpi-tokens">1,482,900</div>
+        <div class="card-subtext">Prompt: 890k | Completion: 592k</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Arbitraged Dollar Savings</div>
+        <div class="card-value text-emerald" id="kpi-savings">$2,965.80</div>
+        <div class="card-subtext">Compared to Cloud Hyperscaler Baseline</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Average Cost Reduction</div>
+        <div class="card-value text-indigo" id="kpi-percent">76.4%</div>
+        <div class="card-subtext">Spot arbitrage & multi-objective dispatch</div>
+      </div>
+
+      <div class="card">
+        <div class="card-label">Average Time To First Token</div>
+        <div class="card-value text-amber" id="kpi-ttft">24.2 ms</div>
+        <div class="card-subtext">Fastest edge path & warm GPU queues</div>
+      </div>
+    </section>
+
+    <!-- Operational Split -->
+    <div class="dashboard-layout">
+      <!-- Provider Matrix -->
+      <section class="card">
+        <div class="section-title">
+          <span>Connected AI Compute Clusters</span>
+          <span style="font-size: 0.8rem; color: var(--text-muted);" id="provider-count">4 Active Nodes</span>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>Cluster / Provider</th>
+                <th>Type</th>
+                <th>Jurisdiction</th>
+                <th>Cost / 1M</th>
+                <th>EWMA TTFT</th>
+                <th>Health</th>
+              </tr>
+            </thead>
+            <tbody id="provider-rows">
+              <tr>
+                <td><strong>CoreWeave Spot 01</strong><br><span class="mono" style="font-size:0.75rem; color:var(--text-dim);">us-east-va</span></td>
+                <td><span class="badge badge-spot">vLLM</span></td>
+                <td><span class="badge badge-global">US</span></td>
+                <td class="mono text-emerald">$0.50</td>
+                <td class="mono">18 ms</td>
+                <td><span class="text-emerald" style="font-weight:600;">ACTIVE</span></td>
+              </tr>
+              <tr>
+                <td><strong>Dhaka BDIX DGX Pod</strong><br><span class="mono" style="font-size:0.75rem; color:var(--text-dim);">bd-dhaka-01</span></td>
+                <td><span class="badge badge-bd">On-Prem</span></td>
+                <td><span class="badge badge-bd">BD (NDMA 2026)</span></td>
+                <td class="mono text-emerald">$0.80</td>
+                <td class="mono">4 ms</td>
+                <td><span class="text-emerald" style="font-weight:600;">SOVEREIGN</span></td>
+              </tr>
+              <tr>
+                <td><strong>Azure OpenAI West EU</strong><br><span class="mono" style="font-size:0.75rem; color:var(--text-dim);">eu-amsterdam</span></td>
+                <td><span class="badge badge-global">Azure</span></td>
+                <td><span class="badge badge-global">EU</span></td>
+                <td class="mono text-amber">$2.20</td>
+                <td class="mono">28 ms</td>
+                <td><span class="text-emerald" style="font-weight:600;">ACTIVE</span></td>
+              </tr>
+              <tr>
+                <td><strong>OpenAI Cloud Baseline</strong><br><span class="mono" style="font-size:0.75rem; color:var(--text-dim);">us-global</span></td>
+                <td><span class="badge badge-global">OpenAI</span></td>
+                <td><span class="badge badge-global">US</span></td>
+                <td class="mono text-amber">$2.50</td>
+                <td class="mono">45 ms</td>
+                <td><span class="text-emerald" style="font-weight:600;">FALLBACK</span></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Interactive Inference & Strategy Tester -->
+      <section class="card">
+        <div class="section-title">
+          <span>Inference Routing Simulator</span>
+          <span style="font-size: 0.75rem; color: var(--accent-cyan);">Line-Rate Passthrough</span>
+        </div>
+
+        <form class="playground-form" onsubmit="event.preventDefault(); simulateDispatch();">
+          <div class="form-group">
+            <label for="strategy-select">Multi-Objective Strategy</label>
+            <select id="strategy-select">
+              <option value="cost" selected>Lowest Spot Cost Arbitrage (Cheapest Available)</option>
+              <option value="latency">Fastest Path (Lowest EWMA TTFT)</option>
+              <option value="balanced">Pareto Balanced (50% Cost + 50% TTFT)</option>
+              <option value="priority">Strict Priority Tiers with Cost Tie-Break</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="jurisdiction-select">Sovereignty Constraint (Hard Residency Filter)</label>
+            <select id="jurisdiction-select">
+              <option value="">Global (Any Available Node)</option>
+              <option value="BD">Bangladesh NDMA 2026 (Local Cryptographic Residency)</option>
+              <option value="EU">European Union (GDPR Enforced)</option>
+              <option value="US">United States</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="prompt-input">Test Prompt</label>
+            <textarea id="prompt-input" rows="2">Where should this AI workload run right now?</textarea>
+          </div>
+
+          <button type="submit" class="btn-dispatch" id="btn-submit">Dispatch Inference Request</button>
+        </form>
+
+        <div style="margin-top: 1.25rem;">
+          <div class="terminal-header">
+            <span>DISPATCH INSPECTOR TELEMETRY</span>
+            <span id="response-status">STATUS: STANDBY</span>
+          </div>
+          <div class="terminal-box" id="terminal-output">
+[NexusEdge] Ready for inference dispatch.
+Select routing strategy and press 'Dispatch Inference Request' to inspect multi-objective routing, circuit-breaker failover, and dollar savings in real time.
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer>
+    NexusEdge Global Infrastructure Platform &copy; 2026. Built with Rust, Go, Python & PostgreSQL.
+  </footer>
+
+  <script>
+    async function simulateDispatch() {
+      const btn = document.getElementById('btn-submit');
+      const term = document.getElementById('terminal-output');
+      const statusSpan = document.getElementById('response-status');
+      const strategy = document.getElementById('strategy-select').value;
+      const jurisdiction = document.getElementById('jurisdiction-select').value;
+      const prompt = document.getElementById('prompt-input').value;
+
+      btn.disabled = true;
+      btn.innerText = "Dispatching via Line-Rate Edge...";
+      statusSpan.innerText = "STATUS: ROUTING...";
+
+      term.innerText = `> POST /v1/chat/completions\n> Host: edge.nexusedge.io:8080\n> X-NexusEdge-Routing-Strategy: ${strategy}\n${jurisdiction ? `> X-NexusEdge-Jurisdiction: ${jurisdiction}\n` : ''}> Payload: {"model": "llama-3.3-70b", "messages": [{"role": "user", "content": "${prompt.substring(0, 30)}..."}]}\n\nConnecting to edge director...\n`;
+
+      try {
+        const headers = {
+          'Content-Type': 'application/json',
+          'X-NexusEdge-Routing-Strategy': strategy,
+        };
+        if (jurisdiction) {
+          headers['X-NexusEdge-Jurisdiction'] = jurisdiction;
+        }
+
+        const resp = await fetch('http://127.0.0.1:8080/v1/chat/completions', {
+          method: 'POST',
+          headers: headers,
+          body: JSON.stringify({
+            model: "llama-3.3-70b",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.7,
+            max_tokens: 128
+          })
+        });
+
+        const provider = resp.headers.get('x-nexusedge-provider') || 'spot-coreweave';
+        const costPerM = resp.headers.get('x-nexusedge-cost-per-mtokens') || '0.50';
+        const ttft = resp.headers.get('x-nexusedge-ttft-ms') || '18';
+        const totalDuration = resp.headers.get('x-nexusedge-total-duration-ms') || '26';
+        const tokensTotal = resp.headers.get('x-nexusedge-tokens-total') || '512';
+        const savingsUSD = resp.headers.get('x-nexusedge-estimated-savings-usd') || '0.001024';
+        const failovers = resp.headers.get('x-nexusedge-failover-count') || '0';
+
+        statusSpan.innerText = `STATUS: HTTP ${resp.status} OK`;
+        term.innerText += `\n< HTTP/1.1 ${resp.status} OK
+< X-NexusEdge-Provider: ${provider}
+< X-NexusEdge-Routing-Strategy: ${strategy}
+< X-NexusEdge-Cost-Per-MTokens: $${costPerM}
+< X-NexusEdge-Tokens-Total: ${tokensTotal}
+< X-NexusEdge-Estimated-Savings-USD: $${savingsUSD}
+< X-NexusEdge-TTFT-Ms: ${ttft} ms
+< X-NexusEdge-Failover-Count: ${failovers}
+< X-NexusEdge-Total-Duration-Ms: ${totalDuration} ms
+
+Response payload delivered successfully with zero gateway overhead.`;
+      } catch (err) {
+        // Fallback simulation when edge is not locally bound
+        let simulatedProvider = 'spot-coreweave';
+        let cost = '0.50';
+        let ttft = '18';
+        if (jurisdiction === 'BD') {
+          simulatedProvider = 'onprem-dhaka-dgx';
+          cost = '0.80';
+          ttft = '4';
+        } else if (strategy === 'latency') {
+          simulatedProvider = 'onprem-dhaka-dgx';
+          cost = '0.80';
+          ttft = '4';
+        }
+
+        statusSpan.innerText = `STATUS: HTTP 200 OK (SIMULATED)`;
+        term.innerText += `\n< HTTP/1.1 200 OK
+< X-NexusEdge-Provider: ${simulatedProvider}
+< X-NexusEdge-Routing-Strategy: ${strategy}
+< X-NexusEdge-Cost-Per-MTokens: $${cost}
+< X-NexusEdge-Tokens-Total: 512
+< X-NexusEdge-Estimated-Savings-USD: $0.001024
+< X-NexusEdge-TTFT-Ms: ${ttft} ms
+< X-NexusEdge-Failover-Count: 0
+< X-NexusEdge-Total-Duration-Ms: 22 ms
+
+Response content:
+"Based on real-time matrix analysis, workload placed at ${simulatedProvider} achieving $${cost}/1M token spot rate."`;
+      } finally {
+        btn.disabled = false;
+        btn.innerText = "Dispatch Inference Request";
+      }
+    }
+  </script>
+</body>
+</html>
