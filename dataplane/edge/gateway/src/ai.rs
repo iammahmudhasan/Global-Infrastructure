@@ -10,14 +10,40 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-/// Standard endpoints recognized as OpenAI / vLLM compatible AI inference requests.
+/// Standard endpoints recognized as OpenAI / Anthropic / vLLM compatible AI inference requests.
 pub const AI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 pub const AI_COMPLETIONS_PATH: &str = "/v1/completions";
 pub const AI_EMBEDDINGS_PATH: &str = "/v1/embeddings";
 pub const AI_MODELS_PATH: &str = "/v1/models";
+pub const AI_ANTHROPIC_MESSAGES_PATH: &str = "/v1/messages";
+pub const AI_ANTHROPIC_COMPLETE_PATH: &str = "/v1/complete";
 
 pub const AI_ANALYTICS_PATH: &str = "/v1/nexusedge/ai/analytics";
 pub const AI_METRICS_PATH: &str = "/v1/nexusedge/ai/metrics";
+
+/// Supported AI inference protocols across clients and providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiProtocol {
+    OpenAi,
+    Anthropic,
+}
+
+impl AiProtocol {
+    pub fn from_path(path: &str) -> Self {
+        if path.contains("/messages") || path.contains("/complete") {
+            AiProtocol::Anthropic
+        } else {
+            AiProtocol::OpenAi
+        }
+    }
+
+    pub fn from_provider_type(ptype: &str) -> Self {
+        match ptype.to_lowercase().as_str() {
+            "anthropic" | "bedrock" => AiProtocol::Anthropic,
+            _ => AiProtocol::OpenAi,
+        }
+    }
+}
 
 /// Multi-objective routing strategy supported by the AI Traffic Director.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -42,7 +68,7 @@ impl RoutingStrategy {
     }
 }
 
-/// Returns true if the path and method correspond to an OpenAI/vLLM AI inference endpoint.
+/// Returns true if the path and method correspond to an OpenAI, Anthropic, or vLLM AI endpoint.
 pub fn is_ai_inference_request(path: &str, method: &Method) -> bool {
     if method == Method::GET
         && (path == AI_MODELS_PATH || path == AI_METRICS_PATH || path == AI_ANALYTICS_PATH)
@@ -52,7 +78,9 @@ pub fn is_ai_inference_request(path: &str, method: &Method) -> bool {
     if method == Method::POST {
         return path == AI_CHAT_COMPLETIONS_PATH
             || path == AI_COMPLETIONS_PATH
-            || path == AI_EMBEDDINGS_PATH;
+            || path == AI_EMBEDDINGS_PATH
+            || path == AI_ANTHROPIC_MESSAGES_PATH
+            || path == AI_ANTHROPIC_COMPLETE_PATH;
     }
     false
 }
@@ -478,15 +506,17 @@ pub fn extract_token_usage(body: &[u8]) -> Option<ExtractedTokenUsage> {
     if body.is_empty() {
         return None;
     }
-    // 1. Try standard JSON payload
+    // 1. Try standard JSON payload (OpenAI prompt_tokens / Anthropic input_tokens)
     if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
         if let Some(usage) = v.get("usage") {
             let p = usage
                 .get("prompt_tokens")
+                .or_else(|| usage.get("input_tokens"))
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0);
             let c = usage
                 .get("completion_tokens")
+                .or_else(|| usage.get("output_tokens"))
                 .and_then(|t| t.as_u64())
                 .unwrap_or(0);
             let total = usage
@@ -516,10 +546,12 @@ pub fn extract_token_usage(body: &[u8]) -> Option<ExtractedTokenUsage> {
                         if let Some(usage) = v.get("usage") {
                             let p = usage
                                 .get("prompt_tokens")
+                                .or_else(|| usage.get("input_tokens"))
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
                             let c = usage
                                 .get("completion_tokens")
+                                .or_else(|| usage.get("output_tokens"))
                                 .and_then(|t| t.as_u64())
                                 .unwrap_or(0);
                             let total = usage
@@ -540,6 +572,274 @@ pub fn extract_token_usage(body: &[u8]) -> Option<ExtractedTokenUsage> {
         }
     }
     None
+}
+
+/// Translates an OpenAI `/v1/chat/completions` JSON payload to an Anthropic `/v1/messages` JSON payload.
+pub fn translate_openai_to_anthropic_payload(body: &[u8]) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        format!(
+            "Failed to parse OpenAI payload for Anthropic translation: {}",
+            e
+        )
+    })?;
+
+    let mut system_prompt = String::new();
+    let mut anthropic_messages = Vec::new();
+
+    if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = match msg.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(arr)) => {
+                    let mut text_acc = String::new();
+                    for part in arr {
+                        if let Some(t) = part.get("text").and_then(|s| s.as_str()) {
+                            text_acc.push_str(t);
+                        }
+                    }
+                    text_acc
+                }
+                _ => String::new(),
+            };
+
+            if role == "system" {
+                if !system_prompt.is_empty() {
+                    system_prompt.push('\n');
+                }
+                system_prompt.push_str(&content);
+            } else {
+                anthropic_messages.push(serde_json::json!({
+                    "role": role,
+                    "content": content
+                }));
+            }
+        }
+    }
+
+    let mut anthropic_obj = serde_json::Map::new();
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("claude-3-5-sonnet-20241022");
+    anthropic_obj.insert("model".to_string(), serde_json::json!(model));
+
+    if !system_prompt.is_empty() {
+        anthropic_obj.insert("system".to_string(), serde_json::json!(system_prompt));
+    }
+
+    anthropic_obj.insert(
+        "messages".to_string(),
+        serde_json::Value::Array(anthropic_messages),
+    );
+
+    let max_tokens = v.get("max_tokens").and_then(|t| t.as_u64()).unwrap_or(1024);
+    anthropic_obj.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+
+    if let Some(temp) = v.get("temperature") {
+        anthropic_obj.insert("temperature".to_string(), temp.clone());
+    }
+
+    if let Some(stream) = v.get("stream") {
+        anthropic_obj.insert("stream".to_string(), stream.clone());
+    }
+
+    serde_json::to_vec(&serde_json::Value::Object(anthropic_obj))
+        .map_err(|e| format!("Failed to serialize translated Anthropic payload: {}", e))
+}
+
+/// Translates an Anthropic `/v1/messages` JSON payload to an OpenAI `/v1/chat/completions` JSON payload.
+pub fn translate_anthropic_to_openai_payload(body: &[u8]) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| {
+        format!(
+            "Failed to parse Anthropic payload for OpenAI translation: {}",
+            e
+        )
+    })?;
+
+    let mut openai_messages = Vec::new();
+
+    if let Some(system) = v.get("system") {
+        let system_str = match system {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(arr) => {
+                let mut acc = String::new();
+                for item in arr {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        acc.push_str(text);
+                    }
+                }
+                acc
+            }
+            _ => String::new(),
+        };
+        if !system_str.is_empty() {
+            openai_messages.push(serde_json::json!({
+                "role": "system",
+                "content": system_str
+            }));
+        }
+    }
+
+    if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            let content = match msg.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(arr)) => {
+                    let mut acc = String::new();
+                    for part in arr {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            acc.push_str(text);
+                        }
+                    }
+                    acc
+                }
+                _ => String::new(),
+            };
+            openai_messages.push(serde_json::json!({
+                "role": role,
+                "content": content
+            }));
+        }
+    }
+
+    let mut openai_obj = serde_json::Map::new();
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("llama-3.3-70b");
+    openai_obj.insert("model".to_string(), serde_json::json!(model));
+    openai_obj.insert(
+        "messages".to_string(),
+        serde_json::Value::Array(openai_messages),
+    );
+
+    if let Some(max_tokens) = v.get("max_tokens") {
+        openai_obj.insert("max_tokens".to_string(), max_tokens.clone());
+    }
+    if let Some(temp) = v.get("temperature") {
+        openai_obj.insert("temperature".to_string(), temp.clone());
+    }
+    if let Some(stream) = v.get("stream") {
+        openai_obj.insert("stream".to_string(), stream.clone());
+    }
+
+    serde_json::to_vec(&serde_json::Value::Object(openai_obj))
+        .map_err(|e| format!("Failed to serialize translated OpenAI payload: {}", e))
+}
+
+/// Translates an OpenAI chat completion JSON response to an Anthropic message JSON response.
+pub fn translate_openai_to_anthropic_response(
+    resp_body: &[u8],
+    requested_model: &str,
+) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(resp_body).map_err(|e| {
+        format!(
+            "Failed to parse OpenAI response for Anthropic translation: {}",
+            e
+        )
+    })?;
+
+    let id = v
+        .get("id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("chatcmpl-unknown");
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(requested_model);
+
+    let content = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    let usage = extract_token_usage(resp_body).unwrap_or_default();
+
+    let anthropic_resp = serde_json::json!({
+        "id": format!("msg_{}", id),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [
+            {
+                "type": "text",
+                "text": content
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": usage.completion_tokens
+        }
+    });
+
+    serde_json::to_vec(&anthropic_resp)
+        .map_err(|e| format!("Failed to serialize translated Anthropic response: {}", e))
+}
+
+/// Translates an Anthropic message JSON response to an OpenAI chat completion JSON response.
+pub fn translate_anthropic_to_openai_response(
+    resp_body: &[u8],
+    requested_model: &str,
+) -> Result<Vec<u8>, String> {
+    let v: serde_json::Value = serde_json::from_slice(resp_body).map_err(|e| {
+        format!(
+            "Failed to parse Anthropic response for OpenAI translation: {}",
+            e
+        )
+    })?;
+
+    let id = v
+        .get("id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("msg-unknown");
+    let model = v
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or(requested_model);
+
+    let mut text_acc = String::new();
+    if let Some(content_arr) = v.get("content").and_then(|c| c.as_array()) {
+        for block in content_arr {
+            if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                text_acc.push_str(text);
+            }
+        }
+    }
+
+    let usage = extract_token_usage(resp_body).unwrap_or_default();
+
+    let openai_resp = serde_json::json!({
+        "id": format!("chatcmpl_{}", id),
+        "object": "chat.completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": text_acc
+                },
+                "finish_reason": "stop"
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "total_tokens": usage.total_tokens
+        }
+    });
+
+    serde_json::to_vec(&openai_resp)
+        .map_err(|e| format!("Failed to serialize translated OpenAI response: {}", e))
 }
 
 /// Parses high-level metadata from an incoming AI inference payload.
@@ -681,21 +981,32 @@ pub async fn dispatch_ai_request_with_failover(
     let mut failover_count = 0u32;
     let mut last_error_status = StatusCode::BAD_GATEWAY;
 
+    let caller_protocol = AiProtocol::from_path(path);
+
     for candidate_state in candidates {
         candidate_state
             .total_requests
             .fetch_add(1, Ordering::Relaxed);
         let provider = &candidate_state.provider;
+        let target_protocol = AiProtocol::from_provider_type(&provider.provider_type);
 
-        // Construct target dispatch URL
+        // Construct target dispatch URL with protocol path adaptation
+        let dispatch_path = match (caller_protocol, target_protocol) {
+            (AiProtocol::OpenAi, AiProtocol::Anthropic) => "/messages",
+            (AiProtocol::Anthropic, AiProtocol::OpenAi) => "/chat/completions",
+            _ => {
+                if path.starts_with("/v1/") {
+                    &path["/v1".len()..]
+                } else {
+                    path
+                }
+            }
+        };
+
         let target_url = format!(
             "{}{}",
             provider.endpoint.trim_end_matches('/'),
-            if path.starts_with("/v1/") {
-                &path["/v1".len()..]
-            } else {
-                path
-            }
+            dispatch_path
         );
 
         let mut req_builder = client.request(
@@ -710,6 +1021,7 @@ pub async fn dispatch_ai_request_with_failover(
                 || name_str == "authorization"
                 || name_str == "connection"
                 || name_str == "transfer-encoding"
+                || name_str == "content-length"
             {
                 continue;
             }
@@ -723,15 +1035,29 @@ pub async fn dispatch_ai_request_with_failover(
 
         // Dynamically inject provider credentials (Key Vault Injection)
         if let Some(ref key) = provider.api_key {
-            if provider.provider_type == "azure" {
-                req_builder = req_builder.header("api-key", key);
-            } else {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+            match provider.provider_type.as_str() {
+                "azure" => {
+                    req_builder = req_builder.header("api-key", key);
+                }
+                "anthropic" | "bedrock" => {
+                    req_builder = req_builder
+                        .header("x-api-key", key)
+                        .header("anthropic-version", "2023-06-01");
+                }
+                _ => {
+                    req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+                }
             }
         } else if let Some(client_auth) = req_headers.get("authorization") {
             // Pass through client's key if provider has no override
             if let Ok(val) = client_auth.to_str() {
                 req_builder = req_builder.header("Authorization", val);
+            }
+        } else if let Some(client_key) = req_headers.get("x-api-key") {
+            if let Ok(val) = client_key.to_str() {
+                req_builder = req_builder
+                    .header("x-api-key", val)
+                    .header("anthropic-version", "2023-06-01");
             }
         }
 
@@ -741,8 +1067,27 @@ pub async fn dispatch_ai_request_with_failover(
             .header("X-NexusEdge-Selected-Provider", &provider.id)
             .header("X-NexusEdge-Model", &metadata.model);
 
-        if !body_bytes.is_empty() {
-            req_builder = req_builder.body(body_bytes.clone());
+        // Translate request payload if caller protocol differs from upstream provider protocol
+        let dispatch_body = if !body_bytes.is_empty() {
+            match (caller_protocol, target_protocol) {
+                (AiProtocol::OpenAi, AiProtocol::Anthropic) => {
+                    translate_openai_to_anthropic_payload(&body_bytes)
+                        .map(Bytes::from)
+                        .unwrap_or_else(|_| body_bytes.clone())
+                }
+                (AiProtocol::Anthropic, AiProtocol::OpenAi) => {
+                    translate_anthropic_to_openai_payload(&body_bytes)
+                        .map(Bytes::from)
+                        .unwrap_or_else(|_| body_bytes.clone())
+                }
+                _ => body_bytes.clone(),
+            }
+        } else {
+            body_bytes.clone()
+        };
+
+        if !dispatch_body.is_empty() {
+            req_builder = req_builder.body(dispatch_body);
         }
 
         let send_start = Instant::now();
@@ -812,9 +1157,29 @@ pub async fn dispatch_ai_request_with_failover(
 
                 let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
 
+                // Translate response body if caller protocol differs from upstream provider protocol
+                let final_resp_bytes = if !resp_bytes.is_empty() && resp_status == StatusCode::OK {
+                    match (caller_protocol, target_protocol) {
+                        (AiProtocol::OpenAi, AiProtocol::Anthropic) => {
+                            translate_anthropic_to_openai_response(&resp_bytes, &metadata.model)
+                                .map(Bytes::from)
+                                .unwrap_or(resp_bytes.clone())
+                        }
+                        (AiProtocol::Anthropic, AiProtocol::OpenAi) => {
+                            translate_openai_to_anthropic_response(&resp_bytes, &metadata.model)
+                                .map(Bytes::from)
+                                .unwrap_or(resp_bytes.clone())
+                        }
+                        _ => resp_bytes.clone(),
+                    }
+                } else {
+                    resp_bytes.clone()
+                };
+
                 // Calculate real-time token economics & dollar savings
                 let baseline_cost = director.get_baseline_cost_per_m();
-                let usage_opt = extract_token_usage(&resp_bytes);
+                let usage_opt = extract_token_usage(&final_resp_bytes)
+                    .or_else(|| extract_token_usage(&resp_bytes));
                 let (tokens_total, savings_usd) = if let Some(ref usage) = usage_opt {
                     director.record_token_usage(
                         usage.prompt_tokens,
@@ -835,7 +1200,7 @@ pub async fn dispatch_ai_request_with_failover(
                         );
                 }
 
-                let resp = builder.body(Full::new(resp_bytes)).unwrap();
+                let resp = builder.body(Full::new(final_resp_bytes)).unwrap();
                 return Ok(resp);
             }
             Err(e) => {

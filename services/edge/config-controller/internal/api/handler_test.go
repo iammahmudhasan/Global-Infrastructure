@@ -3169,3 +3169,64 @@ func TestPoPConfigSync_WithDynamicAIProviders(t *testing.T) {
 		t.Fatalf("unexpected AI provider in snapshot: %+v", syncResp.AIProviders[0])
 	}
 }
+
+func TestEdgeAIProviders_SyncEndpoint(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	st := handler.Store()
+
+	authInst.RegisterTenantWithRole("key-ops-edge-sync", "tenant-ops", "prj-ops", auth.RolePlatformOperator, "*")
+	authInst.RegisterTenantWithRole("key-node-sync", "tenant-node", "prj-infra", auth.RoleEdgeNode, "*")
+	authInst.RegisterTenantWithRole("key-dev-sync", "tenant-dev", "prj-dev", auth.RoleTenant, "prj-dev")
+
+	_ = st.SaveAIProvider(&model.AIProvider{
+		ID:                      "ai-edge-sync-test",
+		ProjectID:               "prj-ops",
+		Name:                    "Edge Sync Provider",
+		Endpoint:                "https://api.openai.com",
+		ProviderType:            "openai",
+		APIKey:                  "sk-secret-edge-key",
+		CostPerMTokens:          1.50,
+		Priority:                1,
+		SovereigntyJurisdiction: "GLOBAL",
+		FailoverCooldownSecs:    60,
+		Enabled:                 true,
+	})
+
+	// 1. Developer role -> 403 Forbidden
+	reqDev := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers", nil)
+	reqDev.Header.Set("X-API-Key", "key-dev-sync")
+	wDev := httptest.NewRecorder()
+	handler.ServeHTTP(wDev, reqDev)
+	if wDev.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for developer role, got %d", wDev.Code)
+	}
+
+	// 2. Edge Node role -> 200 OK
+	reqNode := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers", nil)
+	reqNode.Header.Set("X-API-Key", "key-node-sync")
+	wNode := httptest.NewRecorder()
+	handler.ServeHTTP(wNode, reqNode)
+	if wNode.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for edge node role, got %d: %s", wNode.Code, wNode.Body.String())
+	}
+	var nodeResp struct {
+		Count     int                 `json:"count"`
+		Providers []*model.AIProvider `json:"providers"`
+	}
+	if err := json.Unmarshal(wNode.Body.Bytes(), &nodeResp); err != nil {
+		t.Fatalf("failed to decode node response: %v", err)
+	}
+	if nodeResp.Count != 1 || len(nodeResp.Providers) != 1 || nodeResp.Providers[0].ID != "ai-edge-sync-test" {
+		t.Fatalf("unexpected providers payload for edge node: %+v", nodeResp)
+	}
+
+	// 3. Platform Operator role -> 200 OK
+	reqOps := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers", nil)
+	reqOps.Header.Set("X-API-Key", "key-ops-edge-sync")
+	wOps := httptest.NewRecorder()
+	handler.ServeHTTP(wOps, reqOps)
+	if wOps.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for platform operator, got %d", wOps.Code)
+	}
+}

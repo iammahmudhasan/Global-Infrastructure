@@ -203,6 +203,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/pops", h.handleListPoPs)
 	h.mux.HandleFunc("/v1/edge/pops/", h.handlePoPsRoute)
 	h.mux.HandleFunc("/v1/edge/routing/", h.handleRoutingRoute)
+	h.mux.HandleFunc("/v1/edge/ai-providers", h.handleEdgeAIProviders)
 	h.mux.HandleFunc("/v1/ai/providers", h.handleAIProvidersRoute)
 	h.mux.HandleFunc("/v1/ai/providers/", h.handleAIProviderByIDRoute)
 }
@@ -1743,9 +1744,32 @@ func (h *APIHandler) handleTopologies(w http.ResponseWriter, r *http.Request) {
 	}
 
 	topologies := h.store.GetActiveTopologies()
+	aiProviders := h.store.ListAIProviders()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"active_topologies_count": len(topologies),
 		"topologies":              topologies,
+		"ai_providers_count":      len(aiProviders),
+		"ai_providers":            aiProviders,
+	})
+}
+
+// GET /v1/edge/ai-providers
+func (h *APIHandler) handleEdgeAIProviders(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// RBAC Boundary: Platform Operators or Edge Nodes can retrieve dynamic AI providers for gateway routing
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+
+	providers := h.store.ListAIProviders()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"count":     len(providers),
+		"providers": providers,
 	})
 }
 

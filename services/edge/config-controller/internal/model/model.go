@@ -493,6 +493,8 @@ const (
 	AIProviderTypeVLLM      AIProviderType = "vllm"
 	AIProviderTypeOnPrem    AIProviderType = "onprem"
 	AIProviderTypeAWS       AIProviderType = "aws"
+	AIProviderTypeAnthropic AIProviderType = "anthropic"
+	AIProviderTypeBedrock   AIProviderType = "bedrock"
 )
 
 // AIProvider represents an external or on-prem AI inference compute provider
@@ -501,7 +503,7 @@ type AIProvider struct {
 	ProjectID               string    `json:"project_id"`
 	Name                    string    `json:"name"`
 	Endpoint                string    `json:"endpoint"`
-	ProviderType            string    `json:"provider_type"` // "openai", "azure", "coreweave", "vllm", "onprem", "aws"
+	ProviderType            string    `json:"provider_type"` // "openai", "azure", "coreweave", "vllm", "onprem", "aws", "anthropic", "bedrock"
 	APIKey                  string    `json:"api_key,omitempty"`
 	CostPerMTokens          float64   `json:"cost_per_m_tokens"`
 	Priority                uint32    `json:"priority"`
