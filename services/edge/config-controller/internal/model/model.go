@@ -458,16 +458,101 @@ type GatewayRouteSync struct {
 	Cache      *GatewayCacheSync      `json:"cache,omitempty"`
 }
 
+// GatewayAIProviderSync models validated AI compute provider destination for edge gateway
+type GatewayAIProviderSync struct {
+	ID                      string  `json:"id"`
+	Name                    string  `json:"name"`
+	Endpoint                string  `json:"endpoint"`
+	ProviderType            string  `json:"provider_type"`
+	APIKey                  string  `json:"api_key,omitempty"`
+	CostPerMTokens          float64 `json:"cost_per_m_tokens"`
+	Priority                uint32  `json:"priority"`
+	SovereigntyJurisdiction string  `json:"sovereignty_jurisdiction,omitempty"`
+	FailoverCooldownSecs    uint64  `json:"failover_cooldown_secs"`
+}
+
 // PoPConfigSync delivers synchronized Envoy configuration tailored for a specific PoP
 type PoPConfigSync struct {
-	PoPID           string             `json:"pop_id"`
-	ConfigVersion   string             `json:"config_version"`
-	ChecksumSHA256  string             `json:"checksum_sha256"`
-	CanonicalSHA256 string             `json:"canonical_sha256,omitempty"`
-	CompiledAt      time.Time          `json:"compiled_at"`
-	TopologiesCount int                `json:"topologies_count"`
-	EnvoyConfig     interface{}        `json:"envoy_config"`
-	Routes          []GatewayRouteSync `json:"routes,omitempty"`
+	PoPID           string                  `json:"pop_id"`
+	ConfigVersion   string                  `json:"config_version"`
+	ChecksumSHA256  string                  `json:"checksum_sha256"`
+	CanonicalSHA256 string                  `json:"canonical_sha256,omitempty"`
+	CompiledAt      time.Time               `json:"compiled_at"`
+	TopologiesCount int                     `json:"topologies_count"`
+	EnvoyConfig     interface{}             `json:"envoy_config"`
+	Routes          []GatewayRouteSync      `json:"routes,omitempty"`
+	AIProviders     []GatewayAIProviderSync `json:"ai_providers,omitempty"`
+}
+
+type AIProviderType string
+
+const (
+	AIProviderTypeOpenAI    AIProviderType = "openai"
+	AIProviderTypeAzure     AIProviderType = "azure"
+	AIProviderTypeCoreWeave AIProviderType = "coreweave"
+	AIProviderTypeVLLM      AIProviderType = "vllm"
+	AIProviderTypeOnPrem    AIProviderType = "onprem"
+	AIProviderTypeAWS       AIProviderType = "aws"
+)
+
+// AIProvider represents an external or on-prem AI inference compute provider
+type AIProvider struct {
+	ID                      string    `json:"id"`
+	ProjectID               string    `json:"project_id"`
+	Name                    string    `json:"name"`
+	Endpoint                string    `json:"endpoint"`
+	ProviderType            string    `json:"provider_type"` // "openai", "azure", "coreweave", "vllm", "onprem", "aws"
+	APIKey                  string    `json:"api_key,omitempty"`
+	CostPerMTokens          float64   `json:"cost_per_m_tokens"`
+	Priority                uint32    `json:"priority"`
+	SovereigntyJurisdiction string    `json:"sovereignty_jurisdiction,omitempty"` // e.g. "BD", "EU", "GLOBAL"
+	FailoverCooldownSecs    uint64    `json:"failover_cooldown_secs"`
+	Enabled                 bool      `json:"enabled"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+// AIProviderResponse masks API keys in public responses (Rules 18, 19)
+type AIProviderResponse struct {
+	ID                      string    `json:"id"`
+	ProjectID               string    `json:"project_id"`
+	Name                    string    `json:"name"`
+	Endpoint                string    `json:"endpoint"`
+	ProviderType            string    `json:"provider_type"`
+	APIKeyRedacted          string    `json:"api_key_redacted"`
+	CostPerMTokens          float64   `json:"cost_per_m_tokens"`
+	Priority                uint32    `json:"priority"`
+	SovereigntyJurisdiction string    `json:"sovereignty_jurisdiction,omitempty"`
+	FailoverCooldownSecs    uint64    `json:"failover_cooldown_secs"`
+	Enabled                 bool      `json:"enabled"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+func (p *AIProvider) ToResponse() AIProviderResponse {
+	redacted := "[NONE]"
+	if p.APIKey != "" {
+		if len(p.APIKey) > 8 {
+			redacted = p.APIKey[:3] + "..." + p.APIKey[len(p.APIKey)-4:]
+		} else {
+			redacted = "[REDACTED]"
+		}
+	}
+	return AIProviderResponse{
+		ID:                      p.ID,
+		ProjectID:               p.ProjectID,
+		Name:                    p.Name,
+		Endpoint:                p.Endpoint,
+		ProviderType:            p.ProviderType,
+		APIKeyRedacted:          redacted,
+		CostPerMTokens:          p.CostPerMTokens,
+		Priority:                p.Priority,
+		SovereigntyJurisdiction: p.SovereigntyJurisdiction,
+		FailoverCooldownSecs:    p.FailoverCooldownSecs,
+		Enabled:                 p.Enabled,
+		CreatedAt:               p.CreatedAt,
+		UpdatedAt:               p.UpdatedAt,
+	}
 }
 
 // LatencyRoute models inter-PoP or PoP-to-Origin physical fiber RTT

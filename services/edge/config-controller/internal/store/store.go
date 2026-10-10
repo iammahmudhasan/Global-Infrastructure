@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ const (
 	MaxRateLimitRulesPerDomain  = 500
 	MaxCacheRulesPerDomain      = 1000
 	DefaultMaxDomainsPerProject = 50 // Default per-project domain ceiling (Finding 2)
+	MaxAIProvidersPerProject    = 100
 
 	// WAF Rule Size Limits (Finding 2)
 	MaxWAFRuleName        = 128
@@ -108,6 +110,7 @@ type Store struct {
 	pendingCertificates map[string]*model.Certificate         // domain ID -> pending renewal/issuance certificate
 	challenges          map[string]*model.ACMEChallenge       // token -> ACMEChallenge
 	tlsSettings         map[string]*model.TLSSettings         // domain ID -> TLSSettings
+	aiProviders         map[string]*model.AIProvider          // provider ID -> AIProvider
 }
 
 func NewStore() *Store {
@@ -132,6 +135,7 @@ func NewStore() *Store {
 		pendingCertificates: make(map[string]*model.Certificate),
 		challenges:          make(map[string]*model.ACMEChallenge),
 		tlsSettings:         make(map[string]*model.TLSSettings),
+		aiProviders:         make(map[string]*model.AIProvider),
 	}
 }
 
@@ -1215,4 +1219,124 @@ func (s *Store) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
 	s.popTopologyCache[targetPoP] = topos
 
 	return cloneTopologies(topos)
+}
+
+func (s *Store) SaveAIProvider(p *model.AIProvider) error {
+	if p == nil {
+		return errors.New("provider cannot be nil")
+	}
+	if strings.TrimSpace(p.ID) == "" {
+		return errors.New("provider id is required")
+	}
+	if strings.TrimSpace(p.ProjectID) == "" {
+		return errors.New("provider project_id is required")
+	}
+	if strings.TrimSpace(p.Name) == "" {
+		return errors.New("provider name is required")
+	}
+	if strings.TrimSpace(p.Endpoint) == "" {
+		return errors.New("provider endpoint is required")
+	}
+	switch p.ProviderType {
+	case string(model.AIProviderTypeOpenAI), string(model.AIProviderTypeAzure),
+		string(model.AIProviderTypeCoreWeave), string(model.AIProviderTypeVLLM),
+		string(model.AIProviderTypeOnPrem), string(model.AIProviderTypeAWS):
+	default:
+		return fmt.Errorf("unsupported provider_type '%s'", p.ProviderType)
+	}
+	if p.CostPerMTokens < 0 {
+		return errors.New("cost_per_m_tokens cannot be negative")
+	}
+	if p.Priority == 0 {
+		p.Priority = 10
+	}
+	if p.FailoverCooldownSecs == 0 {
+		p.FailoverCooldownSecs = 60
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.aiProviders[p.ID]; !exists {
+		count := 0
+		for _, existing := range s.aiProviders {
+			if existing.ProjectID == p.ProjectID {
+				count++
+			}
+		}
+		if count >= MaxAIProvidersPerProject {
+			return errors.New("maximum AI providers per project exceeded")
+		}
+	}
+
+	now := time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+
+	clone := *p
+	s.aiProviders[p.ID] = &clone
+	return nil
+}
+
+func (s *Store) GetAIProvider(id string) (*model.AIProvider, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	p, exists := s.aiProviders[id]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	clone := *p
+	return &clone, nil
+}
+
+func (s *Store) ListAIProvidersByProject(projectID string) []*model.AIProvider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var list []*model.AIProvider
+	for _, p := range s.aiProviders {
+		if p.ProjectID == projectID {
+			clone := *p
+			list = append(list, &clone)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority < list[j].Priority
+		}
+		return list[i].Name < list[j].Name
+	})
+	return list
+}
+
+func (s *Store) ListAIProviders() []*model.AIProvider {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var list []*model.AIProvider
+	for _, p := range s.aiProviders {
+		clone := *p
+		list = append(list, &clone)
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority < list[j].Priority
+		}
+		return list[i].Name < list[j].Name
+	})
+	return list
+}
+
+func (s *Store) DeleteAIProvider(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.aiProviders[id]; !exists {
+		return ErrNotFound
+	}
+	delete(s.aiProviders, id)
+	return nil
 }

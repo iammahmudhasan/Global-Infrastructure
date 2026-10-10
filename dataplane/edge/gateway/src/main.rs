@@ -6,7 +6,7 @@ use nexusedge_gateway::proxy::{
 };
 use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{self, Router};
-use nexusedge_gateway::sync::fetch_and_apply_control_plane_snapshot;
+use nexusedge_gateway::sync::fetch_and_apply_control_plane_snapshot_full;
 use nexusedge_gateway::waf::WafEngine;
 
 use hyper::service::service_fn;
@@ -177,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sync_router = router.clone();
         let sync_dns = Arc::clone(&dns_resolver);
         let sync_is_ready = Arc::clone(&is_ready);
+        let sync_ai = state.ai_director.clone();
         let cp_cfg = config.control_plane.clone();
 
         // Control Plane HTTP client uses standard host DNS resolution (completely decoupled from origin DNS pinning)
@@ -210,18 +211,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 );
                             }
                         }
+                        if let Some(ref director) = sync_ai {
+                            if let Ok(new_ai) = router::parse_pop_config_ai_providers(&content) {
+                                if !new_ai.is_empty() {
+                                    director.update_providers(new_ai);
+                                }
+                            }
+                        }
                     }
                 }
 
                 // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config (P1 Integrity & SSRF Hardening)
                 if cp_cfg.enabled {
-                    match fetch_and_apply_control_plane_snapshot(
+                    match fetch_and_apply_control_plane_snapshot_full(
                         &cp_cfg.endpoint,
                         &cp_cfg.pop_id,
                         &cp_cfg.auth_token,
                         &sync_client,
                         &sync_router,
                         &sync_dns,
+                        sync_ai.as_deref(),
                     )
                     .await
                     {
@@ -230,8 +239,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             tracing::info!(
                                 pop_id = %cp_cfg.pop_id,
                                 routes = stats.routes_applied,
+                                ai_providers = stats.ai_providers_applied,
                                 checksum = %stats.checksum,
-                                "Atomically refreshed PoP routes from Control Plane"
+                                "Atomically refreshed PoP routes and AI compute providers from Control Plane"
                             );
                         }
                         Err(e) => {

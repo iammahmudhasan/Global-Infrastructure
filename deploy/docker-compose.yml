@@ -107,6 +107,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ../migrations/postgres/edge/0001_initial_edge_schema.sql:/docker-entrypoint-initdb.d/0001_initial_edge_schema.sql:ro
+      - ../migrations/postgres/edge/0002_ai_providers_vault.sql:/docker-entrypoint-initdb.d/0002_ai_providers_vault.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-nexusedge} -d $${POSTGRES_DB:-nexusedge_edge}"]
       interval: 5s

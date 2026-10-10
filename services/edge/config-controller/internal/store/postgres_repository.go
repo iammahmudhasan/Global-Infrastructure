@@ -244,6 +244,27 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`CREATE INDEX IF NOT EXISTS idx_acme_challenges_token ON acme_challenges(token);`,
 			},
 		},
+		{
+			version: "0002_ai_providers_vault",
+			stmts: []string{
+				`CREATE TABLE IF NOT EXISTS ai_providers (
+					id VARCHAR(64) PRIMARY KEY,
+					project_id VARCHAR(64) NOT NULL,
+					name VARCHAR(255) NOT NULL,
+					endpoint VARCHAR(512) NOT NULL,
+					provider_type VARCHAR(32) NOT NULL,
+					api_key TEXT NOT NULL DEFAULT '',
+					cost_per_m_tokens DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+					priority INT NOT NULL DEFAULT 10,
+					sovereignty_jurisdiction VARCHAR(32) NOT NULL DEFAULT '',
+					failover_cooldown_secs BIGINT NOT NULL DEFAULT 60,
+					enabled BOOLEAN NOT NULL DEFAULT TRUE,
+					created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_ai_providers_project ON ai_providers(project_id);`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -492,6 +513,18 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	}
 	if err := chRows.Err(); err != nil {
 		return fmt.Errorf("iterate acme_challenges: %w", err)
+	}
+
+	// 10. AI Compute Providers
+	aiRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, endpoint, provider_type, api_key, cost_per_m_tokens, priority, sovereignty_jurisdiction, failover_cooldown_secs, enabled, created_at, updated_at FROM ai_providers")
+	if err == nil {
+		defer aiRows.Close()
+		for aiRows.Next() {
+			var p model.AIProvider
+			if err := aiRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.Endpoint, &p.ProviderType, &p.APIKey, &p.CostPerMTokens, &p.Priority, &p.SovereigntyJurisdiction, &p.FailoverCooldownSecs, &p.Enabled, &p.CreatedAt, &p.UpdatedAt); err == nil {
+				_ = r.cache.SaveAIProvider(&p)
+			}
+		}
 	}
 
 	return nil
@@ -1122,4 +1155,73 @@ func (r *PostgresRepository) GetActiveTopologies() []*DomainTopology {
 
 func (r *PostgresRepository) GetActiveTopologiesForPoP(popID string) []*DomainTopology {
 	return r.cache.GetActiveTopologiesForPoP(popID)
+}
+
+// -------------------------------------------------------------------------
+// AI Compute Providers
+// -------------------------------------------------------------------------
+
+func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
+	if p == nil {
+		return errors.New("provider cannot be nil")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC()
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now
+	}
+	p.UpdatedAt = now
+
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO ai_providers (
+			id, project_id, name, endpoint, provider_type, api_key,
+			cost_per_m_tokens, priority, sovereignty_jurisdiction,
+			failover_cooldown_secs, enabled, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		ON CONFLICT (id) DO UPDATE SET
+			name = EXCLUDED.name,
+			endpoint = EXCLUDED.endpoint,
+			provider_type = EXCLUDED.provider_type,
+			api_key = EXCLUDED.api_key,
+			cost_per_m_tokens = EXCLUDED.cost_per_m_tokens,
+			priority = EXCLUDED.priority,
+			sovereignty_jurisdiction = EXCLUDED.sovereignty_jurisdiction,
+			failover_cooldown_secs = EXCLUDED.failover_cooldown_secs,
+			enabled = EXCLUDED.enabled,
+			updated_at = EXCLUDED.updated_at
+	`, p.ID, p.ProjectID, p.Name, p.Endpoint, p.ProviderType, p.APIKey,
+		p.CostPerMTokens, p.Priority, p.SovereigntyJurisdiction,
+		p.FailoverCooldownSecs, p.Enabled, p.CreatedAt, p.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("persist ai_provider: %w", err)
+	}
+
+	return r.cache.SaveAIProvider(p)
+}
+
+func (r *PostgresRepository) GetAIProvider(id string) (*model.AIProvider, error) {
+	return r.cache.GetAIProvider(id)
+}
+
+func (r *PostgresRepository) ListAIProvidersByProject(projectID string) []*model.AIProvider {
+	return r.cache.ListAIProvidersByProject(projectID)
+}
+
+func (r *PostgresRepository) ListAIProviders() []*model.AIProvider {
+	return r.cache.ListAIProviders()
+}
+
+func (r *PostgresRepository) DeleteAIProvider(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	_, err := r.db.ExecContext(ctx, "DELETE FROM ai_providers WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("delete ai_provider: %w", err)
+	}
+
+	return r.cache.DeleteAIProvider(id)
 }

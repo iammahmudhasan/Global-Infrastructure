@@ -468,3 +468,113 @@ func TestStore_SweepExpiredPendingDomains(t *testing.T) {
 		t.Errorf("old active domain should remain")
 	}
 }
+
+func TestStore_AIProviderCRUDAndValidation(t *testing.T) {
+	st := store.NewStore()
+
+	// 1. Validation failures
+	if err := st.SaveAIProvider(nil); err == nil {
+		t.Fatal("expected error on nil provider")
+	}
+	if err := st.SaveAIProvider(&model.AIProvider{ID: ""}); err == nil {
+		t.Fatal("expected error on empty ID")
+	}
+	if err := st.SaveAIProvider(&model.AIProvider{ID: "ai-1", ProjectID: "p1", Name: "Azure", Endpoint: "https://azure.openai.com", ProviderType: "invalid_type"}); err == nil {
+		t.Fatal("expected error on invalid provider_type")
+	}
+	if err := st.SaveAIProvider(&model.AIProvider{ID: "ai-1", ProjectID: "p1", Name: "Azure", Endpoint: "https://azure.openai.com", ProviderType: "azure", CostPerMTokens: -1.0}); err == nil {
+		t.Fatal("expected error on negative cost")
+	}
+
+	// 2. Successful save
+	provAzure := &model.AIProvider{
+		ID:                      "ai-azure",
+		ProjectID:               "prj-alpha",
+		Name:                    "Azure OpenAI East US",
+		Endpoint:                "https://azure-eastus.openai.azure.com",
+		ProviderType:            "azure",
+		APIKey:                  "sk-secret-azure-key",
+		CostPerMTokens:          2.50,
+		Priority:                1,
+		SovereigntyJurisdiction: "GLOBAL",
+		FailoverCooldownSecs:    30,
+		Enabled:                 true,
+	}
+	if err := st.SaveAIProvider(provAzure); err != nil {
+		t.Fatalf("failed to save azure provider: %v", err)
+	}
+
+	provCoreWeave := &model.AIProvider{
+		ID:                      "ai-coreweave",
+		ProjectID:               "prj-alpha",
+		Name:                    "CoreWeave vLLM Llama-3",
+		Endpoint:                "https://coreweave-inference.tenant.com",
+		ProviderType:            "coreweave",
+		APIKey:                  "sk-secret-cw-key",
+		CostPerMTokens:          0.80,
+		Priority:                2,
+		SovereigntyJurisdiction: "GLOBAL",
+		FailoverCooldownSecs:    45,
+		Enabled:                 true,
+	}
+	if err := st.SaveAIProvider(provCoreWeave); err != nil {
+		t.Fatalf("failed to save coreweave provider: %v", err)
+	}
+
+	provBDIX := &model.AIProvider{
+		ID:                      "ai-bdix",
+		ProjectID:               "prj-alpha",
+		Name:                    "Dhaka BDIX DGX Sovereign",
+		Endpoint:                "https://bdix-gpu.dhaka.nexusedge.io",
+		ProviderType:            "onprem",
+		APIKey:                  "sk-secret-bd-key",
+		CostPerMTokens:          1.20,
+		Priority:                1,
+		SovereigntyJurisdiction: "BD",
+		FailoverCooldownSecs:    60,
+		Enabled:                 true,
+	}
+	if err := st.SaveAIProvider(provBDIX); err != nil {
+		t.Fatalf("failed to save bdix provider: %v", err)
+	}
+
+	// 3. Retrieval and deep copy verification
+	got, err := st.GetAIProvider("ai-azure")
+	if err != nil {
+		t.Fatalf("failed to get ai-azure: %v", err)
+	}
+	if got.Name != "Azure OpenAI East US" || got.CostPerMTokens != 2.50 {
+		t.Fatalf("unexpected provider fields: %+v", got)
+	}
+
+	// Mutate local struct and ensure store is isolated
+	got.CostPerMTokens = 999.0
+	reGot, _ := st.GetAIProvider("ai-azure")
+	if reGot.CostPerMTokens == 999.0 {
+		t.Fatal("store was mutated through pointer reference")
+	}
+
+	// 4. Listing sorted by priority then name
+	list := st.ListAIProvidersByProject("prj-alpha")
+	if len(list) != 3 {
+		t.Fatalf("expected 3 providers, got %d", len(list))
+	}
+	// Priority 1: Azure and BDIX (sorted by name: "Azure..." before "Dhaka...")
+	if list[0].ID != "ai-azure" || list[1].ID != "ai-bdix" || list[2].ID != "ai-coreweave" {
+		t.Fatalf("unexpected priority ordering: %s, %s, %s", list[0].ID, list[1].ID, list[2].ID)
+	}
+
+	// 5. Redacted response view
+	resp := provAzure.ToResponse()
+	if resp.APIKeyRedacted == provAzure.APIKey || resp.APIKeyRedacted == "" {
+		t.Fatalf("API key was not redacted in response: %s", resp.APIKeyRedacted)
+	}
+
+	// 6. Deletion
+	if err := st.DeleteAIProvider("ai-azure"); err != nil {
+		t.Fatalf("failed to delete provider: %v", err)
+	}
+	if _, err := st.GetAIProvider("ai-azure"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("expected ErrNotFound after deletion")
+	}
+}

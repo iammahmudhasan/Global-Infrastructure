@@ -125,7 +125,7 @@ impl ProviderRuntimeState {
 /// Thread-safe AI Traffic Director & Routing Pool.
 #[derive(Clone)]
 pub struct AiTrafficDirector {
-    providers: Arc<Vec<Arc<ProviderRuntimeState>>>,
+    providers: Arc<RwLock<Vec<Arc<ProviderRuntimeState>>>>,
 }
 
 impl AiTrafficDirector {
@@ -135,8 +135,51 @@ impl AiTrafficDirector {
             .map(|p| Arc::new(ProviderRuntimeState::new(p)))
             .collect();
         Self {
-            providers: Arc::new(runtime_states),
+            providers: Arc::new(RwLock::new(runtime_states)),
         }
+    }
+
+    /// Atomically updates or replaces the provider pool from Control Plane dynamic sync.
+    /// Preserves existing runtime stats and health history for providers that remain in the pool.
+    pub fn update_providers(&self, new_providers: Vec<AiProvider>) {
+        let mut guard = self.providers.write().unwrap();
+        let existing_map: std::collections::HashMap<String, Arc<ProviderRuntimeState>> = guard
+            .drain(..)
+            .map(|s| (s.provider.id.clone(), s))
+            .collect();
+
+        let updated_states: Vec<Arc<ProviderRuntimeState>> = new_providers
+            .into_iter()
+            .map(|p| {
+                if let Some(existing) = existing_map.get(&p.id) {
+                    Arc::new(ProviderRuntimeState {
+                        provider: p,
+                        backoff_until: RwLock::new(*existing.backoff_until.read().unwrap()),
+                        total_requests: AtomicU64::new(
+                            existing.total_requests.load(Ordering::Relaxed),
+                        ),
+                        successful_requests: AtomicU64::new(
+                            existing.successful_requests.load(Ordering::Relaxed),
+                        ),
+                        rate_limited_429_count: AtomicU64::new(
+                            existing.rate_limited_429_count.load(Ordering::Relaxed),
+                        ),
+                        error_count: AtomicU64::new(existing.error_count.load(Ordering::Relaxed)),
+                        failovers_triggered: AtomicU64::new(
+                            existing.failovers_triggered.load(Ordering::Relaxed),
+                        ),
+                        total_ttft_ms: AtomicU64::new(
+                            existing.total_ttft_ms.load(Ordering::Relaxed),
+                        ),
+                        ttft_samples: AtomicU64::new(existing.ttft_samples.load(Ordering::Relaxed)),
+                    })
+                } else {
+                    Arc::new(ProviderRuntimeState::new(p))
+                }
+            })
+            .collect();
+
+        *guard = updated_states;
     }
 
     /// Selects ordered candidate providers matching request constraints.
@@ -146,8 +189,8 @@ impl AiTrafficDirector {
         &self,
         requested_jurisdiction: Option<&str>,
     ) -> Vec<Arc<ProviderRuntimeState>> {
-        let mut candidates: Vec<Arc<ProviderRuntimeState>> = self
-            .providers
+        let guard = self.providers.read().unwrap();
+        let mut candidates: Vec<Arc<ProviderRuntimeState>> = guard
             .iter()
             .filter(|state| {
                 if let Some(req_jur) = requested_jurisdiction {
@@ -182,8 +225,8 @@ impl AiTrafficDirector {
     }
 
     pub fn get_metrics_summary(&self) -> serde_json::Value {
-        let summary: Vec<serde_json::Value> = self
-            .providers
+        let guard = self.providers.read().unwrap();
+        let summary: Vec<serde_json::Value> = guard
             .iter()
             .map(|state| {
                 serde_json::json!({
@@ -207,7 +250,7 @@ impl AiTrafficDirector {
             "status": "active",
             "engine": "NexusEdge Universal Compute Director",
             "timestamp": Utc::now().to_rfc3339(),
-            "providers_count": self.providers.len(),
+            "providers_count": guard.len(),
             "providers": summary,
         })
     }

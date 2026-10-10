@@ -2998,3 +2998,174 @@ func TestAPI_CertificateOrderProductionGuard(t *testing.T) {
 		t.Fatalf("expected error message explaining production ACME issuer not configured, got: %s", w.Body.String())
 	}
 }
+
+func TestAIProviderAPI_WorkflowAndTenantIsolation(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	// Register two separate tenants and an operator
+	authInst.RegisterTenantWithRole("key-tenant-alpha", "t-alpha", "prj-alpha", auth.RoleTenant, "prj-alpha")
+	authInst.RegisterTenantWithRole("key-tenant-beta", "t-beta", "prj-beta", auth.RoleTenant, "prj-beta")
+	authInst.RegisterTenantWithRole("key-operator", "t-ops", "prj-ops", auth.RolePlatformOperator, "*")
+
+	// 1. Tenant Alpha creates an AI provider
+	createBody, _ := json.Marshal(map[string]interface{}{
+		"name":                     "Azure East US",
+		"endpoint":                 "https://azure-eastus.openai.azure.com",
+		"provider_type":            "azure",
+		"api_key":                  "sk-super-secret-azure-token-12345",
+		"cost_per_m_tokens":        2.50,
+		"priority":                 1,
+		"sovereignty_jurisdiction": "GLOBAL",
+		"failover_cooldown_secs":   30,
+		"enabled":                  true,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/ai/providers", bytes.NewReader(createBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var created model.AIProviderResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("failed to decode created provider: %v", err)
+	}
+	if created.ID == "" {
+		t.Fatal("expected non-empty provider ID")
+	}
+	// Verify API key is redacted (Rules 18, 19)
+	if created.APIKeyRedacted == "sk-super-secret-azure-token-12345" || !strings.Contains(created.APIKeyRedacted, "...") {
+		t.Fatalf("API key not properly redacted: %s", created.APIKeyRedacted)
+	}
+
+	providerID := created.ID
+
+	// 2. Tenant Beta attempts to access Tenant Alpha's provider (Rules 54, 55 Tenant Isolation)
+	req = httptest.NewRequest(http.MethodGet, "/v1/ai/providers/"+providerID, nil)
+	req.Header.Set("X-API-Key", "key-tenant-beta")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant read, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Tenant Beta attempts to delete Tenant Alpha's provider
+	req = httptest.NewRequest(http.MethodDelete, "/v1/ai/providers/"+providerID, nil)
+	req.Header.Set("X-API-Key", "key-tenant-beta")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant delete, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Tenant Alpha lists providers
+	req = httptest.NewRequest(http.MethodGet, "/v1/projects/prj-alpha/ai/providers", nil)
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+	var listResp struct {
+		Providers []model.AIProviderResponse `json:"providers"`
+		Count     int                        `json:"count"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("failed to parse list response: %v", err)
+	}
+	if listResp.Count != 1 || listResp.Providers[0].ID != providerID {
+		t.Fatalf("expected 1 provider matching %s, got count=%d", providerID, listResp.Count)
+	}
+
+	// 5. Tenant Alpha updates provider without providing api_key (existing key preserved)
+	updateBody, _ := json.Marshal(map[string]interface{}{
+		"name":              "Azure East US Renamed",
+		"cost_per_m_tokens": 2.10,
+	})
+	req = httptest.NewRequest(http.MethodPut, "/v1/projects/prj-alpha/ai/providers/"+providerID, bytes.NewReader(updateBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+	// Verify in underlying store that the secret API key was preserved
+	underlying, err := handler.Store().GetAIProvider(providerID)
+	if err != nil {
+		t.Fatalf("failed to get underlying provider: %v", err)
+	}
+	if underlying.APIKey != "sk-super-secret-azure-token-12345" {
+		t.Fatalf("existing API key was lost on partial update: %s", underlying.APIKey)
+	}
+	if underlying.Name != "Azure East US Renamed" || underlying.CostPerMTokens != 2.10 {
+		t.Fatalf("updated fields not reflected: %+v", underlying)
+	}
+
+	// 6. Tenant Alpha deletes provider
+	req = httptest.NewRequest(http.MethodDelete, "/v1/projects/prj-alpha/ai/providers/"+providerID, nil)
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for delete, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify deletion
+	_, err = handler.Store().GetAIProvider(providerID)
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after deletion, got: %v", err)
+	}
+}
+
+func TestPoPConfigSync_WithDynamicAIProviders(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	st := handler.Store()
+
+	authInst.RegisterTenantWithRole("key-ops-ai-sync", "tenant-ops", "prj-ops", auth.RolePlatformOperator, "*")
+
+	// Save active AI provider
+	_ = st.SaveAIProvider(&model.AIProvider{
+		ID:                      "ai-sync-coreweave",
+		ProjectID:               "prj-ops",
+		Name:                    "CoreWeave vLLM FastPath",
+		Endpoint:                "https://vllm.coreweave.cloud",
+		ProviderType:            "vllm",
+		APIKey:                  "sk-coreweave-token",
+		CostPerMTokens:          0.75,
+		Priority:                1,
+		SovereigntyJurisdiction: "GLOBAL",
+		FailoverCooldownSecs:    30,
+		Enabled:                 true,
+	})
+
+	// Fetch PoP config snapshot
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req.Header.Set("X-API-Key", "key-ops-ai-sync")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var syncResp model.PoPConfigSync
+	if err := json.Unmarshal(w.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("failed to decode PoP config sync response: %v", err)
+	}
+
+	if len(syncResp.AIProviders) != 1 {
+		t.Fatalf("expected 1 AI provider in snapshot, got %d", len(syncResp.AIProviders))
+	}
+	if syncResp.AIProviders[0].ID != "ai-sync-coreweave" || syncResp.AIProviders[0].ProviderType != "vllm" {
+		t.Fatalf("unexpected AI provider in snapshot: %+v", syncResp.AIProviders[0])
+	}
+}

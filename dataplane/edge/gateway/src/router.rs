@@ -1623,6 +1623,73 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
     Ok(result)
 }
 
+/// Parses Control Plane PoP configuration sync JSON for AI compute providers
+pub fn parse_pop_config_ai_providers(
+    json_str: &str,
+) -> Result<Vec<crate::ai::AiProvider>, RouterError> {
+    #[derive(serde::Deserialize)]
+    struct WireAIProvider {
+        id: String,
+        name: String,
+        endpoint: String,
+        provider_type: String,
+        #[serde(default)]
+        api_key: String,
+        #[serde(default)]
+        cost_per_m_tokens: f64,
+        #[serde(default = "default_ai_priority")]
+        priority: u32,
+        #[serde(default)]
+        sovereignty_jurisdiction: String,
+        #[serde(default = "default_ai_cooldown")]
+        failover_cooldown_secs: u64,
+    }
+
+    fn default_ai_priority() -> u32 {
+        10
+    }
+
+    fn default_ai_cooldown() -> u64 {
+        60
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AIWire {
+        #[serde(default)]
+        ai_providers: Vec<WireAIProvider>,
+    }
+
+    let wire: AIWire = serde_json::from_str(json_str).map_err(|e| {
+        RouterError::InvalidPayload(format!("Failed to parse PoP sync AI providers JSON: {}", e))
+    })?;
+
+    let providers = wire
+        .ai_providers
+        .into_iter()
+        .map(|w| crate::ai::AiProvider {
+            id: w.id,
+            name: w.name,
+            endpoint: w.endpoint,
+            provider_type: w.provider_type,
+            api_key: if w.api_key.trim().is_empty() {
+                None
+            } else {
+                Some(w.api_key.trim().to_string())
+            },
+            cost_per_m_tokens: w.cost_per_m_tokens,
+            priority: w.priority,
+            sovereignty_jurisdiction: if w.sovereignty_jurisdiction.trim().is_empty() {
+                None
+            } else {
+                Some(w.sovereignty_jurisdiction.trim().to_string())
+            },
+            failover_cooldown_secs: w.failover_cooldown_secs,
+        })
+        .collect();
+
+    Ok(providers)
+}
+
 fn select_from_nodes<'a>(
     nodes: &'a [UpstreamNode],
     index_counter: &AtomicUsize,

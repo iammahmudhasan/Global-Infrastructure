@@ -11,6 +11,7 @@ pub const MAX_CONTROL_PLANE_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncStats {
     pub routes_applied: usize,
+    pub ai_providers_applied: usize,
     pub checksum: String,
 }
 
@@ -146,6 +147,28 @@ pub async fn fetch_and_apply_control_plane_snapshot(
     router: &Router,
     dns_resolver: &PinnedDnsResolver,
 ) -> Result<SyncStats, SyncError> {
+    fetch_and_apply_control_plane_snapshot_full(
+        endpoint,
+        pop_id,
+        auth_token,
+        client,
+        router,
+        dns_resolver,
+        None,
+    )
+    .await
+}
+
+/// Extended snapshot sync including dynamic AI & compute provider pool updates.
+pub async fn fetch_and_apply_control_plane_snapshot_full(
+    endpoint: &str,
+    pop_id: &str,
+    auth_token: &str,
+    client: &HttpClient,
+    router: &Router,
+    dns_resolver: &PinnedDnsResolver,
+    ai_director: Option<&crate::ai::AiTrafficDirector>,
+) -> Result<SyncStats, SyncError> {
     validate_control_plane_endpoint(endpoint, auth_token).map_err(SyncError::InvalidEndpoint)?;
 
     let url = format!(
@@ -227,8 +250,19 @@ pub async fn fetch_and_apply_control_plane_snapshot(
         .update_routes_with_dns(new_routes, vec![], dns_resolver)
         .map_err(|e| SyncError::RouteApplyError(e.to_string()))?;
 
+    let mut ai_providers_applied = 0;
+    if let Some(director) = ai_director {
+        if let Ok(new_ai) = router::parse_pop_config_ai_providers(body_str) {
+            ai_providers_applied = new_ai.len();
+            if !new_ai.is_empty() {
+                director.update_providers(new_ai);
+            }
+        }
+    }
+
     Ok(SyncStats {
         routes_applied: routes_count,
+        ai_providers_applied,
         checksum: computed_hash,
     })
 }

@@ -72,6 +72,13 @@ type Repository interface {
 	// Topologies (Compiled snapshots for Envoy and PoP Edge nodes)
 	GetActiveTopologies() []*DomainTopology
 	GetActiveTopologiesForPoP(popID string) []*DomainTopology
+
+	// AI Compute Providers
+	SaveAIProvider(p *model.AIProvider) error
+	GetAIProvider(id string) (*model.AIProvider, error)
+	ListAIProvidersByProject(projectID string) []*model.AIProvider
+	ListAIProviders() []*model.AIProvider
+	DeleteAIProvider(id string) error
 }
 
 // Ensure *Store satisfies Repository at compile time.

@@ -203,6 +203,8 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/pops", h.handleListPoPs)
 	h.mux.HandleFunc("/v1/edge/pops/", h.handlePoPsRoute)
 	h.mux.HandleFunc("/v1/edge/routing/", h.handleRoutingRoute)
+	h.mux.HandleFunc("/v1/ai/providers", h.handleAIProvidersRoute)
+	h.mux.HandleFunc("/v1/ai/providers/", h.handleAIProviderByIDRoute)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -217,11 +219,11 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// /v1/projects/{project_id}/domains
+// /v1/projects/{project_id}/domains and /v1/projects/{project_id}/ai/providers
 func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/projects/")
 	parts := strings.Split(path, "/")
-	if len(parts) < 2 || parts[1] != "domains" {
+	if len(parts) < 2 {
 		writeError(w, http.StatusNotFound, "route not found")
 		return
 	}
@@ -238,14 +240,28 @@ func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	switch r.Method {
-	case http.MethodPost:
-		h.handleCreateDomain(w, r, projectID)
-	case http.MethodGet:
-		h.handleListDomains(w, r, projectID)
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	if parts[1] == "domains" {
+		switch r.Method {
+		case http.MethodPost:
+			h.handleCreateDomain(w, r, projectID)
+		case http.MethodGet:
+			h.handleListDomains(w, r, projectID)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
 	}
+
+	if parts[1] == "ai" && len(parts) >= 3 && parts[2] == "providers" {
+		providerID := ""
+		if len(parts) >= 4 {
+			providerID = parts[3]
+		}
+		h.handleProjectAIProvidersRoute(w, r, projectID, providerID)
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "route not found")
 }
 
 func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -2104,6 +2120,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		checksum := hex.EncodeToString(hash[:])
 
 		gatewayRoutes := h.buildGatewayRoutesForPoP(topologies)
+		gatewayAIProviders := h.buildGatewayAIProviders()
 
 		canonicalBytes, _ := json.Marshal(gatewayRoutes)
 		canonicalSum := sha256.Sum256(canonicalBytes)
@@ -2118,6 +2135,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			TopologiesCount: len(topologies),
 			EnvoyConfig:     envoyCfg,
 			Routes:          gatewayRoutes,
+			AIProviders:     gatewayAIProviders,
 		}
 
 		respBytes, err := json.Marshal(syncResult)
@@ -2406,4 +2424,322 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 		})
 	}
 	return gatewayRoutes
+}
+
+func (h *APIHandler) buildGatewayAIProviders() []model.GatewayAIProviderSync {
+	all := h.store.ListAIProviders()
+	var result []model.GatewayAIProviderSync
+	for _, p := range all {
+		if !p.Enabled {
+			continue
+		}
+		result = append(result, model.GatewayAIProviderSync{
+			ID:                      p.ID,
+			Name:                    p.Name,
+			Endpoint:                p.Endpoint,
+			ProviderType:            p.ProviderType,
+			APIKey:                  p.APIKey,
+			CostPerMTokens:          p.CostPerMTokens,
+			Priority:                p.Priority,
+			SovereigntyJurisdiction: p.SovereigntyJurisdiction,
+			FailoverCooldownSecs:    p.FailoverCooldownSecs,
+		})
+	}
+	return result
+}
+
+func generateAIProviderID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "aip-" + hex.EncodeToString(b)
+}
+
+func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		release, ok := h.acquireControlPlaneSlot(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+
+		var p model.AIProvider
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: must be valid JSON")
+			return
+		}
+
+		if strings.TrimSpace(p.ProjectID) == "" {
+			if tc, ok := auth.FromContext(r.Context()); ok && tc.ProjectID != "" {
+				p.ProjectID = tc.ProjectID
+			} else {
+				writeError(w, http.StatusBadRequest, "project_id is required")
+				return
+			}
+		}
+
+		if !h.authenticator.AuthorizeProject(r.Context(), p.ProjectID) {
+			writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+p.ProjectID)
+			return
+		}
+
+		parsedURL, err := url.Parse(strings.TrimSpace(p.Endpoint))
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+			return
+		}
+
+		if p.ID == "" {
+			p.ID = generateAIProviderID()
+		}
+
+		if err := h.store.SaveAIProvider(&p); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusCreated, p.ToResponse())
+
+	case http.MethodGet:
+		projectID := r.URL.Query().Get("project_id")
+		var providers []*model.AIProvider
+		if projectID != "" {
+			if !h.authenticator.AuthorizeProject(r.Context(), projectID) {
+				writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+projectID)
+				return
+			}
+			providers = h.store.ListAIProvidersByProject(projectID)
+		} else {
+			if h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+				providers = h.store.ListAIProviders()
+			} else if tc, ok := auth.FromContext(r.Context()); ok && tc.ProjectID != "" {
+				providers = h.store.ListAIProvidersByProject(tc.ProjectID)
+			} else {
+				writeError(w, http.StatusBadRequest, "project_id query parameter is required")
+				return
+			}
+		}
+
+		resp := make([]model.AIProviderResponse, 0, len(providers))
+		for _, item := range providers {
+			resp = append(resp, item.ToResponse())
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"providers": resp,
+			"count":     len(resp),
+		})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/ai/providers/")
+	id = strings.Trim(id, "/")
+	if id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusBadRequest, "invalid provider id in path")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		p, err := h.store.GetAIProvider(id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "provider not found: "+id)
+			return
+		}
+		if !h.authenticator.AuthorizeProject(r.Context(), p.ProjectID) {
+			writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+p.ProjectID)
+			return
+		}
+		writeJSON(w, http.StatusOK, p.ToResponse())
+
+	case http.MethodPut:
+		release, ok := h.acquireControlPlaneSlot(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+
+		existing, err := h.store.GetAIProvider(id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "provider not found: "+id)
+			return
+		}
+		if !h.authenticator.AuthorizeProject(r.Context(), existing.ProjectID) {
+			writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+existing.ProjectID)
+			return
+		}
+
+		var update model.AIProvider
+		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: must be valid JSON")
+			return
+		}
+
+		update.ID = id
+		update.ProjectID = existing.ProjectID
+		if strings.TrimSpace(update.APIKey) == "" {
+			update.APIKey = existing.APIKey
+		}
+		if strings.TrimSpace(update.Name) == "" {
+			update.Name = existing.Name
+		}
+		if strings.TrimSpace(update.Endpoint) == "" {
+			update.Endpoint = existing.Endpoint
+		}
+		if strings.TrimSpace(update.ProviderType) == "" {
+			update.ProviderType = existing.ProviderType
+		}
+
+		parsedURL, err := url.Parse(strings.TrimSpace(update.Endpoint))
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+			return
+		}
+
+		if err := h.store.SaveAIProvider(&update); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		writeJSON(w, http.StatusOK, update.ToResponse())
+
+	case http.MethodDelete:
+		existing, err := h.store.GetAIProvider(id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "provider not found: "+id)
+			return
+		}
+		if !h.authenticator.AuthorizeProject(r.Context(), existing.ProjectID) {
+			writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+existing.ProjectID)
+			return
+		}
+
+		if err := h.store.DeleteAIProvider(id); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete provider: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "deleted",
+			"id":     id,
+		})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *http.Request, projectID string, providerID string) {
+	if providerID == "" {
+		switch r.Method {
+		case http.MethodPost:
+			release, ok := h.acquireControlPlaneSlot(w, r)
+			if !ok {
+				return
+			}
+			defer release()
+
+			var p model.AIProvider
+			if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid request body: must be valid JSON")
+				return
+			}
+			p.ProjectID = projectID
+			if p.ID == "" {
+				p.ID = generateAIProviderID()
+			}
+
+			parsedURL, err := url.Parse(strings.TrimSpace(p.Endpoint))
+			if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+				writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+				return
+			}
+
+			if err := h.store.SaveAIProvider(&p); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusCreated, p.ToResponse())
+
+		case http.MethodGet:
+			providers := h.store.ListAIProvidersByProject(projectID)
+			resp := make([]model.AIProviderResponse, 0, len(providers))
+			for _, item := range providers {
+				resp = append(resp, item.ToResponse())
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"providers": resp,
+				"count":     len(resp),
+			})
+
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
+	p, err := h.store.GetAIProvider(providerID)
+	if err != nil || p.ProjectID != projectID {
+		writeError(w, http.StatusNotFound, "provider not found: "+providerID)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, p.ToResponse())
+
+	case http.MethodPut:
+		release, ok := h.acquireControlPlaneSlot(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+
+		var update model.AIProvider
+		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body: must be valid JSON")
+			return
+		}
+		update.ID = providerID
+		update.ProjectID = projectID
+		if strings.TrimSpace(update.APIKey) == "" {
+			update.APIKey = p.APIKey
+		}
+		if strings.TrimSpace(update.Name) == "" {
+			update.Name = p.Name
+		}
+		if strings.TrimSpace(update.Endpoint) == "" {
+			update.Endpoint = p.Endpoint
+		}
+		if strings.TrimSpace(update.ProviderType) == "" {
+			update.ProviderType = p.ProviderType
+		}
+
+		parsedURL, err := url.Parse(strings.TrimSpace(update.Endpoint))
+		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+			return
+		}
+
+		if err := h.store.SaveAIProvider(&update); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, update.ToResponse())
+
+	case http.MethodDelete:
+		if err := h.store.DeleteAIProvider(providerID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to delete provider: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status": "deleted",
+			"id":     providerID,
+		})
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
