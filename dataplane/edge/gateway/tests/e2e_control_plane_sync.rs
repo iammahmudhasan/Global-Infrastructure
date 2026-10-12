@@ -927,6 +927,7 @@ async fn test_e2e_readiness_and_liveness_probes() {
         trusted_proxies: config.parsed_trusted_proxies(),
         config,
         ai_director: None,
+        metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
     });
 
     let (addr, shutdown_tx) = spawn_mock_gateway(state).await;
@@ -961,6 +962,27 @@ async fn test_e2e_readiness_and_liveness_probes() {
         .await
         .expect("Ready probe request must succeed");
     assert_eq!(ready_resp.status(), reqwest::StatusCode::OK);
+
+    // 5. /metrics must return 200 OK with Prometheus exposition text format
+    let metrics_resp = client
+        .get(format!("http://127.0.0.1:{}/metrics", addr.port()))
+        .send()
+        .await
+        .expect("Metrics request must succeed");
+    assert_eq!(metrics_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        metrics_resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let metrics_body = metrics_resp.text().await.unwrap();
+    assert!(metrics_body.contains("nexusedge_requests_total"));
+    assert!(metrics_body.contains("nexusedge_responses_total"));
+    assert!(metrics_body.contains("nexusedge_waf_blocked_total"));
 
     let _ = shutdown_tx.send(());
 }

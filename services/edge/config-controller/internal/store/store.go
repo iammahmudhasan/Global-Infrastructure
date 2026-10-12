@@ -111,6 +111,8 @@ type Store struct {
 	challenges          map[string]*model.ACMEChallenge       // token -> ACMEChallenge
 	tlsSettings         map[string]*model.TLSSettings         // domain ID -> TLSSettings
 	aiProviders         map[string]*model.AIProvider          // provider ID -> AIProvider
+	auditLogs           []*model.AuditLog
+	auditLogMap         map[string]*model.AuditLog // id -> AuditLog
 }
 
 func NewStore() *Store {
@@ -136,6 +138,8 @@ func NewStore() *Store {
 		challenges:          make(map[string]*model.ACMEChallenge),
 		tlsSettings:         make(map[string]*model.TLSSettings),
 		aiProviders:         make(map[string]*model.AIProvider),
+		auditLogs:           make([]*model.AuditLog, 0),
+		auditLogMap:         make(map[string]*model.AuditLog),
 	}
 }
 
@@ -1339,4 +1343,70 @@ func (s *Store) DeleteAIProvider(id string) error {
 	}
 	delete(s.aiProviders, id)
 	return nil
+}
+
+func (s *Store) SaveAuditLog(log *model.AuditLog) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if log == nil {
+		return errors.New("audit log is nil")
+	}
+	clone := *log
+	s.auditLogs = append(s.auditLogs, &clone)
+	s.auditLogMap[clone.ID] = &clone
+	return nil
+}
+
+func (s *Store) ListAuditLogs(projectID string, limit int, offset int) ([]*model.AuditLog, int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var filtered []*model.AuditLog
+	for i := len(s.auditLogs) - 1; i >= 0; i-- {
+		l := s.auditLogs[i]
+		if projectID == "" || l.ProjectID == projectID {
+			clone := *l
+			filtered = append(filtered, &clone)
+		}
+	}
+
+	total := len(filtered)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		return []*model.AuditLog{}, total, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+
+	return filtered[offset:end], total, nil
+}
+
+func (s *Store) GetAuditLog(id string) (*model.AuditLog, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	log, exists := s.auditLogMap[id]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	clone := *log
+	return &clone, nil
+}
+
+func (s *Store) GetLastAuditHash() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.auditLogs) == 0 {
+		return "0000000000000000000000000000000000000000000000000000000000000000"
+	}
+	return s.auditLogs[len(s.auditLogs)-1].Hash
 }

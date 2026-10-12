@@ -79,6 +79,12 @@ type Repository interface {
 	ListAIProvidersByProject(projectID string) []*model.AIProvider
 	ListAIProviders() []*model.AIProvider
 	DeleteAIProvider(id string) error
+
+	// Audit Logs
+	SaveAuditLog(log *model.AuditLog) error
+	ListAuditLogs(projectID string, limit int, offset int) ([]*model.AuditLog, int, error)
+	GetAuditLog(id string) (*model.AuditLog, error)
+	GetLastAuditHash() string
 }
 
 // Ensure *Store satisfies Repository at compile time.

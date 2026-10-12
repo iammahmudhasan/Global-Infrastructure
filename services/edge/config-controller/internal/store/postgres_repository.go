@@ -266,6 +266,20 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`CREATE INDEX IF NOT EXISTS idx_ai_providers_project ON ai_providers(project_id);`,
 			},
 		},
+		{
+			version: "0003_audit_trail_chain",
+			stmts: []string{
+				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS project_id VARCHAR(64) NOT NULL DEFAULT '';`,
+				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS client_ip VARCHAR(64) NOT NULL DEFAULT '';`,
+				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS prev_hash VARCHAR(128) NOT NULL DEFAULT '';`,
+				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS hash VARCHAR(128) NOT NULL DEFAULT '';`,
+				`ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS audit_logs_org_id_fkey;`,
+				`ALTER TABLE audit_logs ALTER COLUMN org_id DROP NOT NULL;`,
+				`ALTER TABLE audit_logs ALTER COLUMN org_id SET DEFAULT '';`,
+				`CREATE INDEX IF NOT EXISTS idx_audit_logs_project ON audit_logs(project_id);`,
+				`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -550,6 +564,22 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	}
 	if err := aiRows.Err(); err != nil {
 		return fmt.Errorf("iterate ai_providers: %w", err)
+	}
+
+	// 11. Audit Logs (Ordered by created_at ASC to seed cryptographic hash chain)
+	auditRows, err := r.db.QueryContext(ctx, "SELECT id, COALESCE(org_id, ''), COALESCE(project_id, ''), actor, action, resource_type, resource_id, COALESCE(client_ip, ''), details, COALESCE(prev_hash, ''), COALESCE(hash, ''), created_at FROM audit_logs ORDER BY created_at ASC")
+	if err == nil {
+		defer auditRows.Close()
+		for auditRows.Next() {
+			var l model.AuditLog
+			var detailsJSON []byte
+			if scanErr := auditRows.Scan(&l.ID, &l.OrgID, &l.ProjectID, &l.Actor, &l.Action, &l.ResourceType, &l.ResourceID, &l.ClientIP, &detailsJSON, &l.PrevHash, &l.Hash, &l.CreatedAt); scanErr == nil {
+				if len(detailsJSON) > 0 {
+					_ = json.Unmarshal(detailsJSON, &l.Details)
+				}
+				_ = r.cache.SaveAuditLog(&l)
+			}
+		}
 	}
 
 	return nil
@@ -1258,4 +1288,48 @@ func (r *PostgresRepository) DeleteAIProvider(id string) error {
 	}
 
 	return r.cache.DeleteAIProvider(id)
+}
+
+// -------------------------------------------------------------------------
+// Tamper-Evident Audit Logs
+// -------------------------------------------------------------------------
+
+func (r *PostgresRepository) SaveAuditLog(log *model.AuditLog) error {
+	if log == nil {
+		return errors.New("audit log cannot be nil")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	detailsJSON, err := json.Marshal(log.Details)
+	if err != nil {
+		detailsJSON = []byte("{}")
+	}
+
+	_, err = r.db.ExecContext(ctx, `
+		INSERT INTO audit_logs (
+			id, org_id, project_id, actor, action, resource_type,
+			resource_id, client_ip, details, prev_hash, hash, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		ON CONFLICT (id) DO NOTHING
+	`, log.ID, log.OrgID, log.ProjectID, log.Actor, log.Action, log.ResourceType,
+		log.ResourceID, log.ClientIP, detailsJSON, log.PrevHash, log.Hash, log.CreatedAt)
+	if err != nil {
+		return fmt.Errorf("persist audit log: %w", err)
+	}
+
+	return r.cache.SaveAuditLog(log)
+}
+
+func (r *PostgresRepository) ListAuditLogs(projectID string, limit int, offset int) ([]*model.AuditLog, int, error) {
+	return r.cache.ListAuditLogs(projectID, limit, offset)
+}
+
+func (r *PostgresRepository) GetAuditLog(id string) (*model.AuditLog, error) {
+	return r.cache.GetAuditLog(id)
+}
+
+func (r *PostgresRepository) GetLastAuditHash() string {
+	return r.cache.GetLastAuditHash()
 }

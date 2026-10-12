@@ -166,6 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         aggregate_buffered_request_bytes,
         is_ready: Arc::clone(&is_ready),
         ai_director,
+        metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)

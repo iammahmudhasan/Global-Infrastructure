@@ -174,3 +174,26 @@ func (l *AuditLogger) GetRecords() []*AuditRecord {
 	copy(out, l.records)
 	return out
 }
+
+// LoadExistingRecords rehydrates the in-memory audit chain from persistent storage
+// and resets the head hash to the latest record's hash.
+func (l *AuditLogger) LoadExistingRecords(records []*AuditRecord) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.records = make([]*AuditRecord, len(records))
+	copy(l.records, records)
+	if len(records) > 0 {
+		l.lastHash = records[len(records)-1].Hash
+	} else {
+		l.lastHash = GenesisHash
+	}
+	return nil
+}
+
+// LastHash returns the current tail hash of the cryptographic chain.
+func (l *AuditLogger) LastHash() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.lastHash
+}

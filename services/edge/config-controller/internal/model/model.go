@@ -576,3 +576,29 @@ type GeoSteeringDecision struct {
 	DirectLatencyMs  float64 `json:"direct_latency_ms"`
 	Reason           string  `json:"reason"` // "LOWEST_RTT", "FAILOVER_CROSS_POP", "ROUND_ROBIN"
 }
+
+// AuditLog represents an immutable, cryptographically chained audit record.
+type AuditLog struct {
+	ID           string                 `json:"id"`
+	OrgID        string                 `json:"org_id"`
+	ProjectID    string                 `json:"project_id"`
+	Actor        string                 `json:"actor"`
+	Action       string                 `json:"action"`
+	ResourceType string                 `json:"resource_type"`
+	ResourceID   string                 `json:"resource_id"`
+	ClientIP     string                 `json:"client_ip,omitempty"`
+	Details      map[string]interface{} `json:"details,omitempty"`
+	PrevHash     string                 `json:"prev_hash,omitempty"`
+	Hash         string                 `json:"hash,omitempty"`
+	CreatedAt    time.Time              `json:"created_at"`
+}
+
+// AuditLogListResponse envelopes paginated audit log queries.
+type AuditLogListResponse struct {
+	AuditLogs  []*AuditLog `json:"audit_logs"`
+	Total      int         `json:"total"`
+	Limit      int         `json:"limit"`
+	Offset     int         `json:"offset"`
+	ChainValid bool        `json:"chain_valid"`
+	LastHash   string      `json:"last_hash,omitempty"`
+}

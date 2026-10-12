@@ -3339,3 +3339,98 @@ func TestEdgeAIProviders_PoPScoping(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for cross-PoP unauthorized access, got %d: %s", wSin.Code, wSin.Body.String())
 	}
 }
+
+func TestAuditLogs_TamperEvidentChain(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-audit-admin", "tenant-audit", "prj-audit", auth.RolePlatformOperator)
+	authInst.RegisterTenant("key-tenant-other", "tenant-other", "prj-other")
+
+	// 1. Initial verify should show empty or genesis chain valid
+	verifyReq := httptest.NewRequest(http.MethodGet, "/v1/audit-logs/verify", nil)
+	verifyReq.Header.Set("X-API-Key", "key-audit-admin")
+	verifyW := httptest.NewRecorder()
+	handler.ServeHTTP(verifyW, verifyReq)
+	if verifyW.Code != http.StatusOK {
+		t.Fatalf("expected 200 for verify, got %d: %s", verifyW.Code, verifyW.Body.String())
+	}
+
+	var verifyRes map[string]interface{}
+	if err := json.Unmarshal(verifyW.Body.Bytes(), &verifyRes); err != nil {
+		t.Fatalf("unmarshal verify response: %v", err)
+	}
+	if verifyRes["chain_valid"] != true {
+		t.Fatalf("expected chain_valid true, got %v", verifyRes["chain_valid"])
+	}
+
+	// 2. Mutate state: create domain
+	domainPayload := map[string]interface{}{
+		"hostname":       "audit-test.example.com",
+		"origin_address": "93.184.216.34",
+		"origin_port":    443,
+	}
+	bodyBytes, _ := json.Marshal(domainPayload)
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-audit/domains", bytes.NewReader(bodyBytes))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("X-API-Key", "key-audit-admin")
+	createW := httptest.NewRecorder()
+	handler.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("failed to create domain: %d: %s", createW.Code, createW.Body.String())
+	}
+
+	// 3. Mutate state: create AI provider
+	aipPayload := map[string]interface{}{
+		"name":          "Audit Provider",
+		"endpoint":      "https://audit-llm.example.com/v1",
+		"provider_type": "openai",
+		"project_id":    "prj-audit",
+	}
+	aipBytes, _ := json.Marshal(aipPayload)
+	aipReq := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-audit/ai/providers", bytes.NewReader(aipBytes))
+	aipReq.Header.Set("Content-Type", "application/json")
+	aipReq.Header.Set("X-API-Key", "key-audit-admin")
+	aipW := httptest.NewRecorder()
+	handler.ServeHTTP(aipW, aipReq)
+	if aipW.Code != http.StatusCreated {
+		t.Fatalf("failed to create provider: %d: %s", aipW.Code, aipW.Body.String())
+	}
+
+	// 4. Query audit logs via /v1/audit-logs
+	logsReq := httptest.NewRequest(http.MethodGet, "/v1/audit-logs?project_id=prj-audit", nil)
+	logsReq.Header.Set("X-API-Key", "key-audit-admin")
+	logsW := httptest.NewRecorder()
+	handler.ServeHTTP(logsW, logsReq)
+	if logsW.Code != http.StatusOK {
+		t.Fatalf("failed to list audit logs: %d: %s", logsW.Code, logsW.Body.String())
+	}
+
+	var listRes model.AuditLogListResponse
+	if err := json.Unmarshal(logsW.Body.Bytes(), &listRes); err != nil {
+		t.Fatalf("unmarshal list response: %v", err)
+	}
+	if listRes.Total < 2 {
+		t.Fatalf("expected at least 2 audit logs, got %d", listRes.Total)
+	}
+	if !listRes.ChainValid {
+		t.Fatalf("expected audit chain to be valid")
+	}
+
+	// 5. Query via project endpoint /v1/projects/prj-audit/audit-logs
+	projLogsReq := httptest.NewRequest(http.MethodGet, "/v1/projects/prj-audit/audit-logs", nil)
+	projLogsReq.Header.Set("X-API-Key", "key-audit-admin")
+	projLogsW := httptest.NewRecorder()
+	handler.ServeHTTP(projLogsW, projLogsReq)
+	if projLogsW.Code != http.StatusOK {
+		t.Fatalf("failed project audit logs: %d: %s", projLogsW.Code, projLogsW.Body.String())
+	}
+
+	// 6. Cross-tenant access check: other tenant cannot read prj-audit logs
+	crossReq := httptest.NewRequest(http.MethodGet, "/v1/projects/prj-audit/audit-logs", nil)
+	crossReq.Header.Set("X-API-Key", "key-tenant-other")
+	crossW := httptest.NewRecorder()
+	handler.ServeHTTP(crossW, crossReq)
+	if crossW.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-tenant audit access, got %d", crossW.Code)
+	}
+}

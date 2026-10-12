@@ -44,6 +44,7 @@ type APIHandler struct {
 	popManager      *pop.Manager
 	authenticator   *auth.Authenticator
 	limiter         *ControlPlaneLimiter
+	auditLogger     *security.AuditLogger
 	handlerChain    http.Handler
 	mux             *http.ServeMux
 }
@@ -51,6 +52,35 @@ type APIHandler struct {
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
 	authenticator := auth.NewAuthenticator()
 	mux := http.NewServeMux()
+
+	auditKey := []byte(os.Getenv("AUDIT_HMAC_KEY"))
+	if len(auditKey) == 0 {
+		auditKey = []byte("nexusedge-immutable-audit-key-2026")
+	}
+	auditLogger := security.NewAuditLogger(auditKey)
+	existingLogs, _, err := s.ListAuditLogs("", 10000, 0)
+	if err == nil && len(existingLogs) > 0 {
+		records := make([]*security.AuditRecord, len(existingLogs))
+		for i, l := range existingLogs {
+			idx := len(existingLogs) - 1 - i
+			records[idx] = &security.AuditRecord{
+				ID:           l.ID,
+				Timestamp:    l.CreatedAt.Format(time.RFC3339Nano),
+				ActorID:      l.Actor,
+				OrgID:        l.OrgID,
+				ProjectID:    l.ProjectID,
+				Action:       l.Action,
+				ResourceType: l.ResourceType,
+				ResourceID:   l.ResourceID,
+				ClientIP:     l.ClientIP,
+				Details:      l.Details,
+				PrevHash:     l.PrevHash,
+				Hash:         l.Hash,
+			}
+		}
+		_ = auditLogger.LoadExistingRecords(records)
+	}
+
 	h := &APIHandler{
 		store:           s,
 		service:         svc,
@@ -64,6 +94,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		popManager:      pop.NewManager(),
 		authenticator:   authenticator,
 		limiter:         NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
+		auditLogger:     auditLogger,
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
 	}
@@ -206,6 +237,8 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/ai-providers", h.handleEdgeAIProviders)
 	h.mux.HandleFunc("/v1/ai/providers", h.handleAIProvidersRoute)
 	h.mux.HandleFunc("/v1/ai/providers/", h.handleAIProviderByIDRoute)
+	h.mux.HandleFunc("/v1/audit-logs", h.handleAuditLogsRoute)
+	h.mux.HandleFunc("/v1/audit-logs/verify", h.handleAuditLogsVerifyRoute)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +253,7 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// /v1/projects/{project_id}/domains and /v1/projects/{project_id}/ai/providers
+// /v1/projects/{project_id}/domains, /v1/projects/{project_id}/ai/providers, and /v1/projects/{project_id}/audit-logs
 func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/projects/")
 	parts := strings.Split(path, "/")
@@ -253,6 +286,16 @@ func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if parts[1] == "audit-logs" {
+		switch r.Method {
+		case http.MethodGet:
+			h.handleListAuditLogs(w, r, projectID)
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
 	if parts[1] == "ai" && len(parts) >= 3 && parts[2] == "providers" {
 		providerID := ""
 		if len(parts) >= 4 {
@@ -263,6 +306,141 @@ func (h *APIHandler) handleProjectsRoute(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeError(w, http.StatusNotFound, "route not found")
+}
+
+func (h *APIHandler) handleAuditLogsRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	tc, _ := auth.FromContext(r.Context())
+	projectID := r.URL.Query().Get("project_id")
+	if tc != nil && tc.ProjectID != "" {
+		projectID = tc.ProjectID
+	}
+
+	h.handleListAuditLogs(w, r, projectID)
+}
+
+func (h *APIHandler) handleListAuditLogs(w http.ResponseWriter, r *http.Request, projectID string) {
+	limit := 50
+	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if val, err := strconv.Atoi(l); err == nil && val > 0 && val <= 500 {
+			limit = val
+		}
+	}
+	if o := r.URL.Query().Get("offset"); o != "" {
+		if val, err := strconv.Atoi(o); err == nil && val >= 0 {
+			offset = val
+		}
+	}
+
+	logs, total, err := h.store.ListAuditLogs(projectID, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list audit logs: "+err.Error())
+		return
+	}
+
+	valid, _ := h.auditLogger.VerifyChain()
+	lastHash := h.auditLogger.LastHash()
+
+	resp := model.AuditLogListResponse{
+		AuditLogs:  logs,
+		Total:      total,
+		Limit:      limit,
+		Offset:     offset,
+		ChainValid: valid,
+		LastHash:   lastHash,
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *APIHandler) handleAuditLogsVerifyRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	valid, err := h.auditLogger.VerifyChain()
+	records := h.auditLogger.GetRecords()
+	lastHash := h.auditLogger.LastHash()
+
+	status := map[string]interface{}{
+		"chain_valid":   valid,
+		"total_records": len(records),
+		"last_hash":     lastHash,
+		"algorithm":     "HMAC-SHA256",
+		"genesis_hash":  security.GenesisHash,
+		"verified_at":   time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err != nil {
+		status["verification_error"] = err.Error()
+	}
+
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, resourceType, resourceID string, details map[string]interface{}) {
+	if h.auditLogger == nil {
+		return
+	}
+
+	actor := "system"
+	clientIP := ""
+	if r != nil {
+		if tc, ok := auth.FromContext(r.Context()); ok {
+			if tc.TenantID != "" {
+				actor = tc.TenantID
+				if orgID == "" {
+					orgID = tc.TenantID
+				}
+			}
+			if projectID == "" && tc.ProjectID != "" {
+				projectID = tc.ProjectID
+			}
+		}
+		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+			parts := strings.Split(xf, ",")
+			clientIP = strings.TrimSpace(parts[0])
+		}
+		if clientIP == "" {
+			host, _, err := net.SplitHostPort(r.RemoteAddr)
+			if err == nil {
+				clientIP = host
+			} else {
+				clientIP = r.RemoteAddr
+			}
+		}
+	}
+
+	rec, err := h.auditLogger.Record(actor, orgID, projectID, action, resourceType, resourceID, clientIP, details)
+	if err != nil {
+		return
+	}
+
+	t, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
+	if parseErr != nil {
+		t = time.Now().UTC()
+	}
+
+	log := &model.AuditLog{
+		ID:           rec.ID,
+		OrgID:        rec.OrgID,
+		ProjectID:    rec.ProjectID,
+		Actor:        rec.ActorID,
+		Action:       rec.Action,
+		ResourceType: rec.ResourceType,
+		ResourceID:   rec.ResourceID,
+		ClientIP:     rec.ClientIP,
+		Details:      rec.Details,
+		PrevHash:     rec.PrevHash,
+		Hash:         rec.Hash,
+		CreatedAt:    t,
+	}
+
+	_ = h.store.SaveAuditLog(log)
 }
 
 func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -291,6 +469,11 @@ func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	h.recordAudit(r, "", projectID, "domain.created", "domain", res.DomainID, map[string]interface{}{
+		"hostname":     res.Hostname,
+		"cname_target": res.CNAMETarget,
+	})
 
 	writeJSON(w, http.StatusCreated, res)
 }
@@ -337,6 +520,9 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
+			h.recordAudit(r, "", domain.ProjectID, "domain.deleted", "domain", domainID, map[string]interface{}{
+				"hostname": domain.Hostname,
+			})
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":    "deleted",
 				"domain_id": domainID,
@@ -1065,6 +1251,18 @@ func (h *APIHandler) handleAddWAFRule(w http.ResponseWriter, r *http.Request, do
 		return
 	}
 
+	domain, _ := h.store.GetDomain(domainID)
+	projID := ""
+	if domain != nil {
+		projID = domain.ProjectID
+	}
+	h.recordAudit(r, "", projID, "waf_rule.created", "waf_rule", rule.ID, map[string]interface{}{
+		"domain_id": domainID,
+		"rule_name": rule.Name,
+		"pattern":   rule.Pattern,
+		"action":    rule.Action,
+	})
+
 	writeJSON(w, http.StatusCreated, rule)
 }
 
@@ -1084,6 +1282,16 @@ func (h *APIHandler) handleDeleteWAFRule(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, "rule not found")
 		return
 	}
+
+	domain, _ := h.store.GetDomain(domainID)
+	projID := ""
+	if domain != nil {
+		projID = domain.ProjectID
+	}
+	h.recordAudit(r, "", projID, "waf_rule.deleted", "waf_rule", ruleID, map[string]interface{}{
+		"domain_id": domainID,
+	})
+
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "WAF rule deleted successfully",
 		"rule_id": ruleID,
@@ -1163,6 +1371,16 @@ func (h *APIHandler) handleSetRateLimits(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+
+	domain, _ := h.store.GetDomain(domainID)
+	projID := ""
+	if domain != nil {
+		projID = domain.ProjectID
+	}
+	h.recordAudit(r, "", projID, "rate_limit.updated", "rate_limit", domainID, map[string]interface{}{
+		"domain_id":  domainID,
+		"rule_count": len(body.Rules),
+	})
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"domain_id": domainID,
@@ -2639,6 +2857,12 @@ func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
+		h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
+			"name":          p.Name,
+			"provider_type": p.ProviderType,
+			"endpoint":      p.Endpoint,
+		})
+
 		writeJSON(w, http.StatusCreated, p.ToResponse())
 
 	case http.MethodGet:
@@ -2745,6 +2969,12 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			return
 		}
 
+		h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
+			"name":          update.Name,
+			"provider_type": update.ProviderType,
+			"endpoint":      update.Endpoint,
+		})
+
 		writeJSON(w, http.StatusOK, update.ToResponse())
 
 	case http.MethodDelete:
@@ -2762,6 +2992,12 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			writeError(w, http.StatusInternalServerError, "failed to delete provider: "+err.Error())
 			return
 		}
+
+		h.recordAudit(r, "", existing.ProjectID, "ai_provider.deleted", "ai_provider", id, map[string]interface{}{
+			"name":          existing.Name,
+			"provider_type": existing.ProviderType,
+		})
+
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "deleted",
 			"id":     id,
@@ -2802,6 +3038,13 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
+
+			h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
+				"name":          p.Name,
+				"provider_type": p.ProviderType,
+				"endpoint":      p.Endpoint,
+			})
+
 			writeJSON(w, http.StatusCreated, p.ToResponse())
 
 		case http.MethodGet:
@@ -2868,6 +3111,13 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+
+		h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
+			"name":          update.Name,
+			"provider_type": update.ProviderType,
+			"endpoint":      update.Endpoint,
+		})
+
 		writeJSON(w, http.StatusOK, update.ToResponse())
 
 	case http.MethodDelete:
@@ -2875,6 +3125,12 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 			writeError(w, http.StatusInternalServerError, "failed to delete provider: "+err.Error())
 			return
 		}
+
+		h.recordAudit(r, "", projectID, "ai_provider.deleted", "ai_provider", providerID, map[string]interface{}{
+			"name":          p.Name,
+			"provider_type": p.ProviderType,
+		})
+
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "deleted",
 			"id":     providerID,

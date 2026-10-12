@@ -109,6 +109,19 @@ pub struct UpstreamClientKey {
     pub tls_server_name: Option<String>,
 }
 
+/// Lock-free atomic operational counters for line-rate Prometheus exposition.
+#[derive(Debug, Default)]
+pub struct GatewayMetrics {
+    pub requests_total: std::sync::atomic::AtomicU64,
+    pub responses_2xx: std::sync::atomic::AtomicU64,
+    pub responses_4xx: std::sync::atomic::AtomicU64,
+    pub responses_5xx: std::sync::atomic::AtomicU64,
+    pub rate_limited_total: std::sync::atomic::AtomicU64,
+    pub waf_blocked_total: std::sync::atomic::AtomicU64,
+    pub cache_hits_total: std::sync::atomic::AtomicU64,
+    pub cache_misses_total: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct ProxyState {
     pub config: GatewayConfig,
@@ -125,9 +138,127 @@ pub struct ProxyState {
     pub aggregate_buffered_request_bytes: Arc<std::sync::atomic::AtomicUsize>,
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
     pub ai_director: Option<Arc<crate::ai::AiTrafficDirector>>,
+    pub metrics: Arc<GatewayMetrics>,
 }
 
 impl ProxyState {
+    /// Formats line-rate atomic telemetry in Prometheus text exposition format (RFC compliant).
+    pub fn render_prometheus_metrics(&self) -> String {
+        let reqs = self
+            .metrics
+            .requests_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let resp2 = self
+            .metrics
+            .responses_2xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let resp4 = self
+            .metrics
+            .responses_4xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let resp5 = self
+            .metrics
+            .responses_5xx
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let rate_drops = self
+            .metrics
+            .rate_limited_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let waf_blocks = self
+            .metrics
+            .waf_blocked_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cache_hits = self
+            .metrics
+            .cache_hits_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cache_misses = self
+            .metrics
+            .cache_misses_total
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let buf_req = self
+            .aggregate_buffered_request_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let buf_resp = self
+            .aggregate_buffered_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut output = String::with_capacity(1024);
+        output.push_str("# HELP nexusedge_requests_total Total HTTP requests received\n");
+        output.push_str("# TYPE nexusedge_requests_total counter\n");
+        output.push_str(&format!("nexusedge_requests_total {}\n\n", reqs));
+
+        output.push_str(
+            "# HELP nexusedge_responses_total Total HTTP responses sent by status code class\n",
+        );
+        output.push_str("# TYPE nexusedge_responses_total counter\n");
+        output.push_str(&format!(
+            "nexusedge_responses_total{{code=\"2xx\"}} {}\n",
+            resp2
+        ));
+        output.push_str(&format!(
+            "nexusedge_responses_total{{code=\"4xx\"}} {}\n",
+            resp4
+        ));
+        output.push_str(&format!(
+            "nexusedge_responses_total{{code=\"5xx\"}} {}\n\n",
+            resp5
+        ));
+
+        output.push_str("# HELP nexusedge_rate_limited_total Total requests rejected due to rate limit exhaustion\n");
+        output.push_str("# TYPE nexusedge_rate_limited_total counter\n");
+        output.push_str(&format!("nexusedge_rate_limited_total {}\n\n", rate_drops));
+
+        output.push_str(
+            "# HELP nexusedge_waf_blocked_total Total requests blocked by WAF inspection rules\n",
+        );
+        output.push_str("# TYPE nexusedge_waf_blocked_total counter\n");
+        output.push_str(&format!("nexusedge_waf_blocked_total {}\n\n", waf_blocks));
+
+        output.push_str("# HELP nexusedge_cache_requests_total Total cache lookups by result\n");
+        output.push_str("# TYPE nexusedge_cache_requests_total counter\n");
+        output.push_str(&format!(
+            "nexusedge_cache_requests_total{{result=\"hit\"}} {}\n",
+            cache_hits
+        ));
+        output.push_str(&format!(
+            "nexusedge_cache_requests_total{{result=\"miss\"}} {}\n\n",
+            cache_misses
+        ));
+
+        output.push_str(
+            "# HELP nexusedge_buffer_bytes Memory footprint in bytes of in-flight buffers\n",
+        );
+        output.push_str("# TYPE nexusedge_buffer_bytes gauge\n");
+        output.push_str(&format!(
+            "nexusedge_buffer_bytes{{direction=\"request\"}} {}\n",
+            buf_req
+        ));
+        output.push_str(&format!(
+            "nexusedge_buffer_bytes{{direction=\"response\"}} {}\n",
+            buf_resp
+        ));
+
+        if let Some(ref director) = self.ai_director {
+            let ai_summary = director.get_analytics_summary();
+            if let Some(total_reqs) = ai_summary.get("total_requests").and_then(|v| v.as_u64()) {
+                output.push_str(
+                    "\n# HELP nexusedge_ai_requests_total Total AI inference requests directed\n",
+                );
+                output.push_str("# TYPE nexusedge_ai_requests_total counter\n");
+                output.push_str(&format!("nexusedge_ai_requests_total {}\n", total_reqs));
+            }
+            if let Some(total_tokens) = ai_summary.get("total_tokens").and_then(|v| v.as_u64()) {
+                output.push_str(
+                    "\n# HELP nexusedge_ai_tokens_total Total AI inference tokens processed\n",
+                );
+                output.push_str("# TYPE nexusedge_ai_tokens_total counter\n");
+                output.push_str(&format!("nexusedge_ai_tokens_total {}\n", total_tokens));
+            }
+        }
+
+        output
+    }
     /// Retrieves or lazily creates a destination-pinned HTTP client.
     /// Ensures that requests to pinned origins connect directly to the selected SocketAddr
     /// while validating the origin hostname for TLS SNI and certificate validation.
@@ -217,6 +348,22 @@ pub async fn handle_request(
         return Ok(resp);
     }
 
+    if path == "/metrics" {
+        let metrics_text = state.render_prometheus_metrics();
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            .header("Server", "NexusEdge/0.1.0")
+            .body(Full::new(Bytes::from(metrics_text)))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     // 1. Extract Client Request Headers before consuming body (Finding 3, 5, 6)
     let req_headers = req.headers().clone();
     let effective_client_ip = extract_client_ip(&req_headers, client_ip, &state.trusted_proxies);
@@ -257,6 +404,14 @@ pub async fn handle_request(
         .rate_limiter
         .check_key(&rate_limit_key, custom_rps, custom_burst)
     {
+        state
+            .metrics
+            .rate_limited_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state
+            .metrics
+            .responses_4xx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         warn!(
             ip = %effective_client_ip,
             host = %host,
@@ -281,6 +436,14 @@ pub async fn handle_request(
     if let Some(ref sec) = domain_sec_policy {
         for blocked_path in &sec.blocked_paths {
             if path.starts_with(blocked_path) {
+                state
+                    .metrics
+                    .waf_blocked_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                state
+                    .metrics
+                    .responses_4xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     ip = %effective_client_ip,
                     host = %host,
@@ -465,6 +628,14 @@ pub async fn handle_request(
         domain_sec_policy.as_ref(),
     ) {
         WafResult::Blocked { rule, pattern } => {
+            state
+                .metrics
+                .waf_blocked_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .responses_4xx
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(
                 ip = %effective_client_ip,
                 rule = rule,
@@ -532,6 +703,14 @@ pub async fn handle_request(
         && !req_cc.no_store
     {
         if let Some(cached) = state.cache.get(&cache_key, Some(&req_headers)) {
+            state
+                .metrics
+                .cache_hits_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .responses_2xx
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let latency_us = start_time.elapsed().as_micros();
             info!(uri = %uri_string, host = %host, latency_us = latency_us, cache = "HIT", "Serving from Edge Cache");
 
@@ -549,6 +728,11 @@ pub async fn handle_request(
             return Ok(resp);
         }
     }
+
+    state
+        .metrics
+        .cache_misses_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // 8. Multi-Tenant Path-Based Upstream Selection (P1 Finding 3, Item 6)
     let selected_upstream = match state.router.select_upstream_for_host_and_path(&host, &path) {
@@ -933,10 +1117,31 @@ pub async fn handle_request(
                 "Upstream request completed"
             );
 
+            if status.is_success() {
+                state
+                    .metrics
+                    .responses_2xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if status.is_client_error() {
+                state
+                    .metrics
+                    .responses_4xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if status.is_server_error() {
+                state
+                    .metrics
+                    .responses_5xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
             let resp = builder.body(Full::new(resp_bytes)).unwrap();
             Ok(resp)
         }
         Err(err) => {
+            state
+                .metrics
+                .responses_5xx
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(url = %forward_url, error = %err, "Upstream connection failed");
             let body = serde_json::json!({
                 "error": "upstream unavailable",
