@@ -88,6 +88,13 @@ func TestWAF_OWASP_Attacks(t *testing.T) {
 			expectBlocked: true,
 			expectRule:    "OWASP_CRS_MALICIOUS_SCANNER",
 		},
+		{
+			name:          "SSRF Metadata Attempt",
+			path:          "/proxy?url=http://169.254.169.254/latest/meta-data/",
+			userAgent:     "Mozilla/5.0",
+			expectBlocked: true,
+			expectRule:    "OWASP_CRS_SSRF_METADATA_ATTEMPT",
+		},
 	}
 
 	for _, tt := range tests {

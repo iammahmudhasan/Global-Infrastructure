@@ -42,6 +42,10 @@ var (
 	}
 
 	scannerUAPatterns = regexp.MustCompile(`(?i)(sqlmap|nikto|acunetix|nessus|masscan|zgrab|nmap)`)
+
+	ssrfPatterns = []*regexp.Regexp{
+		regexp.MustCompile(`(?i)(169\.254\.169\.254|metadata\.google\.internal|100\.100\.100\.200|latest/meta-data|instance/service-accounts)`),
+	}
 )
 
 type EvaluationResult struct {
@@ -163,6 +167,19 @@ func (e *WAFEngine) EvaluateRequestWithContext(req *http.Request, policy *model.
 				RuleTriggered: "OWASP_CRS_COMMAND_INJECTION",
 				Action:        model.WAFActionBlock,
 				Reason:        "command injection / RCE signature detected",
+			}
+		}
+	}
+
+	// F. SSRF & Internal Cloud Metadata Shield
+	for _, p := range ssrfPatterns {
+		if p.MatchString(fullTarget) {
+			return EvaluationResult{
+				Blocked:       policy.WAFMode == "BLOCK" || policy.WAFMode == "",
+				StatusCode:    http.StatusForbidden,
+				RuleTriggered: "OWASP_CRS_SSRF_METADATA_ATTEMPT",
+				Action:        model.WAFActionBlock,
+				Reason:        "internal cloud metadata / SSRF exploitation attempt blocked",
 			}
 		}
 	}
