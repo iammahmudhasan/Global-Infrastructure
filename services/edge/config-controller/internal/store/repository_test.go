@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		t.Fatalf("failed to initialize first repository instance: %v", err)
 	}
 
-	testDomainID := "dom-restart-recovery-" + time.Now().Format("150405")
+	testDomainID := fmt.Sprintf("dom-restart-recovery-%d", time.Now().UnixNano())
 	dom := &model.Domain{
 		ID:             testDomainID,
 		ProjectID:      "prj-recovery",

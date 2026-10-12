@@ -41,7 +41,7 @@ func NewPostgresRepository(databaseURL string) (*PostgresRepository, error) {
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	if err := db.PingContext(ctx); err != nil {
@@ -59,7 +59,7 @@ func NewPostgresRepositoryFromDB(db *sql.DB) (*PostgresRepository, error) {
 		cache: NewStore(),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := repo.migrateSchema(ctx); err != nil {
