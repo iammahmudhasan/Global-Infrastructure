@@ -252,11 +252,9 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
 
     let mut ai_providers_applied = 0;
     if let Some(director) = ai_director {
-        if let Ok(new_ai) = router::parse_pop_config_ai_providers(body_str) {
+        if let Ok(Some(new_ai)) = router::parse_pop_config_ai_providers(body_str) {
             ai_providers_applied = new_ai.len();
-            if !new_ai.is_empty() {
-                director.update_providers(new_ai);
-            }
+            director.update_providers(new_ai);
         }
     }
 

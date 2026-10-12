@@ -1623,13 +1623,17 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
     Ok(result)
 }
 
-/// Parses Control Plane PoP configuration sync JSON for AI compute providers
+/// Parses Control Plane PoP configuration sync JSON for AI compute providers.
+/// Returns Ok(None) if the ai_providers field is absent (legacy/routes-only snapshot).
+/// Returns Ok(Some(vec)) if the ai_providers field is present (even if empty, representing an authoritative pool clear).
 pub fn parse_pop_config_ai_providers(
     json_str: &str,
-) -> Result<Vec<crate::ai::AiProvider>, RouterError> {
+) -> Result<Option<Vec<crate::ai::AiProvider>>, RouterError> {
     #[derive(serde::Deserialize)]
     struct WireAIProvider {
         id: String,
+        #[serde(default)]
+        project_id: Option<String>,
         name: String,
         endpoint: String,
         provider_type: String,
@@ -1656,15 +1660,18 @@ pub fn parse_pop_config_ai_providers(
     #[derive(serde::Deserialize)]
     struct AIWire {
         #[serde(default)]
-        ai_providers: Vec<WireAIProvider>,
+        ai_providers: Option<Vec<WireAIProvider>>,
     }
 
     let wire: AIWire = serde_json::from_str(json_str).map_err(|e| {
         RouterError::InvalidPayload(format!("Failed to parse PoP sync AI providers JSON: {}", e))
     })?;
 
-    let providers = wire
-        .ai_providers
+    let Some(raw_list) = wire.ai_providers else {
+        return Ok(None);
+    };
+
+    let providers = raw_list
         .into_iter()
         .map(|w| crate::ai::AiProvider {
             id: w.id,
@@ -1684,10 +1691,18 @@ pub fn parse_pop_config_ai_providers(
                 Some(w.sovereignty_jurisdiction.trim().to_string())
             },
             failover_cooldown_secs: w.failover_cooldown_secs,
+            project_id: w.project_id.and_then(|p| {
+                let trimmed = p.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
         })
         .collect();
 
-    Ok(providers)
+    Ok(Some(providers))
 }
 
 fn select_from_nodes<'a>(
@@ -2524,5 +2539,45 @@ mod tests {
         std::env::remove_var("NEXUSEDGE_DEV_MODE");
         std::env::remove_var("NEXUSEDGE_ENV");
         assert!(!is_test_profile_active());
+    }
+
+    #[test]
+    fn test_parse_pop_config_ai_providers_distinguishes_absent_vs_empty() {
+        // 1. Snapshot with populated providers
+        let json_with_providers = r#"{
+            "routes": [],
+            "ai_providers": [
+                {
+                    "id": "openai-1",
+                    "project_id": "proj-corp",
+                    "name": "OpenAI Primary",
+                    "endpoint": "https://api.openai.com/v1",
+                    "provider_type": "openai"
+                }
+            ]
+        }"#;
+        let parsed = parse_pop_config_ai_providers(json_with_providers).unwrap();
+        assert!(parsed.is_some());
+        let providers = parsed.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "openai-1");
+        assert_eq!(providers[0].project_id.as_deref(), Some("proj-corp"));
+
+        // 2. Snapshot with explicitly empty providers (authoritative revocation)
+        let json_empty_providers = r#"{
+            "routes": [],
+            "ai_providers": []
+        }"#;
+        let parsed_empty = parse_pop_config_ai_providers(json_empty_providers).unwrap();
+        assert!(parsed_empty.is_some());
+        let empty_list = parsed_empty.unwrap();
+        assert!(empty_list.is_empty());
+
+        // 3. Snapshot with absent ai_providers field (legacy snapshot)
+        let json_absent = r#"{
+            "routes": []
+        }"#;
+        let parsed_absent = parse_pop_config_ai_providers(json_absent).unwrap();
+        assert!(parsed_absent.is_none());
     }
 }

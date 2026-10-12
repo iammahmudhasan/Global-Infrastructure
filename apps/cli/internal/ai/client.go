@@ -153,11 +153,27 @@ func (c *Client) ListProviders(ctx context.Context, projectID string) ([]AIProvi
 		return nil, fmt.Errorf("server returned HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
-	var providers []AIProvider
-	if err := json.NewDecoder(resp.Body).Decode(&providers); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	return providers, nil
+
+	// Primary: Decode Control Plane API envelope format {"providers": [...], "count": N}
+	var envelope struct {
+		Providers []AIProvider `json:"providers"`
+		Count     int          `json:"count"`
+	}
+	if err := json.Unmarshal(bodyBytes, &envelope); err == nil && envelope.Providers != nil {
+		return envelope.Providers, nil
+	}
+
+	// Fallback: Raw array format [...] for backward compatibility
+	var rawProviders []AIProvider
+	if err := json.Unmarshal(bodyBytes, &rawProviders); err == nil {
+		return rawProviders, nil
+	}
+
+	return nil, fmt.Errorf("failed to decode provider list response: %s", string(bodyBytes))
 }
 
 // AddProvider registers a new upstream AI provider in the Control Plane Key Vault.

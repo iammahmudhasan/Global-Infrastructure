@@ -1766,10 +1766,36 @@ func (h *APIHandler) handleEdgeAIProviders(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	providers := h.store.ListAIProviders()
+	tc, _ := auth.FromContext(r.Context())
+	popID := strings.TrimSpace(r.URL.Query().Get("pop_id"))
+	if popID == "" && tc != nil && tc.PoPID != "" && tc.PoPID != "*" {
+		popID = tc.PoPID
+	}
+
+	// Scope enforcement: If PoP ID is specified or node has designated PoPID, verify PoP authorization
+	if popID != "" && !h.authenticator.AuthorizePoP(r.Context(), popID) {
+		writeError(w, http.StatusForbidden, "forbidden: node not authorized for pop "+popID)
+		return
+	}
+
+	all := h.store.ListAIProviders()
+	var filtered []*model.AIProvider
+	for _, p := range all {
+		if !p.Enabled {
+			continue
+		}
+		// If caller is an edge node with project constraints, restrict to authorized projects
+		if tc != nil && tc.Role == auth.RoleEdgeNode && len(tc.AllowedProjects) > 0 && !tc.AllowedProjects["*"] {
+			if !tc.AllowedProjects[p.ProjectID] && p.ProjectID != "proj-default" && p.ProjectID != "system" {
+				continue
+			}
+		}
+		filtered = append(filtered, p)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"count":     len(providers),
-		"providers": providers,
+		"count":     len(filtered),
+		"providers": filtered,
 	})
 }
 
@@ -2118,6 +2144,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
 			return
 		}
+		if !h.authenticator.AuthorizePoP(r.Context(), popID) {
+			writeError(w, http.StatusForbidden, "forbidden: node is not authorized for target pop "+popID)
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -2144,7 +2174,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		checksum := hex.EncodeToString(hash[:])
 
 		gatewayRoutes := h.buildGatewayRoutesForPoP(topologies)
-		gatewayAIProviders := h.buildGatewayAIProviders()
+		gatewayAIProviders := h.buildGatewayAIProvidersForPoP(pop, topologies)
 
 		canonicalBytes, _ := json.Marshal(gatewayRoutes)
 		canonicalSum := sha256.Sum256(canonicalBytes)
@@ -2450,15 +2480,102 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 	return gatewayRoutes
 }
 
-func (h *APIHandler) buildGatewayAIProviders() []model.GatewayAIProviderSync {
+func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOperator bool) error {
+	trimmed := strings.TrimSpace(rawEndpoint)
+	parsedURL, err := url.Parse(trimmed)
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
+		return errors.New("endpoint must be a valid HTTP or HTTPS URL")
+	}
+
+	if parsedURL.User != nil {
+		return errors.New("endpoint cannot contain userinfo or credentials")
+	}
+	if parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
+		return errors.New("endpoint cannot contain query parameters or fragments")
+	}
+
+	host := parsedURL.Hostname()
+	if host == "" {
+		return errors.New("endpoint host cannot be empty")
+	}
+
+	// Prohibit known cloud metadata and internal management domains
+	lowerHost := strings.ToLower(host)
+	if lowerHost == "169.254.169.254" ||
+		lowerHost == "metadata.google.internal" ||
+		lowerHost == "instance-data" ||
+		lowerHost == "metadata" ||
+		strings.HasSuffix(lowerHost, ".internal") ||
+		strings.HasSuffix(lowerHost, ".local") {
+		return errors.New("endpoint destination violates SSRF protection policy (cloud metadata or internal domain prohibited)")
+	}
+
+	// Public providers strictly require HTTPS
+	switch providerType {
+	case string(model.AIProviderTypeOpenAI), string(model.AIProviderTypeAnthropic),
+		string(model.AIProviderTypeAzure), string(model.AIProviderTypeAWS),
+		string(model.AIProviderTypeCoreWeave):
+		if parsedURL.Scheme != "https" {
+			return errors.New("public AI provider endpoints must strictly use HTTPS")
+		}
+	}
+
+	// IP Destination Checks
+	ip := net.ParseIP(host)
+	if ip != nil {
+		if ip.IsLoopback() && !isOperator {
+			return errors.New("loopback IP destinations are prohibited for non-operator tenants")
+		}
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+			return errors.New("link-local IP destinations are strictly prohibited")
+		}
+		if ip.IsPrivate() {
+			// Private IPs only allowed for onprem/vllm by platform operators
+			if providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) {
+				return errors.New("private RFC1918 IP addresses are not permitted for public cloud provider types")
+			}
+			if !isOperator {
+				return errors.New("private network destinations require platform operator authorization")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologies []*store.DomainTopology) []model.GatewayAIProviderSync {
 	all := h.store.ListAIProviders()
 	var result []model.GatewayAIProviderSync
+	activeProjects := make(map[string]bool)
+	for _, topo := range topologies {
+		if topo.Domain != nil && topo.Domain.ProjectID != "" {
+			activeProjects[topo.Domain.ProjectID] = true
+		}
+	}
+
 	for _, p := range all {
 		if !p.Enabled {
 			continue
 		}
+		// Multi-tenant PoP Scoping: If active domain topologies exist for this PoP,
+		// restrict providers to those owned by the active projects on this PoP or system/default
+		if len(activeProjects) > 0 {
+			if !activeProjects[p.ProjectID] && p.ProjectID != "proj-default" && p.ProjectID != "system" {
+				continue
+			}
+		}
+
+		// Jurisdiction Scoping: Filter sovereign providers if designated
+		if p.SovereigntyJurisdiction != "" && pop != nil && pop.Country != "" {
+			if !strings.EqualFold(p.SovereigntyJurisdiction, pop.Country) &&
+				!strings.EqualFold(p.SovereigntyJurisdiction, "GLOBAL") {
+				continue
+			}
+		}
+
 		result = append(result, model.GatewayAIProviderSync{
 			ID:                      p.ID,
+			ProjectID:               p.ProjectID,
 			Name:                    p.Name,
 			Endpoint:                p.Endpoint,
 			ProviderType:            p.ProviderType,
@@ -2507,9 +2624,9 @@ func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		parsedURL, err := url.Parse(strings.TrimSpace(p.Endpoint))
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+		isOperator := h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+		if err := validateAIProviderEndpoint(p.Endpoint, p.ProviderType, isOperator); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 

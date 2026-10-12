@@ -98,6 +98,8 @@ pub struct AiRequestMetadata {
     pub requested_jurisdiction: Option<String>,
     #[serde(default)]
     pub routing_strategy: RoutingStrategy,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Extracted candidate AI upstream compute provider.
@@ -112,6 +114,8 @@ pub struct AiProvider {
     pub priority: u32,
     pub sovereignty_jurisdiction: Option<String>,
     pub failover_cooldown_secs: u64,
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Runtime health state for an AI provider candidate.
@@ -151,10 +155,14 @@ impl ProviderRuntimeState {
         }
     }
 
-    pub fn trigger_backoff(&self, duration: Duration) {
+    pub fn trigger_backoff(&self, duration: Duration, is_429: bool) {
         let mut backoff = self.backoff_until.write().unwrap();
         *backoff = Some(Instant::now() + duration);
-        self.rate_limited_429_count.fetch_add(1, Ordering::Relaxed);
+        if is_429 {
+            self.rate_limited_429_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.failovers_triggered.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -291,27 +299,42 @@ impl AiTrafficDirector {
         &self,
         requested_jurisdiction: Option<&str>,
     ) -> Vec<Arc<ProviderRuntimeState>> {
-        self.select_candidates_with_strategy(requested_jurisdiction, RoutingStrategy::Priority)
+        self.select_candidates_with_strategy(
+            requested_jurisdiction,
+            RoutingStrategy::Priority,
+            None,
+        )
     }
 
-    /// Multi-objective candidate selection: filters strictly by data sovereignty,
+    /// Multi-objective candidate selection: filters strictly by data sovereignty and tenant project scope,
     /// then ranks providers based on the requested optimization strategy.
     pub fn select_candidates_with_strategy(
         &self,
         requested_jurisdiction: Option<&str>,
         strategy: RoutingStrategy,
+        target_project_id: Option<&str>,
     ) -> Vec<Arc<ProviderRuntimeState>> {
         let guard = self.providers.read().unwrap();
         let mut candidates: Vec<Arc<ProviderRuntimeState>> = guard
             .iter()
             .filter(|state| {
                 if let Some(req_jur) = requested_jurisdiction {
-                    match state.provider.sovereignty_jurisdiction.as_deref() {
+                    let jur_match = match state.provider.sovereignty_jurisdiction.as_deref() {
                         Some(jur) => jur.eq_ignore_ascii_case(req_jur),
                         None => false,
+                    };
+                    if !jur_match {
+                        return false;
                     }
-                } else {
-                    true
+                }
+
+                // Enforce tenant project isolation:
+                // If a target_project_id is provided, match that tenant's providers or global providers (project_id: None).
+                // If NO target_project_id is provided, match only global providers (project_id: None) so tenant providers are never leaked.
+                match (&state.provider.project_id, target_project_id) {
+                    (Some(prov_proj), Some(target_proj)) => prov_proj == target_proj,
+                    (Some(_), None) => false,
+                    (None, _) => true,
                 }
             })
             .cloned()
@@ -463,11 +486,13 @@ impl AiTrafficDirector {
                     "name": state.provider.name,
                     "endpoint": state.provider.endpoint,
                     "type": state.provider.provider_type,
+                    "project_id": state.provider.project_id,
                     "jurisdiction": state.provider.sovereignty_jurisdiction,
                     "is_available": state.is_available(),
                     "total_requests": state.total_requests.load(Ordering::Relaxed),
                     "successful_requests": state.successful_requests.load(Ordering::Relaxed),
                     "rate_limited_429": state.rate_limited_429_count.load(Ordering::Relaxed),
+                    "error_count": state.error_count.load(Ordering::Relaxed),
                     "failovers_triggered": state.failovers_triggered.load(Ordering::Relaxed),
                     "avg_ttft_ms": (state.avg_ttft_ms() * 10.0).round() / 10.0,
                     "cost_per_m_tokens": state.provider.cost_per_m_tokens,
@@ -857,6 +882,13 @@ pub fn parse_ai_request_metadata(
         .and_then(|v| v.to_str().ok())
         .map(RoutingStrategy::parse);
 
+    let header_project_id = req_headers
+        .get("x-nexusedge-project-id")
+        .or_else(|| req_headers.get("x-project-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     if body.is_empty() {
         return Ok(AiRequestMetadata {
             model: "default".to_string(),
@@ -865,6 +897,7 @@ pub fn parse_ai_request_metadata(
             temperature: None,
             requested_jurisdiction: jurisdiction_header,
             routing_strategy: header_strategy.unwrap_or_default(),
+            project_id: header_project_id,
         });
     }
 
@@ -897,7 +930,14 @@ pub fn parse_ai_request_metadata(
         .and_then(|s| s.as_str())
         .map(RoutingStrategy::parse);
 
+    let body_project_id = json_val
+        .get("project_id")
+        .and_then(|p| p.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let routing_strategy = header_strategy.or(body_strategy).unwrap_or_default();
+    let project_id = header_project_id.or(body_project_id);
 
     Ok(AiRequestMetadata {
         model,
@@ -906,6 +946,7 @@ pub fn parse_ai_request_metadata(
         temperature,
         requested_jurisdiction: jurisdiction_header,
         routing_strategy,
+        project_id,
     })
 }
 
@@ -933,6 +974,36 @@ pub async fn dispatch_ai_request_with_failover(
         return Ok(resp);
     }
 
+    // Enforce Tenant & Client Authentication
+    let has_auth = req_headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_api_key = req_headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if !has_auth && !has_api_key {
+        let body = serde_json::json!({
+            "error": {
+                "message": "Missing or empty client authentication credentials (Authorization: Bearer <token> or x-api-key required)",
+                "type": "authentication_error",
+                "code": "unauthorized"
+            }
+        });
+        let resp = Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge-AI-Director/0.1.0")
+            .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        return Ok(resp);
+    }
+
     let metadata = match parse_ai_request_metadata(&body_bytes, req_headers) {
         Ok(meta) => meta,
         Err(err) => {
@@ -956,6 +1027,7 @@ pub async fn dispatch_ai_request_with_failover(
     let candidates = director.select_candidates_with_strategy(
         metadata.requested_jurisdiction.as_deref(),
         metadata.routing_strategy,
+        metadata.project_id.as_deref(),
     );
     if candidates.is_empty() {
         warn!(
@@ -1071,14 +1143,46 @@ pub async fn dispatch_ai_request_with_failover(
         let dispatch_body = if !body_bytes.is_empty() {
             match (caller_protocol, target_protocol) {
                 (AiProtocol::OpenAi, AiProtocol::Anthropic) => {
-                    translate_openai_to_anthropic_payload(&body_bytes)
-                        .map(Bytes::from)
-                        .unwrap_or_else(|_| body_bytes.clone())
+                    match translate_openai_to_anthropic_payload(&body_bytes) {
+                        Ok(b) => Bytes::from(b),
+                        Err(err) => {
+                            let body = serde_json::json!({
+                                "error": {
+                                    "message": format!("Payload translation to Anthropic schema failed: {}", err),
+                                    "type": "invalid_request_error",
+                                    "code": "payload_translation_error"
+                                }
+                            });
+                            let resp = Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("Content-Type", "application/json")
+                                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                                .body(Full::new(Bytes::from(body.to_string())))
+                                .unwrap();
+                            return Ok(resp);
+                        }
+                    }
                 }
                 (AiProtocol::Anthropic, AiProtocol::OpenAi) => {
-                    translate_anthropic_to_openai_payload(&body_bytes)
-                        .map(Bytes::from)
-                        .unwrap_or_else(|_| body_bytes.clone())
+                    match translate_anthropic_to_openai_payload(&body_bytes) {
+                        Ok(b) => Bytes::from(b),
+                        Err(err) => {
+                            let body = serde_json::json!({
+                                "error": {
+                                    "message": format!("Payload translation to OpenAI schema failed: {}", err),
+                                    "type": "invalid_request_error",
+                                    "code": "payload_translation_error"
+                                }
+                            });
+                            let resp = Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header("Content-Type", "application/json")
+                                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                                .body(Full::new(Bytes::from(body.to_string())))
+                                .unwrap();
+                            return Ok(resp);
+                        }
+                    }
                 }
                 _ => body_bytes.clone(),
             }
@@ -1099,23 +1203,29 @@ pub async fn dispatch_ai_request_with_failover(
                 if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status_code == reqwest::StatusCode::SERVICE_UNAVAILABLE
                 {
+                    let is_429 = status_code == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     warn!(
                         provider = %provider.id,
                         status = status_code.as_u16(),
                         "Upstream AI provider rate-limited or overloaded; triggering transparent failover"
                     );
-                    candidate_state.trigger_backoff(Duration::from_secs(
-                        provider.failover_cooldown_secs.max(5),
-                    ));
+                    candidate_state.trigger_backoff(
+                        Duration::from_secs(provider.failover_cooldown_secs.max(5)),
+                        is_429,
+                    );
                     failover_count += 1;
                     last_error_status = StatusCode::from_u16(status_code.as_u16())
                         .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                     continue; // Try next candidate!
                 }
 
-                // Successful or valid business response from upstream provider
+                // Upstream response received
                 let ttft_ms = send_start.elapsed().as_millis() as u64;
-                candidate_state.record_success(Some(ttft_ms));
+                if status_code.is_success() {
+                    candidate_state.record_success(Some(ttft_ms));
+                } else {
+                    candidate_state.record_error();
+                }
 
                 let resp_status = StatusCode::from_u16(status_code.as_u16())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1210,8 +1320,10 @@ pub async fn dispatch_ai_request_with_failover(
                     "Connection to AI compute provider failed; triggering failover"
                 );
                 candidate_state.record_error();
-                candidate_state
-                    .trigger_backoff(Duration::from_secs(provider.failover_cooldown_secs.max(5)));
+                candidate_state.trigger_backoff(
+                    Duration::from_secs(provider.failover_cooldown_secs.max(5)),
+                    false,
+                );
                 failover_count += 1;
                 continue;
             }
@@ -1289,6 +1401,7 @@ mod tests {
                 priority: 1,
                 sovereignty_jurisdiction: Some("US".to_string()),
                 failover_cooldown_secs: 10,
+                project_id: None,
             },
             AiProvider {
                 id: "onprem-dhaka".to_string(),
@@ -1300,6 +1413,7 @@ mod tests {
                 priority: 0,
                 sovereignty_jurisdiction: Some("BD".to_string()),
                 failover_cooldown_secs: 10,
+                project_id: None,
             },
             AiProvider {
                 id: "coreweave-spot".to_string(),
@@ -1311,6 +1425,7 @@ mod tests {
                 priority: 2,
                 sovereignty_jurisdiction: Some("US".to_string()),
                 failover_cooldown_secs: 10,
+                project_id: None,
             },
         ];
 
@@ -1327,10 +1442,98 @@ mod tests {
         assert_eq!(global_candidates[0].provider.id, "onprem-dhaka"); // priority 0
 
         // Test 3: Circuit Breaker cooldown excludes rate-limited provider from top slot
-        global_candidates[0].trigger_backoff(Duration::from_secs(60));
+        global_candidates[0].trigger_backoff(Duration::from_secs(60), true);
         let updated_candidates = director.select_candidates(None);
         assert_eq!(updated_candidates[0].provider.id, "azure-us"); // priority 1 takes over
         assert_eq!(updated_candidates[1].provider.id, "coreweave-spot"); // priority 2
         assert_eq!(updated_candidates[2].provider.id, "onprem-dhaka"); // backed off node pushed to end
+    }
+
+    #[test]
+    fn test_tenant_project_isolation() {
+        let providers = vec![
+            AiProvider {
+                id: "global-vllm".to_string(),
+                name: "Global Shared vLLM".to_string(),
+                endpoint: "https://global.example.com".to_string(),
+                provider_type: "vllm".to_string(),
+                api_key: None,
+                cost_per_m_tokens: 1.0,
+                priority: 2,
+                sovereignty_jurisdiction: None,
+                failover_cooldown_secs: 10,
+                project_id: None,
+            },
+            AiProvider {
+                id: "tenant-alpha-custom".to_string(),
+                name: "Alpha Custom Fine-Tuned".to_string(),
+                endpoint: "https://alpha.example.com".to_string(),
+                provider_type: "openai".to_string(),
+                api_key: Some("alpha-key".to_string()),
+                cost_per_m_tokens: 0.5,
+                priority: 0,
+                sovereignty_jurisdiction: None,
+                failover_cooldown_secs: 10,
+                project_id: Some("proj-alpha".to_string()),
+            },
+            AiProvider {
+                id: "tenant-beta-private".to_string(),
+                name: "Beta Private Azure".to_string(),
+                endpoint: "https://beta.example.com".to_string(),
+                provider_type: "azure".to_string(),
+                api_key: Some("beta-key".to_string()),
+                cost_per_m_tokens: 0.4,
+                priority: 0,
+                sovereignty_jurisdiction: None,
+                failover_cooldown_secs: 10,
+                project_id: Some("proj-beta".to_string()),
+            },
+        ];
+
+        let director = AiTrafficDirector::new(providers);
+
+        // Alpha query: sees Alpha's custom model + shared global model, never Beta's model
+        let alpha_candidates = director.select_candidates_with_strategy(
+            None,
+            RoutingStrategy::Priority,
+            Some("proj-alpha"),
+        );
+        assert_eq!(alpha_candidates.len(), 2);
+        assert_eq!(alpha_candidates[0].provider.id, "tenant-alpha-custom");
+        assert_eq!(alpha_candidates[1].provider.id, "global-vllm");
+
+        // Beta query: sees Beta's private model + shared global model, never Alpha's model
+        let beta_candidates = director.select_candidates_with_strategy(
+            None,
+            RoutingStrategy::Priority,
+            Some("proj-beta"),
+        );
+        assert_eq!(beta_candidates.len(), 2);
+        assert_eq!(beta_candidates[0].provider.id, "tenant-beta-private");
+        assert_eq!(beta_candidates[1].provider.id, "global-vllm");
+
+        // Unscoped / public query: sees only global model, never private tenant models
+        let unscoped_candidates =
+            director.select_candidates_with_strategy(None, RoutingStrategy::Priority, None);
+        assert_eq!(unscoped_candidates.len(), 1);
+        assert_eq!(unscoped_candidates[0].provider.id, "global-vllm");
+    }
+
+    #[test]
+    fn test_parse_ai_request_metadata_with_project_id() {
+        let payload = br#"{"model": "llama-3.3-70b", "project_id": "proj-from-body"}"#;
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-nexusedge-project-id",
+            HeaderValue::from_static("proj-from-header"),
+        );
+
+        // Header takes precedence when both provided
+        let meta = parse_ai_request_metadata(payload, &headers).unwrap();
+        assert_eq!(meta.project_id.as_deref(), Some("proj-from-header"));
+
+        // Fallback to body when header absent
+        let meta_body = parse_ai_request_metadata(payload, &hyper::HeaderMap::new()).unwrap();
+        assert_eq!(meta_body.project_id.as_deref(), Some("proj-from-body"));
     }
 }

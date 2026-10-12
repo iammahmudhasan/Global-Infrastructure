@@ -218,10 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         }
                         if let Some(ref director) = sync_ai {
-                            if let Ok(new_ai) = router::parse_pop_config_ai_providers(&content) {
-                                if !new_ai.is_empty() {
-                                    director.update_providers(new_ai);
-                                }
+                            if let Ok(Some(new_ai)) =
+                                router::parse_pop_config_ai_providers(&content)
+                            {
+                                director.update_providers(new_ai);
                             }
                         }
                     }

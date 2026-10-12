@@ -461,6 +461,7 @@ type GatewayRouteSync struct {
 // GatewayAIProviderSync models validated AI compute provider destination for edge gateway
 type GatewayAIProviderSync struct {
 	ID                      string  `json:"id"`
+	ProjectID               string  `json:"project_id"`
 	Name                    string  `json:"name"`
 	Endpoint                string  `json:"endpoint"`
 	ProviderType            string  `json:"provider_type"`

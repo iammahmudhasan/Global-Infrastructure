@@ -9,6 +9,7 @@ import (
 )
 
 func TestClient_ListProviders(t *testing.T) {
+	// 1. Test Control Plane standard envelope format {"providers": [...], "count": 1}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/ai/providers" {
 			t.Errorf("expected path /v1/ai/providers, got %s", r.URL.Path)
@@ -29,7 +30,10 @@ func TestClient_ListProviders(t *testing.T) {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(providers)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"providers": providers,
+			"count":     len(providers),
+		})
 	}))
 	defer server.Close()
 
@@ -47,6 +51,36 @@ func TestClient_ListProviders(t *testing.T) {
 	}
 	if providers[0].ID != "vllm-spot" {
 		t.Errorf("expected provider ID vllm-spot, got %s", providers[0].ID)
+	}
+}
+
+func TestClient_ListProviders_RawArrayFallback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providers := []AIProvider{
+			{
+				ID:           "raw-prov",
+				ProjectID:    "test-proj",
+				Name:         "Raw Provider",
+				ProviderType: "openai",
+				Enabled:      true,
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(providers)
+	}))
+	defer server.Close()
+
+	client := &Client{
+		ControlPlaneURL: server.URL,
+		HTTPClient:      server.Client(),
+	}
+
+	providers, err := client.ListProviders(context.Background(), "test-proj")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(providers) != 1 || providers[0].ID != "raw-prov" {
+		t.Fatalf("expected raw provider fallback to succeed, got %+v", providers)
 	}
 }
 

@@ -18,14 +18,38 @@ const (
 	nonceSize   = 12 // 96-bit nonce for AES-GCM
 )
 
-// getVaultKey derives a 32-byte AES-256 key from environment or fallback
-func getVaultKey() []byte {
-	raw := os.Getenv("NEXUSEDGE_VAULT_KEY")
+// GetVaultKey derives a 32-byte AES-256 key from the environment.
+// In production (NEXUSEDGE_ENV=production), a valid 32-byte key or base64-encoded 32-byte key is mandatory.
+func GetVaultKey() ([]byte, error) {
+	raw := strings.TrimSpace(os.Getenv("NEXUSEDGE_VAULT_KEY"))
+	isProd := strings.EqualFold(os.Getenv("NEXUSEDGE_ENV"), "production") ||
+		strings.EqualFold(os.Getenv("ENVIRONMENT"), "production") ||
+		strings.EqualFold(os.Getenv("APP_ENV"), "production")
+
 	if raw == "" {
-		raw = "nexusedge-default-dev-vault-encryption-key-2026"
+		if isProd {
+			return nil, errors.New("NEXUSEDGE_VAULT_KEY is strictly required in production environment")
+		}
+		raw = "nexusedge-dev-vault-encryption-key-2026-local"
 	}
+
+	// Try base64 decoding (e.g. from KMS or secret manager)
+	if key, err := base64.StdEncoding.DecodeString(raw); err == nil && len(key) == 32 {
+		return key, nil
+	}
+
+	// Check raw byte length
+	if len(raw) == 32 {
+		return []byte(raw), nil
+	}
+
+	if isProd {
+		return nil, errors.New("NEXUSEDGE_VAULT_KEY in production must be either 32 raw bytes or base64-encoded 32 bytes")
+	}
+
+	// Non-production fallback uses SHA-256 derivation of dev passphrase
 	hash := sha256.Sum256([]byte(raw))
-	return hash[:]
+	return hash[:], nil
 }
 
 // EncryptSecret encrypts plaintext using AES-256-GCM and formats as enc:v1:<base64>
@@ -37,7 +61,11 @@ func EncryptSecret(plaintext string) (string, error) {
 		return plaintext, nil // Already encrypted
 	}
 
-	key := getVaultKey()
+	key, err := GetVaultKey()
+	if err != nil {
+		return "", fmt.Errorf("retrieve vault key: %w", err)
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("create cipher: %w", err)
@@ -78,7 +106,11 @@ func DecryptSecret(ciphertext string) (string, error) {
 		return "", errors.New("vault payload too short")
 	}
 
-	key := getVaultKey()
+	key, err := GetVaultKey()
+	if err != nil {
+		return "", fmt.Errorf("retrieve vault key: %w", err)
+	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("create cipher: %w", err)

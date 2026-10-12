@@ -3230,3 +3230,112 @@ func TestEdgeAIProviders_SyncEndpoint(t *testing.T) {
 		t.Fatalf("expected 200 OK for platform operator, got %d", wOps.Code)
 	}
 }
+
+func TestAIProvider_SSRFProtection(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant-ssrf", "tenant-ssrf", "prj-ssrf", auth.RoleTenant, "prj-ssrf")
+
+	testCases := []struct {
+		name         string
+		endpoint     string
+		providerType string
+		expectedCode int
+	}{
+		{
+			name:         "Prohibit Cloud Metadata IP",
+			endpoint:     "http://169.254.169.254/latest/meta-data",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Google Metadata Hostname",
+			endpoint:     "http://metadata.google.internal/computeMetadata/v1",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Userinfo Credentials in URL",
+			endpoint:     "https://admin:secret@api.openai.com/v1",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Query Parameters",
+			endpoint:     "https://api.openai.com/v1?token=123",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Plain HTTP for Public Cloud",
+			endpoint:     "http://api.openai.com/v1",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Private RFC1918 IP for Public Cloud Provider",
+			endpoint:     "https://10.20.30.40/v1",
+			providerType: "openai",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Prohibit Loopback for Non-Operator Tenant",
+			endpoint:     "http://127.0.0.1:8000/v1",
+			providerType: "onprem",
+			expectedCode: http.StatusBadRequest,
+		},
+		{
+			name:         "Allow Legitimate Public HTTPS Endpoint",
+			endpoint:     "https://api.openai.com/v1",
+			providerType: "openai",
+			expectedCode: http.StatusCreated,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := map[string]interface{}{
+				"name":          "SSRF Probe Test",
+				"endpoint":      tc.endpoint,
+				"provider_type": tc.providerType,
+				"project_id":    "prj-ssrf",
+			}
+			bodyBytes, _ := json.Marshal(payload)
+			req := httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-API-Key", "key-tenant-ssrf")
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tc.expectedCode {
+				t.Fatalf("case %q: expected HTTP %d, got %d: %s", tc.name, tc.expectedCode, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestEdgeAIProviders_PoPScoping(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	// Register an edge node specifically tied to pop "dhaka"
+	authInst.RegisterNodeWithPoP("key-node-dhaka", "tenant-infra", "prj-infra", "node-dhk-01", "dhaka")
+
+	// 1. Authorized PoP -> 200 OK
+	reqDhk := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers?pop_id=dhaka", nil)
+	reqDhk.Header.Set("X-API-Key", "key-node-dhaka")
+	wDhk := httptest.NewRecorder()
+	handler.ServeHTTP(wDhk, reqDhk)
+	if wDhk.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for authorized pop dhaka, got %d: %s", wDhk.Code, wDhk.Body.String())
+	}
+
+	// 2. Unauthorized PoP -> 403 Forbidden
+	reqSin := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers?pop_id=singapore", nil)
+	reqSin.Header.Set("X-API-Key", "key-node-dhaka")
+	wSin := httptest.NewRecorder()
+	handler.ServeHTTP(wSin, reqSin)
+	if wSin.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for cross-PoP unauthorized access, got %d: %s", wSin.Code, wSin.Body.String())
+	}
+}

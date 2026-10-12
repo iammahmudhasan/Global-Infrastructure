@@ -529,11 +529,20 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 			return fmt.Errorf("scan ai_provider: %w", err)
 		}
 		if p.APIKey != "" {
-			decrypted, decErr := security.DecryptSecret(p.APIKey)
+			rawStored := p.APIKey
+			decrypted, decErr := security.DecryptSecret(rawStored)
 			if decErr != nil {
 				return fmt.Errorf("decrypt ai_provider secret %s: %w", p.ID, decErr)
 			}
 			p.APIKey = decrypted
+
+			// Transparent application-level migration: encrypt legacy plaintext keys at rest
+			if !security.IsEncrypted(rawStored) {
+				enc, encErr := security.EncryptSecret(rawStored)
+				if encErr == nil {
+					_, _ = r.db.ExecContext(ctx, "UPDATE ai_providers SET api_key = $1 WHERE id = $2", enc, p.ID)
+				}
+			}
 		}
 		if err := r.cache.SaveAIProvider(&p); err != nil {
 			return fmt.Errorf("cache save ai_provider: %w", err)

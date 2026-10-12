@@ -54,6 +54,7 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
             priority: 0,
             sovereignty_jurisdiction: Some("US".to_string()),
             failover_cooldown_secs: 10,
+            project_id: None,
         },
         AiProvider {
             id: "coreweave-fallback".to_string(),
@@ -65,6 +66,7 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
             priority: 1,
             sovereignty_jurisdiction: Some("US".to_string()),
             failover_cooldown_secs: 10,
+            project_id: None,
         },
     ];
 
@@ -81,6 +83,10 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
     req_headers.insert(
         "content-type",
         hyper::header::HeaderValue::from_static("application/json"),
+    );
+    req_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer test-client-token"),
     );
 
     // 3. Dispatch AI request: Azure fails with 429, CoreWeave transparently succeeds!
@@ -152,6 +158,7 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
             priority: 10,
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
+            project_id: None,
         },
         AiProvider {
             id: "spot-coreweave".to_string(),
@@ -163,6 +170,7 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
             priority: 1,
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
+            project_id: None,
         },
     ];
 
@@ -179,6 +187,10 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
     req_headers.insert(
         "content-type",
         hyper::header::HeaderValue::from_static("application/json"),
+    );
+    req_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer test-client-token"),
     );
     req_headers.insert(
         "x-nexusedge-routing-strategy",
@@ -259,6 +271,7 @@ fn test_ai_multi_strategy_selection() {
             priority: 5,
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
+            project_id: None,
         },
         AiProvider {
             id: "fast-provider".to_string(),
@@ -270,11 +283,12 @@ fn test_ai_multi_strategy_selection() {
             priority: 1,
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
+            project_id: None,
         },
     ];
 
     let director = AiTrafficDirector::new(providers);
-    let candidates = director.select_candidates_with_strategy(None, RoutingStrategy::Cost);
+    let candidates = director.select_candidates_with_strategy(None, RoutingStrategy::Cost, None);
 
     // Record sample TTFT on fast-provider
     candidates[1].record_success(Some(15));
@@ -282,17 +296,18 @@ fn test_ai_multi_strategy_selection() {
     candidates[0].record_success(Some(180));
 
     // Under Cost strategy: cheap-provider ($0.40) must be first
-    let cost_candidates = director.select_candidates_with_strategy(None, RoutingStrategy::Cost);
+    let cost_candidates =
+        director.select_candidates_with_strategy(None, RoutingStrategy::Cost, None);
     assert_eq!(cost_candidates[0].provider.id, "cheap-provider");
 
     // Under Latency strategy: fast-provider (15ms) must be first
     let latency_candidates =
-        director.select_candidates_with_strategy(None, RoutingStrategy::Latency);
+        director.select_candidates_with_strategy(None, RoutingStrategy::Latency, None);
     assert_eq!(latency_candidates[0].provider.id, "fast-provider");
 
     // Under Priority strategy: fast-provider (priority 1 vs 5) must be first
     let priority_candidates =
-        director.select_candidates_with_strategy(None, RoutingStrategy::Priority);
+        director.select_candidates_with_strategy(None, RoutingStrategy::Priority, None);
     assert_eq!(priority_candidates[0].provider.id, "fast-provider");
 }
 
@@ -441,6 +456,7 @@ async fn test_anthropic_client_to_vllm_cross_protocol_dispatch() {
         priority: 0,
         sovereignty_jurisdiction: None,
         failover_cooldown_secs: 10,
+        project_id: None,
     }];
 
     let director = AiTrafficDirector::new(providers);
@@ -490,4 +506,73 @@ async fn test_anthropic_client_to_vllm_cross_protocol_dispatch() {
     );
     assert_eq!(resp_val["usage"]["input_tokens"], 12);
     assert_eq!(resp_val["usage"]["output_tokens"], 8);
+}
+
+#[tokio::test]
+async fn test_ai_inference_authentication_required() {
+    let director = AiTrafficDirector::new(vec![]);
+    let client = HttpClient::new();
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+
+    // Request with no Authorization and no x-api-key header
+    let mut req_headers = hyper::HeaderMap::new();
+    req_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+
+    let resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &req_headers,
+        req_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_ai_payload_translation_fails_closed() {
+    let providers = vec![AiProvider {
+        id: "mock-vllm".to_string(),
+        name: "Mock vLLM".to_string(),
+        endpoint: "http://127.0.0.1:9".to_string(),
+        provider_type: "vllm".to_string(), // OpenAI protocol
+        api_key: None,
+        cost_per_m_tokens: 0.50,
+        priority: 0,
+        sovereignty_jurisdiction: None,
+        failover_cooldown_secs: 10,
+        project_id: None,
+    }];
+    let director = AiTrafficDirector::new(providers);
+    let client = HttpClient::new();
+
+    // Caller sends Anthropic endpoint /v1/messages requiring translation to vLLM,
+    // but the payload is completely malformed (not valid JSON)
+    let malformed_payload = Bytes::from_static(b"not valid json at all");
+    let mut req_headers = hyper::HeaderMap::new();
+    req_headers.insert(
+        "x-api-key",
+        hyper::header::HeaderValue::from_static("test-key"),
+    );
+
+    let resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/messages",
+        &Method::POST,
+        &req_headers,
+        malformed_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
