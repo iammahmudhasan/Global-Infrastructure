@@ -61,3 +61,8 @@ cache:
   enabled: true
   default_ttl_seconds: 60
   max_entries: 10000
+
+ai:
+  enabled: true
+  route_prefix: "/v1"
+  providers: []

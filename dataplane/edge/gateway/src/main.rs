@@ -131,8 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "Configured trusted reverse proxy CIDRs"
     );
 
-    let ai_director = config.ai.as_ref().and_then(|ai_cfg| {
-        if ai_cfg.enabled {
+    let ai_director = match &config.ai {
+        Some(ai_cfg) if ai_cfg.enabled => {
             info!(
                 providers = ai_cfg.providers.len(),
                 "NexusEdge Universal AI & Compute Director: ACTIVE"
@@ -140,10 +140,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(Arc::new(nexusedge_gateway::ai::AiTrafficDirector::new(
                 ai_cfg.providers.clone(),
             )))
-        } else {
-            None
         }
-    });
+        Some(_) => None,
+        None if requires_dynamic_sync => {
+            info!("NexusEdge Universal AI & Compute Director: ACTIVE (Dynamic Control Plane Sync Mode)");
+            Some(Arc::new(nexusedge_gateway::ai::AiTrafficDirector::new(
+                vec![],
+            )))
+        }
+        None => None,
+    };
 
     let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {

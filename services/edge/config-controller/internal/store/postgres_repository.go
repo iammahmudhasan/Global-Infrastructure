@@ -12,6 +12,7 @@ import (
 	"github.com/lib/pq"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 )
 
 // PostgresRepository provides a durable, ACID-compliant PostgreSQL storage implementation
@@ -517,14 +518,29 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 
 	// 10. AI Compute Providers
 	aiRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, endpoint, provider_type, api_key, cost_per_m_tokens, priority, sovereignty_jurisdiction, failover_cooldown_secs, enabled, created_at, updated_at FROM ai_providers")
-	if err == nil {
-		defer aiRows.Close()
-		for aiRows.Next() {
-			var p model.AIProvider
-			if err := aiRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.Endpoint, &p.ProviderType, &p.APIKey, &p.CostPerMTokens, &p.Priority, &p.SovereigntyJurisdiction, &p.FailoverCooldownSecs, &p.Enabled, &p.CreatedAt, &p.UpdatedAt); err == nil {
-				_ = r.cache.SaveAIProvider(&p)
-			}
+	if err != nil {
+		return fmt.Errorf("query ai_providers: %w", err)
+	}
+	defer aiRows.Close()
+
+	for aiRows.Next() {
+		var p model.AIProvider
+		if err := aiRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.Endpoint, &p.ProviderType, &p.APIKey, &p.CostPerMTokens, &p.Priority, &p.SovereigntyJurisdiction, &p.FailoverCooldownSecs, &p.Enabled, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return fmt.Errorf("scan ai_provider: %w", err)
 		}
+		if p.APIKey != "" {
+			decrypted, decErr := security.DecryptSecret(p.APIKey)
+			if decErr != nil {
+				return fmt.Errorf("decrypt ai_provider secret %s: %w", p.ID, decErr)
+			}
+			p.APIKey = decrypted
+		}
+		if err := r.cache.SaveAIProvider(&p); err != nil {
+			return fmt.Errorf("cache save ai_provider: %w", err)
+		}
+	}
+	if err := aiRows.Err(); err != nil {
+		return fmt.Errorf("iterate ai_providers: %w", err)
 	}
 
 	return nil
@@ -1175,6 +1191,15 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 	}
 	p.UpdatedAt = now
 
+	encryptedKey := p.APIKey
+	if p.APIKey != "" {
+		enc, encErr := security.EncryptSecret(p.APIKey)
+		if encErr != nil {
+			return fmt.Errorf("encrypt ai_provider secret: %w", encErr)
+		}
+		encryptedKey = enc
+	}
+
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO ai_providers (
 			id, project_id, name, endpoint, provider_type, api_key,
@@ -1192,7 +1217,7 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 			failover_cooldown_secs = EXCLUDED.failover_cooldown_secs,
 			enabled = EXCLUDED.enabled,
 			updated_at = EXCLUDED.updated_at
-	`, p.ID, p.ProjectID, p.Name, p.Endpoint, p.ProviderType, p.APIKey,
+	`, p.ID, p.ProjectID, p.Name, p.Endpoint, p.ProviderType, encryptedKey,
 		p.CostPerMTokens, p.Priority, p.SovereigntyJurisdiction,
 		p.FailoverCooldownSecs, p.Enabled, p.CreatedAt, p.UpdatedAt)
 	if err != nil {
