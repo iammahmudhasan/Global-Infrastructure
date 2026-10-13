@@ -280,6 +280,28 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);`,
 			},
 		},
+		{
+			version: "0004_durable_health_monitors_and_policies",
+			stmts: []string{
+				`CREATE TABLE IF NOT EXISTS health_monitors (
+					id VARCHAR(64) PRIMARY KEY,
+					pool_id VARCHAR(64) NOT NULL REFERENCES origin_pools(id) ON DELETE CASCADE,
+					protocol VARCHAR(32) NOT NULL DEFAULT 'HTTP',
+					path VARCHAR(255) NOT NULL DEFAULT '/healthz',
+					port INT NOT NULL DEFAULT 80,
+					interval_seconds INT NOT NULL DEFAULT 10,
+					timeout_seconds INT NOT NULL DEFAULT 2,
+					healthy_threshold INT NOT NULL DEFAULT 2,
+					unhealthy_threshold INT NOT NULL DEFAULT 3,
+					expected_status_codes INT[] NOT NULL DEFAULT '{200}'
+				);`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_health_monitors_pool ON health_monitors(pool_id);`,
+				`ALTER TABLE tls_settings ADD COLUMN IF NOT EXISTS hsts BOOLEAN NOT NULL DEFAULT FALSE;`,
+				`ALTER TABLE tls_settings ADD COLUMN IF NOT EXISTS hsts_max_age INT NOT NULL DEFAULT 0;`,
+				`ALTER TABLE cache_policies ADD COLUMN IF NOT EXISTS query_handling VARCHAR(32) NOT NULL DEFAULT 'INCLUDE_ALL';`,
+				`ALTER TABLE cache_policies ADD COLUMN IF NOT EXISTS strip_cookies BOOLEAN NOT NULL DEFAULT FALSE;`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -377,7 +399,9 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 			return fmt.Errorf("scan origin_pool: %w", err)
 		}
 		p.AllowedPoPs = []string(pops)
-		_ = r.cache.SaveOriginPoolBypass(&p)
+		if err := r.cache.SaveOriginPoolBypass(&p); err != nil {
+			return fmt.Errorf("cache save origin_pool %s: %w", p.ID, err)
+		}
 	}
 	if err := poolRows.Err(); err != nil {
 		return fmt.Errorf("iterate origin_pools: %w", err)
@@ -395,7 +419,9 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 			return fmt.Errorf("scan origin: %w", err)
 		}
 		o.AllowedPoPs = []string(pops)
-		_ = r.cache.AddOrigin(&o)
+		if err := r.cache.AddOrigin(&o); err != nil {
+			return fmt.Errorf("cache save origin %s: %w", o.ID, err)
+		}
 	}
 	if err := origRows.Err(); err != nil {
 		return fmt.Errorf("iterate origins: %w", err)
@@ -412,7 +438,9 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 		if err := routeRows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err != nil {
 			return fmt.Errorf("scan route: %w", err)
 		}
-		_ = r.cache.SaveRoute(&rt)
+		if err := r.cache.SaveRoute(&rt); err != nil {
+			return fmt.Errorf("cache save route %s: %w", rt.ID, err)
+		}
 	}
 	if err := routeRows.Err(); err != nil {
 		return fmt.Errorf("iterate routes: %w", err)
@@ -440,14 +468,16 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 				return fmt.Errorf("unmarshal rate_limit_rules: %w", err)
 			}
 		}
-		_ = r.cache.SaveSecurityPolicy(&sp)
+		if err := r.cache.SaveSecurityPolicy(&sp); err != nil {
+			return fmt.Errorf("cache save security_policy %s: %w", sp.ID, err)
+		}
 	}
 	if err := secRows.Err(); err != nil {
 		return fmt.Errorf("iterate security_policies: %w", err)
 	}
 
 	// 6. Cache Policies
-	cacheRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, cache_enabled, default_ttl_seconds, respect_origin_headers, cache_rules_json FROM cache_policies")
+	cacheRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, cache_enabled, default_ttl_seconds, respect_origin_headers, query_handling, strip_cookies, cache_rules_json FROM cache_policies")
 	if err != nil {
 		return fmt.Errorf("query cache_policies: %w", err)
 	}
@@ -455,15 +485,19 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	for cacheRows.Next() {
 		var cp model.CachePolicy
 		var rulesJSON []byte
-		if err := cacheRows.Scan(&cp.ID, &cp.DomainID, &cp.CacheEnabled, &cp.DefaultTTLSeconds, &cp.RespectOriginHeaders, &rulesJSON); err != nil {
+		var qHandling string
+		if err := cacheRows.Scan(&cp.ID, &cp.DomainID, &cp.CacheEnabled, &cp.DefaultTTLSeconds, &cp.RespectOriginHeaders, &qHandling, &cp.StripCookies, &rulesJSON); err != nil {
 			return fmt.Errorf("scan cache_policy: %w", err)
 		}
+		cp.QueryHandling = model.QueryStringHandling(qHandling)
 		if len(rulesJSON) > 0 {
 			if err := json.Unmarshal(rulesJSON, &cp.CacheRules); err != nil {
 				return fmt.Errorf("unmarshal cache_rules: %w", err)
 			}
 		}
-		_ = r.cache.SaveCachePolicy(&cp)
+		if err := r.cache.SaveCachePolicy(&cp); err != nil {
+			return fmt.Errorf("cache save cache_policy %s: %w", cp.ID, err)
+		}
 	}
 	if err := cacheRows.Err(); err != nil {
 		return fmt.Errorf("iterate cache_policies: %w", err)
@@ -497,16 +531,27 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 			}
 			c.PrivateKeyPEM = decrypted
 
-			// Transparent application-level migration: encrypt legacy plaintext keys at rest
+			// Transparent fail-closed application-level migration: encrypt legacy plaintext keys at rest
 			if !security.IsEncrypted(rawStored) {
 				enc, encErr := security.EncryptSecret(rawStored)
-				if encErr == nil {
-					_, _ = r.db.ExecContext(ctx, "UPDATE certificates SET private_key_pem = $1 WHERE id = $2", enc, c.ID)
+				if encErr != nil {
+					return fmt.Errorf("encrypt certificate private key %s: %w", c.ID, encErr)
+				}
+				res, err := r.db.ExecContext(ctx, "UPDATE certificates SET private_key_pem = $1 WHERE id = $2 AND private_key_pem = $3", enc, c.ID, rawStored)
+				if err != nil {
+					return fmt.Errorf("migrate plaintext certificate private key %s: %w", c.ID, err)
+				}
+				rows, _ := res.RowsAffected()
+				if rows == 0 {
+					var currentKey string
+					if err := r.db.QueryRowContext(ctx, "SELECT private_key_pem FROM certificates WHERE id = $1", c.ID).Scan(&currentKey); err != nil || !security.IsEncrypted(currentKey) {
+						return fmt.Errorf("failed to migrate plaintext certificate private key %s: concurrent conflict or unmodified", c.ID)
+					}
 				}
 			}
 		}
 		if err := r.cache.SaveCertificate(&c); err != nil {
-			return fmt.Errorf("cache save certificate: %w", err)
+			return fmt.Errorf("cache save certificate %s: %w", c.ID, err)
 		}
 	}
 	if err := certRows.Err(); err != nil {
@@ -514,7 +559,7 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	}
 
 	// 8. TLS Settings
-	tlsRows, err := r.db.QueryContext(ctx, "SELECT domain_id, enforce_https, min_tls_version FROM tls_settings")
+	tlsRows, err := r.db.QueryContext(ctx, "SELECT domain_id, enforce_https, min_tls_version, hsts, hsts_max_age FROM tls_settings")
 	if err != nil {
 		return fmt.Errorf("query tls_settings: %w", err)
 	}
@@ -522,10 +567,12 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	for tlsRows.Next() {
 		var domID string
 		var s model.TLSSettings
-		if err := tlsRows.Scan(&domID, &s.EnforceHTTPS, &s.MinTLSVersion); err != nil {
+		if err := tlsRows.Scan(&domID, &s.EnforceHTTPS, &s.MinTLSVersion, &s.HSTS, &s.HSTSMaxAge); err != nil {
 			return fmt.Errorf("scan tls_settings: %w", err)
 		}
-		_ = r.cache.SaveTLSSettings(domID, &s)
+		if err := r.cache.SaveTLSSettings(domID, &s); err != nil {
+			return fmt.Errorf("cache save tls_settings %s: %w", domID, err)
+		}
 	}
 	if err := tlsRows.Err(); err != nil {
 		return fmt.Errorf("iterate tls_settings: %w", err)
@@ -542,7 +589,9 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 		if err := chRows.Scan(&ch.ID, &ch.Token, &ch.CertificateID, &ch.DomainID, &ch.Hostname, &ch.Type, &ch.KeyAuthorization, &ch.Status, &ch.CreatedAt, &ch.ExpiresAt); err != nil {
 			return fmt.Errorf("scan acme_challenge: %w", err)
 		}
-		_ = r.cache.SaveACMEChallenge(&ch)
+		if err := r.cache.SaveACMEChallenge(&ch); err != nil {
+			return fmt.Errorf("cache save acme_challenge %s: %w", ch.ID, err)
+		}
 	}
 	if err := chRows.Err(); err != nil {
 		return fmt.Errorf("iterate acme_challenges: %w", err)
@@ -568,11 +617,22 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 			}
 			p.APIKey = decrypted
 
-			// Transparent application-level migration: encrypt legacy plaintext keys at rest
+			// Transparent fail-closed application-level migration: encrypt legacy plaintext keys at rest
 			if !security.IsEncrypted(rawStored) {
 				enc, encErr := security.EncryptSecret(rawStored)
-				if encErr == nil {
-					_, _ = r.db.ExecContext(ctx, "UPDATE ai_providers SET api_key = $1 WHERE id = $2", enc, p.ID)
+				if encErr != nil {
+					return fmt.Errorf("encrypt ai_provider secret %s: %w", p.ID, encErr)
+				}
+				res, err := r.db.ExecContext(ctx, "UPDATE ai_providers SET api_key = $1 WHERE id = $2 AND api_key = $3", enc, p.ID, rawStored)
+				if err != nil {
+					return fmt.Errorf("migrate plaintext ai_provider secret %s: %w", p.ID, err)
+				}
+				rows, _ := res.RowsAffected()
+				if rows == 0 {
+					var currentKey string
+					if err := r.db.QueryRowContext(ctx, "SELECT api_key FROM ai_providers WHERE id = $1", p.ID).Scan(&currentKey); err != nil || !security.IsEncrypted(currentKey) {
+						return fmt.Errorf("failed to migrate plaintext ai_provider secret %s: concurrent conflict or unmodified", p.ID)
+					}
 				}
 			}
 		}
@@ -584,20 +644,52 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 		return fmt.Errorf("iterate ai_providers: %w", err)
 	}
 
-	// 11. Audit Logs (Ordered by created_at ASC to seed cryptographic hash chain)
+	// 11. Health Monitors
+	hmRows, err := r.db.QueryContext(ctx, "SELECT id, pool_id, protocol, path, port, interval_seconds, timeout_seconds, healthy_threshold, unhealthy_threshold, expected_status_codes FROM health_monitors")
+	if err != nil {
+		return fmt.Errorf("query health_monitors: %w", err)
+	}
+	defer hmRows.Close()
+	for hmRows.Next() {
+		var hm model.HealthMonitor
+		var codes pq.Int64Array
+		if err := hmRows.Scan(&hm.ID, &hm.PoolID, &hm.Protocol, &hm.Path, &hm.Port, &hm.IntervalSeconds, &hm.TimeoutSeconds, &hm.HealthyThreshold, &hm.UnhealthyThreshold, &codes); err != nil {
+			return fmt.Errorf("scan health_monitor: %w", err)
+		}
+		for _, c := range codes {
+			hm.ExpectedStatusCodes = append(hm.ExpectedStatusCodes, int(c))
+		}
+		if err := r.cache.SaveHealthMonitor(&hm); err != nil {
+			return fmt.Errorf("cache save health_monitor %s: %w", hm.ID, err)
+		}
+	}
+	if err := hmRows.Err(); err != nil {
+		return fmt.Errorf("iterate health_monitors: %w", err)
+	}
+
+	// 12. Audit Logs (Ordered by created_at ASC to seed cryptographic hash chain)
 	auditRows, err := r.db.QueryContext(ctx, "SELECT id, COALESCE(org_id, ''), COALESCE(project_id, ''), actor, action, resource_type, resource_id, COALESCE(client_ip, ''), details, COALESCE(prev_hash, ''), COALESCE(hash, ''), created_at FROM audit_logs ORDER BY created_at ASC")
-	if err == nil {
-		defer auditRows.Close()
-		for auditRows.Next() {
-			var l model.AuditLog
-			var detailsJSON []byte
-			if scanErr := auditRows.Scan(&l.ID, &l.OrgID, &l.ProjectID, &l.Actor, &l.Action, &l.ResourceType, &l.ResourceID, &l.ClientIP, &detailsJSON, &l.PrevHash, &l.Hash, &l.CreatedAt); scanErr == nil {
-				if len(detailsJSON) > 0 {
-					_ = json.Unmarshal(detailsJSON, &l.Details)
-				}
-				_ = r.cache.SaveAuditLog(&l)
+	if err != nil {
+		return fmt.Errorf("query audit_logs: %w", err)
+	}
+	defer auditRows.Close()
+	for auditRows.Next() {
+		var l model.AuditLog
+		var detailsJSON []byte
+		if err := auditRows.Scan(&l.ID, &l.OrgID, &l.ProjectID, &l.Actor, &l.Action, &l.ResourceType, &l.ResourceID, &l.ClientIP, &detailsJSON, &l.PrevHash, &l.Hash, &l.CreatedAt); err != nil {
+			return fmt.Errorf("scan audit_log: %w", err)
+		}
+		if len(detailsJSON) > 0 {
+			if err := json.Unmarshal(detailsJSON, &l.Details); err != nil {
+				return fmt.Errorf("unmarshal audit_log details %s: %w", l.ID, err)
 			}
 		}
+		if err := r.cache.SaveAuditLog(&l); err != nil {
+			return fmt.Errorf("cache save audit_log %s: %w", l.ID, err)
+		}
+	}
+	if err := auditRows.Err(); err != nil {
+		return fmt.Errorf("iterate audit_logs: %w", err)
 	}
 
 	return nil
@@ -878,6 +970,37 @@ func (r *PostgresRepository) GetOriginPool(poolID string) (*model.OriginPool, er
 // -------------------------------------------------------------------------
 
 func (r *PostgresRepository) SaveHealthMonitor(hm *model.HealthMonitor) error {
+	if hm == nil {
+		return errors.New("health monitor cannot be nil")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	statusCodes := hm.ExpectedStatusCodes
+	if len(statusCodes) == 0 {
+		statusCodes = []int{200}
+	}
+
+	_, err := r.db.ExecContext(ctx,
+		`INSERT INTO health_monitors (id, pool_id, protocol, path, port, interval_seconds, timeout_seconds, healthy_threshold, unhealthy_threshold, expected_status_codes)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		 ON CONFLICT (pool_id) DO UPDATE SET
+		   protocol = EXCLUDED.protocol,
+		   path = EXCLUDED.path,
+		   port = EXCLUDED.port,
+		   interval_seconds = EXCLUDED.interval_seconds,
+		   timeout_seconds = EXCLUDED.timeout_seconds,
+		   healthy_threshold = EXCLUDED.healthy_threshold,
+		   unhealthy_threshold = EXCLUDED.unhealthy_threshold,
+		   expected_status_codes = EXCLUDED.expected_status_codes`,
+		hm.ID, hm.PoolID, string(hm.Protocol), hm.Path, hm.Port,
+		hm.IntervalSeconds, hm.TimeoutSeconds, hm.HealthyThreshold, hm.UnhealthyThreshold,
+		pq.Array(statusCodes),
+	)
+	if err != nil {
+		return fmt.Errorf("persist health monitor: %w", err)
+	}
+
 	return r.cache.SaveHealthMonitor(hm)
 }
 
@@ -979,14 +1102,15 @@ func (r *PostgresRepository) GetSecurityPolicy(domainID string) *model.SecurityP
 }
 
 func (r *PostgresRepository) AddWAFRule(domainID string, rule model.WAFRule) error {
-	err := r.cache.AddWAFRule(domainID, rule)
-	if err == nil {
-		sp := r.cache.GetSecurityPolicy(domainID)
-		if sp != nil {
-			return r.SaveSecurityPolicy(sp)
-		}
+	sp := r.cache.GetSecurityPolicy(domainID)
+	if sp == nil {
+		return fmt.Errorf("security policy for domain %s not found", domainID)
 	}
-	return err
+	cloned := *sp
+	cloned.WAFRules = make([]model.WAFRule, len(sp.WAFRules), len(sp.WAFRules)+1)
+	copy(cloned.WAFRules, sp.WAFRules)
+	cloned.WAFRules = append(cloned.WAFRules, rule)
+	return r.SaveSecurityPolicy(&cloned)
 }
 
 func (r *PostgresRepository) GetWAFRules(domainID string) []model.WAFRule {
@@ -994,25 +1118,34 @@ func (r *PostgresRepository) GetWAFRules(domainID string) []model.WAFRule {
 }
 
 func (r *PostgresRepository) DeleteWAFRule(domainID string, ruleID string) error {
-	err := r.cache.DeleteWAFRule(domainID, ruleID)
-	if err == nil {
-		sp := r.cache.GetSecurityPolicy(domainID)
-		if sp != nil {
-			return r.SaveSecurityPolicy(sp)
+	sp := r.cache.GetSecurityPolicy(domainID)
+	if sp == nil {
+		return fmt.Errorf("security policy for domain %s not found", domainID)
+	}
+	cloned := *sp
+	cloned.WAFRules = make([]model.WAFRule, 0, len(sp.WAFRules))
+	found := false
+	for _, rw := range sp.WAFRules {
+		if rw.ID != ruleID {
+			cloned.WAFRules = append(cloned.WAFRules, rw)
+		} else {
+			found = true
 		}
 	}
-	return err
+	if !found {
+		return fmt.Errorf("rule %s not found", ruleID)
+	}
+	return r.SaveSecurityPolicy(&cloned)
 }
 
 func (r *PostgresRepository) SetRateLimitRules(domainID string, rules []model.RateLimitRule) error {
-	err := r.cache.SetRateLimitRules(domainID, rules)
-	if err == nil {
-		sp := r.cache.GetSecurityPolicy(domainID)
-		if sp != nil {
-			return r.SaveSecurityPolicy(sp)
-		}
+	sp := r.cache.GetSecurityPolicy(domainID)
+	if sp == nil {
+		return fmt.Errorf("security policy for domain %s not found", domainID)
 	}
-	return err
+	cloned := *sp
+	cloned.RateLimitRules = rules
+	return r.SaveSecurityPolicy(&cloned)
 }
 
 func (r *PostgresRepository) GetRateLimitRules(domainID string) []model.RateLimitRule {
@@ -1040,15 +1173,22 @@ func (r *PostgresRepository) SaveCachePolicy(cp *model.CachePolicy) error {
 		return fmt.Errorf("marshal cache rules: %w", err)
 	}
 
+	qHandling := string(cp.QueryHandling)
+	if qHandling == "" {
+		qHandling = "INCLUDE_ALL"
+	}
+
 	_, err = r.db.ExecContext(ctx,
-		`INSERT INTO cache_policies (id, domain_id, cache_enabled, default_ttl_seconds, respect_origin_headers, cache_rules_json)
-		 VALUES ($1, $2, $3, $4, $5, $6)
+		`INSERT INTO cache_policies (id, domain_id, cache_enabled, default_ttl_seconds, respect_origin_headers, query_handling, strip_cookies, cache_rules_json)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (domain_id) DO UPDATE SET
 		   cache_enabled = EXCLUDED.cache_enabled,
 		   default_ttl_seconds = EXCLUDED.default_ttl_seconds,
 		   respect_origin_headers = EXCLUDED.respect_origin_headers,
+		   query_handling = EXCLUDED.query_handling,
+		   strip_cookies = EXCLUDED.strip_cookies,
 		   cache_rules_json = EXCLUDED.cache_rules_json`,
-		cp.ID, cp.DomainID, cp.CacheEnabled, cp.DefaultTTLSeconds, cp.RespectOriginHeaders, rulesJSON,
+		cp.ID, cp.DomainID, cp.CacheEnabled, cp.DefaultTTLSeconds, cp.RespectOriginHeaders, qHandling, cp.StripCookies, rulesJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("persist cache policy: %w", err)
@@ -1062,14 +1202,15 @@ func (r *PostgresRepository) GetCachePolicy(domainID string) *model.CachePolicy 
 }
 
 func (r *PostgresRepository) AddCacheRule(domainID string, rule model.CacheRule) error {
-	err := r.cache.AddCacheRule(domainID, rule)
-	if err == nil {
-		cp := r.cache.GetCachePolicy(domainID)
-		if cp != nil {
-			return r.SaveCachePolicy(cp)
-		}
+	cp := r.cache.GetCachePolicy(domainID)
+	if cp == nil {
+		return fmt.Errorf("cache policy for domain %s not found", domainID)
 	}
-	return err
+	cloned := *cp
+	cloned.CacheRules = make([]model.CacheRule, len(cp.CacheRules), len(cp.CacheRules)+1)
+	copy(cloned.CacheRules, cp.CacheRules)
+	cloned.CacheRules = append(cloned.CacheRules, rule)
+	return r.SaveCachePolicy(&cloned)
 }
 
 func (r *PostgresRepository) GetCacheRules(domainID string) []model.CacheRule {
@@ -1077,14 +1218,24 @@ func (r *PostgresRepository) GetCacheRules(domainID string) []model.CacheRule {
 }
 
 func (r *PostgresRepository) DeleteCacheRule(domainID string, ruleID string) error {
-	err := r.cache.DeleteCacheRule(domainID, ruleID)
-	if err == nil {
-		cp := r.cache.GetCachePolicy(domainID)
-		if cp != nil {
-			return r.SaveCachePolicy(cp)
+	cp := r.cache.GetCachePolicy(domainID)
+	if cp == nil {
+		return fmt.Errorf("cache policy for domain %s not found", domainID)
+	}
+	cloned := *cp
+	cloned.CacheRules = make([]model.CacheRule, 0, len(cp.CacheRules))
+	found := false
+	for _, rc := range cp.CacheRules {
+		if rc.ID != ruleID {
+			cloned.CacheRules = append(cloned.CacheRules, rc)
+		} else {
+			found = true
 		}
 	}
-	return err
+	if !found {
+		return fmt.Errorf("rule %s not found", ruleID)
+	}
+	return r.SaveCachePolicy(&cloned)
 }
 
 // -------------------------------------------------------------------------
@@ -1209,12 +1360,14 @@ func (r *PostgresRepository) SaveTLSSettings(domainID string, settings *model.TL
 	defer cancel()
 
 	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO tls_settings (domain_id, enforce_https, min_tls_version)
-		 VALUES ($1, $2, $3)
+		`INSERT INTO tls_settings (domain_id, enforce_https, min_tls_version, hsts, hsts_max_age)
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (domain_id) DO UPDATE SET
 		   enforce_https = EXCLUDED.enforce_https,
-		   min_tls_version = EXCLUDED.min_tls_version`,
-		domainID, settings.EnforceHTTPS, settings.MinTLSVersion,
+		   min_tls_version = EXCLUDED.min_tls_version,
+		   hsts = EXCLUDED.hsts,
+		   hsts_max_age = EXCLUDED.hsts_max_age`,
+		domainID, settings.EnforceHTTPS, settings.MinTLSVersion, settings.HSTS, settings.HSTSMaxAge,
 	)
 	if err != nil {
 		return fmt.Errorf("persist tls settings: %w", err)

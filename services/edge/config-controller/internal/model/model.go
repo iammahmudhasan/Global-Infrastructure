@@ -466,6 +466,7 @@ type GatewayAIProviderSync struct {
 	Endpoint                string  `json:"endpoint"`
 	ProviderType            string  `json:"provider_type"`
 	APIKey                  string  `json:"api_key,omitempty"`
+	SecretRef               string  `json:"secret_ref,omitempty"`
 	CostPerMTokens          float64 `json:"cost_per_m_tokens"`
 	Priority                uint32  `json:"priority"`
 	SovereigntyJurisdiction string  `json:"sovereignty_jurisdiction,omitempty"`

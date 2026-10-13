@@ -210,7 +210,9 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
     // Cryptographic Audit Trail Verification Engine (HMAC-SHA256)
     async function fetchAuditLogs() {
       try {
-        const resp = await fetch('http://127.0.0.1:8081/v1/audit-logs?limit=10');
+        const resp = await fetch('http://127.0.0.1:9091/v1/audit-logs?limit=10', {
+          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
+        });
         if (!resp.ok) return;
         const data = await resp.json();
         if (!data || !data.audit_logs || data.audit_logs.length === 0) return;
@@ -221,7 +223,7 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
 
         data.audit_logs.forEach(log => {
           const tr = document.createElement('tr');
-          const time = new Date(log.timestamp).toISOString().substr(11, 8);
+          const time = new Date(log.timestamp || log.created_at).toISOString().substr(11, 8);
           const prevDisplay = log.prev_hash && log.prev_hash.startsWith('00000000') ? '00000000... (GENESIS)' : (log.prev_hash ? log.prev_hash.substring(0, 8) + '...' : '-');
           const hashDisplay = log.hash ? log.hash.substring(0, 8) + '...' : '-';
 
@@ -230,15 +232,43 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
           if (log.action.includes('ai') || log.action.includes('provider')) actionBadge = 'badge-amber';
           if (log.action.includes('delete')) actionBadge = 'badge-bd';
 
-          tr.innerHTML = `
-            <td class="mono">${time}</td>
-            <td class="mono">${log.actor} / ${log.client_ip || '127.0.0.1'}</td>
-            <td><span class="badge ${actionBadge}">${log.action}</span></td>
-            <td class="mono">${log.resource_type}:${log.resource_id}</td>
-            <td class="mono" style="color: var(--text-dim);" title="${log.prev_hash || ''}">${prevDisplay}</td>
-            <td class="mono" style="color: var(--accent-cyan);" title="${log.hash || ''}">${hashDisplay}</td>
-            <td><span class="badge badge-bd">CRYPTOGRAPHICALLY VALID</span></td>
-          `;
+          const tdTime = document.createElement('td');
+          tdTime.className = 'mono';
+          tdTime.textContent = time;
+
+          const tdActor = document.createElement('td');
+          tdActor.className = 'mono';
+          tdActor.textContent = `${log.actor || 'system'} / ${log.client_ip || '127.0.0.1'}`;
+
+          const tdAction = document.createElement('td');
+          const actionSpan = document.createElement('span');
+          actionSpan.className = `badge ${actionBadge}`;
+          actionSpan.textContent = log.action;
+          tdAction.appendChild(actionSpan);
+
+          const tdResource = document.createElement('td');
+          tdResource.className = 'mono';
+          tdResource.textContent = `${log.resource_type}:${log.resource_id}`;
+
+          const tdPrev = document.createElement('td');
+          tdPrev.className = 'mono';
+          tdPrev.style.color = 'var(--text-dim)';
+          tdPrev.title = log.prev_hash || '';
+          tdPrev.textContent = prevDisplay;
+
+          const tdHash = document.createElement('td');
+          tdHash.className = 'mono';
+          tdHash.style.color = 'var(--accent-cyan)';
+          tdHash.title = log.hash || '';
+          tdHash.textContent = hashDisplay;
+
+          const tdValid = document.createElement('td');
+          const validSpan = document.createElement('span');
+          validSpan.className = 'badge badge-bd';
+          validSpan.textContent = 'CRYPTOGRAPHICALLY VALID';
+          tdValid.appendChild(validSpan);
+
+          tr.append(tdTime, tdActor, tdAction, tdResource, tdPrev, tdHash, tdValid);
           tbody.appendChild(tr);
         });
 
@@ -263,7 +293,9 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       }
 
       try {
-        const resp = await fetch('http://127.0.0.1:8081/v1/audit-logs/verify');
+        const resp = await fetch('http://127.0.0.1:9091/v1/audit-logs/verify', {
+          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
+        });
         if (resp.ok) {
           const data = await resp.json();
           if (data.chain_valid) {
@@ -276,15 +308,12 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
             showToast('Audit verification failed: hash chain broken!');
           }
         } else {
-          throw new Error('Verify endpoint unavailable');
+          throw new Error(`Verify endpoint returned HTTP ${resp.status}`);
         }
       } catch (err) {
-        // Fallback simulated cryptographic verification
-        setTimeout(() => {
-          if (statusEl) statusEl.innerText = 'Chain Integrity: VERIFIED (HMAC-SHA256)';
-          if (badge) badge.className = 'badge badge-bd';
-          showToast('Cryptographic Audit Chain verified: Genesis to Head validated.');
-        }, 500);
+        if (statusEl) statusEl.innerText = 'Chain Integrity: UNVERIFIED (Control Plane Offline)';
+        if (badge) badge.className = 'badge badge-amber';
+        showToast('Audit verification unavailable: unable to reach Control Plane verification endpoint.');
       } finally {
         setTimeout(() => {
           if (btn) {
@@ -303,13 +332,13 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       if (!pill || !dot || !text) return;
 
       try {
-        const res = await fetch('http://127.0.0.1:8081/healthz');
+        const res = await fetch('http://127.0.0.1:9091/healthz');
         if (res.ok) {
           pill.style.borderColor = 'rgba(16, 185, 129, 0.4)';
           pill.style.background = 'rgba(16, 185, 129, 0.12)';
           dot.style.background = 'var(--accent-emerald)';
           dot.style.boxShadow = '0 0 8px var(--accent-emerald)';
-          text.innerText = 'CONTROL PLANE: ONLINE (:8081)';
+          text.innerText = 'CONTROL PLANE: ONLINE (:9091)';
           text.style.color = 'var(--accent-emerald)';
           return true;
         }
@@ -333,21 +362,45 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       if (!tbody) return;
 
       try {
-        const resp = await fetch('http://127.0.0.1:8081/v1/domains');
+        const resp = await fetch('http://127.0.0.1:9091/v1/projects/proj-core/domains', {
+          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
+        });
         if (resp.ok) {
-          const domains = await resp.json();
-          if (Array.isArray(domains) && domains.length > 0) {
+          const data = await resp.json();
+          const domains = data.domains || (Array.isArray(data) ? data : []);
+          if (domains.length > 0) {
             tbody.innerHTML = '';
             domains.forEach(d => {
               const tr = document.createElement('tr');
-              tr.innerHTML = `
-                <td><strong>${d.hostname}</strong></td>
-                <td class="mono">${d.default_origin || 'edge.nexusedge.net'}</td>
-                <td><span class="badge badge-bd">Auto Let's Encrypt (ECDSA)</span></td>
-                <td>Dhaka, Singapore, Frankfurt, Virginia</td>
-                <td>${d.project_id || 'Global Anycast'}</td>
-                <td><span class="badge badge-bd">LIVE (PostgreSQL)</span></td>
-              `;
+
+              const tdHost = document.createElement('td');
+              const strong = document.createElement('strong');
+              strong.textContent = d.hostname || '';
+              tdHost.appendChild(strong);
+
+              const tdOrigin = document.createElement('td');
+              tdOrigin.className = 'mono';
+              tdOrigin.textContent = d.cname_target || d.default_origin || 'edge.nexusedge.net';
+
+              const tdCert = document.createElement('td');
+              const certSpan = document.createElement('span');
+              certSpan.className = 'badge badge-bd';
+              certSpan.textContent = "Auto Let's Encrypt (ECDSA)";
+              tdCert.appendChild(certSpan);
+
+              const tdPops = document.createElement('td');
+              tdPops.textContent = (d.allowed_pops && d.allowed_pops.length > 0) ? d.allowed_pops.join(', ') : 'Dhaka, Singapore, Frankfurt, Virginia';
+
+              const tdProject = document.createElement('td');
+              tdProject.textContent = d.project_id || 'proj-core';
+
+              const tdStatus = document.createElement('td');
+              const statusSpan = document.createElement('span');
+              statusSpan.className = 'badge badge-bd';
+              statusSpan.textContent = 'LIVE (PostgreSQL)';
+              tdStatus.appendChild(statusSpan);
+
+              tr.append(tdHost, tdOrigin, tdCert, tdPops, tdProject, tdStatus);
               tbody.appendChild(tr);
             });
             if (badge) {

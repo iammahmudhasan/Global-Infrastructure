@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -53,10 +54,14 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	authenticator := auth.NewAuthenticator()
 	mux := http.NewServeMux()
 
-	auditKey := []byte(os.Getenv("AUDIT_HMAC_KEY"))
-	if len(auditKey) == 0 {
-		auditKey = []byte("nexusedge-immutable-audit-key-2026")
+	auditKeyStr := os.Getenv("AUDIT_HMAC_KEY")
+	if len(auditKeyStr) == 0 {
+		if !onboarding.IsExplicitDevEnvironment() {
+			panic("FATAL: AUDIT_HMAC_KEY environment variable is required in production mode for cryptographic audit logging")
+		}
+		auditKeyStr = "nexusedge-immutable-audit-key-2026"
 	}
+	auditKey := []byte(auditKeyStr)
 	auditLogger := security.NewAuditLogger(auditKey)
 	existingLogs, _, err := s.ListAuditLogs("", 10000, 0)
 	if err == nil && len(existingLogs) > 0 {
@@ -363,6 +368,11 @@ func (h *APIHandler) handleAuditLogsVerifyRoute(w http.ResponseWriter, r *http.R
 		return
 	}
 
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+		writeError(w, http.StatusForbidden, "forbidden: operator role required for audit verification")
+		return
+	}
+
 	valid, err := h.auditLogger.VerifyChain()
 	records := h.auditLogger.GetRecords()
 	lastHash := h.auditLogger.LastHash()
@@ -401,22 +411,27 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 				projectID = tc.ProjectID
 			}
 		}
-		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-			parts := strings.Split(xf, ",")
-			clientIP = strings.TrimSpace(parts[0])
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err == nil {
+			clientIP = host
+		} else {
+			clientIP = r.RemoteAddr
 		}
-		if clientIP == "" {
-			host, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err == nil {
-				clientIP = host
-			} else {
-				clientIP = r.RemoteAddr
+		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+			remoteIP := net.ParseIP(clientIP)
+			if remoteIP != nil && (remoteIP.IsLoopback() || remoteIP.IsPrivate() || os.Getenv("NEXUSEDGE_TRUST_PROXY") == "true") {
+				parts := strings.Split(xf, ",")
+				forwarded := strings.TrimSpace(parts[0])
+				if net.ParseIP(forwarded) != nil {
+					clientIP = forwarded
+				}
 			}
 		}
 	}
 
 	rec, err := h.auditLogger.Record(actor, orgID, projectID, action, resourceType, resourceID, clientIP, details)
 	if err != nil {
+		log.Printf("[AUDIT ERROR] failed to record audit event: %v", err)
 		return
 	}
 
@@ -425,7 +440,7 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 		t = time.Now().UTC()
 	}
 
-	log := &model.AuditLog{
+	auditLog := &model.AuditLog{
 		ID:           rec.ID,
 		OrgID:        rec.OrgID,
 		ProjectID:    rec.ProjectID,
@@ -440,7 +455,9 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 		CreatedAt:    t,
 	}
 
-	_ = h.store.SaveAuditLog(log)
+	if err := h.store.SaveAuditLog(auditLog); err != nil {
+		log.Printf("[AUDIT ERROR] failed to persist audit log %s: %v", auditLog.ID, err)
+	}
 }
 
 func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -2732,7 +2749,7 @@ func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOpera
 	switch providerType {
 	case string(model.AIProviderTypeOpenAI), string(model.AIProviderTypeAnthropic),
 		string(model.AIProviderTypeAzure), string(model.AIProviderTypeAWS),
-		string(model.AIProviderTypeCoreWeave):
+		string(model.AIProviderTypeBedrock), string(model.AIProviderTypeCoreWeave):
 		if parsedURL.Scheme != "https" {
 			return errors.New("public AI provider endpoints must strictly use HTTPS")
 		}
@@ -2748,12 +2765,27 @@ func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOpera
 			return errors.New("link-local IP destinations are strictly prohibited")
 		}
 		if ip.IsPrivate() {
-			// Private IPs only allowed for onprem/vllm by platform operators
+			// Private IPs only allowed for onprem/vllm by platform operators or explicit dev environment
 			if providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) {
 				return errors.New("private RFC1918 IP addresses are not permitted for public cloud provider types")
 			}
-			if !isOperator {
+			if !isOperator && !(os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment()) {
 				return errors.New("private network destinations require platform operator authorization")
+			}
+		}
+	} else {
+		// Hostname destination resolution check (DNS SSRF prevention)
+		if ips, err := net.LookupIP(host); err == nil && len(ips) > 0 {
+			for _, resolvedIP := range ips {
+				if resolvedIP.IsLinkLocalUnicast() || resolvedIP.IsLinkLocalMulticast() {
+					return fmt.Errorf("endpoint hostname %q resolves to prohibited link-local IP %s", host, resolvedIP)
+				}
+				if resolvedIP.IsLoopback() && !isOperator {
+					return fmt.Errorf("endpoint hostname %q resolves to prohibited loopback IP %s", host, resolvedIP)
+				}
+				if resolvedIP.IsPrivate() && providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) && !(os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment()) {
+					return fmt.Errorf("endpoint hostname %q resolves to prohibited private IP %s for public cloud provider", host, resolvedIP)
+				}
 			}
 		}
 	}
@@ -2787,6 +2819,10 @@ func validateAIProviderPayload(p *model.AIProvider, isOperator bool) error {
 	return nil
 }
 
+func (h *APIHandler) isOperatorProject(projectID string) bool {
+	return projectID == "system" || projectID == "proj-default" || projectID == "proj-core" || projectID == "prj-ops" || projectID == "proj-infra"
+}
+
 func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologies []*store.DomainTopology) []model.GatewayAIProviderSync {
 	all := h.store.ListAIProviders()
 	var result []model.GatewayAIProviderSync
@@ -2801,10 +2837,16 @@ func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologie
 		if !p.Enabled {
 			continue
 		}
-		// Multi-tenant PoP Scoping: If active domain topologies exist for this PoP,
-		// restrict providers to those owned by the active projects on this PoP or system/default
+		// Multi-tenant PoP Scoping (Finding 2):
+		// When active domain topologies exist on this PoP, strictly limit to providers owned by those active projects (or system/operator platform providers).
+		// When NO active topologies exist on this PoP, strictly limit to system/operator platform providers only (never leak tenant providers into empty PoP topologies).
+		isPlatform := h.isOperatorProject(p.ProjectID)
 		if len(activeProjects) > 0 {
-			if !activeProjects[p.ProjectID] && p.ProjectID != "proj-default" && p.ProjectID != "system" {
+			if !activeProjects[p.ProjectID] && !isPlatform {
+				continue
+			}
+		} else {
+			if !isPlatform {
 				continue
 			}
 		}
@@ -2824,6 +2866,7 @@ func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologie
 			Endpoint:                p.Endpoint,
 			ProviderType:            p.ProviderType,
 			APIKey:                  p.APIKey,
+			SecretRef:               fmt.Sprintf("vault://projects/%s/ai-providers/%s/key", p.ProjectID, p.ID),
 			CostPerMTokens:          p.CostPerMTokens,
 			Priority:                p.Priority,
 			SovereigntyJurisdiction: p.SovereigntyJurisdiction,

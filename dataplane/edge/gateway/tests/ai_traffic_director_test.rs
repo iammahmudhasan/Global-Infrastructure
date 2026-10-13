@@ -72,7 +72,7 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
         },
     ];
 
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::builder()
         .timeout(Duration::from_millis(2000))
         .build()
@@ -176,7 +176,7 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
         },
     ];
 
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::builder()
         .timeout(Duration::from_millis(2000))
         .build()
@@ -308,7 +308,7 @@ fn test_ai_multi_strategy_selection() {
         },
     ];
 
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let candidates = director.select_candidates_with_strategy(None, RoutingStrategy::Cost, None);
 
     // Record sample TTFT on fast-provider
@@ -480,7 +480,7 @@ async fn test_anthropic_client_to_vllm_cross_protocol_dispatch() {
         project_id: None,
     }];
 
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::builder()
         .timeout(Duration::from_millis(2000))
         .build()
@@ -571,7 +571,7 @@ async fn test_ai_payload_translation_fails_closed() {
         failover_cooldown_secs: 10,
         project_id: None,
     }];
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::new();
 
     // Caller sends Anthropic endpoint /v1/messages requiring translation to vLLM,
@@ -722,7 +722,7 @@ async fn test_ai_gateway_sanitizes_upstream_headers_and_injects_latency_metric()
         project_id: None,
     }];
 
-    let director = AiTrafficDirector::new(providers);
+    let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::builder()
         .timeout(Duration::from_millis(2000))
         .build()
@@ -767,4 +767,157 @@ async fn test_ai_gateway_sanitizes_upstream_headers_and_injects_latency_metric()
         resp.headers().get("x-nexusedge-provider").unwrap(),
         "clean-upstream-provider"
     );
+}
+
+#[tokio::test]
+async fn test_production_mode_rejects_all_fixture_keys() {
+    // 1. Force production environment mode
+    std::env::set_var("NEXUSEDGE_DEV_MODE", "false");
+    std::env::set_var("NEXUSEDGE_ENV", "production");
+    // Register a valid production key
+    std::env::set_var(
+        "NEXUSEDGE_AI_API_KEYS",
+        "valid-prod-key-777:tenant-prod:proj-prod:proj-prod:inference:GLOBAL",
+    );
+
+    let director = AiTrafficDirector::new(vec![]);
+    let client = HttpClient::new();
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+
+    // 2. Acceptance test: All 4 dev fixture keys MUST return 401 Unauthorized in production
+    let fixture_keys = [
+        "dev-fixture-key-01",
+        "test-client-token",
+        "anthropic-client-key",
+        "test-key",
+    ];
+
+    for key in fixture_keys {
+        let mut req_headers = hyper::HeaderMap::new();
+        req_headers.insert(
+            "content-type",
+            hyper::header::HeaderValue::from_static("application/json"),
+        );
+        req_headers.insert(
+            "authorization",
+            hyper::header::HeaderValue::from_str(&format!("Bearer {}", key)).unwrap(),
+        );
+
+        let resp = dispatch_ai_request_with_failover(
+            &client,
+            &director,
+            "/v1/chat/completions",
+            &Method::POST,
+            &req_headers,
+            req_payload.clone(),
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "Fixture key '{}' must be rejected in production mode",
+            key
+        );
+    }
+
+    // 3. Valid production key passes authentication
+    let mut prod_headers = hyper::HeaderMap::new();
+    prod_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    prod_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer valid-prod-key-777"),
+    );
+
+    let prod_resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &prod_headers,
+        req_payload.clone(),
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Key is authenticated; fails with 503 since no active provider exists in pool, not 401
+    assert_ne!(prod_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Clean up test environment
+    std::env::remove_var("NEXUSEDGE_DEV_MODE");
+    std::env::remove_var("NEXUSEDGE_ENV");
+    std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+}
+
+#[tokio::test]
+async fn test_ai_scope_enforcement_inference_vs_analytics() {
+    let director = AiTrafficDirector::new_empty();
+
+    // Register a key that has ONLY analytics scope (no inference scope)
+    let mut allowed_projects = std::collections::HashSet::new();
+    allowed_projects.insert("proj-analytics-only".to_string());
+    let mut scopes = std::collections::HashSet::new();
+    scopes.insert("analytics".to_string());
+    let mut allowed_jurisdictions = std::collections::HashSet::new();
+    allowed_jurisdictions.insert("GLOBAL".to_string());
+
+    director.auth_registry().register_key(
+        "analytics-only-key",
+        AiAuthIdentity {
+            tenant_id: "tenant-analytics".to_string(),
+            default_project_id: "proj-analytics-only".to_string(),
+            allowed_projects,
+            allowed_jurisdictions,
+            scopes,
+        },
+    );
+
+    let client = HttpClient::new();
+
+    // 1. Calling inference endpoint with analytics-only key must return 403 Forbidden (insufficient_scope)
+    let mut inf_headers = hyper::HeaderMap::new();
+    inf_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    inf_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer analytics-only-key"),
+    );
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+
+    let inf_resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &inf_headers,
+        req_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(inf_resp.status(), StatusCode::FORBIDDEN);
+
+    // 2. Calling analytics endpoint with analytics-only key succeeds (200 OK)
+    let analytics_resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/nexusedge/ai/analytics",
+        &Method::GET,
+        &inf_headers,
+        Bytes::new(),
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(analytics_resp.status(), StatusCode::OK);
 }

@@ -19,6 +19,9 @@ services:
       - NEXUSEDGE_ACME_PORT=9091
       - NEXUSEDGE_CERTS_DIR=/etc/envoy/certs
       - NEXUSEDGE_CERTS_GID=${ENVOY_CERT_GID:-101}
+      - NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:-}
+      - AUDIT_HMAC_KEY=${AUDIT_HMAC_KEY:-}
+      - NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:-}
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
     depends_on:
@@ -74,7 +77,8 @@ services:
       - NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091
       - NEXUSEDGE_CP_POP_ID=singapore
       - NEXUSEDGE_CP_POLL_INTERVAL_SECS=10
-      - NEXUSEDGE_CP_AUTH_TOKEN=dev-fixture-key-01
+      - NEXUSEDGE_CP_AUTH_TOKEN=${NEXUSEDGE_CP_AUTH_TOKEN:-dev-fixture-key-01}
+      - NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:-}
     volumes:
       - ../dataplane/edge/gateway/gateway.yaml:/app/gateway.yaml:ro
     healthcheck:

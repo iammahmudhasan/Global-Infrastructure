@@ -690,6 +690,68 @@ impl Router {
         self.update_routes_with_dns_and_ai(new_routes, new_defaults, None, dns_resolver)
     }
 
+    /// Validates an AI provider destination IP address against SSRF policies.
+    /// Public cloud providers (openai, azure, anthropic, coreweave, aws, bedrock) MUST resolve
+    /// to globally routable public IPs (no private RFC 1918, CGNAT, link-local, multicast, or reserved ranges).
+    /// Cloud metadata (169.254.169.254, fe80::/10), multicast, and unspecified addresses are strictly blocked for all providers.
+    pub fn validate_ai_provider_destination_ip(
+        ip: std::net::IpAddr,
+        provider_type: &str,
+        host: &str,
+    ) -> Result<(), RouterError> {
+        let lower_type = provider_type.to_ascii_lowercase();
+        let is_onprem = lower_type == "onprem" || lower_type == "vllm";
+
+        // 1. Link-local (169.254.0.0/16, fe80::/10) including cloud metadata 169.254.169.254 is ALWAYS blocked
+        match ip {
+            std::net::IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                if octets[0] == 169 && octets[1] == 254 {
+                    return Err(RouterError::InvalidPayload(format!(
+                        "AI provider destination '{}' resolves to prohibited link-local/cloud metadata IP {}",
+                        host, ip
+                    )));
+                }
+            }
+            std::net::IpAddr::V6(ipv6) => {
+                let segments = ipv6.segments();
+                if (segments[0] & 0xffc0) == 0xfe80 {
+                    return Err(RouterError::InvalidPayload(format!(
+                        "AI provider destination '{}' resolves to prohibited link-local IPv6 {}",
+                        host, ip
+                    )));
+                }
+            }
+        }
+
+        // 2. Unspecified, Multicast, Broadcast are ALWAYS strictly blocked
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Err(RouterError::InvalidPayload(format!(
+                "AI provider destination '{}' resolves to prohibited unspecified or multicast IP {}",
+                host, ip
+            )));
+        }
+
+        // 3. Loopback is blocked unless active test profile (e.g. mock test upstream)
+        if ip.is_loopback() && !is_test_profile_active() {
+            return Err(RouterError::InvalidPayload(format!(
+                "AI provider destination '{}' resolves to prohibited loopback IP {}",
+                host, ip
+            )));
+        }
+
+        // 4. For public cloud providers (openai, azure, anthropic, coreweave, aws, bedrock):
+        // Private RFC 1918, CGNAT, and reserved IPs are strictly prohibited
+        if !is_onprem && is_private_or_reserved_ip(ip) && !is_test_profile_active() {
+            return Err(RouterError::InvalidPayload(format!(
+                "Public AI provider destination '{}' (type: '{}') resolves to prohibited private or reserved IP {}",
+                host, provider_type, ip
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Atomically updates routing tables and pre-publishes DNS pinning mappings for routes AND AI providers into PinnedDnsResolver.
     pub fn update_routes_with_dns_and_ai(
         &self,
@@ -802,6 +864,7 @@ impl Router {
                 }
 
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    Self::validate_ai_provider_destination_ip(ip, &p.provider_type, host)?;
                     let addr = std::net::SocketAddr::new(ip, port);
                     let addrs = candidate_dns.entry(lower_host).or_default();
                     if !addrs.contains(&addr) {
@@ -809,24 +872,28 @@ impl Router {
                     }
                 } else {
                     let host_port = format!("{}:{}", host, port);
-                    if let Ok(resolved_iter) = std::net::ToSocketAddrs::to_socket_addrs(&host_port)
-                    {
-                        let addrs = candidate_dns.entry(lower_host).or_default();
-                        for addr in resolved_iter {
-                            let ip = addr.ip();
-                            if (ip.is_loopback() || ip.is_unspecified())
-                                && p.provider_type != "onprem"
-                                && p.provider_type != "vllm"
-                            {
-                                return Err(RouterError::InvalidPayload(format!(
-                                    "AI provider destination '{}' resolves to prohibited IP {}",
-                                    host, ip
-                                )));
-                            }
-                            if !addrs.contains(&addr) {
-                                addrs.push(addr);
-                            }
+                    let resolved_iter = std::net::ToSocketAddrs::to_socket_addrs(&host_port)
+                        .map_err(|e| {
+                            RouterError::InvalidPayload(format!(
+                                "Failed to resolve AI provider destination '{}': {}",
+                                host, e
+                            ))
+                        })?;
+                    let mut resolved_any = false;
+                    let addrs = candidate_dns.entry(lower_host).or_default();
+                    for addr in resolved_iter {
+                        let ip = addr.ip();
+                        Self::validate_ai_provider_destination_ip(ip, &p.provider_type, host)?;
+                        if !addrs.contains(&addr) {
+                            addrs.push(addr);
                         }
+                        resolved_any = true;
+                    }
+                    if !resolved_any {
+                        return Err(RouterError::InvalidPayload(format!(
+                            "AI provider destination '{}' resolved to 0 network addresses",
+                            host
+                        )));
                     }
                 }
             }

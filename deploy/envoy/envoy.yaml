@@ -45,6 +45,13 @@ static_resources:
                 route:
                   cluster: control_plane_cluster
                   timeout: 5s
+              # Block public exposure of internal telemetry/metrics endpoint
+              - match:
+                  path: "/metrics"
+                direct_response:
+                  status: 403
+                  body:
+                    inline_string: "Forbidden: internal metrics endpoint\n"
               # All customer traffic routes directly to Rust Data Plane Gateway
               - match:
                   prefix: "/"
@@ -94,6 +101,13 @@ static_resources:
                   value: "https"
                 append_action: OVERWRITE_IF_EXISTS_OR_ADD
               routes:
+              # Block public exposure of internal telemetry/metrics endpoint
+              - match:
+                  path: "/metrics"
+                direct_response:
+                  status: 403
+                  body:
+                    inline_string: "Forbidden: internal metrics endpoint\n"
               # All customer HTTPS traffic routes directly to Rust Data Plane Gateway
               - match:
                   prefix: "/"

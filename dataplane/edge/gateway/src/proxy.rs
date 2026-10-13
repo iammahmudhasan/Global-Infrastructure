@@ -349,6 +349,34 @@ pub async fn handle_request(
     }
 
     if path == "/metrics" {
+        // Enforce metrics access control: restrict to internal networks / loopback or authorized scraper token
+        let is_internal = client_ip.is_loopback()
+            || state
+                .trusted_proxies
+                .iter()
+                .any(|cidr| cidr.contains(client_ip));
+        let auth_header = req
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim();
+        let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+        let expected_token = std::env::var("NEXUSEDGE_METRICS_AUTH_TOKEN")
+            .unwrap_or_else(|_| std::env::var("NEXUSEDGE_CP_AUTH_TOKEN").unwrap_or_default());
+
+        let is_authenticated = !expected_token.is_empty() && token == expected_token;
+
+        if !is_internal && !is_authenticated {
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("Content-Type", "text/plain")
+                .header("Server", "NexusEdge/0.1.0")
+                .body(Full::new(Bytes::from("Forbidden: metrics endpoint restricted to internal network or authorized scraper\n")))
+                .unwrap();
+            return Ok(resp);
+        }
+
         let metrics_text = state.render_prometheus_metrics();
         let resp = Response::builder()
             .status(StatusCode::OK)

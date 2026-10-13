@@ -3536,3 +3536,37 @@ func TestAIProvider_UnifiedValidationAndRedaction(t *testing.T) {
 		t.Fatalf("expected [REDACTED] in edge AI providers response: %s", edgeBody)
 	}
 }
+
+func TestAuditLogsVerifyRoute_OperatorOnlyRBAC(t *testing.T) {
+	handler := setupTestServer()
+	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenantWithRole("key-operator-01", "operator-system", "proj-core", auth.RolePlatformOperator)
+	authenticator.RegisterTenantWithRole("key-tenant-01", "tenant-client", "proj-client", auth.RoleTenant)
+	handler.SetAuthenticator(authenticator)
+
+	// 1. Regular tenant must be rejected with 403 Forbidden
+	reqTenant := httptest.NewRequest(http.MethodGet, "/v1/audit-logs/verify", nil)
+	reqTenant.Header.Set("X-API-Key", "key-tenant-01")
+	wTenant := httptest.NewRecorder()
+	handler.ServeHTTP(wTenant, reqTenant)
+	if wTenant.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant accessing audit verify, got %d: %s", wTenant.Code, wTenant.Body.String())
+	}
+
+	// 2. Operator must be allowed with 200 OK
+	reqOp := httptest.NewRequest(http.MethodGet, "/v1/audit-logs/verify", nil)
+	reqOp.Header.Set("X-API-Key", "key-operator-01")
+	wOp := httptest.NewRecorder()
+	handler.ServeHTTP(wOp, reqOp)
+	if wOp.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator accessing audit verify, got %d: %s", wOp.Code, wOp.Body.String())
+	}
+
+	var verifyResp map[string]interface{}
+	if err := json.Unmarshal(wOp.Body.Bytes(), &verifyResp); err != nil {
+		t.Fatalf("failed to decode verify response: %v", err)
+	}
+	if verifyResp["chain_valid"] != true {
+		t.Fatalf("expected chain_valid=true, got %v", verifyResp["chain_valid"])
+	}
+}

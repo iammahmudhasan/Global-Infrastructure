@@ -47,6 +47,23 @@ pub enum AiAuthError {
 }
 
 /// Dynamic tenant and client authentication registry for the AI Gateway (Rule 18, 54, 55).
+/// Determines whether the gateway is running in an explicit development or testing mode.
+pub fn is_dev_mode() -> bool {
+    if let Ok(dev) = std::env::var("NEXUSEDGE_DEV_MODE") {
+        let d = dev.trim().to_ascii_lowercase();
+        if d == "true" || d == "1" || d == "yes" {
+            return true;
+        }
+    }
+    if let Ok(env) = std::env::var("NEXUSEDGE_ENV") {
+        let e = env.trim().to_ascii_lowercase();
+        if e == "development" || e == "dev" || e == "test" {
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 pub struct AiGatewayAuthRegistry {
     identities: Arc<RwLock<HashMap<String, AiAuthIdentity>>>,
@@ -59,72 +76,207 @@ impl Default for AiGatewayAuthRegistry {
 }
 
 impl AiGatewayAuthRegistry {
-    pub fn new() -> Self {
-        let mut map = HashMap::new();
+    /// Creates an empty auth registry with zero registered keys.
+    pub fn new_empty() -> Self {
+        Self {
+            identities: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
 
-        // Register default dev / test fixture keys
+    /// Creates an auth registry pre-populated with standard dev/testing fixture keys.
+    /// Strictly intended for local test suites and unit testing.
+    pub fn new_development_fixtures() -> Self {
+        let mut map = HashMap::new();
         let default_identity = AiAuthIdentity::default();
         map.insert("dev-fixture-key-01".to_string(), default_identity.clone());
         map.insert("test-client-token".to_string(), default_identity.clone());
         map.insert("anthropic-client-key".to_string(), default_identity.clone());
         map.insert("test-key".to_string(), default_identity);
-
-        let registry = Self {
+        Self {
             identities: Arc::new(RwLock::new(map)),
-        };
+        }
+    }
 
-        // Environment key registration: NEXUSEDGE_AI_API_KEYS
-        // Format: key:tenant_id:default_project_id:allowed_projs_csv:scopes_csv;...
-        if let Ok(env_keys) = std::env::var("NEXUSEDGE_AI_API_KEYS") {
-            for entry in env_keys.split(';') {
-                let parts: Vec<&str> = entry.split(':').collect();
-                if parts.len() >= 3 {
-                    let key = parts[0].trim().to_string();
-                    let tenant = parts[1].trim().to_string();
-                    let def_proj = parts[2].trim().to_string();
-                    let mut allowed_projs = HashSet::new();
-                    if parts.len() >= 4 {
-                        for p in parts[3].split(',') {
-                            let pt = p.trim().to_string();
-                            if !pt.is_empty() {
-                                allowed_projs.insert(pt);
+    /// Creates an auth registry strictly for production environments.
+    /// Fails closed if NEXUSEDGE_AI_API_KEYS is missing, empty, or contains invalid policies.
+    /// Never loads development fixture keys.
+    pub fn new_production() -> Result<Self, String> {
+        let env_keys = std::env::var("NEXUSEDGE_AI_API_KEYS").map_err(|_| {
+            "NEXUSEDGE_AI_API_KEYS environment variable is required in production mode".to_string()
+        })?;
+
+        let trimmed = env_keys.trim();
+        if trimmed.is_empty() {
+            return Err("NEXUSEDGE_AI_API_KEYS cannot be empty in production mode".to_string());
+        }
+
+        let mut map = HashMap::new();
+        for entry in trimmed.split(';') {
+            let entry_trimmed = entry.trim();
+            if entry_trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = entry_trimmed.split(':').collect();
+            if parts.len() < 3 {
+                return Err(format!(
+                    "Invalid AI API key definition '{}': format must be key:tenant_id:default_project_id[:allowed_projs_csv][:scopes_csv][:jurisdictions_csv]",
+                    entry_trimmed
+                ));
+            }
+
+            let key = parts[0].trim().to_string();
+            let tenant = parts[1].trim().to_string();
+            let def_proj = parts[2].trim().to_string();
+
+            if key.is_empty() || tenant.is_empty() || def_proj.is_empty() {
+                return Err(format!(
+                    "Invalid AI key, tenant, or default_project in '{}'",
+                    entry_trimmed
+                ));
+            }
+
+            // 1. Projects Allowlist
+            let mut allowed_projs = HashSet::new();
+            if parts.len() >= 4 && !parts[3].trim().is_empty() {
+                for p in parts[3].split(',') {
+                    let pt = p.trim().to_string();
+                    if !pt.is_empty() {
+                        allowed_projs.insert(pt);
+                    }
+                }
+            } else {
+                allowed_projs.insert(def_proj.clone());
+            }
+
+            // 2. Scopes Allowlist (e.g. "inference", "analytics", or explicit "*")
+            let mut scopes = HashSet::new();
+            if parts.len() >= 5 && !parts[4].trim().is_empty() {
+                for s in parts[4].split(',') {
+                    let st = s.trim().to_ascii_lowercase();
+                    if !st.is_empty() {
+                        scopes.insert(st);
+                    }
+                }
+            } else {
+                // In production, default scope is "inference" only; wildcard "*" must be explicitly configured
+                scopes.insert("inference".to_string());
+            }
+
+            // 3. Jurisdictions Allowlist (e.g. "BD", "EU", "SG", or explicit "*")
+            let mut allowed_jurisdictions = HashSet::new();
+            if parts.len() >= 6 && !parts[5].trim().is_empty() {
+                for j in parts[5].split(',') {
+                    let jt = j.trim().to_ascii_uppercase();
+                    if !jt.is_empty() {
+                        allowed_jurisdictions.insert(jt);
+                    }
+                }
+            } else {
+                // In production, default jurisdiction is GLOBAL only; wildcard "*" must be explicitly configured
+                allowed_jurisdictions.insert("GLOBAL".to_string());
+            }
+
+            map.insert(
+                key,
+                AiAuthIdentity {
+                    tenant_id: tenant,
+                    default_project_id: def_proj,
+                    allowed_projects: allowed_projs,
+                    allowed_jurisdictions,
+                    scopes,
+                },
+            );
+        }
+
+        if map.is_empty() {
+            return Err("No valid AI API keys were loaded from NEXUSEDGE_AI_API_KEYS".to_string());
+        }
+
+        Ok(Self {
+            identities: Arc::new(RwLock::new(map)),
+        })
+    }
+
+    /// Automatically selects production or development auth registry based on environment.
+    pub fn new() -> Self {
+        if is_dev_mode() {
+            let registry = Self::new_development_fixtures();
+            // In dev mode, optionally merge keys from NEXUSEDGE_AI_API_KEYS
+            if let Ok(env_keys) = std::env::var("NEXUSEDGE_AI_API_KEYS") {
+                for entry in env_keys.split(';') {
+                    let parts: Vec<&str> = entry.trim().split(':').collect();
+                    if parts.len() >= 3 {
+                        let key = parts[0].trim().to_string();
+                        let tenant = parts[1].trim().to_string();
+                        let def_proj = parts[2].trim().to_string();
+                        let mut allowed_projs = HashSet::new();
+                        if parts.len() >= 4 && !parts[3].trim().is_empty() {
+                            for p in parts[3].split(',') {
+                                let pt = p.trim().to_string();
+                                if !pt.is_empty() {
+                                    allowed_projs.insert(pt);
+                                }
                             }
+                        } else {
+                            allowed_projs.insert(def_proj.clone());
                         }
-                    }
-                    if allowed_projs.is_empty() {
-                        allowed_projs.insert(def_proj.clone());
-                    }
 
-                    let mut scopes = HashSet::new();
-                    if parts.len() >= 5 {
-                        for s in parts[4].split(',') {
-                            let st = s.trim().to_string();
-                            if !st.is_empty() {
-                                scopes.insert(st);
+                        let mut scopes = HashSet::new();
+                        if parts.len() >= 5 && !parts[4].trim().is_empty() {
+                            for s in parts[4].split(',') {
+                                let st = s.trim().to_ascii_lowercase();
+                                if !st.is_empty() {
+                                    scopes.insert(st);
+                                }
                             }
+                        } else {
+                            scopes.insert("*".to_string());
                         }
-                    } else {
-                        scopes.insert("*".to_string());
+
+                        let mut allowed_jurisdictions = HashSet::new();
+                        if parts.len() >= 6 && !parts[5].trim().is_empty() {
+                            for j in parts[5].split(',') {
+                                let jt = j.trim().to_ascii_uppercase();
+                                if !jt.is_empty() {
+                                    allowed_jurisdictions.insert(jt);
+                                }
+                            }
+                        } else {
+                            allowed_jurisdictions.insert("*".to_string());
+                        }
+
+                        registry.register_key(
+                            &key,
+                            AiAuthIdentity {
+                                tenant_id: tenant,
+                                default_project_id: def_proj,
+                                allowed_projects: allowed_projs,
+                                allowed_jurisdictions,
+                                scopes,
+                            },
+                        );
                     }
-
-                    let mut allowed_jurisdictions = HashSet::new();
-                    allowed_jurisdictions.insert("*".to_string());
-
-                    registry.register_key(
-                        &key,
-                        AiAuthIdentity {
-                            tenant_id: tenant,
-                            default_project_id: def_proj,
-                            allowed_projects: allowed_projs,
-                            allowed_jurisdictions,
-                            scopes,
-                        },
+                }
+            }
+            registry
+        } else {
+            // Production mode: strict fail-closed
+            match Self::new_production() {
+                Ok(reg) => {
+                    tracing::info!(
+                        "Initialized production AI Gateway auth registry from environment"
                     );
+                    reg
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "FATAL/FAIL-CLOSED: Failed to initialize production AI Gateway auth registry: {}. Gateway will reject all incoming inference requests.",
+                        err
+                    );
+                    Self::new_empty()
                 }
             }
         }
-
-        registry
     }
 
     pub fn register_key(&self, key: &str, identity: AiAuthIdentity) {
@@ -370,6 +522,17 @@ pub struct AiTrafficDirector {
 impl AiTrafficDirector {
     pub fn new(providers: Vec<AiProvider>) -> Self {
         Self::new_with_auth(providers, Arc::new(AiGatewayAuthRegistry::new()))
+    }
+
+    pub fn new_with_fixtures(providers: Vec<AiProvider>) -> Self {
+        Self::new_with_auth(
+            providers,
+            Arc::new(AiGatewayAuthRegistry::new_development_fixtures()),
+        )
+    }
+
+    pub fn new_empty() -> Self {
+        Self::new_with_auth(vec![], Arc::new(AiGatewayAuthRegistry::new_empty()))
     }
 
     pub fn new_with_auth(
@@ -1210,7 +1373,25 @@ pub async fn dispatch_ai_request_with_failover(
         return Ok(resp);
     }
 
-    // 3. Extract and validate inference request payload & metadata
+    // 3. Enforce inference scope authorization (Finding 4)
+    if !identity.scopes.contains("*") && !identity.scopes.contains("inference") {
+        let body = serde_json::json!({
+            "error": {
+                "message": "Forbidden: insufficient scope for AI inference operations ('inference' scope required)",
+                "type": "authorization_error",
+                "code": "insufficient_scope"
+            }
+        });
+        let resp = Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header("Content-Type", "application/json")
+            .header("Server", "NexusEdge-AI-Director/0.1.0")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap();
+        return Ok(resp);
+    }
+
+    // 4. Extract and validate inference request payload & metadata
     let metadata = match parse_ai_request_metadata(&body_bytes, req_headers) {
         Ok(meta) => meta,
         Err(err) => {
@@ -1457,15 +1638,17 @@ pub async fn dispatch_ai_request_with_failover(
             Ok(upstream_resp) => {
                 let status_code = upstream_resp.status();
 
-                // Check for 429 Too Many Requests or 503 Overload (Trigger Transparent Failover)
+                // Check for 429 Too Many Requests, 503 Overload, 502 Bad Gateway, or 504 Gateway Timeout (Trigger Transparent Failover)
                 if status_code == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status_code == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    || status_code == reqwest::StatusCode::BAD_GATEWAY
+                    || status_code == reqwest::StatusCode::GATEWAY_TIMEOUT
                 {
                     let is_429 = status_code == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     warn!(
                         provider = %provider.id,
                         status = status_code.as_u16(),
-                        "Upstream AI provider rate-limited or overloaded; triggering transparent failover"
+                        "Upstream AI provider returned transient error; triggering transparent failover"
                     );
                     candidate_state.trigger_backoff(
                         Duration::from_secs(provider.failover_cooldown_secs.max(5)),
