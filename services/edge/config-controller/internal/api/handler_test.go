@@ -3037,7 +3037,7 @@ func TestAIProviderAPI_WorkflowAndTenantIsolation(t *testing.T) {
 		t.Fatal("expected non-empty provider ID")
 	}
 	// Verify API key is redacted (Rules 18, 19)
-	if created.APIKeyRedacted == "sk-super-secret-azure-token-12345" || !strings.Contains(created.APIKeyRedacted, "...") {
+	if created.APIKeyRedacted == "sk-super-secret-azure-token-12345" || created.APIKeyRedacted != "[REDACTED]" {
 		t.Fatalf("API key not properly redacted: %s", created.APIKeyRedacted)
 	}
 
@@ -3432,5 +3432,107 @@ func TestAuditLogs_TamperEvidentChain(t *testing.T) {
 	handler.ServeHTTP(crossW, crossReq)
 	if crossW.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for cross-tenant audit access, got %d", crossW.Code)
+	}
+}
+
+func TestAIProvider_UnifiedValidationAndRedaction(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant-alpha", "t-alpha", "prj-alpha", auth.RoleTenant, "prj-alpha")
+	authInst.RegisterTenantWithRole("key-edge-node-01", "t-edge", "prj-alpha", auth.RoleEdgeNode, "*")
+
+	// 1. Invalid provider type rejection on creation
+	badTypeBody, _ := json.Marshal(map[string]interface{}{
+		"name":          "Invalid Type Provider",
+		"endpoint":      "https://api.openai.com/v1",
+		"provider_type": "invalid_unsupported_protocol",
+		"project_id":    "prj-alpha",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(badTypeBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for unsupported provider type, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. SSRF metadata address rejection on PUT /v1/ai/providers/{id}
+	validCreateBody, _ := json.Marshal(map[string]interface{}{
+		"name":          "Valid Provider",
+		"endpoint":      "https://api.openai.com/v1",
+		"provider_type": "openai",
+		"api_key":       "sk-valid-key-12345",
+		"project_id":    "prj-alpha",
+		"enabled":       true,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(validCreateBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", w.Code, w.Body.String())
+	}
+	var created model.AIProviderResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+	if created.APIKeyRedacted != "[REDACTED]" {
+		t.Fatalf("expected [REDACTED], got %s", created.APIKeyRedacted)
+	}
+
+	// Attempt PUT with SSRF metadata IP
+	ssrfPutBody, _ := json.Marshal(map[string]interface{}{
+		"name":          "SSRF Attempt",
+		"endpoint":      "http://169.254.169.254/latest/meta-data",
+		"provider_type": "openai",
+	})
+	req = httptest.NewRequest(http.MethodPut, "/v1/ai/providers/"+created.ID, bytes.NewReader(ssrfPutBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for SSRF metadata on PUT, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. Project-scoped POST rejection for non-HTTPS public cloud provider
+	nonHttpsBody, _ := json.Marshal(map[string]interface{}{
+		"name":          "Non HTTPS Public Provider",
+		"endpoint":      "http://api.anthropic.com/v1",
+		"provider_type": "anthropic",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/ai/providers", bytes.NewReader(nonHttpsBody))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for non-HTTPS public provider, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Project-scoped PUT rejection for internal domain
+	internalDomainPut, _ := json.Marshal(map[string]interface{}{
+		"name":          "Internal Domain Target",
+		"endpoint":      "https://internal-service.internal/v1",
+		"provider_type": "openai",
+	})
+	req = httptest.NewRequest(http.MethodPut, "/v1/projects/prj-alpha/ai/providers/"+created.ID, bytes.NewReader(internalDomainPut))
+	req.Header.Set("X-API-Key", "key-tenant-alpha")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request for internal domain target, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. Verify /v1/edge/ai-providers returns redacted credentials
+	edgeReq := httptest.NewRequest(http.MethodGet, "/v1/edge/ai-providers", nil)
+	edgeReq.Header.Set("X-API-Key", "key-edge-node-01")
+	edgeW := httptest.NewRecorder()
+	handler.ServeHTTP(edgeW, edgeReq)
+	if edgeW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from /v1/edge/ai-providers, got %d: %s", edgeW.Code, edgeW.Body.String())
+	}
+	edgeBody := edgeW.Body.String()
+	if strings.Contains(edgeBody, "sk-valid-key-12345") {
+		t.Fatalf("raw API key leaked in edge AI providers payload: %s", edgeBody)
+	}
+	if !strings.Contains(edgeBody, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in edge AI providers response: %s", edgeBody)
 	}
 }

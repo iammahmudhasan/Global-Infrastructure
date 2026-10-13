@@ -1997,7 +1997,7 @@ func (h *APIHandler) handleEdgeAIProviders(w http.ResponseWriter, r *http.Reques
 	}
 
 	all := h.store.ListAIProviders()
-	var filtered []*model.AIProvider
+	var filtered []model.AIProviderResponse
 	for _, p := range all {
 		if !p.Enabled {
 			continue
@@ -2008,7 +2008,7 @@ func (h *APIHandler) handleEdgeAIProviders(w http.ResponseWriter, r *http.Reques
 				continue
 			}
 		}
-		filtered = append(filtered, p)
+		filtered = append(filtered, p.ToResponse())
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -2761,6 +2761,32 @@ func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOpera
 	return nil
 }
 
+func validateAIProviderPayload(p *model.AIProvider, isOperator bool) error {
+	if p == nil {
+		return errors.New("provider payload cannot be nil")
+	}
+
+	trimmedType := strings.ToLower(strings.TrimSpace(p.ProviderType))
+	switch trimmedType {
+	case string(model.AIProviderTypeOpenAI),
+		string(model.AIProviderTypeAzure),
+		string(model.AIProviderTypeCoreWeave),
+		string(model.AIProviderTypeVLLM),
+		string(model.AIProviderTypeOnPrem),
+		string(model.AIProviderTypeAWS),
+		string(model.AIProviderTypeAnthropic),
+		string(model.AIProviderTypeBedrock):
+		p.ProviderType = trimmedType
+	default:
+		return fmt.Errorf("invalid provider_type %q: must be one of openai, azure, coreweave, vllm, onprem, aws, anthropic, bedrock", p.ProviderType)
+	}
+
+	if err := validateAIProviderEndpoint(p.Endpoint, p.ProviderType, isOperator); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologies []*store.DomainTopology) []model.GatewayAIProviderSync {
 	all := h.store.ListAIProviders()
 	var result []model.GatewayAIProviderSync
@@ -2843,7 +2869,7 @@ func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Reque
 		}
 
 		isOperator := h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
-		if err := validateAIProviderEndpoint(p.Endpoint, p.ProviderType, isOperator); err != nil {
+		if err := validateAIProviderPayload(&p, isOperator); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -2958,9 +2984,9 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			update.ProviderType = existing.ProviderType
 		}
 
-		parsedURL, err := url.Parse(strings.TrimSpace(update.Endpoint))
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+		isOperator := h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+		if err := validateAIProviderPayload(&update, isOperator); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -3028,9 +3054,9 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 				p.ID = generateAIProviderID()
 			}
 
-			parsedURL, err := url.Parse(strings.TrimSpace(p.Endpoint))
-			if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-				writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+			isOperator := h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+			if err := validateAIProviderPayload(&p, isOperator); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 
@@ -3101,9 +3127,9 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 			update.ProviderType = p.ProviderType
 		}
 
-		parsedURL, err := url.Parse(strings.TrimSpace(update.Endpoint))
-		if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
-			writeError(w, http.StatusBadRequest, "endpoint must be a valid HTTP or HTTPS URL")
+		isOperator := h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator)
+		if err := validateAIProviderPayload(&update, isOperator); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 

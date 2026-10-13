@@ -202,27 +202,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 // Option A: Synchronize from local/mounted snapshot file
                 if let Some(ref snapshot_path) = cp_cfg.snapshot_file {
                     if let Ok(content) = tokio::fs::read_to_string(snapshot_path).await {
-                        if let Ok(new_routes) = router::parse_pop_config_routes(&content) {
-                            if let Err(e) =
-                                sync_router.update_routes_with_dns(new_routes, vec![], &sync_dns)
-                            {
+                        let parsed_routes = router::parse_pop_config_routes(&content);
+                        let parsed_ai = router::parse_pop_config_ai_providers(&content);
+                        if let (Ok(new_routes), Ok(maybe_ai)) = (parsed_routes, parsed_ai) {
+                            let ai_ref = maybe_ai.as_deref();
+                            if let Err(e) = sync_router.update_routes_with_dns_and_ai(
+                                new_routes,
+                                vec![],
+                                ai_ref,
+                                &sync_dns,
+                            ) {
                                 tracing::warn!(
-                                    "Failed to atomically swap routes from snapshot file: {}",
+                                    "Failed to atomically swap routes and AI DNS from snapshot file: {}",
                                     e
                                 );
                             } else {
+                                if let (Some(director), Some(new_ai)) = (sync_ai.as_ref(), maybe_ai)
+                                {
+                                    director.update_providers(new_ai);
+                                }
                                 sync_is_ready.store(true, Ordering::SeqCst);
                                 tracing::info!(
-                                    "Atomically synchronized edge routes from snapshot file: {}",
+                                    "Atomically synchronized edge routes and AI DNS from snapshot file: {}",
                                     snapshot_path
                                 );
-                            }
-                        }
-                        if let Some(ref director) = sync_ai {
-                            if let Ok(Some(new_ai)) =
-                                router::parse_pop_config_ai_providers(&content)
-                            {
-                                director.update_providers(new_ai);
                             }
                         }
                     }

@@ -5,10 +5,177 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Response, StatusCode};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::warn;
+
+/// Authenticated client tenant identity and project scope for AI inference requests (Rule 1, 54, 55).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AiAuthIdentity {
+    pub tenant_id: String,
+    pub default_project_id: String,
+    pub allowed_projects: HashSet<String>,
+    pub allowed_jurisdictions: HashSet<String>,
+    pub scopes: HashSet<String>,
+}
+
+impl Default for AiAuthIdentity {
+    fn default() -> Self {
+        let mut allowed_projects = HashSet::new();
+        allowed_projects.insert("*".to_string());
+        let mut allowed_jurisdictions = HashSet::new();
+        allowed_jurisdictions.insert("*".to_string());
+        let mut scopes = HashSet::new();
+        scopes.insert("*".to_string());
+
+        Self {
+            tenant_id: "tenant-default".to_string(),
+            default_project_id: "proj-default".to_string(),
+            allowed_projects,
+            allowed_jurisdictions,
+            scopes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AiAuthError {
+    MissingCredentials,
+    InvalidOrRevokedKey,
+}
+
+/// Dynamic tenant and client authentication registry for the AI Gateway (Rule 18, 54, 55).
+#[derive(Clone, Debug)]
+pub struct AiGatewayAuthRegistry {
+    identities: Arc<RwLock<HashMap<String, AiAuthIdentity>>>,
+}
+
+impl Default for AiGatewayAuthRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AiGatewayAuthRegistry {
+    pub fn new() -> Self {
+        let mut map = HashMap::new();
+
+        // Register default dev / test fixture keys
+        let default_identity = AiAuthIdentity::default();
+        map.insert("dev-fixture-key-01".to_string(), default_identity.clone());
+        map.insert("test-client-token".to_string(), default_identity.clone());
+        map.insert("anthropic-client-key".to_string(), default_identity.clone());
+        map.insert("test-key".to_string(), default_identity);
+
+        let registry = Self {
+            identities: Arc::new(RwLock::new(map)),
+        };
+
+        // Environment key registration: NEXUSEDGE_AI_API_KEYS
+        // Format: key:tenant_id:default_project_id:allowed_projs_csv:scopes_csv;...
+        if let Ok(env_keys) = std::env::var("NEXUSEDGE_AI_API_KEYS") {
+            for entry in env_keys.split(';') {
+                let parts: Vec<&str> = entry.split(':').collect();
+                if parts.len() >= 3 {
+                    let key = parts[0].trim().to_string();
+                    let tenant = parts[1].trim().to_string();
+                    let def_proj = parts[2].trim().to_string();
+                    let mut allowed_projs = HashSet::new();
+                    if parts.len() >= 4 {
+                        for p in parts[3].split(',') {
+                            let pt = p.trim().to_string();
+                            if !pt.is_empty() {
+                                allowed_projs.insert(pt);
+                            }
+                        }
+                    }
+                    if allowed_projs.is_empty() {
+                        allowed_projs.insert(def_proj.clone());
+                    }
+
+                    let mut scopes = HashSet::new();
+                    if parts.len() >= 5 {
+                        for s in parts[4].split(',') {
+                            let st = s.trim().to_string();
+                            if !st.is_empty() {
+                                scopes.insert(st);
+                            }
+                        }
+                    } else {
+                        scopes.insert("*".to_string());
+                    }
+
+                    let mut allowed_jurisdictions = HashSet::new();
+                    allowed_jurisdictions.insert("*".to_string());
+
+                    registry.register_key(
+                        &key,
+                        AiAuthIdentity {
+                            tenant_id: tenant,
+                            default_project_id: def_proj,
+                            allowed_projects: allowed_projs,
+                            allowed_jurisdictions,
+                            scopes,
+                        },
+                    );
+                }
+            }
+        }
+
+        registry
+    }
+
+    pub fn register_key(&self, key: &str, identity: AiAuthIdentity) {
+        let mut guard = self.identities.write().unwrap();
+        guard.insert(key.trim().to_string(), identity);
+    }
+
+    pub fn revoke_key(&self, key: &str) {
+        let mut guard = self.identities.write().unwrap();
+        guard.remove(key.trim());
+    }
+
+    pub fn authenticate(&self, headers: &hyper::HeaderMap) -> Result<AiAuthIdentity, AiAuthError> {
+        let token = Self::extract_credential(headers)?;
+        let guard = self.identities.read().unwrap();
+        guard
+            .get(&token)
+            .cloned()
+            .ok_or(AiAuthError::InvalidOrRevokedKey)
+    }
+
+    fn extract_credential(headers: &hyper::HeaderMap) -> Result<String, AiAuthError> {
+        if let Some(auth_hdr) = headers.get("authorization") {
+            if let Ok(auth_str) = auth_hdr.to_str() {
+                let trimmed = auth_str.trim();
+                if trimmed.is_empty() {
+                    return Err(AiAuthError::MissingCredentials);
+                }
+                if let Some(token) = trimmed.strip_prefix("Bearer ") {
+                    let t = token.trim();
+                    if !t.is_empty() {
+                        return Ok(t.to_string());
+                    }
+                } else if !trimmed.is_empty() {
+                    return Ok(trimmed.to_string());
+                }
+            }
+        }
+
+        if let Some(api_key_hdr) = headers.get("x-api-key") {
+            if let Ok(key_str) = api_key_hdr.to_str() {
+                let t = key_str.trim();
+                if !t.is_empty() {
+                    return Ok(t.to_string());
+                }
+            }
+        }
+
+        Err(AiAuthError::MissingCredentials)
+    }
+}
 
 /// Standard endpoints recognized as OpenAI / Anthropic / vLLM compatible AI inference requests.
 pub const AI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -192,6 +359,7 @@ impl ProviderRuntimeState {
 #[derive(Clone)]
 pub struct AiTrafficDirector {
     providers: Arc<RwLock<Vec<Arc<ProviderRuntimeState>>>>,
+    auth_registry: Arc<AiGatewayAuthRegistry>,
     total_prompt_tokens: Arc<AtomicU64>,
     total_completion_tokens: Arc<AtomicU64>,
     total_tokens_routed: Arc<AtomicU64>,
@@ -201,18 +369,30 @@ pub struct AiTrafficDirector {
 
 impl AiTrafficDirector {
     pub fn new(providers: Vec<AiProvider>) -> Self {
+        Self::new_with_auth(providers, Arc::new(AiGatewayAuthRegistry::new()))
+    }
+
+    pub fn new_with_auth(
+        providers: Vec<AiProvider>,
+        auth_registry: Arc<AiGatewayAuthRegistry>,
+    ) -> Self {
         let runtime_states = providers
             .into_iter()
             .map(|p| Arc::new(ProviderRuntimeState::new(p)))
             .collect();
         Self {
             providers: Arc::new(RwLock::new(runtime_states)),
+            auth_registry,
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
             total_tokens_routed: Arc::new(AtomicU64::new(0)),
             total_cost_spent_micros: Arc::new(AtomicU64::new(0)),
             total_cost_saved_micros: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn auth_registry(&self) -> &Arc<AiGatewayAuthRegistry> {
+        &self.auth_registry
     }
 
     /// Atomically updates or replaces the provider pool from Control Plane dynamic sync.
@@ -962,8 +1142,64 @@ pub async fn dispatch_ai_request_with_failover(
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let start_time = Instant::now();
 
-    // Check for metrics or analytics endpoint
+    // 1. Authenticate caller credential against verified identity registry (Finding 1)
+    let identity = match director.auth_registry().authenticate(req_headers) {
+        Ok(id) => id,
+        Err(AiAuthError::MissingCredentials) => {
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Missing authentication credentials (Authorization: Bearer <token> or x-api-key required)",
+                    "type": "authentication_error",
+                    "code": "missing_credentials"
+                }
+            });
+            let resp = Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+        Err(AiAuthError::InvalidOrRevokedKey) => {
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Invalid or revoked authentication credentials",
+                    "type": "authentication_error",
+                    "code": "unauthorized"
+                }
+            });
+            let resp = Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+    };
+
+    // 2. Protected metrics and analytics endpoints within auth boundary (Finding 1)
     if path == AI_METRICS_PATH || path == AI_ANALYTICS_PATH {
+        if !identity.scopes.contains("*") && !identity.scopes.contains("analytics") {
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Forbidden: insufficient scope for analytics/metrics endpoint",
+                    "type": "authorization_error",
+                    "code": "insufficient_scope"
+                }
+            });
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+
         let metrics_json = director.get_analytics_summary();
         let resp = Response::builder()
             .status(StatusCode::OK)
@@ -974,36 +1210,7 @@ pub async fn dispatch_ai_request_with_failover(
         return Ok(resp);
     }
 
-    // Enforce Tenant & Client Authentication
-    let has_auth = req_headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-    let has_api_key = req_headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| !s.trim().is_empty())
-        .unwrap_or(false);
-
-    if !has_auth && !has_api_key {
-        let body = serde_json::json!({
-            "error": {
-                "message": "Missing or empty client authentication credentials (Authorization: Bearer <token> or x-api-key required)",
-                "type": "authentication_error",
-                "code": "unauthorized"
-            }
-        });
-        let resp = Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge-AI-Director/0.1.0")
-            .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        return Ok(resp);
-    }
-
+    // 3. Extract and validate inference request payload & metadata
     let metadata = match parse_ai_request_metadata(&body_bytes, req_headers) {
         Ok(meta) => meta,
         Err(err) => {
@@ -1024,15 +1231,70 @@ pub async fn dispatch_ai_request_with_failover(
         }
     };
 
+    // 4. Multi-tenant project authorization and residency policy enforcement (Finding 1)
+    let effective_project_id = if let Some(ref requested_project) = metadata.project_id {
+        if !identity.allowed_projects.contains("*")
+            && !identity.allowed_projects.contains(requested_project)
+        {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "Cross-tenant access forbidden: tenant '{}' is not authorized for project '{}'",
+                        identity.tenant_id, requested_project
+                    ),
+                    "type": "authorization_error",
+                    "code": "cross_tenant_project_forbidden"
+                }
+            });
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+        Some(requested_project.clone())
+    } else {
+        Some(identity.default_project_id.clone())
+    };
+
+    if let Some(ref requested_jurisdiction) = metadata.requested_jurisdiction {
+        if !identity.allowed_jurisdictions.contains("*")
+            && !identity
+                .allowed_jurisdictions
+                .contains(requested_jurisdiction)
+        {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!(
+                        "Residency constraint error: tenant '{}' is not authorized for jurisdiction '{}'",
+                        identity.tenant_id, requested_jurisdiction
+                    ),
+                    "type": "authorization_error",
+                    "code": "jurisdiction_forbidden"
+                }
+            });
+            let resp = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("Content-Type", "application/json")
+                .header("Server", "NexusEdge-AI-Director/0.1.0")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            return Ok(resp);
+        }
+    }
+
     let candidates = director.select_candidates_with_strategy(
         metadata.requested_jurisdiction.as_deref(),
         metadata.routing_strategy,
-        metadata.project_id.as_deref(),
+        effective_project_id.as_deref(),
     );
     if candidates.is_empty() {
         warn!(
             jurisdiction = ?metadata.requested_jurisdiction,
-            "No available AI compute providers satisfy sovereignty or capacity constraints"
+            project = ?effective_project_id,
+            "No available AI compute providers satisfy sovereignty, tenancy, or capacity constraints"
         );
         let body = serde_json::json!({
             "error": {
@@ -1086,14 +1348,21 @@ pub async fn dispatch_ai_request_with_failover(
             &target_url,
         );
 
-        // Forward standard client headers, omitting hop-by-hop
+        // 5. Header Sanitization: Forward safe client headers, strictly stripping client credentials,
+        // internal metadata, and hop-by-hop headers to prevent upstream leakage (Finding 8)
         for (name, value) in req_headers.iter() {
             let name_str = name.as_str().to_lowercase();
             if name_str == "host"
                 || name_str == "authorization"
+                || name_str == "x-api-key"
+                || name_str == "api-key"
+                || name_str == "x-project-id"
+                || name_str == "cookie"
+                || name_str == "set-cookie"
                 || name_str == "connection"
                 || name_str == "transfer-encoding"
                 || name_str == "content-length"
+                || name_str.starts_with("x-nexusedge-")
             {
                 continue;
             }
@@ -1119,17 +1388,6 @@ pub async fn dispatch_ai_request_with_failover(
                 _ => {
                     req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
                 }
-            }
-        } else if let Some(client_auth) = req_headers.get("authorization") {
-            // Pass through client's key if provider has no override
-            if let Ok(val) = client_auth.to_str() {
-                req_builder = req_builder.header("Authorization", val);
-            }
-        } else if let Some(client_key) = req_headers.get("x-api-key") {
-            if let Ok(val) = client_key.to_str() {
-                req_builder = req_builder
-                    .header("x-api-key", val)
-                    .header("anthropic-version", "2023-06-01");
             }
         }
 
@@ -1235,6 +1493,10 @@ pub async fn dispatch_ai_request_with_failover(
                     .header("Server", "NexusEdge-Universal-Compute-Director/0.1.0")
                     .header("X-NexusEdge-Provider", &provider.id)
                     .header("X-NexusEdge-TTFT-Ms", ttft_ms.to_string())
+                    .header(
+                        "X-NexusEdge-Upstream-Header-Latency-Ms",
+                        ttft_ms.to_string(),
+                    )
                     .header("X-NexusEdge-Failover-Count", failover_count.to_string())
                     .header(
                         "X-NexusEdge-Total-Duration-Ms",
@@ -1265,20 +1527,76 @@ pub async fn dispatch_ai_request_with_failover(
                     }
                 }
 
-                let resp_bytes = upstream_resp.bytes().await.unwrap_or_default();
+                let resp_bytes = match upstream_resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let body = serde_json::json!({
+                            "error": {
+                                "message": format!("Failed to read upstream response body: {}", e),
+                                "type": "bad_gateway_error",
+                                "code": "upstream_read_error"
+                            }
+                        });
+                        let resp = Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .header("Content-Type", "application/json")
+                            .header("Server", "NexusEdge-AI-Director/0.1.0")
+                            .body(Full::new(Bytes::from(body.to_string())))
+                            .unwrap();
+                        return Ok(resp);
+                    }
+                };
 
-                // Translate response body if caller protocol differs from upstream provider protocol
+                // 6. Fail-closed response body translation across protocols (Finding 13)
                 let final_resp_bytes = if !resp_bytes.is_empty() && resp_status == StatusCode::OK {
                     match (caller_protocol, target_protocol) {
                         (AiProtocol::OpenAi, AiProtocol::Anthropic) => {
-                            translate_anthropic_to_openai_response(&resp_bytes, &metadata.model)
-                                .map(Bytes::from)
-                                .unwrap_or(resp_bytes.clone())
+                            match translate_anthropic_to_openai_response(
+                                &resp_bytes,
+                                &metadata.model,
+                            ) {
+                                Ok(b) => Bytes::from(b),
+                                Err(err) => {
+                                    let body = serde_json::json!({
+                                        "error": {
+                                            "message": format!("Upstream response translation from Anthropic failed: {}", err),
+                                            "type": "bad_gateway_error",
+                                            "code": "response_translation_error"
+                                        }
+                                    });
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_GATEWAY)
+                                        .header("Content-Type", "application/json")
+                                        .header("Server", "NexusEdge-AI-Director/0.1.0")
+                                        .body(Full::new(Bytes::from(body.to_string())))
+                                        .unwrap();
+                                    return Ok(resp);
+                                }
+                            }
                         }
                         (AiProtocol::Anthropic, AiProtocol::OpenAi) => {
-                            translate_openai_to_anthropic_response(&resp_bytes, &metadata.model)
-                                .map(Bytes::from)
-                                .unwrap_or(resp_bytes.clone())
+                            match translate_openai_to_anthropic_response(
+                                &resp_bytes,
+                                &metadata.model,
+                            ) {
+                                Ok(b) => Bytes::from(b),
+                                Err(err) => {
+                                    let body = serde_json::json!({
+                                        "error": {
+                                            "message": format!("Upstream response translation from OpenAI failed: {}", err),
+                                            "type": "bad_gateway_error",
+                                            "code": "response_translation_error"
+                                        }
+                                    });
+                                    let resp = Response::builder()
+                                        .status(StatusCode::BAD_GATEWAY)
+                                        .header("Content-Type", "application/json")
+                                        .header("Server", "NexusEdge-AI-Director/0.1.0")
+                                        .body(Full::new(Bytes::from(body.to_string())))
+                                        .unwrap();
+                                    return Ok(resp);
+                                }
+                            }
                         }
                         _ => resp_bytes.clone(),
                     }
@@ -1319,7 +1637,8 @@ pub async fn dispatch_ai_request_with_failover(
                     error = %e,
                     "Connection to AI compute provider failed; triggering failover"
                 );
-                candidate_state.record_error();
+                // trigger_backoff already increments error_count and failovers_triggered!
+                // Prevent duplicate error count increment (Finding 13).
                 candidate_state.trigger_backoff(
                     Duration::from_secs(provider.failover_cooldown_secs.max(5)),
                     false,

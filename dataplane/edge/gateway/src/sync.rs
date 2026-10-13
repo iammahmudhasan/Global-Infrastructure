@@ -245,14 +245,18 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
     let new_routes = router::parse_pop_config_routes(body_str)
         .map_err(|e| SyncError::ParseError(e.to_string()))?;
 
+    let maybe_new_ai = router::parse_pop_config_ai_providers(body_str)
+        .map_err(|e| SyncError::ParseError(e.to_string()))?;
+
     let routes_count = new_routes.len();
+    let ai_ref = maybe_new_ai.as_deref();
     router
-        .update_routes_with_dns(new_routes, vec![], dns_resolver)
+        .update_routes_with_dns_and_ai(new_routes, vec![], ai_ref, dns_resolver)
         .map_err(|e| SyncError::RouteApplyError(e.to_string()))?;
 
     let mut ai_providers_applied = 0;
     if let Some(director) = ai_director {
-        if let Ok(Some(new_ai)) = router::parse_pop_config_ai_providers(body_str) {
+        if let Some(new_ai) = maybe_new_ai {
             ai_providers_applied = new_ai.len();
             director.update_providers(new_ai);
         }

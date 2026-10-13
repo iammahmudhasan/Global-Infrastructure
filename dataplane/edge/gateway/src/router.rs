@@ -683,8 +683,19 @@ impl Router {
     /// Guarantees that if route validation fails, neither active routes nor DNS mappings are modified.
     pub fn update_routes_with_dns(
         &self,
+        new_routes: Vec<DomainRoute>,
+        new_defaults: Vec<String>,
+        dns_resolver: &crate::dns::PinnedDnsResolver,
+    ) -> Result<(), RouterError> {
+        self.update_routes_with_dns_and_ai(new_routes, new_defaults, None, dns_resolver)
+    }
+
+    /// Atomically updates routing tables and pre-publishes DNS pinning mappings for routes AND AI providers into PinnedDnsResolver.
+    pub fn update_routes_with_dns_and_ai(
+        &self,
         mut new_routes: Vec<DomainRoute>,
         new_defaults: Vec<String>,
+        ai_providers: Option<&[crate::ai::AiProvider]>,
         dns_resolver: &crate::dns::PinnedDnsResolver,
     ) -> Result<(), RouterError> {
         let mut routes_map = HashMap::new();
@@ -741,6 +752,82 @@ impl Router {
             for pr in &route.path_routes {
                 for n in &pr.origins {
                     insert_node(n);
+                }
+            }
+        }
+
+        // 2.1 Prepare candidate DNS mappings for AI compute providers (Finding 4)
+        if let Some(providers) = ai_providers {
+            for p in providers {
+                let trimmed = p.endpoint.trim();
+                let parsed_url = reqwest::Url::parse(trimmed).map_err(|e| {
+                    RouterError::InvalidPayload(format!(
+                        "Invalid AI provider endpoint URL '{}': {}",
+                        trimmed, e
+                    ))
+                })?;
+
+                let scheme = parsed_url.scheme();
+                if scheme != "http" && scheme != "https" {
+                    return Err(RouterError::InvalidPayload(format!(
+                        "AI provider endpoint scheme must be http or https: '{}'",
+                        scheme
+                    )));
+                }
+
+                let host = match parsed_url.host_str() {
+                    Some(h) if !h.trim().is_empty() => h.trim(),
+                    _ => {
+                        return Err(RouterError::InvalidPayload(
+                            "AI provider endpoint host cannot be empty".to_string(),
+                        ))
+                    }
+                };
+
+                let port = parsed_url
+                    .port_or_known_default()
+                    .unwrap_or(if scheme == "https" { 443 } else { 80 });
+
+                let lower_host = host.to_ascii_lowercase();
+                if lower_host == "169.254.169.254"
+                    || lower_host == "metadata.google.internal"
+                    || lower_host == "metadata"
+                    || lower_host.ends_with(".internal")
+                    || lower_host.ends_with(".local")
+                {
+                    return Err(RouterError::InvalidPayload(format!(
+                        "AI provider endpoint '{}' violates SSRF policy (cloud metadata prohibited)",
+                        host
+                    )));
+                }
+
+                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                    let addr = std::net::SocketAddr::new(ip, port);
+                    let addrs = candidate_dns.entry(lower_host).or_default();
+                    if !addrs.contains(&addr) {
+                        addrs.push(addr);
+                    }
+                } else {
+                    let host_port = format!("{}:{}", host, port);
+                    if let Ok(resolved_iter) = std::net::ToSocketAddrs::to_socket_addrs(&host_port)
+                    {
+                        let addrs = candidate_dns.entry(lower_host).or_default();
+                        for addr in resolved_iter {
+                            let ip = addr.ip();
+                            if (ip.is_loopback() || ip.is_unspecified())
+                                && p.provider_type != "onprem"
+                                && p.provider_type != "vllm"
+                            {
+                                return Err(RouterError::InvalidPayload(format!(
+                                    "AI provider destination '{}' resolves to prohibited IP {}",
+                                    host, ip
+                                )));
+                            }
+                            if !addrs.contains(&addr) {
+                                addrs.push(addr);
+                            }
+                        }
+                    }
                 }
             }
         }

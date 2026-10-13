@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use hyper::{Method, StatusCode};
-use nexusedge_gateway::ai::{dispatch_ai_request_with_failover, AiProvider, AiTrafficDirector};
+use nexusedge_gateway::ai::{
+    dispatch_ai_request_with_failover, AiAuthIdentity, AiProvider, AiTrafficDirector,
+};
 use reqwest::Client as HttpClient;
 use std::time::Duration;
 
@@ -229,13 +231,32 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
         "0.002000"
     );
 
-    // Verify /v1/nexusedge/ai/analytics
-    let analytics_resp = dispatch_ai_request_with_failover(
+    // Verify unauthenticated /v1/nexusedge/ai/analytics is rejected (401)
+    let unauth_analytics_resp = dispatch_ai_request_with_failover(
         &client,
         &director,
         "/v1/nexusedge/ai/analytics",
         &Method::GET,
         &hyper::HeaderMap::new(),
+        Bytes::new(),
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .expect("analytics endpoint should return response");
+    assert_eq!(unauth_analytics_resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Verify authenticated /v1/nexusedge/ai/analytics succeeds with 200 OK
+    let mut auth_headers = hyper::HeaderMap::new();
+    auth_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer test-client-token"),
+    );
+    let analytics_resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/nexusedge/ai/analytics",
+        &Method::GET,
+        &auth_headers,
         Bytes::new(),
         "127.0.0.1".parse().unwrap(),
     )
@@ -575,4 +596,175 @@ async fn test_ai_payload_translation_fails_closed() {
     .unwrap();
 
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_ai_gateway_invalid_or_revoked_token_rejected() {
+    let director = AiTrafficDirector::new(vec![]);
+    let client = HttpClient::new();
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+
+    let mut req_headers = hyper::HeaderMap::new();
+    req_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    req_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer definitely-invalid-secret-token"),
+    );
+
+    let resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &req_headers,
+        req_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_ai_gateway_cross_tenant_project_forbidden() {
+    let director = AiTrafficDirector::new(vec![]);
+    let mut allowed_projects = std::collections::HashSet::new();
+    allowed_projects.insert("proj-tenant-a".to_string());
+    let mut scopes = std::collections::HashSet::new();
+    scopes.insert("*".to_string());
+    let mut allowed_jurisdictions = std::collections::HashSet::new();
+    allowed_jurisdictions.insert("*".to_string());
+
+    director.auth_registry().register_key(
+        "token-tenant-a",
+        AiAuthIdentity {
+            tenant_id: "tenant-a".to_string(),
+            default_project_id: "proj-tenant-a".to_string(),
+            allowed_projects,
+            allowed_jurisdictions,
+            scopes,
+        },
+    );
+
+    let client = HttpClient::new();
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+
+    let mut req_headers = hyper::HeaderMap::new();
+    req_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    req_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer token-tenant-a"),
+    );
+    req_headers.insert(
+        "x-project-id",
+        hyper::header::HeaderValue::from_static("proj-tenant-b"),
+    );
+
+    let resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &req_headers,
+        req_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_ai_gateway_sanitizes_upstream_headers_and_injects_latency_metric() {
+    let mock_server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = mock_server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = mock_server.accept().await {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&buf[..n]);
+
+            assert!(!req_str.contains("caller-client-token"));
+            assert!(!req_str.contains("x-project-id"));
+            assert!(!req_str.contains("x-nexusedge-routing-strategy"));
+            assert!(req_str.contains("authorization: Bearer upstream-provider-secret"));
+
+            let body = r#"{"id":"chatcmpl-clean","choices":[{"message":{"role":"assistant","content":"Clean upstream"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let providers = vec![AiProvider {
+        id: "clean-upstream-provider".to_string(),
+        name: "Clean Provider".to_string(),
+        endpoint: format!("http://{}", addr),
+        provider_type: "vllm".to_string(),
+        api_key: Some("upstream-provider-secret".to_string()),
+        cost_per_m_tokens: 0.50,
+        priority: 0,
+        sovereignty_jurisdiction: None,
+        failover_cooldown_secs: 10,
+        project_id: None,
+    }];
+
+    let director = AiTrafficDirector::new(providers);
+    let client = HttpClient::builder()
+        .timeout(Duration::from_millis(2000))
+        .build()
+        .unwrap();
+
+    let req_payload = Bytes::from_static(br#"{"model": "llama-3.3-70b"}"#);
+    let mut req_headers = hyper::HeaderMap::new();
+    req_headers.insert(
+        "content-type",
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+    req_headers.insert(
+        "authorization",
+        hyper::header::HeaderValue::from_static("Bearer test-client-token"),
+    );
+    req_headers.insert(
+        "x-project-id",
+        hyper::header::HeaderValue::from_static("default-project"),
+    );
+    req_headers.insert(
+        "x-nexusedge-routing-strategy",
+        hyper::header::HeaderValue::from_static("cost"),
+    );
+
+    let resp = dispatch_ai_request_with_failover(
+        &client,
+        &director,
+        "/v1/chat/completions",
+        &Method::POST,
+        &req_headers,
+        req_payload,
+        "127.0.0.1".parse().unwrap(),
+    )
+    .await
+    .expect("dispatch should succeed");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp
+        .headers()
+        .contains_key("x-nexusedge-upstream-header-latency-ms"));
+    assert_eq!(
+        resp.headers().get("x-nexusedge-provider").unwrap(),
+        "clean-upstream-provider"
+    );
 }

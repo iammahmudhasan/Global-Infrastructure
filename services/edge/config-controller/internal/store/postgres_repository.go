@@ -489,7 +489,25 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 		if expiresAt.Valid {
 			c.ExpiresAt = expiresAt.Time
 		}
-		_ = r.cache.SaveCertificate(&c)
+		if c.PrivateKeyPEM != "" {
+			rawStored := c.PrivateKeyPEM
+			decrypted, decErr := security.DecryptSecret(rawStored)
+			if decErr != nil {
+				return fmt.Errorf("decrypt certificate private key %s: %w", c.ID, decErr)
+			}
+			c.PrivateKeyPEM = decrypted
+
+			// Transparent application-level migration: encrypt legacy plaintext keys at rest
+			if !security.IsEncrypted(rawStored) {
+				enc, encErr := security.EncryptSecret(rawStored)
+				if encErr == nil {
+					_, _ = r.db.ExecContext(ctx, "UPDATE certificates SET private_key_pem = $1 WHERE id = $2", enc, c.ID)
+				}
+			}
+		}
+		if err := r.cache.SaveCertificate(&c); err != nil {
+			return fmt.Errorf("cache save certificate: %w", err)
+		}
 	}
 	if err := certRows.Err(); err != nil {
 		return fmt.Errorf("iterate certificates: %w", err)
@@ -1102,6 +1120,15 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 		}
 	}
 
+	storedKey := cert.PrivateKeyPEM
+	if storedKey != "" && !security.IsEncrypted(storedKey) {
+		enc, encErr := security.EncryptSecret(storedKey)
+		if encErr != nil {
+			return fmt.Errorf("encrypt certificate private key: %w", encErr)
+		}
+		storedKey = enc
+	}
+
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO certificates (id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -1118,7 +1145,7 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 		   issued_at = EXCLUDED.issued_at,
 		   expires_at = EXCLUDED.expires_at`,
 		cert.ID, cert.DomainID, string(cert.Status), cert.Issuer, cert.SerialNumber,
-		cert.CertPEM, cert.PrivateKeyPEM, cert.FingerprintSHA256, string(cert.KeyType),
+		cert.CertPEM, storedKey, cert.FingerprintSHA256, string(cert.KeyType),
 		pqStringArray(cert.Domains), cert.AutoRenew, issuedAt, expiresAt,
 	)
 	if err != nil {

@@ -535,11 +535,7 @@ type AIProviderResponse struct {
 func (p *AIProvider) ToResponse() AIProviderResponse {
 	redacted := "[NONE]"
 	if p.APIKey != "" {
-		if len(p.APIKey) > 8 {
-			redacted = p.APIKey[:3] + "..." + p.APIKey[len(p.APIKey)-4:]
-		} else {
-			redacted = "[REDACTED]"
-		}
+		redacted = "[REDACTED]"
 	}
 	return AIProviderResponse{
 		ID:                      p.ID,
