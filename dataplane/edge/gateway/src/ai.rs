@@ -67,6 +67,7 @@ pub fn is_dev_mode() -> bool {
 #[derive(Clone, Debug)]
 pub struct AiGatewayAuthRegistry {
     identities: Arc<RwLock<HashMap<String, AiAuthIdentity>>>,
+    initialization_error: Option<String>,
 }
 
 impl Default for AiGatewayAuthRegistry {
@@ -80,6 +81,7 @@ impl AiGatewayAuthRegistry {
     pub fn new_empty() -> Self {
         Self {
             identities: Arc::new(RwLock::new(HashMap::new())),
+            initialization_error: None,
         }
     }
 
@@ -94,12 +96,14 @@ impl AiGatewayAuthRegistry {
         map.insert("test-key".to_string(), default_identity);
         Self {
             identities: Arc::new(RwLock::new(map)),
+            initialization_error: None,
         }
     }
 
     /// Creates an auth registry strictly for production environments.
-    /// Fails closed if NEXUSEDGE_AI_API_KEYS is missing, empty, or contains invalid policies.
-    /// Never loads development fixture keys.
+    /// Fails closed if NEXUSEDGE_AI_API_KEYS is missing, empty, or contains invalid/incomplete policies.
+    /// Strictly requires explicit project, scope, and jurisdiction policies.
+    /// Rejects duplicate keys, empty allowlists, and malformed entries.
     pub fn new_production() -> Result<Self, String> {
         let env_keys = std::env::var("NEXUSEDGE_AI_API_KEYS").map_err(|_| {
             "NEXUSEDGE_AI_API_KEYS environment variable is required in production mode".to_string()
@@ -117,9 +121,10 @@ impl AiGatewayAuthRegistry {
                 continue;
             }
             let parts: Vec<&str> = entry_trimmed.split(':').collect();
-            if parts.len() < 3 {
+            // Production requires explicit project, scope, and jurisdiction policies (6 parts minimum)
+            if parts.len() < 6 {
                 return Err(format!(
-                    "Invalid AI API key definition '{}': format must be key:tenant_id:default_project_id[:allowed_projs_csv][:scopes_csv][:jurisdictions_csv]",
+                    "Incomplete production key definition '{}': format must explicitly specify all 6 fields: key:tenant_id:default_project_id:allowed_projs_csv:scopes_csv:jurisdictions_csv (implicit defaults forbidden in production)",
                     entry_trimmed
                 ));
             }
@@ -130,50 +135,62 @@ impl AiGatewayAuthRegistry {
 
             if key.is_empty() || tenant.is_empty() || def_proj.is_empty() {
                 return Err(format!(
-                    "Invalid AI key, tenant, or default_project in '{}'",
+                    "Invalid AI key, tenant, or default_project in '{}': none of these fields may be empty",
                     entry_trimmed
                 ));
             }
 
-            // 1. Projects Allowlist
+            // Reject duplicate API keys (Rule 18 / Finding 3)
+            if map.contains_key(&key) {
+                return Err(format!(
+                    "Duplicate API key detected in production registry: '{}'",
+                    key
+                ));
+            }
+
+            // 1. Explicit Projects Allowlist
             let mut allowed_projs = HashSet::new();
-            if parts.len() >= 4 && !parts[3].trim().is_empty() {
-                for p in parts[3].split(',') {
-                    let pt = p.trim().to_string();
-                    if !pt.is_empty() {
-                        allowed_projs.insert(pt);
-                    }
+            for p in parts[3].split(',') {
+                let pt = p.trim().to_string();
+                if !pt.is_empty() {
+                    allowed_projs.insert(pt);
                 }
-            } else {
-                allowed_projs.insert(def_proj.clone());
+            }
+            if allowed_projs.is_empty() {
+                return Err(format!(
+                    "Allowed projects list cannot be empty for key '{}' in production",
+                    key
+                ));
             }
 
-            // 2. Scopes Allowlist (e.g. "inference", "analytics", or explicit "*")
+            // 2. Explicit Scopes Allowlist (e.g. "inference", "analytics", or explicit "*")
             let mut scopes = HashSet::new();
-            if parts.len() >= 5 && !parts[4].trim().is_empty() {
-                for s in parts[4].split(',') {
-                    let st = s.trim().to_ascii_lowercase();
-                    if !st.is_empty() {
-                        scopes.insert(st);
-                    }
+            for s in parts[4].split(',') {
+                let st = s.trim().to_ascii_lowercase();
+                if !st.is_empty() {
+                    scopes.insert(st);
                 }
-            } else {
-                // In production, default scope is "inference" only; wildcard "*" must be explicitly configured
-                scopes.insert("inference".to_string());
+            }
+            if scopes.is_empty() {
+                return Err(format!(
+                    "Scopes list cannot be empty for key '{}' in production (must specify explicit scopes e.g. 'inference' or '*')",
+                    key
+                ));
             }
 
-            // 3. Jurisdictions Allowlist (e.g. "BD", "EU", "SG", or explicit "*")
+            // 3. Explicit Jurisdictions Allowlist (e.g. "BD", "EU", "SG", or explicit "*")
             let mut allowed_jurisdictions = HashSet::new();
-            if parts.len() >= 6 && !parts[5].trim().is_empty() {
-                for j in parts[5].split(',') {
-                    let jt = j.trim().to_ascii_uppercase();
-                    if !jt.is_empty() {
-                        allowed_jurisdictions.insert(jt);
-                    }
+            for j in parts[5].split(',') {
+                let jt = j.trim().to_ascii_uppercase();
+                if !jt.is_empty() {
+                    allowed_jurisdictions.insert(jt);
                 }
-            } else {
-                // In production, default jurisdiction is GLOBAL only; wildcard "*" must be explicitly configured
-                allowed_jurisdictions.insert("GLOBAL".to_string());
+            }
+            if allowed_jurisdictions.is_empty() {
+                return Err(format!(
+                    "Jurisdictions list cannot be empty for key '{}' in production (must specify explicit jurisdictions e.g. 'GLOBAL', 'BD', or '*')",
+                    key
+                ));
             }
 
             map.insert(
@@ -194,6 +211,7 @@ impl AiGatewayAuthRegistry {
 
         Ok(Self {
             identities: Arc::new(RwLock::new(map)),
+            initialization_error: None,
         })
     }
 
@@ -270,13 +288,36 @@ impl AiGatewayAuthRegistry {
                 }
                 Err(err) => {
                     tracing::error!(
-                        "FATAL/FAIL-CLOSED: Failed to initialize production AI Gateway auth registry: {}. Gateway will reject all incoming inference requests.",
+                        "FATAL/FAIL-CLOSED: Failed to initialize production AI Gateway auth registry: {}. Gateway readiness is disabled.",
                         err
                     );
-                    Self::new_empty()
+                    Self {
+                        identities: Arc::new(RwLock::new(HashMap::new())),
+                        initialization_error: Some(err),
+                    }
                 }
             }
         }
+    }
+
+    /// Returns true if the registry was successfully initialized with production keys or is running in dev mode.
+    pub fn is_healthy(&self) -> bool {
+        if is_dev_mode() {
+            true
+        } else {
+            self.initialization_error.is_none() && !self.is_empty()
+        }
+    }
+
+    /// Returns the initialization error message if production configuration failed.
+    pub fn initialization_error(&self) -> Option<&str> {
+        self.initialization_error.as_deref()
+    }
+
+    /// Checks if the identity map is empty.
+    pub fn is_empty(&self) -> bool {
+        let guard = self.identities.read().unwrap();
+        guard.is_empty()
     }
 
     pub fn register_key(&self, key: &str, identity: AiAuthIdentity) {
@@ -435,6 +476,8 @@ pub struct AiProvider {
     pub failover_cooldown_secs: u64,
     #[serde(default)]
     pub project_id: Option<String>,
+    #[serde(default)]
+    pub secret_ref: Option<String>,
 }
 
 /// Runtime health state for an AI provider candidate.
@@ -512,6 +555,7 @@ impl ProviderRuntimeState {
 pub struct AiTrafficDirector {
     providers: Arc<RwLock<Vec<Arc<ProviderRuntimeState>>>>,
     auth_registry: Arc<AiGatewayAuthRegistry>,
+    vault: Arc<RwLock<HashMap<String, String>>>,
     total_prompt_tokens: Arc<AtomicU64>,
     total_completion_tokens: Arc<AtomicU64>,
     total_tokens_routed: Arc<AtomicU64>,
@@ -546,12 +590,23 @@ impl AiTrafficDirector {
         Self {
             providers: Arc::new(RwLock::new(runtime_states)),
             auth_registry,
+            vault: Arc::new(RwLock::new(HashMap::new())),
             total_prompt_tokens: Arc::new(AtomicU64::new(0)),
             total_completion_tokens: Arc::new(AtomicU64::new(0)),
             total_tokens_routed: Arc::new(AtomicU64::new(0)),
             total_cost_spent_micros: Arc::new(AtomicU64::new(0)),
             total_cost_saved_micros: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_secret(&self, secret_ref: &str, api_key: &str) {
+        let mut v = self.vault.write().unwrap();
+        v.insert(secret_ref.to_string(), api_key.to_string());
+    }
+
+    pub fn get_secret(&self, secret_ref: &str) -> Option<String> {
+        let v = self.vault.read().unwrap();
+        v.get(secret_ref).cloned()
     }
 
     pub fn auth_registry(&self) -> &Arc<AiGatewayAuthRegistry> {
@@ -1555,8 +1610,15 @@ pub async fn dispatch_ai_request_with_failover(
             }
         }
 
-        // Dynamically inject provider credentials (Key Vault Injection)
-        if let Some(ref key) = provider.api_key {
+        // Dynamically inject provider credentials (Key Vault Injection / SecretRef Resolution)
+        let resolved_key = provider.api_key.clone().or_else(|| {
+            provider
+                .secret_ref
+                .as_deref()
+                .and_then(|sref| director.get_secret(sref))
+        });
+
+        if let Some(ref key) = resolved_key {
             match provider.provider_type.as_str() {
                 "azure" => {
                     req_builder = req_builder.header("api-key", key);
@@ -1904,6 +1966,7 @@ mod tests {
                 sovereignty_jurisdiction: Some("US".to_string()),
                 failover_cooldown_secs: 10,
                 project_id: None,
+                secret_ref: None,
             },
             AiProvider {
                 id: "onprem-dhaka".to_string(),
@@ -1916,6 +1979,7 @@ mod tests {
                 sovereignty_jurisdiction: Some("BD".to_string()),
                 failover_cooldown_secs: 10,
                 project_id: None,
+                secret_ref: None,
             },
             AiProvider {
                 id: "coreweave-spot".to_string(),
@@ -1928,6 +1992,7 @@ mod tests {
                 sovereignty_jurisdiction: Some("US".to_string()),
                 failover_cooldown_secs: 10,
                 project_id: None,
+                secret_ref: None,
             },
         ];
 
@@ -1965,6 +2030,7 @@ mod tests {
                 sovereignty_jurisdiction: None,
                 failover_cooldown_secs: 10,
                 project_id: None,
+                secret_ref: None,
             },
             AiProvider {
                 id: "tenant-alpha-custom".to_string(),
@@ -1977,6 +2043,7 @@ mod tests {
                 sovereignty_jurisdiction: None,
                 failover_cooldown_secs: 10,
                 project_id: Some("proj-alpha".to_string()),
+                secret_ref: None,
             },
             AiProvider {
                 id: "tenant-beta-private".to_string(),
@@ -1989,6 +2056,7 @@ mod tests {
                 sovereignty_jurisdiction: None,
                 failover_cooldown_secs: 10,
                 project_id: Some("proj-beta".to_string()),
+                secret_ref: None,
             },
         ];
 
@@ -2037,5 +2105,116 @@ mod tests {
         // Fallback to body when header absent
         let meta_body = parse_ai_request_metadata(payload, &hyper::HeaderMap::new()).unwrap();
         assert_eq!(meta_body.project_id.as_deref(), Some("proj-from-body"));
+    }
+
+    #[test]
+    fn test_production_auth_fails_on_missing_or_empty_env() {
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+        let res = AiGatewayAuthRegistry::new_production();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("required in production mode"));
+
+        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "   ");
+        let res_empty = AiGatewayAuthRegistry::new_production();
+        assert!(res_empty.is_err());
+        assert!(res_empty.unwrap_err().contains("cannot be empty"));
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+    }
+
+    #[test]
+    fn test_production_auth_fails_on_incomplete_definition() {
+        // Only 3 parts provided instead of required explicit 6 parts
+        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "prod-key-1:tenant-1:proj-1");
+        let res = AiGatewayAuthRegistry::new_production();
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("Incomplete production key definition"));
+
+        // Only 5 parts provided
+        std::env::set_var(
+            "NEXUSEDGE_AI_API_KEYS",
+            "prod-key-1:tenant-1:proj-1:proj-1:inference",
+        );
+        let res_5 = AiGatewayAuthRegistry::new_production();
+        assert!(res_5.is_err());
+        assert!(res_5
+            .unwrap_err()
+            .contains("Incomplete production key definition"));
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+    }
+
+    #[test]
+    fn test_production_auth_fails_on_duplicate_key() {
+        std::env::set_var(
+            "NEXUSEDGE_AI_API_KEYS",
+            "duplicate-key:t1:p1:p1:inference:GLOBAL;duplicate-key:t2:p2:p2:inference:BD",
+        );
+        let res = AiGatewayAuthRegistry::new_production();
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("Duplicate API key detected in production registry"));
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+    }
+
+    #[test]
+    fn test_production_auth_fails_on_empty_allowlists() {
+        // Empty allowed_projects
+        std::env::set_var(
+            "NEXUSEDGE_AI_API_KEYS",
+            "valid-key:t1:p1: :inference:GLOBAL",
+        );
+        let res_proj = AiGatewayAuthRegistry::new_production();
+        assert!(res_proj.is_err());
+        assert!(res_proj
+            .unwrap_err()
+            .contains("Allowed projects list cannot be empty"));
+
+        // Empty scopes
+        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "valid-key:t1:p1:p1: :GLOBAL");
+        let res_scopes = AiGatewayAuthRegistry::new_production();
+        assert!(res_scopes.is_err());
+        assert!(res_scopes
+            .unwrap_err()
+            .contains("Scopes list cannot be empty"));
+
+        // Empty jurisdictions
+        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "valid-key:t1:p1:p1:inference: ");
+        let res_jur = AiGatewayAuthRegistry::new_production();
+        assert!(res_jur.is_err());
+        assert!(res_jur
+            .unwrap_err()
+            .contains("Jurisdictions list cannot be empty"));
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
+    }
+
+    #[test]
+    fn test_production_auth_succeeds_on_explicit_policy() {
+        std::env::set_var(
+            "NEXUSEDGE_AI_API_KEYS",
+            "prod-key-alpha:t-alpha:prj-alpha:prj-alpha,prj-shared:inference,analytics:BD,GLOBAL",
+        );
+        let reg =
+            AiGatewayAuthRegistry::new_production().expect("expected valid production registry");
+        assert!(!reg.is_empty());
+        assert!(reg.initialization_error().is_none());
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer prod-key-alpha"),
+        );
+        let identity = reg
+            .authenticate(&headers)
+            .expect("expected authenticated identity");
+        assert_eq!(identity.tenant_id, "t-alpha");
+        assert_eq!(identity.default_project_id, "prj-alpha");
+        assert!(identity.allowed_projects.contains("prj-shared"));
+        assert!(identity.scopes.contains("inference"));
+        assert!(identity.scopes.contains("analytics"));
+        assert!(identity.allowed_jurisdictions.contains("BD"));
+        assert!(identity.allowed_jurisdictions.contains("GLOBAL"));
+        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
     }
 }

@@ -89,3 +89,41 @@ func TestAuditLogger_ConcurrentSafety(t *testing.T) {
 		t.Fatalf("concurrent chain verification failed: %v", err)
 	}
 }
+
+func TestAuditLogger_RollbackOnFailure(t *testing.T) {
+	hmacKey := []byte("nexusedge-audit-hmac-secret-key-32b")
+	logger := security.NewAuditLogger(hmacKey)
+
+	r1, err := logger.Record("admin", "org-1", "proj-1", "domain.create", "domain", "dom-1", "127.0.0.1", nil)
+	if err != nil {
+		t.Fatalf("failed to record r1: %v", err)
+	}
+
+	r2, err := logger.Record("admin", "org-1", "proj-1", "domain.update", "domain", "dom-1", "127.0.0.1", nil)
+	if err != nil {
+		t.Fatalf("failed to record r2: %v", err)
+	}
+
+	if logger.LastHash() != r2.Hash {
+		t.Fatalf("expected lastHash %s, got %s", r2.Hash, logger.LastHash())
+	}
+
+	// Simulate failure in database persistence: rollback r2
+	logger.RollbackLastRecord(r2.ID)
+
+	records := logger.GetRecords()
+	if len(records) != 1 {
+		t.Fatalf("expected 1 record after rollback, got %d", len(records))
+	}
+	if records[0].ID != r1.ID {
+		t.Fatalf("expected remaining record to be r1, got %s", records[0].ID)
+	}
+	if logger.LastHash() != r1.Hash {
+		t.Fatalf("expected lastHash to be restored to r1.Hash (%s), got %s", r1.Hash, logger.LastHash())
+	}
+
+	valid, err := logger.VerifyChain()
+	if !valid || err != nil {
+		t.Fatalf("chain must remain valid after rollback: %v", err)
+	}
+}

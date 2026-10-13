@@ -63,11 +63,24 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	}
 	auditKey := []byte(auditKeyStr)
 	auditLogger := security.NewAuditLogger(auditKey)
-	existingLogs, _, err := s.ListAuditLogs("", 10000, 0)
-	if err == nil && len(existingLogs) > 0 {
-		records := make([]*security.AuditRecord, len(existingLogs))
-		for i, l := range existingLogs {
-			idx := len(existingLogs) - 1 - i
+	var allLogs []*model.AuditLog
+	offset := 0
+	batchSize := 1000
+	for {
+		batch, total, err := s.ListAuditLogs("", batchSize, offset)
+		if err != nil || len(batch) == 0 {
+			break
+		}
+		allLogs = append(allLogs, batch...)
+		offset += len(batch)
+		if offset >= total || len(batch) < batchSize {
+			break
+		}
+	}
+	if len(allLogs) > 0 {
+		records := make([]*security.AuditRecord, len(allLogs))
+		for i, l := range allLogs {
+			idx := len(allLogs) - 1 - i
 			records[idx] = &security.AuditRecord{
 				ID:           l.ID,
 				Timestamp:    l.CreatedAt.Format(time.RFC3339Nano),
@@ -84,6 +97,9 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 			}
 		}
 		_ = auditLogger.LoadExistingRecords(records)
+		if valid, err := auditLogger.VerifyChain(); !valid {
+			log.Printf("[AUDIT WARNING] Historical audit chain verification failed at startup: %v", err)
+		}
 	}
 
 	h := &APIHandler{
@@ -238,6 +254,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/telemetry", h.handleEdgeTelemetry)
 	h.mux.HandleFunc("/v1/edge/pops", h.handleListPoPs)
 	h.mux.HandleFunc("/v1/edge/pops/", h.handlePoPsRoute)
+	h.mux.HandleFunc("/v1/pops/", h.handlePoPsRoute)
 	h.mux.HandleFunc("/v1/edge/routing/", h.handleRoutingRoute)
 	h.mux.HandleFunc("/v1/edge/ai-providers", h.handleEdgeAIProviders)
 	h.mux.HandleFunc("/v1/ai/providers", h.handleAIProvidersRoute)
@@ -392,9 +409,9 @@ func (h *APIHandler) handleAuditLogsVerifyRoute(w http.ResponseWriter, r *http.R
 	writeJSON(w, http.StatusOK, status)
 }
 
-func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, resourceType, resourceID string, details map[string]interface{}) {
+func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, resourceType, resourceID string, details map[string]interface{}) error {
 	if h.auditLogger == nil {
-		return
+		return nil
 	}
 
 	actor := "system"
@@ -432,7 +449,7 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 	rec, err := h.auditLogger.Record(actor, orgID, projectID, action, resourceType, resourceID, clientIP, details)
 	if err != nil {
 		log.Printf("[AUDIT ERROR] failed to record audit event: %v", err)
-		return
+		return err
 	}
 
 	t, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
@@ -456,8 +473,12 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 	}
 
 	if err := h.store.SaveAuditLog(auditLog); err != nil {
-		log.Printf("[AUDIT ERROR] failed to persist audit log %s: %v", auditLog.ID, err)
+		h.auditLogger.RollbackLastRecord(rec.ID)
+		log.Printf("[AUDIT ERROR] failed to persist audit log %s, rolled back in-memory chain: %v", auditLog.ID, err)
+		return err
 	}
+
+	return nil
 }
 
 func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -2233,6 +2254,7 @@ func (h *APIHandler) handleListPoPs(w http.ResponseWriter, r *http.Request) {
 // /v1/edge/pops/{pop_id}/...
 func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/v1/edge/pops/")
+	path = strings.TrimPrefix(path, "/v1/pops/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
 		h.handleListPoPs(w, r)
@@ -2439,9 +2461,113 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(respBytes)
 
+	case "secrets":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+			return
+		}
+		if !h.authenticator.AuthorizePoP(r.Context(), popID) {
+			writeError(w, http.StatusForbidden, "forbidden: node is not authorized for target pop "+popID)
+			return
+		}
+		if len(parts) >= 3 && parts[2] != "retrieve" {
+			writeError(w, http.StatusNotFound, "unknown secrets action: "+parts[2])
+			return
+		}
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed: must be POST")
+			return
+		}
+		h.handleRetrieveSecretForPoP(w, r, popID)
+		return
+
 	default:
 		writeError(w, http.StatusNotFound, "unknown pop action: "+action)
 	}
+}
+
+func (h *APIHandler) handleRetrieveSecretForPoP(w http.ResponseWriter, r *http.Request, popID string) {
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var req model.SecretRetrieveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: must be valid JSON")
+		return
+	}
+
+	req.SecretRef = strings.TrimSpace(req.SecretRef)
+	req.ProjectID = strings.TrimSpace(req.ProjectID)
+	req.ProviderID = strings.TrimSpace(req.ProviderID)
+
+	if req.SecretRef == "" || req.ProjectID == "" || req.ProviderID == "" {
+		writeError(w, http.StatusBadRequest, "secret_ref, project_id, and provider_id are required")
+		return
+	}
+
+	expectedRef := fmt.Sprintf("vault://projects/%s/ai-providers/%s/key", req.ProjectID, req.ProviderID)
+	if req.SecretRef != expectedRef {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid secret_ref: expected %q, got %q", expectedRef, req.SecretRef))
+		return
+	}
+
+	// 1. Multi-tenant PoP Scope check:
+	// Verify that popID hosts at least one active domain for req.ProjectID, OR req.ProjectID is a platform operator project.
+	isOperator := h.isOperatorProject(req.ProjectID)
+	if !isOperator {
+		topologies := h.store.GetActiveTopologiesForPoP(popID)
+		hasProject := false
+		for _, topo := range topologies {
+			if topo.Domain != nil && topo.Domain.ProjectID == req.ProjectID {
+				hasProject = true
+				break
+			}
+		}
+		if !hasProject {
+			writeError(w, http.StatusForbidden, fmt.Sprintf("forbidden: pop %q is not authorized to host or retrieve secrets for project %q", popID, req.ProjectID))
+			return
+		}
+	}
+
+	// 2. Project Authorization Check (Prevent Cross-Tenant / Cross-Project Secret Theft):
+	if !h.authenticator.AuthorizeProject(r.Context(), req.ProjectID) {
+		writeError(w, http.StatusForbidden, fmt.Sprintf("forbidden: caller is not authorized for project %q", req.ProjectID))
+		return
+	}
+
+	// 3. Retrieve provider and verify identity, project ownership, and active/revocation state
+	provider, err := h.store.GetAIProvider(req.ProviderID)
+	if err != nil || provider == nil {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("provider not found: %s", req.ProviderID))
+		return
+	}
+
+	if provider.ProjectID != req.ProjectID {
+		writeError(w, http.StatusForbidden, "forbidden: provider does not belong to specified project")
+		return
+	}
+
+	if !provider.Enabled {
+		writeError(w, http.StatusForbidden, fmt.Sprintf("forbidden: provider %s is disabled or secret has been revoked", req.ProviderID))
+		return
+	}
+
+	h.recordAudit(r, "", req.ProjectID, "ai_provider.secret_retrieved", "ai_provider_secret", req.ProviderID, map[string]interface{}{
+		"pop_id":     popID,
+		"secret_ref": req.SecretRef,
+	})
+
+	writeJSON(w, http.StatusOK, model.SecretRetrieveResponse{
+		SecretRef:  req.SecretRef,
+		ProjectID:  provider.ProjectID,
+		ProviderID: provider.ID,
+		APIKey:     provider.APIKey,
+		KeyVersion: "v1",
+		ExpiresAt:  time.Now().UTC().Add(24 * time.Hour),
+	})
 }
 
 // /v1/edge/routing/...
@@ -2865,7 +2991,6 @@ func (h *APIHandler) buildGatewayAIProvidersForPoP(pop *model.EdgePoP, topologie
 			Name:                    p.Name,
 			Endpoint:                p.Endpoint,
 			ProviderType:            p.ProviderType,
-			APIKey:                  p.APIKey,
 			SecretRef:               fmt.Sprintf("vault://projects/%s/ai-providers/%s/key", p.ProjectID, p.ID),
 			CostPerMTokens:          p.CostPerMTokens,
 			Priority:                p.Priority,

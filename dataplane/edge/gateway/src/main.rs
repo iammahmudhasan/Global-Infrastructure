@@ -151,6 +151,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None => None,
     };
 
+    if !nexusedge_gateway::ai::is_dev_mode() {
+        if let Some(ref director) = ai_director {
+            if let Some(err) = director.auth_registry().initialization_error() {
+                error!(
+                    error = %err,
+                    "FATAL: Production AI auth configuration is invalid. Terminating gateway startup."
+                );
+                return Err(format!(
+                    "Fatal production startup error: AI auth registry invalid: {}",
+                    err
+                )
+                .into());
+            }
+        }
+    }
+
     let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {
         config: config.clone(),

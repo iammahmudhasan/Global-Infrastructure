@@ -124,11 +124,30 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host " -> Python optimizer passed." -ForegroundColor Green
 
-# 7. Docker Compose Manifest Validation Gate
-Write-Host "[7/7] Validating Docker Compose configuration..." -ForegroundColor Yellow
+# 7. Dashboard Security & BFF Acceptance Gate
+Write-Host "[7/8] Running Dashboard Security & BFF test suite..." -ForegroundColor Yellow
+$DashboardDir = Join-Path $RepoRoot "apps/dashboard"
+if (Get-Command node -ErrorAction SilentlyContinue) {
+    Push-Location $DashboardDir
+    try {
+        & node --test test/bff.test.js
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Dashboard BFF test suite failed." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host " -> Dashboard security tests passed." -ForegroundColor Green
+    } finally {
+        Pop-Location
+    }
+} else {
+    Write-Host " -> Node.js not found, skipping local dashboard check." -ForegroundColor Gray
+}
+
+# 8. Docker Compose Manifest Validation Gate
+Write-Host "[8/8] Validating Docker Compose configurations..." -ForegroundColor Yellow
 $ComposeFile = Join-Path $RepoRoot "deploy/docker-compose.yml"
 if (Get-Command docker -ErrorAction SilentlyContinue) {
-    & docker compose -f $ComposeFile config
+    & docker compose -f $ComposeFile config --quiet
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Docker Compose configuration validation failed." -ForegroundColor Red
         exit 1

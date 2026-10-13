@@ -690,19 +690,28 @@ impl Router {
         self.update_routes_with_dns_and_ai(new_routes, new_defaults, None, dns_resolver)
     }
 
+    /// Allowed destination network ports for private on-prem / vLLM AI model inference.
+    pub const ALLOWED_ONPREM_AI_PORTS: &[u16] = &[80, 443, 5000, 8000, 8080, 8443, 9000, 11434];
+
     /// Validates an AI provider destination IP address against SSRF policies.
     /// Public cloud providers (openai, azure, anthropic, coreweave, aws, bedrock) MUST resolve
     /// to globally routable public IPs (no private RFC 1918, CGNAT, link-local, multicast, or reserved ranges).
     /// Cloud metadata (169.254.169.254, fe80::/10), multicast, and unspecified addresses are strictly blocked for all providers.
+    /// On-prem / vLLM private destinations are strictly constrained to:
+    /// 1. Platform operator project authorization (system, proj-default, proj-core, prj-ops, proj-infra).
+    /// 2. Operator-approved AI inference ports (80, 443, 5000, 8000, 8080, 8443, 9000, 11434).
+    /// 3. Operator-approved CIDRs via NEXUSEDGE_ONPREM_ALLOWED_CIDRS (fail-closed in production if unconfigured).
     pub fn validate_ai_provider_destination_ip(
         ip: std::net::IpAddr,
         provider_type: &str,
         host: &str,
+        port: u16,
+        project_id: Option<&str>,
     ) -> Result<(), RouterError> {
         let lower_type = provider_type.to_ascii_lowercase();
         let is_onprem = lower_type == "onprem" || lower_type == "vllm";
 
-        // 1. Link-local (169.254.0.0/16, fe80::/10) including cloud metadata 169.254.169.254 is ALWAYS blocked
+        // 1. Link-local (169.254.0.0/16, fe80::/10) including cloud metadata 169.254.169.254 is ALWAYS strictly blocked
         match ip {
             std::net::IpAddr::V4(ipv4) => {
                 let octets = ipv4.octets();
@@ -747,6 +756,43 @@ impl Router {
                 "Public AI provider destination '{}' (type: '{}') resolves to prohibited private or reserved IP {}",
                 host, provider_type, ip
             )));
+        }
+
+        // 5. For on-prem / vLLM providers resolving to private RFC 1918 or reserved IP:
+        if is_onprem && is_private_or_reserved_ip(ip) && !ip.is_loopback() {
+            // (a) Project authorization check: only platform operator projects may bind to private networks
+            if !is_operator_project(project_id) && !is_test_profile_active() {
+                return Err(RouterError::InvalidPayload(format!(
+                    "Private destination for on-prem AI provider '{}' ({}) requires platform operator project authorization",
+                    host, ip
+                )));
+            }
+
+            // (b) Destination port check: must target recognized AI inference ports, never infrastructure DBs/management
+            if !Self::ALLOWED_ONPREM_AI_PORTS.contains(&port) {
+                return Err(RouterError::InvalidPayload(format!(
+                    "Private destination for on-prem AI provider '{}' ({}:{}) uses unauthorized port {}. Allowed inference ports: {:?}",
+                    host, ip, port, port, Self::ALLOWED_ONPREM_AI_PORTS
+                )));
+            }
+
+            // (c) Operator-approved CIDR matching
+            let allowed_cidrs_env =
+                std::env::var("NEXUSEDGE_ONPREM_ALLOWED_CIDRS").unwrap_or_default();
+            let trimmed_cidrs = allowed_cidrs_env.trim();
+            if !trimmed_cidrs.is_empty() {
+                if !is_ip_in_allowed_cidrs(ip, trimmed_cidrs) {
+                    return Err(RouterError::InvalidPayload(format!(
+                        "Private destination for on-prem AI provider '{}' ({}) is not in NEXUSEDGE_ONPREM_ALLOWED_CIDRS ({})",
+                        host, ip, trimmed_cidrs
+                    )));
+                }
+            } else if !is_test_profile_active() {
+                return Err(RouterError::InvalidPayload(format!(
+                    "Private destination for on-prem AI provider '{}' ({}) rejected: NEXUSEDGE_ONPREM_ALLOWED_CIDRS must be configured in production",
+                    host, ip
+                )));
+            }
         }
 
         Ok(())
@@ -864,7 +910,13 @@ impl Router {
                 }
 
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                    Self::validate_ai_provider_destination_ip(ip, &p.provider_type, host)?;
+                    Self::validate_ai_provider_destination_ip(
+                        ip,
+                        &p.provider_type,
+                        host,
+                        port,
+                        p.project_id.as_deref(),
+                    )?;
                     let addr = std::net::SocketAddr::new(ip, port);
                     let addrs = candidate_dns.entry(lower_host).or_default();
                     if !addrs.contains(&addr) {
@@ -883,7 +935,13 @@ impl Router {
                     let addrs = candidate_dns.entry(lower_host).or_default();
                     for addr in resolved_iter {
                         let ip = addr.ip();
-                        Self::validate_ai_provider_destination_ip(ip, &p.provider_type, host)?;
+                        Self::validate_ai_provider_destination_ip(
+                            ip,
+                            &p.provider_type,
+                            host,
+                            port,
+                            p.project_id.as_deref(),
+                        )?;
                         if !addrs.contains(&addr) {
                             addrs.push(addr);
                         }
@@ -1392,7 +1450,16 @@ pub fn is_private_or_reserved_ip(ip: std::net::IpAddr) -> bool {
 
 /// Returns true only if NEXUSEDGE_DEV_MODE=true AND NEXUSEDGE_ENV is development or test.
 /// Follows strict parity with Go Control Plane's isExplicitDevEnvironment().
+/// In production environments, test-only destination bypass is STRICTLY neutralized.
 pub fn is_test_profile_active() -> bool {
+    let env = std::env::var("NEXUSEDGE_ENV")
+        .or_else(|_| std::env::var("ENV"))
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+    if env == "production" || env == "prod" {
+        return false;
+    }
     let dev = std::env::var("NEXUSEDGE_DEV_MODE")
         .unwrap_or_default()
         .trim()
@@ -1400,12 +1467,78 @@ pub fn is_test_profile_active() -> bool {
     if !dev {
         return false;
     }
-    let env = std::env::var("NEXUSEDGE_ENV")
-        .or_else(|_| std::env::var("ENV"))
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
     env == "development" || env == "test"
+}
+
+/// Identifies whether a project identifier corresponds to an authorized platform operator project.
+/// Parity with Control Plane's isOperatorProject (Rule 54, 55).
+pub fn is_operator_project(project_id: Option<&str>) -> bool {
+    match project_id {
+        Some(p) => {
+            let p_trim = p.trim();
+            p_trim == "system"
+                || p_trim == "proj-default"
+                || p_trim == "proj-core"
+                || p_trim == "prj-ops"
+                || p_trim == "proj-infra"
+        }
+        None => false,
+    }
+}
+
+/// Checks whether an IP address falls within a specified CIDR block (e.g., "10.244.0.0/16" or "192.168.1.1").
+pub fn is_ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+    let parts: Vec<&str> = cidr.trim().split('/').collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let Ok(base_ip) = parts[0].parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let prefix = if parts.len() > 1 {
+        parts[1].parse::<u32>().ok()
+    } else {
+        None
+    };
+
+    match (ip, base_ip) {
+        (std::net::IpAddr::V4(target_v4), std::net::IpAddr::V4(base_v4)) => {
+            let prefix_len = prefix.unwrap_or(32).min(32);
+            if prefix_len == 0 {
+                return true;
+            }
+            let mask = !((1u64 << (32 - prefix_len)) - 1) as u32;
+            let target_u32 = u32::from(target_v4);
+            let base_u32 = u32::from(base_v4);
+            (target_u32 & mask) == (base_u32 & mask)
+        }
+        (std::net::IpAddr::V6(target_v6), std::net::IpAddr::V6(base_v6)) => {
+            let prefix_len = prefix.unwrap_or(128).min(128);
+            if prefix_len == 0 {
+                return true;
+            }
+            let target_u128 = u128::from(target_v6);
+            let base_u128 = u128::from(base_v6);
+            let mask = if prefix_len == 128 {
+                !0u128
+            } else {
+                !((1u128 << (128 - prefix_len)) - 1)
+            };
+            (target_u128 & mask) == (base_u128 & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Checks whether an IP address matches any of the comma-separated CIDR blocks in allowed_cidrs.
+pub fn is_ip_in_allowed_cidrs(ip: std::net::IpAddr, allowed_cidrs: &str) -> bool {
+    for cidr in allowed_cidrs.split(',') {
+        let trimmed = cidr.trim();
+        if !trimmed.is_empty() && is_ip_in_cidr(ip, trimmed) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Evaluates whether an origin destination IP is unsafe.
@@ -1794,6 +1927,8 @@ pub fn parse_pop_config_ai_providers(
         #[serde(default)]
         api_key: String,
         #[serde(default)]
+        secret_ref: Option<String>,
+        #[serde(default)]
         cost_per_m_tokens: f64,
         #[serde(default = "default_ai_priority")]
         priority: u32,
@@ -1847,6 +1982,14 @@ pub fn parse_pop_config_ai_providers(
             failover_cooldown_secs: w.failover_cooldown_secs,
             project_id: w.project_id.and_then(|p| {
                 let trimmed = p.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
+            secret_ref: w.secret_ref.and_then(|s| {
+                let trimmed = s.trim().to_string();
                 if trimmed.is_empty() {
                     None
                 } else {
@@ -2733,5 +2876,216 @@ mod tests {
         }"#;
         let parsed_absent = parse_pop_config_ai_providers(json_absent).unwrap();
         assert!(parsed_absent.is_none());
+    }
+
+    #[test]
+    fn test_validate_ai_provider_destination_ssrf_and_onprem_policy() {
+        use std::net::IpAddr;
+
+        // Ensure clean test environment baseline
+        std::env::remove_var("NEXUSEDGE_DEV_MODE");
+        std::env::remove_var("NEXUSEDGE_ENV");
+        std::env::remove_var("NEXUSEDGE_ONPREM_ALLOWED_CIDRS");
+
+        let metadata_ip: IpAddr = "169.254.169.254".parse().unwrap();
+        let loopback_ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let private_ip: IpAddr = "10.244.1.5".parse().unwrap();
+        let public_ip: IpAddr = "104.18.2.1".parse().unwrap();
+
+        // 1. Metadata IP is strictly blocked for both public and onprem providers
+        assert!(Router::validate_ai_provider_destination_ip(
+            metadata_ip,
+            "openai",
+            "169.254.169.254",
+            443,
+            None
+        )
+        .is_err());
+        assert!(Router::validate_ai_provider_destination_ip(
+            metadata_ip,
+            "onprem",
+            "169.254.169.254",
+            8000,
+            Some("system")
+        )
+        .is_err());
+
+        // 2. Loopback is blocked when test profile is inactive
+        assert!(Router::validate_ai_provider_destination_ip(
+            loopback_ip,
+            "openai",
+            "127.0.0.1",
+            443,
+            None
+        )
+        .is_err());
+
+        // 3. Public AI providers cannot resolve to private IP
+        assert!(Router::validate_ai_provider_destination_ip(
+            private_ip,
+            "openai",
+            "api.openai.com",
+            443,
+            None
+        )
+        .is_err());
+
+        // 4. Public AI providers resolve to valid public IP
+        assert!(Router::validate_ai_provider_destination_ip(
+            public_ip,
+            "openai",
+            "api.openai.com",
+            443,
+            None
+        )
+        .is_ok());
+
+        // 5. On-prem provider from tenant project attempting private IP is rejected (requires operator)
+        assert!(Router::validate_ai_provider_destination_ip(
+            private_ip,
+            "onprem",
+            "models.internal",
+            8000,
+            Some("tenant-corp-project")
+        )
+        .is_err());
+
+        // 6. On-prem provider from operator project on database port (5432) is rejected
+        assert!(Router::validate_ai_provider_destination_ip(
+            private_ip,
+            "onprem",
+            "models.internal",
+            5432,
+            Some("system")
+        )
+        .is_err());
+
+        // 7. On-prem provider with authorized operator project and inference port:
+        // (a) In production mode without NEXUSEDGE_ONPREM_ALLOWED_CIDRS -> rejected fail-closed
+        assert!(Router::validate_ai_provider_destination_ip(
+            private_ip,
+            "onprem",
+            "models.internal",
+            8000,
+            Some("system")
+        )
+        .is_err());
+
+        // (b) With NEXUSEDGE_ONPREM_ALLOWED_CIDRS matching 10.244.0.0/16 -> accepted
+        std::env::set_var(
+            "NEXUSEDGE_ONPREM_ALLOWED_CIDRS",
+            "10.244.0.0/16,172.20.0.0/16",
+        );
+        assert!(Router::validate_ai_provider_destination_ip(
+            private_ip,
+            "onprem",
+            "models.internal",
+            8000,
+            Some("system")
+        )
+        .is_ok());
+
+        // (c) With non-matching CIDR -> rejected
+        let other_private_ip: IpAddr = "192.168.1.50".parse().unwrap();
+        assert!(Router::validate_ai_provider_destination_ip(
+            other_private_ip,
+            "onprem",
+            "models.internal",
+            8000,
+            Some("system")
+        )
+        .is_err());
+
+        // 8. Invariant: NEXUSEDGE_ENV=production neutralizes dev-mode bypass
+        std::env::set_var("NEXUSEDGE_DEV_MODE", "true");
+        std::env::set_var("NEXUSEDGE_ENV", "production");
+        assert!(!is_test_profile_active());
+
+        // Cleanup
+        std::env::remove_var("NEXUSEDGE_DEV_MODE");
+        std::env::remove_var("NEXUSEDGE_ENV");
+        std::env::remove_var("NEXUSEDGE_ONPREM_ALLOWED_CIDRS");
+    }
+
+    #[test]
+    fn test_atomic_update_failure_preserves_valid_snapshot() {
+        let router = Router::new(vec![], 5000);
+        let resolver = crate::dns::PinnedDnsResolver::new();
+
+        // 1. Install initial valid route
+        let initial_route = DomainRoute {
+            host: "api.valid.com".to_string(),
+            origins: vec![UpstreamNode {
+                url: "http://104.18.2.1:80".to_string(),
+                sni: Some("api.valid.com".to_string()),
+                destination_addr: Some("104.18.2.1:80".parse().unwrap()),
+                healthy: true,
+                latency_ms: 5,
+                ewma_latency_ms: 5.0,
+                consecutive_passes: 3,
+                consecutive_failures: 0,
+            }],
+            path_routes: vec![],
+            security: None,
+            cache: None,
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
+        };
+
+        assert!(router
+            .update_routes_with_dns_and_ai(vec![initial_route], vec![], None, &resolver,)
+            .is_ok());
+
+        let initial_generation = router.generation();
+        assert!(router.select_upstream_for_host("api.valid.com").is_ok());
+
+        // 2. Attempt update with an SSRF-violating AI provider (cloud metadata 169.254.169.254)
+        let invalid_ai_provider = crate::ai::AiProvider {
+            id: "bad-ai".to_string(),
+            name: "Bad AI".to_string(),
+            endpoint: "http://169.254.169.254/v1".to_string(),
+            provider_type: "openai".to_string(),
+            api_key: None,
+            cost_per_m_tokens: 0.1,
+            priority: 1,
+            sovereignty_jurisdiction: None,
+            failover_cooldown_secs: 30,
+            project_id: Some("proj-corp".to_string()),
+            secret_ref: None,
+        };
+
+        let new_candidate_route = DomainRoute {
+            host: "api.candidate.com".to_string(),
+            origins: vec![UpstreamNode {
+                url: "http://104.18.2.2:80".to_string(),
+                sni: Some("api.candidate.com".to_string()),
+                destination_addr: Some("104.18.2.2:80".parse().unwrap()),
+                healthy: true,
+                latency_ms: 5,
+                ewma_latency_ms: 5.0,
+                consecutive_passes: 3,
+                consecutive_failures: 0,
+            }],
+            path_routes: vec![],
+            security: None,
+            cache: None,
+            round_robin_index: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let result = router.update_routes_with_dns_and_ai(
+            vec![new_candidate_route],
+            vec![],
+            Some(&[invalid_ai_provider]),
+            &resolver,
+        );
+
+        // Validation MUST fail
+        assert!(result.is_err());
+
+        // 3. Invariant: Router snapshot generation and routes remain UNTOUCHED
+        assert_eq!(router.generation(), initial_generation);
+        assert!(router.select_upstream_for_host("api.valid.com").is_ok());
+        assert!(router
+            .select_upstream_for_host("api.candidate.com")
+            .is_err());
     }
 }

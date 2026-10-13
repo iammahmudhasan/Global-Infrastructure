@@ -85,12 +85,11 @@
       closeModal('new-domain-modal');
 
       try {
-        const resp = await fetch('http://127.0.0.1:8081/v1/projects/proj-default/domains', {
+        const resp = await fetch('/api/proxy/domains', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             hostname: domain,
-            project_id: 'proj-default',
             default_origin: '172.28.0.10:8081'
           })
         });
@@ -126,13 +125,49 @@
       const prompt = document.getElementById('sim-prompt').value;
       const term = document.getElementById('sim-terminal');
       const btn = document.getElementById('sim-dispatch-btn');
+      const isDemo = document.getElementById('sim-demo-mode') && document.getElementById('sim-demo-mode').checked;
 
       btn.disabled = true;
       btn.innerText = "Dispatching Through Edge Fast-Path...";
 
-      term.innerText += `\n\n> [DISPATCH] Strategy: ${strategy.toUpperCase()} | Jurisdiction: ${jurisdiction || 'GLOBAL'}`;
+      term.innerText += `\n\n> [DISPATCH] Strategy: ${strategy.toUpperCase()} | Jurisdiction: ${jurisdiction || 'GLOBAL'}${isDemo ? ' [DEMO MODE]' : ''}`;
       term.innerText += `\n> Routing payload: "${prompt.substring(0, 40)}..."`;
 
+      if (isDemo) {
+        // Explicit Offline Demo Simulation Mode
+        let simulatedProvider = 'spot-coreweave';
+        let cost = '0.50';
+        let ttft = '18';
+        if (jurisdiction === 'BD') {
+          simulatedProvider = 'onprem-dhaka-dgx';
+          cost = '0.80';
+          ttft = '3.8';
+        } else if (strategy === 'latency') {
+          simulatedProvider = 'onprem-dhaka-dgx';
+          cost = '0.80';
+          ttft = '3.8';
+        }
+
+        term.innerText += `\n< HTTP/1.1 200 OK (DEMO SIMULATION ONLY)
+< [SIMULATED] Mode active: synthetic metrics are not real gateway measurements.
+< X-NexusEdge-Provider: ${simulatedProvider} [SIMULATED]
+< X-NexusEdge-Routing-Strategy: ${strategy}
+< X-NexusEdge-Cost-Per-MTokens: $${cost}
+< X-NexusEdge-Tokens-Total: 512
+< X-NexusEdge-Estimated-Savings-USD: $0.001024
+< X-NexusEdge-TTFT-Ms: ${ttft} ms
+< X-NexusEdge-Failover-Count: 0
+< X-NexusEdge-Total-Duration-Ms: 22 ms
+
+Result: [SIMULATED] Demo placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within Bangladesh NDMA 2026 constraints.`;
+        showToast(`Demo Simulation: routed to ${simulatedProvider} (Simulated)`);
+        btn.disabled = false;
+        btn.innerText = "Dispatch Through Edge Director";
+        term.scrollTop = term.scrollHeight;
+        return;
+      }
+
+      // Real Edge Execution through BFF Proxy (Zero Browser Credentials)
       try {
         const headers = {
           'Content-Type': 'application/json',
@@ -142,7 +177,7 @@
           headers['X-NexusEdge-Jurisdiction'] = jurisdiction;
         }
 
-        const resp = await fetch('http://127.0.0.1:8080/v1/chat/completions', {
+        const resp = await fetch('/api/proxy/inference', {
           method: 'POST',
           headers: headers,
           body: JSON.stringify({
@@ -152,6 +187,26 @@
             max_tokens: 128
           })
         });
+
+        if (!resp.ok) {
+          let errDetail = '';
+          try {
+            const errJson = await resp.json();
+            errDetail = errJson.error || errJson.message || JSON.stringify(errJson);
+          } catch (e) {
+            errDetail = await resp.text();
+          }
+
+          term.innerText += `\n< HTTP/1.1 ${resp.status} ${resp.statusText || 'Error'}
+< Content-Type: application/json
+
+[ERROR] Edge Gateway inference dispatch failed:
+Status: ${resp.status}
+Details: ${errDetail || 'Gateway rejected request'}
+To test simulated placement offline, enable 'Offline Demo Mode' toggle.`;
+          showToast(`Inference failed: HTTP ${resp.status}`);
+          return;
+        }
 
         const provider = resp.headers.get('x-nexusedge-provider') || 'spot-coreweave';
         const costPerM = resp.headers.get('x-nexusedge-cost-per-mtokens') || '0.50';
@@ -174,32 +229,10 @@
 Response payload delivered successfully with zero gateway overhead.`;
         showToast(`Inference dispatched: routed to ${provider} ($${costPerM}/1M tokens)`);
       } catch (err) {
-        // Fallback simulation when edge is not locally bound
-        let simulatedProvider = 'spot-coreweave';
-        let cost = '0.50';
-        let ttft = '18';
-        if (jurisdiction === 'BD') {
-          simulatedProvider = 'onprem-dhaka-dgx';
-          cost = '0.80';
-          ttft = '3.8';
-        } else if (strategy === 'latency') {
-          simulatedProvider = 'onprem-dhaka-dgx';
-          cost = '0.80';
-          ttft = '3.8';
-        }
-
-        term.innerText += `\n< HTTP/1.1 200 OK (SIMULATED ENGINE)
-< X-NexusEdge-Provider: ${simulatedProvider}
-< X-NexusEdge-Routing-Strategy: ${strategy}
-< X-NexusEdge-Cost-Per-MTokens: $${cost}
-< X-NexusEdge-Tokens-Total: 512
-< X-NexusEdge-Estimated-Savings-USD: $0.001024
-< X-NexusEdge-TTFT-Ms: ${ttft} ms
-< X-NexusEdge-Failover-Count: 0
-< X-NexusEdge-Total-Duration-Ms: 22 ms
-
-Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within Bangladesh NDMA 2026 constraints.`;
-        showToast(`Inference dispatched: routed to ${simulatedProvider} (Simulated)`);
+        term.innerText += `\n[ERROR] Connection failed: Edge Gateway is unreachable or rejected connection.
+Details: ${err.message}
+Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' checkbox for synthetic walkthrough.`;
+        showToast(`Inference failed: Edge Gateway unreachable`);
       } finally {
         btn.disabled = false;
         btn.innerText = "Dispatch Through Edge Director";
@@ -210,9 +243,7 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
     // Cryptographic Audit Trail Verification Engine (HMAC-SHA256)
     async function fetchAuditLogs() {
       try {
-        const resp = await fetch('http://127.0.0.1:9091/v1/audit-logs?limit=10', {
-          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
-        });
+        const resp = await fetch('/api/proxy/audit-logs?limit=10');
         if (!resp.ok) return;
         const data = await resp.json();
         if (!data || !data.audit_logs || data.audit_logs.length === 0) return;
@@ -293,9 +324,7 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       }
 
       try {
-        const resp = await fetch('http://127.0.0.1:9091/v1/audit-logs/verify', {
-          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
-        });
+        const resp = await fetch('/api/proxy/audit-logs/verify');
         if (resp.ok) {
           const data = await resp.json();
           if (data.chain_valid) {
@@ -332,7 +361,7 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       if (!pill || !dot || !text) return;
 
       try {
-        const res = await fetch('http://127.0.0.1:9091/healthz');
+        const res = await fetch('/api/health');
         if (res.ok) {
           pill.style.borderColor = 'rgba(16, 185, 129, 0.4)';
           pill.style.background = 'rgba(16, 185, 129, 0.12)';
@@ -362,9 +391,7 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       if (!tbody) return;
 
       try {
-        const resp = await fetch('http://127.0.0.1:9091/v1/projects/proj-core/domains', {
-          headers: { 'Authorization': 'Bearer dev-fixture-key-01' }
-        });
+        const resp = await fetch('/api/proxy/domains');
         if (resp.ok) {
           const data = await resp.json();
           const domains = data.domains || (Array.isArray(data) ? data : []);
@@ -468,7 +495,20 @@ Result: Placed at [${simulatedProvider}], achieving $${cost}/1M spot rate within
       tbody.prepend(tr);
     }
 
+    async function initSessionContext() {
+      try {
+        const resp = await fetch('/api/auth/session');
+        if (resp.ok) {
+          const session = await resp.json();
+          window.__nexusedge_session = session;
+        }
+      } catch (e) {
+        // BFF running offline
+      }
+    }
+
     // Initial Dashboard Bootstrap
+    initSessionContext();
     checkControlPlaneHealth();
     loadDomains();
     fetchAuditLogs();

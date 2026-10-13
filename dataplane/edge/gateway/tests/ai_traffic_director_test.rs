@@ -57,6 +57,7 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
             sovereignty_jurisdiction: Some("US".to_string()),
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
         AiProvider {
             id: "coreweave-fallback".to_string(),
@@ -69,6 +70,7 @@ async fn test_ai_traffic_director_sovereignty_and_transparent_failover() {
             sovereignty_jurisdiction: Some("US".to_string()),
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
     ];
 
@@ -161,6 +163,7 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
         AiProvider {
             id: "spot-coreweave".to_string(),
@@ -173,6 +176,7 @@ async fn test_ai_cost_arbitrage_and_token_savings_telemetry() {
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
     ];
 
@@ -293,6 +297,7 @@ fn test_ai_multi_strategy_selection() {
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
         AiProvider {
             id: "fast-provider".to_string(),
@@ -305,6 +310,7 @@ fn test_ai_multi_strategy_selection() {
             sovereignty_jurisdiction: None,
             failover_cooldown_secs: 10,
             project_id: None,
+            secret_ref: None,
         },
     ];
 
@@ -478,6 +484,7 @@ async fn test_anthropic_client_to_vllm_cross_protocol_dispatch() {
         sovereignty_jurisdiction: None,
         failover_cooldown_secs: 10,
         project_id: None,
+        secret_ref: None,
     }];
 
     let director = AiTrafficDirector::new_with_fixtures(providers);
@@ -570,6 +577,7 @@ async fn test_ai_payload_translation_fails_closed() {
         sovereignty_jurisdiction: None,
         failover_cooldown_secs: 10,
         project_id: None,
+        secret_ref: None,
     }];
     let director = AiTrafficDirector::new_with_fixtures(providers);
     let client = HttpClient::new();
@@ -720,6 +728,7 @@ async fn test_ai_gateway_sanitizes_upstream_headers_and_injects_latency_metric()
         sovereignty_jurisdiction: None,
         failover_cooldown_secs: 10,
         project_id: None,
+        secret_ref: None,
     }];
 
     let director = AiTrafficDirector::new_with_fixtures(providers);

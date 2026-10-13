@@ -1244,7 +1244,8 @@ func (s *Store) SaveAIProvider(p *model.AIProvider) error {
 	switch p.ProviderType {
 	case string(model.AIProviderTypeOpenAI), string(model.AIProviderTypeAzure),
 		string(model.AIProviderTypeCoreWeave), string(model.AIProviderTypeVLLM),
-		string(model.AIProviderTypeOnPrem), string(model.AIProviderTypeAWS):
+		string(model.AIProviderTypeOnPrem), string(model.AIProviderTypeAWS),
+		string(model.AIProviderTypeAnthropic), string(model.AIProviderTypeBedrock):
 	default:
 		return fmt.Errorf("unsupported provider_type '%s'", p.ProviderType)
 	}

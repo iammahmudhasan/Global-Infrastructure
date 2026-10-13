@@ -3570,3 +3570,257 @@ func TestAuditLogsVerifyRoute_OperatorOnlyRBAC(t *testing.T) {
 		t.Fatalf("expected chain_valid=true, got %v", verifyResp["chain_valid"])
 	}
 }
+
+func TestPoPSnapshot_NeverContainsRawAPIKey(t *testing.T) {
+	handler := setupTestServer()
+	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenantWithRole("key-operator-01", "operator-system", "proj-core", auth.RolePlatformOperator, "*")
+	authenticator.RegisterTenantWithRole("key-tenant-alpha", "t-alpha", "prj-alpha", auth.RoleTenant)
+	authenticator.RegisterNodeWithPoP("key-node-dhaka", "t-node", "prj-alpha", "node-dhk-01", "dhaka", "prj-alpha")
+	handler.SetAuthenticator(authenticator)
+
+	// 1. Configure active domain topology for prj-alpha on Dhaka
+	st := handler.Store()
+	_ = st.SaveDomain(&model.Domain{
+		ID:          "dom-alpha",
+		ProjectID:   "prj-alpha",
+		Hostname:    "api.tenant-alpha.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"dhaka"},
+	})
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          "pool-alpha",
+		ProjectID:   "prj-alpha",
+		AllowedPoPs: []string{"dhaka"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-alpha-1",
+				PoolID:      "pool-alpha",
+				Address:     "198.51.100.22",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				AllowedPoPs: []string{"dhaka"},
+			},
+		},
+	})
+	_ = st.SaveRoute(&model.Route{
+		ID:         "rt-alpha",
+		DomainID:   "dom-alpha",
+		PoolID:     "pool-alpha",
+		PathPrefix: "/",
+	})
+
+	// 2. Register an AI Provider with a sensitive API key for prj-alpha
+	sensitiveKey := "sk-live-super-secret-production-token-9988"
+	providerBody, _ := json.Marshal(map[string]interface{}{
+		"project_id":                "prj-alpha",
+		"name":                      "OpenAI Alpha Production",
+		"provider_type":             "openai",
+		"endpoint":                  "https://api.openai.com/v1",
+		"api_key":                   sensitiveKey,
+		"enabled":                   true,
+		"cost_per_m_tokens":         2.50,
+		"priority":                  1,
+		"sovereignty_jurisdiction":  "GLOBAL",
+		"failover_cooldown_seconds": 60,
+	})
+	provReq := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/ai/providers", bytes.NewReader(providerBody))
+	provReq.Header.Set("X-API-Key", "key-tenant-alpha")
+	provW := httptest.NewRecorder()
+	handler.ServeHTTP(provW, provReq)
+	if provW.Code != http.StatusCreated {
+		t.Fatalf("failed to create provider: %d: %s", provW.Code, provW.Body.String())
+	}
+
+	var createdProvider model.AIProviderResponse
+	if err := json.Unmarshal(provW.Body.Bytes(), &createdProvider); err != nil {
+		t.Fatalf("failed to decode provider response: %v", err)
+	}
+
+	// 3. Request PoP snapshot config (GET /v1/edge/pops/dhaka/config)
+	snapshotReq := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/config", nil)
+	snapshotReq.Header.Set("X-API-Key", "key-node-dhaka")
+	snapshotW := httptest.NewRecorder()
+	handler.ServeHTTP(snapshotW, snapshotReq)
+	if snapshotW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from pop snapshot, got %d: %s", snapshotW.Code, snapshotW.Body.String())
+	}
+
+	snapshotJSON := snapshotW.Body.String()
+
+	// ACCEPTANCE CRITERIA: Serialized snapshot must NEVER contain raw provider key
+	if strings.Contains(snapshotJSON, sensitiveKey) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: Raw provider API key leaked into serialized PoP snapshot: %s", snapshotJSON)
+	}
+
+	var syncResp model.PoPConfigSync
+	if err := json.Unmarshal(snapshotW.Body.Bytes(), &syncResp); err != nil {
+		t.Fatalf("failed to parse PoPConfigSync: %v", err)
+	}
+
+	if len(syncResp.AIProviders) == 0 {
+		t.Fatalf("expected at least 1 AI provider in PoP snapshot, got 0")
+	}
+
+	// Verify SecretRef is correctly generated and raw key is absent
+	expectedSecretRef := fmt.Sprintf("vault://projects/prj-alpha/ai-providers/%s/key", createdProvider.ID)
+	foundRef := false
+	for _, p := range syncResp.AIProviders {
+		if p.ID == createdProvider.ID {
+			foundRef = true
+			if p.SecretRef != expectedSecretRef {
+				t.Fatalf("expected secret_ref %q, got %q", expectedSecretRef, p.SecretRef)
+			}
+		}
+	}
+	if !foundRef {
+		t.Fatalf("expected provider %s with SecretRef in snapshot", createdProvider.ID)
+	}
+}
+
+func TestSecretRetrieval_MultiTenantPoPScopeAndSecurity(t *testing.T) {
+	handler := setupTestServer()
+	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenantWithRole("key-operator-01", "operator-system", "proj-core", auth.RolePlatformOperator, "*")
+	authenticator.RegisterTenantWithRole("key-tenant-alpha", "t-alpha", "prj-alpha", auth.RoleTenant)
+	authenticator.RegisterTenantWithRole("key-tenant-bravo", "t-bravo", "prj-bravo", auth.RoleTenant)
+	// Node in Dhaka authorized only for prj-alpha
+	authenticator.RegisterNodeWithPoP("key-node-dhaka", "t-node", "prj-alpha", "node-dhk-01", "dhaka", "prj-alpha")
+	// Node in Virginia authorized for prj-bravo
+	authenticator.RegisterNodeWithPoP("key-node-virginia", "t-node", "prj-bravo", "node-iad-01", "virginia", "prj-bravo")
+	handler.SetAuthenticator(authenticator)
+
+	// 1. Configure active domain topology for prj-alpha on Dhaka
+	st := handler.Store()
+	_ = st.SaveDomain(&model.Domain{
+		ID:          "dom-alpha",
+		ProjectID:   "prj-alpha",
+		Hostname:    "alpha.example.com",
+		Status:      model.DomainStatusActive,
+		AllowedPoPs: []string{"dhaka"},
+	})
+	_ = st.SaveOriginPool(&model.OriginPool{
+		ID:          "pool-alpha",
+		ProjectID:   "prj-alpha",
+		AllowedPoPs: []string{"dhaka"},
+		Origins: []model.Origin{
+			{
+				ID:          "orig-alpha-1",
+				PoolID:      "pool-alpha",
+				Address:     "198.51.100.22",
+				Port:        443,
+				Protocol:    "HTTPS",
+				Healthy:     true,
+				AllowedPoPs: []string{"dhaka"},
+			},
+		},
+	})
+	_ = st.SaveRoute(&model.Route{
+		ID:         "rt-alpha",
+		DomainID:   "dom-alpha",
+		PoolID:     "pool-alpha",
+		PathPrefix: "/",
+	})
+
+	// 2. Create provider for prj-alpha
+	providerAlpha, _ := json.Marshal(map[string]interface{}{
+		"project_id":                "prj-alpha",
+		"name":                      "OpenAI Alpha",
+		"provider_type":             "openai",
+		"endpoint":                  "https://api.openai.com/v1",
+		"api_key":                   "sk-alpha-secure-key-9999",
+		"enabled":                   true,
+		"cost_per_m_tokens":         2.0,
+		"priority":                  1,
+		"sovereignty_jurisdiction":  "GLOBAL",
+		"failover_cooldown_seconds": 60,
+	})
+	pReq := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-alpha/ai/providers", bytes.NewReader(providerAlpha))
+	pReq.Header.Set("X-API-Key", "key-tenant-alpha")
+	pW := httptest.NewRecorder()
+	handler.ServeHTTP(pW, pReq)
+	var createdAlpha model.AIProviderResponse
+	_ = json.Unmarshal(pW.Body.Bytes(), &createdAlpha)
+
+	// 3. Create provider for prj-bravo
+	providerBravo, _ := json.Marshal(map[string]interface{}{
+		"project_id":                "prj-bravo",
+		"name":                      "Anthropic Bravo",
+		"provider_type":             "anthropic",
+		"endpoint":                  "https://api.anthropic.com/v1",
+		"api_key":                   "sk-ant-bravo-confidential-8888",
+		"enabled":                   true,
+		"cost_per_m_tokens":         3.0,
+		"priority":                  1,
+		"sovereignty_jurisdiction":  "GLOBAL",
+		"failover_cooldown_seconds": 60,
+	})
+	pReqB := httptest.NewRequest(http.MethodPost, "/v1/projects/prj-bravo/ai/providers", bytes.NewReader(providerBravo))
+	pReqB.Header.Set("X-API-Key", "key-tenant-bravo")
+	pWB := httptest.NewRecorder()
+	handler.ServeHTTP(pWB, pReqB)
+	if pWB.Code != http.StatusCreated {
+		t.Fatalf("failed to create provider bravo: %d: %s", pWB.Code, pWB.Body.String())
+	}
+	var createdBravo model.AIProviderResponse
+	_ = json.Unmarshal(pWB.Body.Bytes(), &createdBravo)
+
+	// CASE 1: Successful Secret Retrieval by authorized Dhaka node for prj-alpha
+	secretReqBody, _ := json.Marshal(model.SecretRetrieveRequest{
+		SecretRef:  fmt.Sprintf("vault://projects/prj-alpha/ai-providers/%s/key", createdAlpha.ID),
+		ProjectID:  "prj-alpha",
+		ProviderID: createdAlpha.ID,
+	})
+	sReq := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(secretReqBody))
+	sReq.Header.Set("X-API-Key", "key-node-dhaka")
+	sW := httptest.NewRecorder()
+	handler.ServeHTTP(sW, sReq)
+	if sW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on authorized secret retrieval, got %d: %s", sW.Code, sW.Body.String())
+	}
+	var sResp model.SecretRetrieveResponse
+	if err := json.Unmarshal(sW.Body.Bytes(), &sResp); err != nil {
+		t.Fatalf("failed to decode secret response: %v", err)
+	}
+	if sResp.APIKey != "sk-alpha-secure-key-9999" {
+		t.Fatalf("expected resolved APIKey 'sk-alpha-secure-key-9999', got %q", sResp.APIKey)
+	}
+
+	// CASE 2: Cross-Project Forbidden - Dhaka node (prj-alpha) attempts to steal prj-bravo secret
+	crossProjectReqBody, _ := json.Marshal(model.SecretRetrieveRequest{
+		SecretRef:  fmt.Sprintf("vault://projects/prj-bravo/ai-providers/%s/key", createdBravo.ID),
+		ProjectID:  "prj-bravo",
+		ProviderID: createdBravo.ID,
+	})
+	crossReq := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(crossProjectReqBody))
+	crossReq.Header.Set("X-API-Key", "key-node-dhaka") // Authorized only for prj-alpha
+	crossW := httptest.NewRecorder()
+	handler.ServeHTTP(crossW, crossReq)
+	if crossW.Code != http.StatusForbidden {
+		t.Fatalf("CRITICAL SECURITY HOLE: Expected 403 Forbidden on cross-project secret access, got %d: %s", crossW.Code, crossW.Body.String())
+	}
+
+	// CASE 3: PoP Identity Mismatch - Node for Dhaka calls Virginia PoP secret endpoint
+	popMismatchReq := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/virginia/secrets/retrieve", bytes.NewReader(secretReqBody))
+	popMismatchReq.Header.Set("X-API-Key", "key-node-dhaka") // Node is in dhaka, not virginia
+	popMismatchW := httptest.NewRecorder()
+	handler.ServeHTTP(popMismatchW, popMismatchReq)
+	if popMismatchW.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when node requests secret from unauthorized PoP, got %d: %s", popMismatchW.Code, popMismatchW.Body.String())
+	}
+
+	// CASE 4: Malformed SecretRef URI rejected
+	malformedReqBody, _ := json.Marshal(model.SecretRetrieveRequest{
+		SecretRef:  "vault://projects/prj-alpha/malformed-path",
+		ProjectID:  "prj-alpha",
+		ProviderID: createdAlpha.ID,
+	})
+	malformedReq := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(malformedReqBody))
+	malformedReq.Header.Set("X-API-Key", "key-node-dhaka")
+	malformedW := httptest.NewRecorder()
+	handler.ServeHTTP(malformedW, malformedReq)
+	if malformedW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on malformed secret_ref, got %d: %s", malformedW.Code, malformedW.Body.String())
+	}
+}

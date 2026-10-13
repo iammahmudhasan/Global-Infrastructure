@@ -465,12 +465,28 @@ type GatewayAIProviderSync struct {
 	Name                    string  `json:"name"`
 	Endpoint                string  `json:"endpoint"`
 	ProviderType            string  `json:"provider_type"`
-	APIKey                  string  `json:"api_key,omitempty"`
 	SecretRef               string  `json:"secret_ref,omitempty"`
 	CostPerMTokens          float64 `json:"cost_per_m_tokens"`
 	Priority                uint32  `json:"priority"`
 	SovereigntyJurisdiction string  `json:"sovereignty_jurisdiction,omitempty"`
 	FailoverCooldownSecs    uint64  `json:"failover_cooldown_secs"`
+}
+
+// SecretRetrieveRequest models edge gateway authenticated secret retrieval
+type SecretRetrieveRequest struct {
+	SecretRef  string `json:"secret_ref"`
+	ProjectID  string `json:"project_id"`
+	ProviderID string `json:"provider_id"`
+}
+
+// SecretRetrieveResponse returns resolved secret for edge gateway
+type SecretRetrieveResponse struct {
+	SecretRef  string    `json:"secret_ref"`
+	ProjectID  string    `json:"project_id"`
+	ProviderID string    `json:"provider_id"`
+	APIKey     string    `json:"api_key"`
+	KeyVersion string    `json:"key_version"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
 // PoPConfigSync delivers synchronized Envoy configuration tailored for a specific PoP

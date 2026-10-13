@@ -19,11 +19,18 @@ RUN cargo build --release
 # Runtime Stage
 FROM ${RUNTIME_IMAGE}
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -g 10001 nexusedge && \
+    useradd -u 10001 -g nexusedge -m -s /bin/bash nexusedge
 
 WORKDIR /app
 COPY --from=builder /usr/src/nexusedge/target/release/nexusedge-gateway /app/nexusedge-gateway
 COPY gateway.yaml /app/gateway.yaml
+
+RUN chown -R 10001:10001 /app
+
+USER 10001:10001
 
 EXPOSE 8080
 

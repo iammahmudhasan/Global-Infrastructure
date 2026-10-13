@@ -197,3 +197,20 @@ func (l *AuditLogger) LastHash() string {
 	defer l.mu.RUnlock()
 	return l.lastHash
 }
+
+// RollbackLastRecord removes the last appended record if its ID matches, restoring the previous head hash.
+// This prevents divergence between persistent database storage and in-memory cryptographic state on storage failure.
+func (l *AuditLogger) RollbackLastRecord(recordID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	n := len(l.records)
+	if n > 0 && l.records[n-1].ID == recordID {
+		l.records = l.records[:n-1]
+		if len(l.records) > 0 {
+			l.lastHash = l.records[len(l.records)-1].Hash
+		} else {
+			l.lastHash = GenesisHash
+		}
+	}
+}

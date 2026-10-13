@@ -125,6 +125,77 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		t.Fatalf("failed to save renewed certificate: %v", err)
 	}
 
+	// 1.5 Additional durable models: TLS settings, WAF rule, Cache rule, Health monitor, AI provider
+	tlsSettings := &model.TLSSettings{
+		EnforceHTTPS:  true,
+		MinTLSVersion: "TLSv1.3",
+		HSTS:          true,
+		HSTSMaxAge:    31536000,
+	}
+	if err := repo1.SaveTLSSettings(dom.ID, tlsSettings); err != nil {
+		t.Fatalf("failed to save TLS settings: %v", err)
+	}
+
+	wafRule := model.WAFRule{
+		ID:          "waf-rec-" + testDomainID,
+		DomainID:    dom.ID,
+		Name:        "Block Admin",
+		Description: "Block administrative uri access",
+		MatchType:   model.WAFMatchPathPrefix,
+		Pattern:     "/admin",
+		Action:      model.WAFActionBlock,
+		Priority:    10,
+		Enabled:     true,
+	}
+	if err := repo1.AddWAFRule(dom.ID, wafRule); err != nil {
+		t.Fatalf("failed to save WAF rule: %v", err)
+	}
+
+	cacheRule := model.CacheRule{
+		ID:          "cache-rec-" + testDomainID,
+		DomainID:    dom.ID,
+		Name:        "Static Cache",
+		PathPattern: "/static/*",
+		TTLSeconds:  86400,
+		Enabled:     true,
+	}
+	if err := repo1.AddCacheRule(dom.ID, cacheRule); err != nil {
+		t.Fatalf("failed to save Cache rule: %v", err)
+	}
+
+	hm := &model.HealthMonitor{
+		ID:                  "hm-rec-" + testDomainID,
+		PoolID:              pool.ID,
+		Protocol:            model.HealthCheckProtocolHTTP,
+		Path:                "/healthz",
+		Port:                443,
+		IntervalSeconds:     10,
+		TimeoutSeconds:      2,
+		UnhealthyThreshold:  3,
+		HealthyThreshold:    2,
+		ExpectedStatusCodes: []int{200, 204},
+	}
+	if err := repo1.SaveHealthMonitor(hm); err != nil {
+		t.Fatalf("failed to save health monitor: %v", err)
+	}
+
+	aiProvider := &model.AIProvider{
+		ID:                      "ai-rec-" + testDomainID,
+		ProjectID:               "prj-recovery",
+		Name:                    "Recovery Anthropic Provider",
+		Endpoint:                "https://api.anthropic.com/v1",
+		ProviderType:            "anthropic",
+		APIKey:                  "sk-ant-test-recovery-key-12345",
+		CostPerMTokens:          15.0,
+		Priority:                1,
+		FailoverCooldownSecs:    30,
+		Enabled:                 true,
+		SovereigntyJurisdiction: "GLOBAL",
+	}
+	if err := repo1.SaveAIProvider(aiProvider); err != nil {
+		t.Fatalf("failed to save AI provider: %v", err)
+	}
+
 	_ = repo1.Close()
 
 	// 2. Simulated process restart: Create second independent repository instance from database
@@ -134,6 +205,7 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	}
 	defer func() {
 		_ = repo2.DeleteDomain(dom.ID)
+		_ = repo2.DeleteAIProvider(aiProvider.ID)
 		_ = repo2.Close()
 	}()
 
@@ -167,6 +239,36 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		t.Fatalf("expected renewed serial number %s, got %s", renewedCert.SerialNumber, recoveredCert.SerialNumber)
 	}
 
+	// 3.1 Verify TLS settings persistence across restart
+	recoveredTLS := repo2.GetTLSSettings(dom.ID)
+	if recoveredTLS == nil || recoveredTLS.MinTLSVersion != "TLSv1.3" || !recoveredTLS.HSTS || recoveredTLS.HSTSMaxAge != 31536000 {
+		t.Fatalf("TLS settings not recovered correctly across restart: %+v", recoveredTLS)
+	}
+
+	// 3.2 Verify WAF rules persistence across restart
+	recoveredWAF := repo2.GetWAFRules(dom.ID)
+	if len(recoveredWAF) != 1 || recoveredWAF[0].Pattern != "/admin" {
+		t.Fatalf("WAF rules not recovered correctly across restart: %+v", recoveredWAF)
+	}
+
+	// 3.3 Verify Cache rules persistence across restart
+	recoveredCache := repo2.GetCacheRules(dom.ID)
+	if len(recoveredCache) != 1 || recoveredCache[0].PathPattern != "/static/*" || recoveredCache[0].TTLSeconds != 86400 {
+		t.Fatalf("Cache rules not recovered correctly across restart: %+v", recoveredCache)
+	}
+
+	// 3.4 Verify Health Monitor persistence across restart
+	recoveredHM := repo2.GetHealthMonitor(pool.ID)
+	if recoveredHM == nil || recoveredHM.Path != "/healthz" || len(recoveredHM.ExpectedStatusCodes) != 2 {
+		t.Fatalf("Health monitor not recovered correctly across restart: %+v", recoveredHM)
+	}
+
+	// 3.5 Verify AI Provider persistence and key decryption across restart
+	recoveredAI, err := repo2.GetAIProvider(aiProvider.ID)
+	if err != nil || recoveredAI == nil || recoveredAI.APIKey != "sk-ant-test-recovery-key-12345" {
+		t.Fatalf("AI provider not recovered correctly across restart: %+v, err: %v", recoveredAI, err)
+	}
+
 	// 4. Verify compiled topology generation across restart
 	topologies := repo2.GetActiveTopologies()
 	var foundTopo *store.DomainTopology
@@ -181,5 +283,48 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	}
 	if len(foundTopo.Routes) != 1 || foundTopo.Pools[pool.ID] == nil {
 		t.Fatalf("recovered topology routes/pools incomplete: %+v", foundTopo)
+	}
+}
+
+func TestPostgresRepository_WriteFailureDoesNotCorruptCache(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping PostgresRepository write failure test: NEXUSEDGE_TEST_DATABASE_URL is not set")
+	}
+
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository: %v", err)
+	}
+
+	// Close underlying DB connection to force database write failures
+	_ = repo.Close()
+
+	unpersistedDomainID := fmt.Sprintf("dom-fail-%d", time.Now().UnixNano())
+	badDom := &model.Domain{
+		ID:             unpersistedDomainID,
+		ProjectID:      "prj-fail",
+		Hostname:       unpersistedDomainID + ".example.com",
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+		AllowedPoPs:    []string{"singapore"},
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}
+
+	// Attempt write — MUST fail because DB is closed
+	err = repo.SaveDomain(badDom)
+	if err == nil {
+		t.Fatalf("expected write error to closed database, got nil")
+	}
+
+	// Invariant: Failed write must NOT update or corrupt active in-memory cache
+	recovered, err := repo.GetDomain(unpersistedDomainID)
+	if err == nil && recovered != nil {
+		t.Fatalf("cache was corrupted with unpersisted domain on DB write failure")
 	}
 }

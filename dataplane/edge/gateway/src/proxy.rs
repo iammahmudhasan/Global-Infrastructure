@@ -329,7 +329,12 @@ pub async fn handle_request(
     }
 
     if path == "/ready" {
-        let is_ready = state.is_ready.load(std::sync::atomic::Ordering::Acquire);
+        let ai_ready = if let Some(ref director) = state.ai_director {
+            director.auth_registry().is_healthy()
+        } else {
+            true
+        };
+        let is_ready = state.is_ready.load(std::sync::atomic::Ordering::Acquire) && ai_ready;
         let status = if is_ready {
             StatusCode::OK
         } else {
@@ -337,7 +342,8 @@ pub async fn handle_request(
         };
         let body = serde_json::json!({
             "status": if is_ready { "ready" } else { "unready" },
-            "control_plane_synced": is_ready,
+            "control_plane_synced": state.is_ready.load(std::sync::atomic::Ordering::Acquire),
+            "auth_registry_healthy": ai_ready,
         });
         let resp = Response::builder()
             .status(status)
