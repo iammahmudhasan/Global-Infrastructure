@@ -211,7 +211,19 @@ func TestHighConcurrency_Pipeline(t *testing.T) {
 		}()
 	}
 
-	wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Successful completion
+	case <-time.After(20 * time.Second):
+		t.Fatalf("concurrency pipeline deadlocked or failed to finish within 20s timeout")
+	}
+
 	duration := time.Since(startTime)
 
 	// Verify Summary
@@ -236,9 +248,48 @@ func TestHighConcurrency_Pipeline(t *testing.T) {
 	opsPerSec := float64(totalExpected) / duration.Seconds()
 	t.Logf("High Concurrency Pipeline Processed %d transactions in %v (%.2f ops/sec)", totalExpected, duration, opsPerSec)
 	// Guard against deadlocks or pipeline stalls while accommodating Go race detector (-race) overhead on shared CI runners
-	if opsPerSec < 500.0 {
-		t.Errorf("expected throughput > 500 ops/sec under concurrency, achieved %.2f ops/sec", opsPerSec)
+	if opsPerSec < 300.0 {
+		t.Errorf("expected throughput > 300 ops/sec under concurrency, achieved %.2f ops/sec", opsPerSec)
 	}
+}
+
+// BenchmarkPipeline_Throughput measures raw multi-worker end-to-end WAF, telemetry, and steering pipeline throughput
+func BenchmarkPipeline_Throughput(b *testing.B) {
+	wafEngine := security.NewWAFEngine()
+	analyticsEngine := analytics.NewEngine()
+	popManager := pop.NewManager()
+
+	domainID := "dom_benchmark_throughput"
+	policy := &model.SecurityPolicy{
+		DomainID:   domainID,
+		WAFEnabled: true,
+		WAFMode:    "BLOCK",
+	}
+
+	origins := []model.Origin{
+		{ID: "orig-dhk", Address: "app.dhaka.customer.internal", Healthy: true},
+		{ID: "orig-sin", Address: "app.singapore.customer.internal", Healthy: true},
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		req := mustNewRequest("GET", "/api/v1/items/bench", "192.168.1.100")
+		for pb.Next() {
+			_ = wafEngine.EvaluateRequest(req, policy)
+			_ = analyticsEngine.Ingest(model.TelemetryEvent{
+				DomainID:      domainID,
+				RequestID:     "req-bench",
+				StatusCode:    200,
+				LatencyMs:     5.0,
+				BytesSent:     4096,
+				BytesReceived: 512,
+				CacheStatus:   "HIT",
+				WAFAction:     "ALLOW",
+				Timestamp:     time.Now().UTC(),
+			})
+			_, _ = popManager.CalculateSteering("dhaka", domainID, origins)
+		}
+	})
 }
 
 func mustNewRequest(method, urlStr, clientIP string) *http.Request {

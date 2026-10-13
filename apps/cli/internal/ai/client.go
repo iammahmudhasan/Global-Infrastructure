@@ -163,13 +163,19 @@ func (c *Client) ListProviders(ctx context.Context, projectID string) ([]AIProvi
 		Providers []AIProvider `json:"providers"`
 		Count     int          `json:"count"`
 	}
-	if err := json.Unmarshal(bodyBytes, &envelope); err == nil && envelope.Providers != nil {
+	if err := json.Unmarshal(bodyBytes, &envelope); err == nil && (envelope.Providers != nil || bytes.Contains(bodyBytes, []byte(`"providers"`))) {
+		if envelope.Providers == nil {
+			return []AIProvider{}, nil
+		}
 		return envelope.Providers, nil
 	}
 
 	// Fallback: Raw array format [...] for backward compatibility
 	var rawProviders []AIProvider
 	if err := json.Unmarshal(bodyBytes, &rawProviders); err == nil {
+		if rawProviders == nil {
+			return []AIProvider{}, nil
+		}
 		return rawProviders, nil
 	}
 

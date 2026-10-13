@@ -84,6 +84,87 @@ func TestClient_ListProviders_RawArrayFallback(t *testing.T) {
 	}
 }
 
+func TestClient_ListProviders_EmptyEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers": [], "count": 0}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		ControlPlaneURL: server.URL,
+		HTTPClient:      server.Client(),
+	}
+
+	providers, err := client.ListProviders(context.Background(), "test-proj")
+	if err != nil {
+		t.Fatalf("unexpected error on empty envelope: %v", err)
+	}
+	if len(providers) != 0 {
+		t.Fatalf("expected 0 providers, got %d", len(providers))
+	}
+}
+
+func TestClient_ListProviders_NullEnvelope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers": null, "count": 0}`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		ControlPlaneURL: server.URL,
+		HTTPClient:      server.Client(),
+	}
+
+	providers, err := client.ListProviders(context.Background(), "test-proj")
+	if err != nil {
+		t.Fatalf("unexpected error on null envelope: %v", err)
+	}
+	if len(providers) != 0 {
+		t.Fatalf("expected 0 providers for null envelope, got %d", len(providers))
+	}
+}
+
+func TestClient_ListProviders_EmptyRawArray(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		ControlPlaneURL: server.URL,
+		HTTPClient:      server.Client(),
+	}
+
+	providers, err := client.ListProviders(context.Background(), "test-proj")
+	if err != nil {
+		t.Fatalf("unexpected error on raw empty array: %v", err)
+	}
+	if len(providers) != 0 {
+		t.Fatalf("expected 0 providers, got %d", len(providers))
+	}
+}
+
+func TestClient_ListProviders_MalformedJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"broken_json": true`))
+	}))
+	defer server.Close()
+
+	client := &Client{
+		ControlPlaneURL: server.URL,
+		HTTPClient:      server.Client(),
+	}
+
+	_, err := client.ListProviders(context.Background(), "test-proj")
+	if err == nil {
+		t.Fatalf("expected error on malformed JSON, got nil")
+	}
+}
+
 func TestClient_AddProvider(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
