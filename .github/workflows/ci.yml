@@ -141,6 +141,15 @@ jobs:
           sudo systemctl stop nginx apache2 2>/dev/null || true
           for i in 1 2 3; do
             echo "Building containers (attempt $i/3)..."
+            if [ "$i" -gt 1 ]; then
+              echo "Retrying build with Docker Hub official mirrors (fallback from Public ECR)..."
+              export CC_GOLANG_IMAGE="docker.io/library/golang:1.23-alpine"
+              export CC_RUNTIME_IMAGE="docker.io/library/alpine:3.20"
+              export GW_RUST_IMAGE="docker.io/library/rust:1-bookworm"
+              export GW_RUNTIME_IMAGE="docker.io/library/debian:bookworm-slim"
+              export MO_GOLANG_IMAGE="docker.io/library/golang:1.23-alpine"
+              export MO_RUNTIME_IMAGE="docker.io/library/alpine:3.20"
+            fi
             if docker compose -f deploy/docker-compose.yml build --progress=plain; then
               BUILD_SUCCESS=1
               break

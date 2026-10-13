@@ -3,6 +3,9 @@ services:
     build:
       context: ../services/edge/config-controller
       dockerfile: Dockerfile
+      args:
+        - GOLANG_IMAGE=${CC_GOLANG_IMAGE:-public.ecr.aws/docker/library/golang:1.23-alpine}
+        - RUNTIME_IMAGE=${CC_RUNTIME_IMAGE:-public.ecr.aws/docker/library/alpine:3.20}
     container_name: nexusedge-config-controller
     ports:
       - "127.0.0.1:9091:9091"
@@ -57,6 +60,9 @@ services:
     build:
       context: ../dataplane/edge/gateway
       dockerfile: Dockerfile
+      args:
+        - RUST_IMAGE=${GW_RUST_IMAGE:-public.ecr.aws/docker/library/rust:1-bookworm}
+        - RUNTIME_IMAGE=${GW_RUNTIME_IMAGE:-public.ecr.aws/docker/library/debian:bookworm-slim}
     container_name: nexusedge-pop-01
     ports:
       - "127.0.0.1:8080:8080"
@@ -86,6 +92,9 @@ services:
     build:
       context: ./mock-origin
       dockerfile: Dockerfile
+      args:
+        - GOLANG_IMAGE=${MO_GOLANG_IMAGE:-public.ecr.aws/docker/library/golang:1.23-alpine}
+        - RUNTIME_IMAGE=${MO_RUNTIME_IMAGE:-public.ecr.aws/docker/library/alpine:3.20}
     container_name: mock-origin-app
     ports:
       - "127.0.0.1:8081:8081"
