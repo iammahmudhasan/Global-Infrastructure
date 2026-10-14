@@ -183,8 +183,25 @@ func (h *APIHandler) Store() store.Repository {
 	return h.store
 }
 
+func (h *APIHandler) SetStore(s store.Repository) {
+	h.store = s
+}
+
+func (h *APIHandler) AuditLogger() *security.AuditLogger {
+	return h.auditLogger
+}
+
 func (h *APIHandler) CertManager() *certificate.Manager {
 	return h.certManager
+}
+
+// SetDNSLookupForTest temporarily overrides the DNS resolution function for testing and returns a restore function.
+func SetDNSLookupForTest(fn func(host string) ([]net.IP, error)) func() {
+	prev := dnsLookup
+	dnsLookup = fn
+	return func() {
+		dnsLookup = prev
+	}
 }
 
 func (h *APIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -508,10 +525,14 @@ func (h *APIHandler) handleCreateDomain(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	h.recordAudit(r, "", projectID, "domain.created", "domain", res.DomainID, map[string]interface{}{
+	if err := h.recordAudit(r, "", projectID, "domain.created", "domain", res.DomainID, map[string]interface{}{
 		"hostname":     res.Hostname,
 		"cname_target": res.CNAMETarget,
-	})
+	}); err != nil {
+		_ = h.store.DeleteDomain(res.DomainID)
+		writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+		return
+	}
 
 	writeJSON(w, http.StatusCreated, res)
 }
@@ -558,9 +579,13 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 				writeError(w, http.StatusInternalServerError, err.Error())
 				return
 			}
-			h.recordAudit(r, "", domain.ProjectID, "domain.deleted", "domain", domainID, map[string]interface{}{
+			if err := h.recordAudit(r, "", domain.ProjectID, "domain.deleted", "domain", domainID, map[string]interface{}{
 				"hostname": domain.Hostname,
-			})
+			}); err != nil {
+				_ = h.store.SaveDomain(domain)
+				writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+				return
+			}
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":    "deleted",
 				"domain_id": domainID,
@@ -2555,10 +2580,13 @@ func (h *APIHandler) handleRetrieveSecretForPoP(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	h.recordAudit(r, "", req.ProjectID, "ai_provider.secret_retrieved", "ai_provider_secret", req.ProviderID, map[string]interface{}{
+	if err := h.recordAudit(r, "", req.ProjectID, "ai_provider.secret_retrieved", "ai_provider_secret", req.ProviderID, map[string]interface{}{
 		"pop_id":     popID,
 		"secret_ref": req.SecretRef,
-	})
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "secret retrieval denied: required audit event could not be persisted")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, model.SecretRetrieveResponse{
 		SecretRef:  req.SecretRef,
@@ -2841,6 +2869,61 @@ func (h *APIHandler) buildGatewayRoutesForPoP(topologies []*store.DomainTopology
 	return gatewayRoutes
 }
 
+var (
+	dnsLookup    = net.LookupIP
+	cgnatNet     = &net.IPNet{IP: net.ParseIP("100.64.0.0"), Mask: net.CIDRMask(10, 32)}
+	benchmarkNet = &net.IPNet{IP: net.ParseIP("198.18.0.0"), Mask: net.CIDRMask(15, 32)}
+	docNet1      = &net.IPNet{IP: net.ParseIP("192.0.2.0"), Mask: net.CIDRMask(24, 32)}
+	docNet2      = &net.IPNet{IP: net.ParseIP("198.51.100.0"), Mask: net.CIDRMask(24, 32)}
+	docNet3      = &net.IPNet{IP: net.ParseIP("203.0.113.0"), Mask: net.CIDRMask(24, 32)}
+)
+
+func isReservedOrProhibitedRange(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	ipv4 := ip.To4()
+	if ipv4 != nil {
+		if cgnatNet.Contains(ipv4) || benchmarkNet.Contains(ipv4) ||
+			docNet1.Contains(ipv4) || docNet2.Contains(ipv4) || docNet3.Contains(ipv4) {
+			return true
+		}
+		if ipv4[0] >= 240 { // Class E / Reserved
+			return true
+		}
+	}
+	return false
+}
+
+func checkIPProhibitions(ip net.IP, host string, providerType string, isOperator bool) error {
+	if ip == nil {
+		return fmt.Errorf("invalid destination IP for host %q", host)
+	}
+	if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return fmt.Errorf("endpoint destination %q resolves to prohibited link-local IP %s", host, ip)
+	}
+	if ip.IsUnspecified() {
+		return fmt.Errorf("endpoint destination %q resolves to prohibited unspecified IP %s", host, ip)
+	}
+	if ip.IsMulticast() {
+		return fmt.Errorf("endpoint destination %q resolves to prohibited multicast IP %s", host, ip)
+	}
+	if ip.IsLoopback() && !isOperator {
+		return fmt.Errorf("endpoint destination %q resolves to prohibited loopback IP %s for non-operator tenant", host, ip)
+	}
+
+	isPrivateOrReserved := ip.IsPrivate() || isReservedOrProhibitedRange(ip)
+	if isPrivateOrReserved {
+		if providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) {
+			return fmt.Errorf("endpoint destination %q resolves to prohibited private/reserved IP %s for public cloud provider", host, ip)
+		}
+		if !isOperator && !(os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment()) {
+			return fmt.Errorf("private network destination %s for %q requires platform operator authorization", ip, host)
+		}
+	}
+	return nil
+}
+
 func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOperator bool) error {
 	trimmed := strings.TrimSpace(rawEndpoint)
 	parsedURL, err := url.Parse(trimmed)
@@ -2884,34 +2967,18 @@ func validateAIProviderEndpoint(rawEndpoint string, providerType string, isOpera
 	// IP Destination Checks
 	ip := net.ParseIP(host)
 	if ip != nil {
-		if ip.IsLoopback() && !isOperator {
-			return errors.New("loopback IP destinations are prohibited for non-operator tenants")
-		}
-		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-			return errors.New("link-local IP destinations are strictly prohibited")
-		}
-		if ip.IsPrivate() {
-			// Private IPs only allowed for onprem/vllm by platform operators or explicit dev environment
-			if providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) {
-				return errors.New("private RFC1918 IP addresses are not permitted for public cloud provider types")
-			}
-			if !isOperator && !(os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment()) {
-				return errors.New("private network destinations require platform operator authorization")
-			}
+		if err := checkIPProhibitions(ip, host, providerType, isOperator); err != nil {
+			return err
 		}
 	} else {
-		// Hostname destination resolution check (DNS SSRF prevention)
-		if ips, err := net.LookupIP(host); err == nil && len(ips) > 0 {
-			for _, resolvedIP := range ips {
-				if resolvedIP.IsLinkLocalUnicast() || resolvedIP.IsLinkLocalMulticast() {
-					return fmt.Errorf("endpoint hostname %q resolves to prohibited link-local IP %s", host, resolvedIP)
-				}
-				if resolvedIP.IsLoopback() && !isOperator {
-					return fmt.Errorf("endpoint hostname %q resolves to prohibited loopback IP %s", host, resolvedIP)
-				}
-				if resolvedIP.IsPrivate() && providerType != string(model.AIProviderTypeOnPrem) && providerType != string(model.AIProviderTypeVLLM) && !(os.Getenv("NEXUSEDGE_DEV_MODE") == "true" && onboarding.IsExplicitDevEnvironment()) {
-					return fmt.Errorf("endpoint hostname %q resolves to prohibited private IP %s for public cloud provider", host, resolvedIP)
-				}
+		// Hostname destination resolution check (Fail-Closed DNS SSRF prevention)
+		ips, err := dnsLookup(host)
+		if err != nil || len(ips) == 0 {
+			return fmt.Errorf("endpoint destination violates SSRF protection policy: hostname %q could not be resolved (%v)", host, err)
+		}
+		for _, resolvedIP := range ips {
+			if err := checkIPProhibitions(resolvedIP, host, providerType, isOperator); err != nil {
+				return err
 			}
 		}
 	}
@@ -3051,11 +3118,15 @@ func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
-		h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
+		if err := h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
 			"name":          p.Name,
 			"provider_type": p.ProviderType,
 			"endpoint":      p.Endpoint,
-		})
+		}); err != nil {
+			_ = h.store.DeleteAIProvider(p.ID)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusCreated, p.ToResponse())
 
@@ -3163,11 +3234,15 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
+		if err := h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
 			"name":          update.Name,
 			"provider_type": update.ProviderType,
 			"endpoint":      update.Endpoint,
-		})
+		}); err != nil {
+			_ = h.store.SaveAIProvider(existing)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, update.ToResponse())
 
@@ -3187,10 +3262,14 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			return
 		}
 
-		h.recordAudit(r, "", existing.ProjectID, "ai_provider.deleted", "ai_provider", id, map[string]interface{}{
+		if err := h.recordAudit(r, "", existing.ProjectID, "ai_provider.deleted", "ai_provider", id, map[string]interface{}{
 			"name":          existing.Name,
 			"provider_type": existing.ProviderType,
-		})
+		}); err != nil {
+			_ = h.store.SaveAIProvider(existing)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "deleted",
@@ -3233,11 +3312,15 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 				return
 			}
 
-			h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
+			if err := h.recordAudit(r, "", p.ProjectID, "ai_provider.created", "ai_provider", p.ID, map[string]interface{}{
 				"name":          p.Name,
 				"provider_type": p.ProviderType,
 				"endpoint":      p.Endpoint,
-			})
+			}); err != nil {
+				_ = h.store.DeleteAIProvider(p.ID)
+				writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+				return
+			}
 
 			writeJSON(w, http.StatusCreated, p.ToResponse())
 
@@ -3306,11 +3389,15 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 			return
 		}
 
-		h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
+		if err := h.recordAudit(r, "", update.ProjectID, "ai_provider.updated", "ai_provider", update.ID, map[string]interface{}{
 			"name":          update.Name,
 			"provider_type": update.ProviderType,
 			"endpoint":      update.Endpoint,
-		})
+		}); err != nil {
+			_ = h.store.SaveAIProvider(p)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, update.ToResponse())
 
@@ -3320,10 +3407,14 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 			return
 		}
 
-		h.recordAudit(r, "", projectID, "ai_provider.deleted", "ai_provider", providerID, map[string]interface{}{
+		if err := h.recordAudit(r, "", projectID, "ai_provider.deleted", "ai_provider", providerID, map[string]interface{}{
 			"name":          p.Name,
 			"provider_type": p.ProviderType,
-		})
+		}); err != nil {
+			_ = h.store.SaveAIProvider(p)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
+			return
+		}
 
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "deleted",

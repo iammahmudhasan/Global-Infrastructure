@@ -3,6 +3,7 @@ package store_test
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -361,5 +362,89 @@ func TestPostgresRepository_WriteFailureDoesNotCorruptCache(t *testing.T) {
 	recovered, err := repo.GetDomain(unpersistedDomainID)
 	if err == nil && recovered != nil {
 		t.Fatalf("cache was corrupted with unpersisted domain on DB write failure")
+	}
+}
+
+func TestValidateProductionDatabaseURL(t *testing.T) {
+	testCases := []struct {
+		name        string
+		databaseURL string
+		expectErr   bool
+		errContains string
+	}{
+		{
+			name:        "Empty URL rejected in production",
+			databaseURL: "",
+			expectErr:   true,
+			errContains: "empty",
+		},
+		{
+			name:        "sslmode=disable rejected in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=disable",
+			expectErr:   true,
+			errContains: "forbidden",
+		},
+		{
+			name:        "Omitted sslmode rejected in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db",
+			expectErr:   true,
+			errContains: "forbidden",
+		},
+		{
+			name:        "sslmode=allow rejected in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=allow",
+			expectErr:   true,
+			errContains: "forbidden",
+		},
+		{
+			name:        "sslmode=prefer rejected in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=prefer",
+			expectErr:   true,
+			errContains: "forbidden",
+		},
+		{
+			name:        "sslmode=disable rejected in DSN format",
+			databaseURL: "host=172.30.0.5 port=5432 user=nexusedge password=pass dbname=db sslmode=disable",
+			expectErr:   true,
+			errContains: "forbidden",
+		},
+		{
+			name:        "sslmode=require permitted in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=require",
+			expectErr:   false,
+		},
+		{
+			name:        "sslmode=verify-ca permitted in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=verify-ca&sslrootcert=/etc/ssl/certs/root.crt",
+			expectErr:   false,
+		},
+		{
+			name:        "sslmode=verify-full permitted in production URL",
+			databaseURL: "postgres://user:pass@172.30.0.5:5432/db?sslmode=verify-full&sslrootcert=/etc/ssl/certs/root.crt",
+			expectErr:   false,
+		},
+		{
+			name:        "sslmode=verify-full permitted in DSN format",
+			databaseURL: "host=172.30.0.5 port=5432 user=nexusedge dbname=db sslmode=verify-full",
+			expectErr:   false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := store.ValidateProductionDatabaseURL(tc.databaseURL)
+			if tc.expectErr {
+				if err == nil {
+					t.Fatalf("expected error for URL %q, got nil", tc.databaseURL)
+				}
+				if !strings.Contains(err.Error(), tc.errContains) {
+					t.Fatalf("expected error to contain %q, got %q", tc.errContains, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error for URL %q: %v", tc.databaseURL, err)
+				}
+			}
+		})
 	}
 }

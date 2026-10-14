@@ -36,6 +36,11 @@ func main() {
 	if env == "production" && os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
 		log.Fatal("[FATAL] NEXUSEDGE_DEV_MODE must be disabled in production")
 	}
+	if env == "production" {
+		if err := store.ValidateProductionDatabaseURL(dbURL); err != nil {
+			log.Fatalf("[FATAL] Insecure production database configuration: %v", err)
+		}
+	}
 
 	var dataStore store.Repository
 	if dbURL != "" {

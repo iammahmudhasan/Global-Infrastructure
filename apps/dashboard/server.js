@@ -287,10 +287,16 @@ function proxyToEdgeGateway(upstreamPath, req, res, session, extraHeaders = {}) 
   };
 
   const proxyReq = http.request(options, (upstreamRes) => {
-    res.writeHead(upstreamRes.statusCode, {
+    const responseHeaders = {
       'Content-Type': upstreamRes.headers['content-type'] || 'application/json',
       'Cache-Control': 'no-store'
-    });
+    };
+    for (const [key, val] of Object.entries(upstreamRes.headers)) {
+      if (key.toLowerCase().startsWith('x-nexusedge-')) {
+        responseHeaders[key] = val;
+      }
+    }
+    res.writeHead(upstreamRes.statusCode, responseHeaders);
     upstreamRes.pipe(res);
   });
 

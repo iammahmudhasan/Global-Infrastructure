@@ -753,4 +753,86 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(server);
     }
   });
+
+  it('Requirement 3.3: Edge Gateway telemetry headers (X-NexusEdge-*) are forwarded to client', async () => {
+    let capturedHeaders = null;
+    const mockEdgeGateway = http.createServer((req, res) => {
+      capturedHeaders = req.headers;
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'X-NexusEdge-Provider': 'spot-coreweave',
+        'X-NexusEdge-Cost': '0.42',
+        'X-NexusEdge-TTFT-Ms': '15',
+        'X-NexusEdge-Region': 'dhaka'
+      });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'mock answer' } }] }));
+    });
+
+    await new Promise((resolve) => mockEdgeGateway.listen(0, '127.0.0.1', resolve));
+    const edgePort = mockEdgeGateway.address().port;
+
+    process.env.EDGE_GATEWAY_URL = `http://127.0.0.1:${edgePort}`;
+    process.env.EDGE_GATEWAY_AI_KEY = 'edge-test-key';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'operator-test-token-telemetry';
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const bffPort = server.address().port;
+
+    try {
+      const loginData = JSON.stringify({ token: 'operator-test-token-telemetry' });
+      const loginRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: bffPort,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(loginData)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(loginData);
+        req.end();
+      });
+
+      assert.strictEqual(loginRes.statusCode, 200);
+      const cookie = loginRes.headers['set-cookie'][0].split(';')[0];
+      loginRes.resume();
+
+      const inferRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: bffPort,
+          path: '/api/proxy/inference',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': cookie,
+            'Content-Type': 'application/json'
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(JSON.stringify({ prompt: 'test telemetry forwarding' }));
+        req.end();
+      });
+
+      assert.strictEqual(inferRes.statusCode, 200);
+      assert.strictEqual(inferRes.headers['x-nexusedge-provider'], 'spot-coreweave');
+      assert.strictEqual(inferRes.headers['x-nexusedge-cost'], '0.42');
+      assert.strictEqual(inferRes.headers['x-nexusedge-ttft-ms'], '15');
+      assert.strictEqual(inferRes.headers['x-nexusedge-region'], 'dhaka');
+      inferRes.resume();
+    } finally {
+      await safeClose(server);
+      await safeClose(mockEdgeGateway);
+    }
+  });
 });
+

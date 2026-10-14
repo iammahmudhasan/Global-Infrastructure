@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -14,6 +16,45 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 )
+
+// ValidateProductionDatabaseURL enforces that database connection strings used in production
+// strictly mandate TLS encryption. Unencrypted connections (sslmode=disable, allow, prefer)
+// or omitted sslmode are strictly forbidden per Rule 1 and Rule 18.
+func ValidateProductionDatabaseURL(databaseURL string) error {
+	raw := strings.TrimSpace(databaseURL)
+	if raw == "" {
+		return errors.New("database URL cannot be empty in production")
+	}
+
+	sslmode := ""
+	if strings.HasPrefix(raw, "postgres://") || strings.HasPrefix(raw, "postgresql://") {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("invalid database URL: %w", err)
+		}
+		sslmode = strings.ToLower(parsed.Query().Get("sslmode"))
+	} else {
+		// Key-value DSN format: e.g. "host=... port=... sslmode=..."
+		parts := strings.Fields(raw)
+		for _, part := range parts {
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) == 2 && strings.ToLower(strings.TrimSpace(kv[0])) == "sslmode" {
+				sslmode = strings.ToLower(strings.Trim(strings.TrimSpace(kv[1]), `'"'`))
+				break
+			}
+		}
+	}
+
+	if sslmode == "" || sslmode == "disable" || sslmode == "allow" || sslmode == "prefer" {
+		return fmt.Errorf("production database connection strictly requires TLS encryption; sslmode=%q is forbidden (must be require, verify-ca, or verify-full)", sslmode)
+	}
+
+	if sslmode != "require" && sslmode != "verify-ca" && sslmode != "verify-full" {
+		return fmt.Errorf("unrecognized or insecure sslmode %q for production database; must be require, verify-ca, or verify-full", sslmode)
+	}
+
+	return nil
+}
 
 // PostgresRepository provides a durable, ACID-compliant PostgreSQL storage implementation
 // of the Repository interface. It combines transactional relational writes with a
@@ -30,6 +71,13 @@ var _ Repository = (*PostgresRepository)(nil)
 func NewPostgresRepository(databaseURL string) (*PostgresRepository, error) {
 	if strings.TrimSpace(databaseURL) == "" {
 		return nil, errors.New("empty PostgreSQL database URL")
+	}
+
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("NEXUSEDGE_ENV")))
+	if env == "production" {
+		if err := ValidateProductionDatabaseURL(databaseURL); err != nil {
+			return nil, fmt.Errorf("enforce production database TLS: %w", err)
+		}
 	}
 
 	db, err := sql.Open("postgres", databaseURL)

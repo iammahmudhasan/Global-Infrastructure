@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -3382,7 +3383,7 @@ func TestAuditLogs_TamperEvidentChain(t *testing.T) {
 	// 3. Mutate state: create AI provider
 	aipPayload := map[string]interface{}{
 		"name":          "Audit Provider",
-		"endpoint":      "https://audit-llm.example.com/v1",
+		"endpoint":      "https://api.openai.com/v1",
 		"provider_type": "openai",
 		"project_id":    "prj-audit",
 	}
@@ -3822,5 +3823,218 @@ func TestSecretRetrieval_MultiTenantPoPScopeAndSecurity(t *testing.T) {
 	handler.ServeHTTP(malformedW, malformedReq)
 	if malformedW.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 Bad Request on malformed secret_ref, got %d: %s", malformedW.Code, malformedW.Body.String())
+	}
+}
+
+type mockFailingAuditStore struct {
+	*store.Store
+	failAudit bool
+}
+
+func (s *mockFailingAuditStore) SaveAuditLog(l *model.AuditLog) error {
+	if s.failAudit {
+		return errors.New("simulated durable audit storage failure: disk partition unreachable")
+	}
+	return s.Store.SaveAuditLog(l)
+}
+
+func TestAIProvider_SecretRetrieval_AuditFailClosedAndDurability(t *testing.T) {
+	handler := setupTestServer()
+	rawStore := handler.Store().(*store.Store)
+	mockStore := &mockFailingAuditStore{Store: rawStore, failAudit: false}
+	handler.SetStore(mockStore)
+	authInst := handler.Authenticator()
+
+	// Register node in dhaka hosting prj-sec
+	authInst.RegisterNodeWithPoP("key-node-sec", "t-sec", "prj-sec", "node-sec-01", "dhaka")
+
+	// Host a domain on dhaka for prj-sec
+	domain := &model.Domain{
+		ID:             "dom-sec-01",
+		ProjectID:      "prj-sec",
+		Hostname:       "secure.example.com",
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+		AllowedPoPs:    []string{"dhaka"},
+	}
+	_ = rawStore.SaveDomain(domain)
+
+	// Create enabled provider with secret
+	secretKey := "sk-super-confidential-production-api-key-xyz99"
+	provider := &model.AIProvider{
+		ID:           "ai-sec-provider-01",
+		ProjectID:    "prj-sec",
+		Name:         "Production Secret Provider",
+		Endpoint:     "https://api.openai.com/v1",
+		ProviderType: string(model.AIProviderTypeOpenAI),
+		APIKey:       secretKey,
+		Enabled:      true,
+	}
+	if err := rawStore.SaveAIProvider(provider); err != nil {
+		t.Fatalf("failed to save provider: %v", err)
+	}
+
+	secretReqBody, _ := json.Marshal(model.SecretRetrieveRequest{
+		SecretRef:  fmt.Sprintf("vault://projects/prj-sec/ai-providers/%s/key", provider.ID),
+		ProjectID:  "prj-sec",
+		ProviderID: provider.ID,
+	})
+
+	// 1. Audit Storage Succeeds -> Secret is returned, audit record persisted
+	reqSuccess := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(secretReqBody))
+	reqSuccess.Header.Set("X-API-Key", "key-node-sec")
+	wSuccess := httptest.NewRecorder()
+	handler.ServeHTTP(wSuccess, reqSuccess)
+
+	if wSuccess.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK when audit succeeds, got %d: %s", wSuccess.Code, wSuccess.Body.String())
+	}
+	var respSuccess model.SecretRetrieveResponse
+	if err := json.Unmarshal(wSuccess.Body.Bytes(), &respSuccess); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if respSuccess.APIKey != secretKey {
+		t.Fatalf("expected APIKey %q, got %q", secretKey, respSuccess.APIKey)
+	}
+
+	auditLogsAfterSuccess, total, _ := rawStore.ListAuditLogs("prj-sec", 10, 0)
+	if total != 1 || len(auditLogsAfterSuccess) != 1 {
+		t.Fatalf("expected exactly 1 persisted audit log, got total=%d len=%d", total, len(auditLogsAfterSuccess))
+	}
+
+	// 2. Audit Storage Fails -> Secret MUST NOT be disclosed (Fail-Closed)
+	mockStore.failAudit = true
+	reqFail := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(secretReqBody))
+	reqFail.Header.Set("X-API-Key", "key-node-sec")
+	wFail := httptest.NewRecorder()
+	handler.ServeHTTP(wFail, reqFail)
+
+	if wFail.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when audit fails, got %d: %s", wFail.Code, wFail.Body.String())
+	}
+	// Verify CRITICAL SECURITY INVARIANT: Secret key is NEVER leaked in failure response
+	if strings.Contains(wFail.Body.String(), secretKey) {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: Secret API key was leaked in response during audit persistence failure!")
+	}
+
+	// 3. Chain Consistency: Verify that audit chain rolled back cleanly and remains cryptographically valid
+	valid, err := handler.AuditLogger().VerifyChain()
+	if err != nil || !valid {
+		t.Fatalf("audit log in-memory chain is corrupt or divergent after rollback: valid=%v, err=%v", valid, err)
+	}
+
+	// Persisted audit logs count must remain unchanged at 1
+	auditLogsAfterFailure, totalFail, _ := rawStore.ListAuditLogs("prj-sec", 10, 0)
+	if totalFail != 1 || len(auditLogsAfterFailure) != 1 {
+		t.Fatalf("expected audit log store to have rolled back unpersisted record, found %d records", totalFail)
+	}
+
+	// 4. Disabled Provider Check: Secret retrieval denied even if audit succeeds
+	mockStore.failAudit = false
+	provider.Enabled = false
+	_ = rawStore.SaveAIProvider(provider)
+
+	reqDisabled := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(secretReqBody))
+	reqDisabled.Header.Set("X-API-Key", "key-node-sec")
+	wDisabled := httptest.NewRecorder()
+	handler.ServeHTTP(wDisabled, reqDisabled)
+
+	if wDisabled.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disabled provider secret, got %d: %s", wDisabled.Code, wDisabled.Body.String())
+	}
+	if strings.Contains(wDisabled.Body.String(), secretKey) {
+		t.Fatalf("secret key leaked for disabled provider!")
+	}
+}
+
+func TestAIProvider_DNSResolution_FailClosed(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+	authInst.RegisterTenantWithRole("key-tenant-dns", "tenant-dns", "prj-dns", auth.RoleTenant, "prj-dns")
+
+	// 1. Unresolvable Hostname -> Strictly rejected with 400 Bad Request (Fail-Closed)
+	badHostPayload := map[string]interface{}{
+		"name":          "Unresolvable DNS Provider",
+		"endpoint":      "https://this-domain-definitely-does-not-exist-9876543210.invalid/v1",
+		"provider_type": "openai",
+		"project_id":    "prj-dns",
+	}
+	bodyBytes, _ := json.Marshal(badHostPayload)
+	req := httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", "key-tenant-dns")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request on unresolvable DNS endpoint, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "could not be resolved") {
+		t.Fatalf("expected error message to mention resolution failure, got: %s", w.Body.String())
+	}
+
+	// 2. Resolving to Prohibited IPs -> Rejected
+	restoreDNS := api.SetDNSLookupForTest(func(host string) ([]net.IP, error) {
+		if host == "mock-loopback.internal" {
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}
+		if host == "mock-cgnat.internal" {
+			return []net.IP{net.ParseIP("100.64.1.1")}, nil
+		}
+		if host == "mock-multicast.internal" {
+			return []net.IP{net.ParseIP("224.0.0.1")}, nil
+		}
+		if host == "mock-public.com" {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return nil, errors.New("simulated DNS NXDOMAIN")
+	})
+	defer restoreDNS()
+
+	prohibitedCases := []struct {
+		name     string
+		endpoint string
+	}{
+		{"Loopback Host", "https://mock-loopback.internal/v1"},
+		{"CGNAT Host", "https://mock-cgnat.internal/v1"},
+		{"Multicast Host", "https://mock-multicast.internal/v1"},
+	}
+
+	for _, pc := range prohibitedCases {
+		t.Run(pc.name, func(t *testing.T) {
+			pBytes, _ := json.Marshal(map[string]interface{}{
+				"name":          pc.name,
+				"endpoint":      pc.endpoint,
+				"provider_type": "openai",
+				"project_id":    "prj-dns",
+			})
+			pReq := httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(pBytes))
+			pReq.Header.Set("Content-Type", "application/json")
+			pReq.Header.Set("X-API-Key", "key-tenant-dns")
+			pW := httptest.NewRecorder()
+			handler.ServeHTTP(pW, pReq)
+
+			if pW.Code != http.StatusBadRequest {
+				t.Fatalf("case %q: expected 400 Bad Request on prohibited IP resolution, got %d: %s", pc.name, pW.Code, pW.Body.String())
+			}
+		})
+	}
+
+	// 3. Legitimate Public Hostname -> Accepted with 201 Created
+	legitBytes, _ := json.Marshal(map[string]interface{}{
+		"name":          "Valid Public Provider",
+		"endpoint":      "https://mock-public.com/v1",
+		"provider_type": "openai",
+		"project_id":    "prj-dns",
+	})
+	legitReq := httptest.NewRequest(http.MethodPost, "/v1/ai/providers", bytes.NewReader(legitBytes))
+	legitReq.Header.Set("Content-Type", "application/json")
+	legitReq.Header.Set("X-API-Key", "key-tenant-dns")
+	legitW := httptest.NewRecorder()
+	handler.ServeHTTP(legitW, legitReq)
+
+	if legitW.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created on valid public IP resolution, got %d: %s", legitW.Code, legitW.Body.String())
 	}
 }
