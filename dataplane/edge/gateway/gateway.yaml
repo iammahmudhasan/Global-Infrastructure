@@ -11,24 +11,34 @@ server:
 upstream:
   origins:
     - address: "185.232.14.188"
-      port: 80
-      protocol: "HTTP"
+      port: 443
+      protocol: "HTTPS"
+      sni: "aeitron.com"
   routes:
     - host: "edge.aeitron.com"
       origins:
         - address: "185.232.14.188"
-          port: 80
-          protocol: "HTTP"
-    - host: "api.aeitron.com"
-      origins:
-        - address: "185.232.14.188"
-          port: 80
-          protocol: "HTTP"
+          port: 443
+          protocol: "HTTPS"
+          sni: "aeitron.com"
     - host: "aeitron.com"
       origins:
         - address: "185.232.14.188"
-          port: 80
-          protocol: "HTTP"
+          port: 443
+          protocol: "HTTPS"
+          sni: "aeitron.com"
+    - host: "www.aeitron.com"
+      origins:
+        - address: "185.232.14.188"
+          port: 443
+          protocol: "HTTPS"
+          sni: "aeitron.com"
+    - host: "api.aeitron.com"
+      origins:
+        - address: "185.232.14.188"
+          port: 443
+          protocol: "HTTPS"
+          sni: "api.aeitron.com"
     - host: "api.nexusedge.io"
       path_routes:
         - path_prefix: "/status/"
