@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 )
 
@@ -25,8 +26,10 @@ const (
 
 // Monitor coordinates active health checking and maintains real-time endpoint state
 type Monitor struct {
-	mu         sync.RWMutex
-	httpClient *http.Client
+	mu                 sync.RWMutex
+	httpClient         *http.Client
+	alerter            alert.Alerter
+	latencyThresholdMs float64
 }
 
 func isExplicitDevEnvironment() bool {
@@ -104,6 +107,12 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 }
 
 func NewMonitor() *Monitor {
+	threshold := 1000.0
+	if raw := os.Getenv("NEXUSEDGE_ALERT_LATENCY_THRESHOLD_MS"); raw != "" {
+		if val, err := strconv.ParseFloat(raw, 64); err == nil && val > 0 {
+			threshold = val
+		}
+	}
 	return &Monitor{
 		httpClient: &http.Client{
 			Transport: &http.Transport{
@@ -114,7 +123,30 @@ func NewMonitor() *Monitor {
 				return http.ErrUseLastResponse // Fail closed against SSRF redirect attacks
 			},
 		},
+		latencyThresholdMs: threshold,
 	}
+}
+
+// SetAlerter wires the operational alert dispatcher into the health monitor.
+func (m *Monitor) SetAlerter(a alert.Alerter) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.alerter = a
+}
+
+// SetLatencyThresholdMs configures the latency SLA breach threshold in milliseconds.
+func (m *Monitor) SetLatencyThresholdMs(thresholdMs float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if thresholdMs > 0 {
+		m.latencyThresholdMs = thresholdMs
+	}
+}
+
+func (m *Monitor) getAlerterAndThreshold() (alert.Alerter, float64) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.alerter, m.latencyThresholdMs
 }
 
 // ProbeEndpoint executes an active health probe against a single origin endpoint
@@ -232,8 +264,57 @@ func (m *Monitor) recordSuccess(state *model.OriginEndpointState, monitor *model
 		threshold = 2
 	}
 
+	wasHealthy := state.Healthy
 	if state.ConsecutivePasses >= threshold {
 		state.Healthy = true
+	}
+
+	alerter, latThreshold := m.getAlerterAndThreshold()
+	if alerter != nil && alerter.IsConfigured() {
+		originTarget := fmt.Sprintf("%s:%d", state.Address, state.Port)
+
+		// 1. State transition: Origin recovered from DOWN to HEALTHY
+		if !wasHealthy && state.Healthy {
+			event := alert.Event{
+				Type:      alert.EventTypeOriginRecovered,
+				Severity:  alert.SeverityInfo,
+				Title:     "Origin Recovered",
+				Message:   fmt.Sprintf("Origin %s has recovered and is now passing health checks.", originTarget),
+				Origin:    originTarget,
+				LatencyMs: latencyMs,
+				Timestamp: state.LastChecked,
+				Details: map[string]string{
+					"status_code": strconv.Itoa(statusCode),
+					"pool_id":     state.PoolID,
+					"origin_id":   state.OriginID,
+				},
+			}
+			go func() {
+				_ = alerter.SendAlert(context.Background(), event)
+			}()
+		}
+
+		// 2. High latency alert (if latency exceeds threshold)
+		if latThreshold > 0 && latencyMs > latThreshold {
+			event := alert.Event{
+				Type:        alert.EventTypeHighLatency,
+				Severity:    alert.SeverityWarning,
+				Title:       "Origin High Latency Detected",
+				Message:     fmt.Sprintf("Origin %s response latency (%.1f ms) exceeded performance SLA threshold (%.1f ms).", originTarget, latencyMs, latThreshold),
+				Origin:      originTarget,
+				LatencyMs:   latencyMs,
+				ThresholdMs: latThreshold,
+				Timestamp:   state.LastChecked,
+				Details: map[string]string{
+					"status_code":     strconv.Itoa(statusCode),
+					"ewma_latency_ms": fmt.Sprintf("%.1f", state.EWMALatencyMs),
+					"pool_id":         state.PoolID,
+				},
+			}
+			go func() {
+				_ = alerter.SendAlert(context.Background(), event)
+			}()
+		}
 	}
 }
 
@@ -249,8 +330,34 @@ func (m *Monitor) recordFailure(state *model.OriginEndpointState, monitor *model
 		threshold = 3
 	}
 
+	wasHealthy := state.Healthy
 	if state.ConsecutiveFailures >= threshold {
 		state.Healthy = false
+	}
+
+	alerter, _ := m.getAlerterAndThreshold()
+	if alerter != nil && alerter.IsConfigured() {
+		// State transition: Origin flipped from HEALTHY to DOWN
+		if wasHealthy && !state.Healthy {
+			originTarget := fmt.Sprintf("%s:%d", state.Address, state.Port)
+			event := alert.Event{
+				Type:      alert.EventTypeOriginDown,
+				Severity:  alert.SeverityCritical,
+				Title:     "Origin Down Alert",
+				Message:   fmt.Sprintf("Origin %s has failed %d consecutive health checks and has been removed from active rotation. Error: %s", originTarget, state.ConsecutiveFailures, errMsg),
+				Origin:    originTarget,
+				Timestamp: state.LastChecked,
+				Details: map[string]string{
+					"status_code":          strconv.Itoa(statusCode),
+					"consecutive_failures": strconv.Itoa(state.ConsecutiveFailures),
+					"pool_id":              state.PoolID,
+					"origin_id":            state.OriginID,
+				},
+			}
+			go func() {
+				_ = alerter.SendAlert(context.Background(), event)
+			}()
+		}
 	}
 }
 

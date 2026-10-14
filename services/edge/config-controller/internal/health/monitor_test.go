@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 )
@@ -374,5 +375,128 @@ func TestMonitor_DevLoopbackEnvironmentBinding(t *testing.T) {
 	st4 := m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
 	if st4.Healthy || !strings.Contains(st4.LastError, "SSRF protection") {
 		t.Errorf("expected loopback to be blocked when DEV_MODE=false, got healthy=%v err=%s", st4.Healthy, st4.LastError)
+	}
+}
+
+type mockAlertReceiver struct {
+	events []string
+}
+
+func (m *mockAlertReceiver) SendAlert(ctx context.Context, event alert.Event) error {
+	m.events = append(m.events, event.Type)
+	return nil
+}
+
+func (m *mockAlertReceiver) IsConfigured() bool {
+	return true
+}
+
+func TestMonitor_AlertDispatching(t *testing.T) {
+	t.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	t.Setenv("NEXUSEDGE_ENV", "test")
+
+	mockAlerter := &mockAlertReceiver{}
+	m := health.NewMonitor()
+	m.SetAlerter(mockAlerter)
+	m.SetLatencyThresholdMs(50.0) // 50ms threshold for test
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow" {
+			time.Sleep(60 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path == "/fail" {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	u, _ := url.Parse(server.URL)
+	port, _ := strconv.Atoi(u.Port())
+
+	origin := &model.Origin{
+		ID:       "orig-alert-test",
+		PoolID:   "pool-1",
+		Address:  u.Hostname(),
+		Port:     port,
+		Protocol: model.ProtocolHTTP,
+		Healthy:  true,
+	}
+
+	monitorConfig := &model.HealthMonitor{
+		ID:                  "hm-alert-test",
+		PoolID:              "pool-1",
+		Protocol:            model.HealthCheckProtocolHTTP,
+		Path:                "/slow",
+		Port:                port,
+		TimeoutSeconds:      2,
+		HealthyThreshold:    2,
+		UnhealthyThreshold:  2,
+		ExpectedStatusCodes: []int{200},
+	}
+
+	ctx := context.Background()
+
+	// 1. Probe /slow -> latency > 50ms -> expect HIGH_LATENCY alert
+	_ = m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
+	time.Sleep(50 * time.Millisecond) // Allow async alert goroutine to record
+
+	hasHighLatency := false
+	for _, ev := range mockAlerter.events {
+		if ev == "HIGH_LATENCY" {
+			hasHighLatency = true
+			break
+		}
+	}
+	if !hasHighLatency {
+		t.Errorf("expected HIGH_LATENCY alert to be dispatched, got %v", mockAlerter.events)
+	}
+
+	// 2. Origin starts failing
+	monitorConfig.Path = "/fail"
+	currentState := &model.OriginEndpointState{
+		OriginID: origin.ID,
+		Address:  origin.Address,
+		Port:     origin.Port,
+		Healthy:  true,
+	}
+
+	// Failure 1 (threshold is 2) -> still healthy
+	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
+	// Failure 2 (reaches threshold 2) -> flips to unhealthy -> expect ORIGIN_DOWN alert
+	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
+	time.Sleep(50 * time.Millisecond)
+
+	hasOriginDown := false
+	for _, ev := range mockAlerter.events {
+		if ev == "ORIGIN_DOWN" {
+			hasOriginDown = true
+			break
+		}
+	}
+	if !hasOriginDown {
+		t.Errorf("expected ORIGIN_DOWN alert to be dispatched, got %v", mockAlerter.events)
+	}
+
+	// 3. Origin recovers
+	monitorConfig.Path = "/healthz"
+	// Pass 1 (threshold 2)
+	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
+	// Pass 2 -> flips to healthy -> expect ORIGIN_RECOVERED alert
+	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
+	time.Sleep(50 * time.Millisecond)
+
+	hasRecovered := false
+	for _, ev := range mockAlerter.events {
+		if ev == "ORIGIN_RECOVERED" {
+			hasRecovered = true
+			break
+		}
+	}
+	if !hasRecovered {
+		t.Errorf("expected ORIGIN_RECOVERED alert to be dispatched, got %v", mockAlerter.events)
 	}
 }

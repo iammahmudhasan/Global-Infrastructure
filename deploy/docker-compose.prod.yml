@@ -32,6 +32,11 @@ services:
       - "NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?NEXUSEDGE_AI_API_KEYS is required for production auth registry}"
       - "NEXUSEDGE_API_KEYS=${NEXUSEDGE_API_KEYS:?NEXUSEDGE_API_KEYS is required for node and operator authentication}"
       - "NEXUSEDGE_PUBLIC_IP=${NEXUSEDGE_PUBLIC_IP:?NEXUSEDGE_PUBLIC_IP is required for production edge verification}"
+      # Automated Instant Alerting (Telegram Bot / Webhooks)
+      - "NEXUSEDGE_ALERT_TELEGRAM_BOT_TOKEN=${NEXUSEDGE_ALERT_TELEGRAM_BOT_TOKEN:-}"
+      - "NEXUSEDGE_ALERT_TELEGRAM_CHAT_ID=${NEXUSEDGE_ALERT_TELEGRAM_CHAT_ID:-}"
+      - "NEXUSEDGE_ALERT_LATENCY_THRESHOLD_MS=${NEXUSEDGE_ALERT_LATENCY_THRESHOLD_MS:-1000}"
+      - "NEXUSEDGE_ALERT_COOLDOWN_SECONDS=${NEXUSEDGE_ALERT_COOLDOWN_SECONDS:-300}"
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
       - ./postgres/certs/root.crt:/etc/ssl/certs/pg_root.crt:ro

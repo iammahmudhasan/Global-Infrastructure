@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/analytics"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
@@ -49,6 +50,7 @@ type APIHandler struct {
 	auditWriteMu    sync.Mutex
 	auditChainValid bool
 	auditChainErr   error
+	alerter         alert.Alerter
 	handlerChain    http.Handler
 	mux             *http.ServeMux
 }
@@ -122,13 +124,17 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		}
 	}
 
+	alerter := alert.NewFromEnv()
+	mon := health.NewMonitor()
+	mon.SetAlerter(alerter)
+
 	h := &APIHandler{
 		store:           s,
 		service:         svc,
 		compiler:        c,
 		wafEngine:       security.NewWAFEngine(),
 		cacheEngine:     cache.NewCacheEngine(100000),
-		monitor:         health.NewMonitor(),
+		monitor:         mon,
 		smartRouter:     health.NewSmartRouter(),
 		certManager:     certificate.NewManager(s),
 		analyticsEngine: analytics.NewEngine(),
@@ -138,11 +144,20 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		auditLogger:     auditLogger,
 		auditChainValid: auditChainValid,
 		auditChainErr:   auditChainErr,
+		alerter:         alerter,
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
 	}
 	h.registerRoutes()
 	return h
+}
+
+// SetAlerter allows overriding the alerter (e.g. for testing)
+func (h *APIHandler) SetAlerter(a alert.Alerter) {
+	h.alerter = a
+	if h.monitor != nil {
+		h.monitor.SetAlerter(a)
+	}
 }
 
 // SetAuthenticator allows overriding or updating the authenticator (e.g. for testing)
@@ -313,6 +328,8 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/ai/providers/", h.handleAIProviderByIDRoute)
 	h.mux.HandleFunc("/v1/audit-logs", h.handleAuditLogsRoute)
 	h.mux.HandleFunc("/v1/audit-logs/verify", h.handleAuditLogsVerifyRoute)
+	h.mux.HandleFunc("/v1/alerts/test", h.handleAlertsTestRoute)
+	h.mux.HandleFunc("/v1/alerts/status", h.handleAlertsStatusRoute)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -3533,4 +3550,83 @@ func (h *APIHandler) handleProjectAIProvidersRoute(w http.ResponseWriter, r *htt
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func (h *APIHandler) handleAlertsTestRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	if h.alerter == nil || !h.alerter.IsConfigured() {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":             "not_configured",
+			"message":            "Telegram alerting is not configured. Set NEXUSEDGE_ALERT_TELEGRAM_BOT_TOKEN and NEXUSEDGE_ALERT_TELEGRAM_CHAT_ID to enable instant phone alerts.",
+			"alerter_configured": false,
+		})
+		return
+	}
+
+	actor := "system"
+	if hActor := r.Header.Get("X-Authenticated-Actor"); hActor != "" {
+		actor = hActor
+	} else if tc, ok := auth.FromContext(r.Context()); ok {
+		if tc.TenantID != "" {
+			actor = "tenant:" + tc.TenantID
+		} else if tc.NodeID != "" {
+			actor = "node:" + tc.NodeID
+		}
+	}
+
+	event := alert.Event{
+		Type:      alert.EventTypeTest,
+		Severity:  alert.SeverityInfo,
+		Title:     "NexusEdge Alert Verification",
+		Message:   fmt.Sprintf("Operational ping triggered by %s. Global infrastructure monitoring & instant alerts are active.", actor),
+		Origin:    "aeitron.com",
+		Timestamp: time.Now().UTC(),
+		Details: map[string]string{
+			"triggered_by": actor,
+			"environment":  os.Getenv("NEXUSEDGE_ENV"),
+			"pop_id":       "singapore",
+		},
+	}
+
+	err := h.alerter.SendAlert(r.Context(), event)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to deliver test alert via Telegram: %v", err),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":             "delivered",
+		"message":            "Test alert delivered successfully to your Telegram chat.",
+		"alerter_configured": true,
+		"timestamp":          event.Timestamp.Format(time.RFC3339),
+	})
+}
+
+func (h *APIHandler) handleAlertsStatusRoute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	configured := h.alerter != nil && h.alerter.IsConfigured()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":               "ok",
+		"alerter_configured":   configured,
+		"channel":              "telegram",
+		"latency_threshold_ms": 1000.0,
+		"target_origins": []string{
+			"aeitron.com (185.232.14.188:443)",
+		},
+	})
 }

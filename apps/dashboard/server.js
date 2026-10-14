@@ -576,6 +576,25 @@ const server = http.createServer((req, res) => {
       return proxyToEdgeGateway('/v1/chat/completions', req, res, session, extraHeaders);
     }
 
+    // Proxy Alert Status (Authenticated session)
+    if (pathname === '/api/proxy/alerts/status') {
+      return proxyToControlPlane('/v1/alerts/status', req, res, session);
+    }
+
+    // Proxy Alert Test (Only PLATFORM_OPERATOR & TENANT_ADMIN permitted)
+    if (pathname === '/api/proxy/alerts/test') {
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to trigger alert tests. PLATFORM_OPERATOR or TENANT_ADMIN role required.`
+        });
+      }
+      return proxyToControlPlane('/v1/alerts/test', req, res, session);
+    }
+
     return sendJSON(res, 404, { code: 404, error: 'Proxy route not found' });
   }
 

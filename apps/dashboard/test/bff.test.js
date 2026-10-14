@@ -1284,6 +1284,80 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(server);
     }
   });
+
+  it('Requirement 11: Alert endpoints proxy correctly and enforce RBAC', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'prod-operator-token-alerts';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'prod-viewer-token:viewer@test.com:VIEWER:proj-viewer';
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Unauthenticated request to /api/proxy/alerts/status returns 401
+      const resUnauth = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/alerts/status',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauth.statusCode, 401);
+      resUnauth.resume();
+
+      // 2. Login as VIEWER
+      const loginViewerRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'prod-viewer-token' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const viewerCookie = loginViewerRes.headers['set-cookie'][0].split(';')[0];
+      loginViewerRes.resume();
+
+      // 3. VIEWER attempting POST /api/proxy/alerts/test must get 403 Forbidden
+      const resViewerTest = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/alerts/test',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': viewerCookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerTest.statusCode, 403, 'VIEWER role must be rejected from triggering alert tests');
+      resViewerTest.resume();
+    } finally {
+      await safeClose(server);
+    }
+  });
 });
 
 
