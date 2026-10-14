@@ -45,19 +45,22 @@ upstream:
           priority: 10
           origins:
             - address: "185.232.14.188"
-              port: 80
-              protocol: "HTTP"
+              port: 443
+              protocol: "HTTPS"
+              sni: "api.nexusedge.io"
         - path_prefix: "/"
           priority: 0
           origins:
             - address: "185.232.14.188"
-              port: 80
-              protocol: "HTTP"
+              port: 443
+              protocol: "HTTPS"
+              sni: "api.nexusedge.io"
     - host: "app.nexusedge.io"
       origins:
         - address: "185.232.14.188"
-          port: 80
-          protocol: "HTTP"
+          port: 443
+          protocol: "HTTPS"
+          sni: "app.nexusedge.io"
   health_check_path: "/"
   timeout_ms: 5000
 

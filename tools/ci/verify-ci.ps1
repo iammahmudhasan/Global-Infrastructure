@@ -167,12 +167,25 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     $env:NEXUSEDGE_CP_AUTH_TOKEN = "ci-token-01"
     $env:NEXUSEDGE_AI_API_KEYS = "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
     $env:NEXUSEDGE_CP_POP_ID = "singapore"
+    $env:NEXUSEDGE_PUBLIC_IP = "80.225.241.129"
     & docker compose -f $ComposeProdFile config --quiet
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Docker Compose prod configuration validation failed." -ForegroundColor Red
         exit 1
     }
-    Write-Host " -> Docker Compose validation passed." -ForegroundColor Green
+    # Verify fail-closed behavior when NEXUSEDGE_PUBLIC_IP is omitted
+    $oldIp = $env:NEXUSEDGE_PUBLIC_IP
+    Remove-Item env:NEXUSEDGE_PUBLIC_IP -ErrorAction SilentlyContinue
+    $ErrorActionPreference = "Continue"
+    $output = & docker compose -f $ComposeProdFile config 2>&1
+    $failCode = $LASTEXITCODE
+    $ErrorActionPreference = "Stop"
+    $env:NEXUSEDGE_PUBLIC_IP = $oldIp
+    if ($failCode -eq 0) {
+        Write-Host "ERROR: Docker Compose prod must fail when NEXUSEDGE_PUBLIC_IP is omitted!" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host " -> Docker Compose validation passed (including fail-closed public IP check)." -ForegroundColor Green
 } else {
     Write-Host " -> Docker CLI not found, skipping local compose check." -ForegroundColor Gray
 }

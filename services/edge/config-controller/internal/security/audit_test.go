@@ -109,7 +109,12 @@ func TestAuditLogger_RollbackOnFailure(t *testing.T) {
 	}
 
 	// Simulate failure in database persistence: rollback r2
-	logger.RollbackLastRecord(r2.ID)
+	if !logger.RollbackLastRecord(r2.ID) {
+		t.Fatalf("expected rollback of r2 to succeed")
+	}
+	if logger.RollbackLastRecord("non-existent-id") {
+		t.Fatalf("expected rollback of non-existent ID to return false")
+	}
 
 	records := logger.GetRecords()
 	if len(records) != 1 {

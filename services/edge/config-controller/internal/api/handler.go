@@ -46,6 +46,7 @@ type APIHandler struct {
 	authenticator   *auth.Authenticator
 	limiter         *ControlPlaneLimiter
 	auditLogger     *security.AuditLogger
+	auditWriteMu    sync.Mutex
 	auditChainValid bool
 	auditChainErr   error
 	handlerChain    http.Handler
@@ -213,11 +214,15 @@ func (h *APIHandler) AuditLogger() *security.AuditLogger {
 }
 
 func (h *APIHandler) SetAuditChainValid(valid bool, err error) {
+	h.auditWriteMu.Lock()
+	defer h.auditWriteMu.Unlock()
 	h.auditChainValid = valid
 	h.auditChainErr = err
 }
 
 func (h *APIHandler) IsAuditChainValid() bool {
+	h.auditWriteMu.Lock()
+	defer h.auditWriteMu.Unlock()
 	return h.auditChainValid
 }
 
@@ -466,6 +471,9 @@ func (h *APIHandler) handleAuditLogsVerifyRoute(w http.ResponseWriter, r *http.R
 }
 
 func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, resourceType, resourceID string, details map[string]interface{}) error {
+	h.auditWriteMu.Lock()
+	defer h.auditWriteMu.Unlock()
+
 	if !h.auditChainValid {
 		return errors.New("audit log operation blocked: control plane audit chain verification failed")
 	}
@@ -476,7 +484,9 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 	actor := "system"
 	clientIP := ""
 	if r != nil {
-		if tc, ok := auth.FromContext(r.Context()); ok {
+		if humanActor := r.Header.Get("X-Authenticated-Actor"); humanActor != "" {
+			actor = humanActor
+		} else if tc, ok := auth.FromContext(r.Context()); ok {
 			if tc.TenantID != "" {
 				actor = tc.TenantID
 				if orgID == "" {
@@ -532,8 +542,13 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 	}
 
 	if err := h.store.SaveAuditLog(auditLog); err != nil {
-		h.auditLogger.RollbackLastRecord(rec.ID)
-		log.Printf("[AUDIT ERROR] failed to persist audit log %s, rolled back in-memory chain: %v", auditLog.ID, err)
+		if rolledBack := h.auditLogger.RollbackLastRecord(rec.ID); !rolledBack {
+			h.auditChainValid = false
+			h.auditChainErr = fmt.Errorf("audit log database save failed and in-memory rollback failed for record %s: %w", rec.ID, err)
+			log.Printf("[CRITICAL AUDIT ERROR] in-memory audit chain corrupted, chain invalidated: %v", h.auditChainErr)
+		} else {
+			log.Printf("[AUDIT ERROR] failed to persist audit log %s, rolled back in-memory chain: %v", auditLog.ID, err)
+		}
 		return err
 	}
 
@@ -1204,7 +1219,10 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 			"prev_status": prevStatus,
 			"status":      model.DomainStatusActive,
 		}); err != nil {
-			_ = h.store.UpdateDomainStatus(domainID, prevStatus)
+			if rbErr := h.store.UpdateDomainStatus(domainID, prevStatus); rbErr != nil {
+				log.Printf("[CRITICAL AUDIT INCONSISTENCY] Failed to rollback domain %s status to %s after audit failure (%v): %v", domainID, prevStatus, err, rbErr)
+				h.SetAuditChainValid(false, fmt.Errorf("domain status rollback failed after audit persistence failure: %w", rbErr))
+			}
 			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
 			return
 		}
@@ -1234,7 +1252,10 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 		"method":   "dns",
 		"status":   domain.Status,
 	}); err != nil {
-		_ = h.store.UpdateDomainStatus(domain.ID, model.DomainStatusPendingVerification)
+		if rbErr := h.store.UpdateDomainStatus(domain.ID, model.DomainStatusPendingVerification); rbErr != nil {
+			log.Printf("[CRITICAL AUDIT INCONSISTENCY] Failed to rollback domain %s status to pending after audit failure (%v): %v", domain.ID, err, rbErr)
+			h.SetAuditChainValid(false, fmt.Errorf("domain status rollback failed after audit persistence failure: %w", rbErr))
+		}
 		writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
 		return
 	}

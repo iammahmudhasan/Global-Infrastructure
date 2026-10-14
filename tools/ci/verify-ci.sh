@@ -95,6 +95,7 @@ if command -v docker >/dev/null 2>&1; then
   NEXUSEDGE_CP_AUTH_TOKEN="ci-token-01" \
   NEXUSEDGE_AI_API_KEYS="ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL" \
   NEXUSEDGE_CP_POP_ID="singapore" \
+  NEXUSEDGE_PUBLIC_IP="80.225.241.129" \
   docker compose -f "${REPO_ROOT}/deploy/docker-compose.prod.yml" config --quiet
   echo " -> Docker Compose validation passed."
 else

@@ -182,13 +182,29 @@ async fn test_e2e_snapshot_sync_and_route_application() {
     let upstream = router
         .select_upstream_for_host_and_path("api.nexusedge.io", "/")
         .unwrap();
-    assert_eq!(upstream, "http://93.184.216.34:8080");
+    assert_eq!(upstream.url, "http://api.nexusedge.io:8080");
+    assert_eq!(
+        upstream.destination_addr,
+        Some("93.184.216.34:8080".parse().unwrap())
+    );
+    assert_eq!(
+        upstream.tls_server_name.as_deref(),
+        Some("api.nexusedge.io")
+    );
 
     // Verify sub-path routes to priority path origin
     let auth_upstream = router
         .select_upstream_for_host_and_path("api.nexusedge.io", "/v1/auth/login")
         .unwrap();
-    assert_eq!(auth_upstream, "http://93.184.216.35:8080");
+    assert_eq!(auth_upstream.url, "http://auth.nexusedge.io:8080");
+    assert_eq!(
+        auth_upstream.destination_addr,
+        Some("93.184.216.35:8080".parse().unwrap())
+    );
+    assert_eq!(
+        auth_upstream.tls_server_name.as_deref(),
+        Some("auth.nexusedge.io")
+    );
 }
 
 #[tokio::test]

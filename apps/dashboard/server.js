@@ -47,6 +47,14 @@ const MAX_LOGIN_BODY_BYTES = 16384;
 const MAX_LOGIN_ATTEMPTS_PER_MIN = 10;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 
+// Valid and allowed Dashboard user roles
+const ALLOWED_ROLES = new Set(['PLATFORM_OPERATOR', 'TENANT_ADMIN', 'DEVELOPER', 'VIEWER']);
+// Roles permitted to perform state-mutating operations on domains (POST, PUT, DELETE)
+const DOMAIN_MUTATION_ROLES = new Set(['PLATFORM_OPERATOR', 'TENANT_ADMIN']);
+
+// Maximum bounded size for login rate limit cache
+const MAX_RATE_LIMIT_ENTRIES = 10000;
+
 // In-Memory Active Session Store
 const sessions = new Map();
 
@@ -67,9 +75,22 @@ function generateSessionId() {
   return crypto.randomBytes(32).toString('hex');
 }
 
+// Clean up expired rate limiting entries
+function pruneExpiredRateLimits() {
+  const now = Date.now();
+  for (const [key, entry] of loginRateLimits.entries()) {
+    if ((now - entry.windowStart) > RATE_LIMIT_WINDOW_MS) {
+      loginRateLimits.delete(key);
+    }
+  }
+}
+
 // Client IP extractor strictly protecting against X-Forwarded-For spoofing
 function getClientIp(req) {
-  const socketIp = (req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown';
+  let socketIp = (req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown';
+  if (socketIp.startsWith('::ffff:')) {
+    socketIp = socketIp.substring(7);
+  }
   const trustedProxies = (process.env.TRUSTED_PROXY_IPS || '')
     .split(',')
     .map(ip => ip.trim())
@@ -81,7 +102,11 @@ function getClientIp(req) {
     if (forwarded && typeof forwarded === 'string') {
       const parts = forwarded.split(',').map(s => s.trim()).filter(Boolean);
       if (parts.length > 0) {
-        return parts[parts.length - 1];
+        let clientIp = parts[parts.length - 1];
+        if (clientIp.startsWith('::ffff:')) {
+          clientIp = clientIp.substring(7);
+        }
+        return clientIp;
       }
     }
   }
@@ -94,7 +119,11 @@ function getClientIp(req) {
 function checkLoginRateLimit(ip) {
   const now = Date.now();
   const entry = loginRateLimits.get(ip);
-  if (!entry || (now - entry.windowStart) > RATE_LIMIT_WINDOW_MS) {
+  if (!entry) {
+    return { allowed: true, remaining: MAX_LOGIN_ATTEMPTS_PER_MIN };
+  }
+  if ((now - entry.windowStart) > RATE_LIMIT_WINDOW_MS) {
+    loginRateLimits.delete(ip);
     return { allowed: true, remaining: MAX_LOGIN_ATTEMPTS_PER_MIN };
   }
   if (entry.count >= MAX_LOGIN_ATTEMPTS_PER_MIN) {
@@ -105,6 +134,13 @@ function checkLoginRateLimit(ip) {
 
 function recordFailedLogin(ip) {
   const now = Date.now();
+  if (loginRateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
+    pruneExpiredRateLimits();
+    if (loginRateLimits.size >= MAX_RATE_LIMIT_ENTRIES) {
+      const oldestKey = loginRateLimits.keys().next().value;
+      if (oldestKey) loginRateLimits.delete(oldestKey);
+    }
+  }
   const entry = loginRateLimits.get(ip);
   if (!entry || (now - entry.windowStart) > RATE_LIMIT_WINDOW_MS) {
     loginRateLimits.set(ip, { count: 1, windowStart: now });
@@ -138,11 +174,12 @@ function verifyCredentials(token) {
     for (const entry of userRegistry.split(';')) {
       const parts = entry.trim().split(':');
       if (parts.length >= 4) {
-        const [regToken, regUser, regRole, regProj] = parts;
+        const [regToken, regUser, rawRole, regProj] = parts;
         if (safeCompare(token, regToken)) {
+          const validatedRole = ALLOWED_ROLES.has(rawRole) ? rawRole : 'UNKNOWN';
           return {
             user: regUser,
-            role: regRole,
+            role: validatedRole,
             projectId: regProj
           };
         }
@@ -239,7 +276,7 @@ function sendJSON(res, statusCode, data, headers = {}) {
 
 // Upstream Proxy Handler 1: Control Plane (Go :9091)
 // Strictly attaches Control Plane token; NEVER sends AI Gateway keys
-function proxyToControlPlane(upstreamPath, req, res, extraHeaders = {}) {
+function proxyToControlPlane(upstreamPath, req, res, session = null, extraHeaders = {}) {
   const targetUrl = new URL(upstreamPath, CONTROL_PLANE_URL);
   const forwardHeaders = {
     'accept': 'application/json',
@@ -251,6 +288,12 @@ function proxyToControlPlane(upstreamPath, req, res, extraHeaders = {}) {
   if (CONTROL_PLANE_TOKEN) {
     forwardHeaders['X-API-Key'] = CONTROL_PLANE_TOKEN;
     forwardHeaders['Authorization'] = `Bearer ${CONTROL_PLANE_TOKEN}`;
+  }
+
+  if (session) {
+    if (session.user) forwardHeaders['X-Authenticated-Actor'] = session.user;
+    if (session.role) forwardHeaders['X-Authenticated-Role'] = session.role;
+    if (session.projectId) forwardHeaders['X-Authenticated-Project-Id'] = session.projectId;
   }
 
   const options = {
@@ -494,7 +537,7 @@ const server = http.createServer((req, res) => {
       if (session.role !== 'PLATFORM_OPERATOR') {
         return sendJSON(res, 403, { code: 403, error: 'Forbidden: PLATFORM_OPERATOR role required for audit verification' });
       }
-      return proxyToControlPlane('/v1/audit-logs/verify', req, res);
+      return proxyToControlPlane('/v1/audit-logs/verify', req, res, session);
     }
 
     // Proxy Audit Logs (Strict multi-tenant project boundary)
@@ -505,15 +548,20 @@ const server = http.createServer((req, res) => {
       }
       const limit = parsedUrl.searchParams.get('limit') || '10';
       const targetProject = session.role === 'PLATFORM_OPERATOR' && requestedProject ? requestedProject : session.projectId;
-      return proxyToControlPlane(`/v1/audit-logs?limit=${encodeURIComponent(limit)}&project_id=${encodeURIComponent(targetProject)}`, req, res);
+      return proxyToControlPlane(`/v1/audit-logs?limit=${encodeURIComponent(limit)}&project_id=${encodeURIComponent(targetProject)}`, req, res, session);
     }
 
-    // Proxy Domains (Strict multi-tenant project boundary; Read-only viewers forbidden from mutation)
+    // Proxy Domains (Strict multi-tenant project boundary; Only PLATFORM_OPERATOR & TENANT_ADMIN permitted to mutate)
     if (pathname === '/api/proxy/domains') {
-      if (req.method !== 'GET' && session.role === 'VIEWER') {
-        return sendJSON(res, 403, { code: 403, error: 'Forbidden: Read-only viewer role cannot modify domains' });
+      if (req.method !== 'GET') {
+        if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+          return sendJSON(res, 403, {
+            code: 403,
+            error: `Forbidden: Role "${session.role}" is not authorized to modify domains. Only PLATFORM_OPERATOR and TENANT_ADMIN roles can perform domain mutations.`
+          });
+        }
       }
-      return proxyToControlPlane(`/v1/projects/${encodeURIComponent(session.projectId)}/domains`, req, res);
+      return proxyToControlPlane(`/v1/projects/${encodeURIComponent(session.projectId)}/domains`, req, res, session);
     }
 
     // Proxy AI Inference (Dedicated Edge Gateway handler; zero Control Plane credential leakage)

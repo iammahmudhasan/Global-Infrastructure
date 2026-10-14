@@ -1038,5 +1038,252 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(mockEdgeGateway);
     }
   });
+
+  it('Requirement 4.4: Domain mutation RBAC strictly enforces allowlist (VIEWER, DEVELOPER, UNKNOWN rejected with 403; TENANT_ADMIN & PLATFORM_OPERATOR permitted)', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = [
+      'tok-admin:admin@acme.com:TENANT_ADMIN:proj-acme',
+      'tok-op:op@nexusedge.io:PLATFORM_OPERATOR:proj-core',
+      'tok-dev:dev@acme.com:DEVELOPER:proj-acme',
+      'tok-view:view@acme.com:VIEWER:proj-acme',
+      'tok-unknown:unknown@acme.com:INVALID_ROLE:proj-acme'
+    ].join(';');
+
+    let capturedMethod = null;
+    let capturedPath = null;
+    const mockControlPlane = http.createServer((req, res) => {
+      capturedMethod = req.method;
+      capturedPath = req.url;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([{ id: 'dom-1', hostname: 'test.example.com' }]));
+    });
+    await new Promise((resolve) => mockControlPlane.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockControlPlane.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    const loginAndGetCookie = async (token) => {
+      const data = JSON.stringify({ token });
+      const res = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(res.statusCode, 200);
+      const cookie = res.headers['set-cookie'][0].split(';')[0];
+      res.resume();
+      return cookie;
+    };
+
+    const callDomainAPI = async (cookie, method) => {
+      return new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains',
+          method: method,
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': cookie,
+            'Content-Type': 'application/json'
+          }
+        }, resolve);
+        req.on('error', reject);
+        if (method !== 'GET') {
+          req.write(JSON.stringify({ hostname: 'new.example.com' }));
+        }
+        req.end();
+      });
+    };
+
+    try {
+      // 1. VIEWER can GET (200) but cannot POST (403)
+      const viewCookie = await loginAndGetCookie('tok-view');
+      const getResView = await callDomainAPI(viewCookie, 'GET');
+      assert.strictEqual(getResView.statusCode, 200, 'VIEWER must be able to read domains');
+      getResView.resume();
+
+      const postResView = await callDomainAPI(viewCookie, 'POST');
+      assert.strictEqual(postResView.statusCode, 403, 'VIEWER role must receive 403 Forbidden for domain mutation');
+      postResView.resume();
+
+      // 2. DEVELOPER can GET (200) but cannot POST (403)
+      const devCookie = await loginAndGetCookie('tok-dev');
+      const getResDev = await callDomainAPI(devCookie, 'GET');
+      assert.strictEqual(getResDev.statusCode, 200, 'DEVELOPER must be able to read domains');
+      getResDev.resume();
+
+      const postResDev = await callDomainAPI(devCookie, 'POST');
+      assert.strictEqual(postResDev.statusCode, 403, 'DEVELOPER role must receive 403 Forbidden for domain mutation');
+      postResDev.resume();
+
+      // 3. UNKNOWN role cannot mutate domains (403)
+      const unknownCookie = await loginAndGetCookie('tok-unknown');
+      const postResUnknown = await callDomainAPI(unknownCookie, 'POST');
+      assert.strictEqual(postResUnknown.statusCode, 403, 'UNKNOWN role must receive 403 Forbidden for domain mutation');
+      postResUnknown.resume();
+
+      // 4. TENANT_ADMIN can mutate domains (200)
+      const adminCookie = await loginAndGetCookie('tok-admin');
+      const postResAdmin = await callDomainAPI(adminCookie, 'POST');
+      assert.strictEqual(postResAdmin.statusCode, 200, 'TENANT_ADMIN must be permitted to mutate domains');
+      postResAdmin.resume();
+
+      // 5. PLATFORM_OPERATOR can mutate domains (200)
+      const opCookie = await loginAndGetCookie('tok-op');
+      const postResOp = await callDomainAPI(opCookie, 'POST');
+      assert.strictEqual(postResOp.statusCode, 200, 'PLATFORM_OPERATOR must be permitted to mutate domains');
+      postResOp.resume();
+    } finally {
+      await safeClose(server);
+      await safeClose(mockControlPlane);
+    }
+  });
+
+  it('Requirement 4.5: Downstream Control Plane requests include human actor attribution (X-Authenticated-Actor)', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'tok-alice:alice.engineer@corp.com:TENANT_ADMIN:proj-corp';
+
+    let capturedHeaders = null;
+    const mockControlPlane = http.createServer((req, res) => {
+      capturedHeaders = req.headers;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([]));
+    });
+    await new Promise((resolve) => mockControlPlane.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockControlPlane.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      const loginData = JSON.stringify({ token: 'tok-alice' });
+      const loginRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(loginData)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(loginData);
+        req.end();
+      });
+      assert.strictEqual(loginRes.statusCode, 200);
+      const cookie = loginRes.headers['set-cookie'][0].split(';')[0];
+      loginRes.resume();
+
+      const domainRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains',
+          method: 'GET',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': cookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(domainRes.statusCode, 200);
+      assert.strictEqual(
+        capturedHeaders['x-authenticated-actor'],
+        'alice.engineer@corp.com',
+        'Control plane proxy must include human actor identity for audit attribution'
+      );
+      assert.strictEqual(capturedHeaders['x-authenticated-role'], 'TENANT_ADMIN');
+      assert.strictEqual(capturedHeaders['x-authenticated-project-id'], 'proj-corp');
+      domainRes.resume();
+    } finally {
+      await safeClose(server);
+      await safeClose(mockControlPlane);
+    }
+  });
+
+  it('Requirement 4.6: Trusted proxy forwarding isolates rate limits across distinct client IPs', async () => {
+    process.env.TRUSTED_PROXY_IPS = '127.0.0.1';
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      const sendLoginFrom = async (clientIp, token) => {
+        const data = JSON.stringify({ token });
+        return new Promise((resolve, reject) => {
+          const req = http.request({
+            hostname: '127.0.0.1',
+            port: port,
+            path: '/api/auth/login',
+            method: 'POST',
+            agent: false,
+            headers: {
+              'Connection': 'close',
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(data),
+              'X-Forwarded-For': clientIp
+            }
+          }, resolve);
+          req.on('error', reject);
+          req.write(data);
+          req.end();
+        });
+      };
+
+      // Client A exhausts rate limit (10 failed attempts)
+      for (let i = 0; i < 10; i++) {
+        const resA = await sendLoginFrom('203.0.113.10', `bad-token-${i}`);
+        assert.strictEqual(resA.statusCode, 401);
+        resA.resume();
+      }
+
+      // 11th attempt for Client A must be rate-limited (429)
+      const resLimitA = await sendLoginFrom('203.0.113.10', 'bad-token-11');
+      assert.strictEqual(resLimitA.statusCode, 429, 'Client A must be rate limited after 10 attempts');
+      resLimitA.resume();
+
+      // Client B from different IP must STILL be allowed (401 invalid creds, NOT 429)
+      const resB = await sendLoginFrom('203.0.113.20', 'bad-token-client-b');
+      assert.strictEqual(resB.statusCode, 401, 'Client B from distinct IP must have independent rate limit bucket');
+      resB.resume();
+    } finally {
+      await safeClose(server);
+    }
+  });
 });
+
 

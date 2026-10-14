@@ -116,7 +116,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Run Dashboard Security Tests
         run: |
@@ -164,6 +164,7 @@ jobs:
           NEXUSEDGE_PROJECT_AI_KEYS: "proj-core:ci-key"
           NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
           NEXUSEDGE_CP_POP_ID: "singapore"
+          NEXUSEDGE_PUBLIC_IP: "80.225.241.129"
         run: |
           docker compose -f deploy/docker-compose.yml config
           docker compose -f deploy/docker-compose.prod.yml config
@@ -183,6 +184,7 @@ jobs:
           NEXUSEDGE_PROJECT_AI_KEYS: "proj-core:ci-key"
           NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
           NEXUSEDGE_CP_POP_ID: "singapore"
+          NEXUSEDGE_PUBLIC_IP: "80.225.241.129"
         run: |
           echo "Starting Production PostgreSQL with server-side TLS..."
           docker compose -f deploy/docker-compose.prod.yml up -d postgres
@@ -239,14 +241,14 @@ jobs:
 
           for i in 1 2 3 4 5; do
             echo "Pulling Envoy ingress image (attempt $i/5)..."
-            if docker pull envoyproxy/envoy:v1.31-latest; then
+            if docker pull envoyproxy/envoy:v1.32-latest; then
               PULL_SUCCESS=1
               break
             fi
             echo "Envoy pull timed out or failed. Retrying in 10s..."
             sleep 10
           done
-          [ "${PULL_SUCCESS:-0}" -eq 1 ] || { echo "ERROR: Failed to pull envoyproxy/envoy:v1.31-latest"; exit 1; }
+          [ "${PULL_SUCCESS:-0}" -eq 1 ] || { echo "ERROR: Failed to pull envoyproxy/envoy:v1.32-latest"; exit 1; }
 
           for i in 1 2 3; do
             echo "Starting compose stack (attempt $i/3)..."

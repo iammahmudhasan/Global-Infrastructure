@@ -200,7 +200,8 @@ func (l *AuditLogger) LastHash() string {
 
 // RollbackLastRecord removes the last appended record if its ID matches, restoring the previous head hash.
 // This prevents divergence between persistent database storage and in-memory cryptographic state on storage failure.
-func (l *AuditLogger) RollbackLastRecord(recordID string) {
+// Returns true if the record was successfully popped from the tail of the in-memory chain; false otherwise.
+func (l *AuditLogger) RollbackLastRecord(recordID string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -212,5 +213,7 @@ func (l *AuditLogger) RollbackLastRecord(recordID string) {
 		} else {
 			l.lastHash = GenesisHash
 		}
+		return true
 	}
+	return false
 }
