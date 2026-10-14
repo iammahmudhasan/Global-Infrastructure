@@ -100,15 +100,10 @@ impl AiGatewayAuthRegistry {
         }
     }
 
-    /// Creates an auth registry strictly for production environments.
-    /// Fails closed if NEXUSEDGE_AI_API_KEYS is missing, empty, or contains invalid/incomplete policies.
-    /// Strictly requires explicit project, scope, and jurisdiction policies.
+    /// Creates an auth registry strictly for production environments from raw key configuration string.
+    /// Strictly requires explicit project, scope, and jurisdiction policies (6 fields minimum).
     /// Rejects duplicate keys, empty allowlists, and malformed entries.
-    pub fn new_production() -> Result<Self, String> {
-        let env_keys = std::env::var("NEXUSEDGE_AI_API_KEYS").map_err(|_| {
-            "NEXUSEDGE_AI_API_KEYS environment variable is required in production mode".to_string()
-        })?;
-
+    pub fn from_production_str(env_keys: &str) -> Result<Self, String> {
         let trimmed = env_keys.trim();
         if trimmed.is_empty() {
             return Err("NEXUSEDGE_AI_API_KEYS cannot be empty in production mode".to_string());
@@ -213,6 +208,17 @@ impl AiGatewayAuthRegistry {
             identities: Arc::new(RwLock::new(map)),
             initialization_error: None,
         })
+    }
+
+    /// Creates an auth registry strictly for production environments.
+    /// Fails closed if NEXUSEDGE_AI_API_KEYS is missing, empty, or contains invalid/incomplete policies.
+    /// Strictly requires explicit project, scope, and jurisdiction policies.
+    /// Rejects duplicate keys, empty allowlists, and malformed entries.
+    pub fn new_production() -> Result<Self, String> {
+        let env_keys = std::env::var("NEXUSEDGE_AI_API_KEYS").map_err(|_| {
+            "NEXUSEDGE_AI_API_KEYS environment variable is required in production mode".to_string()
+        })?;
+        Self::from_production_str(&env_keys)
     }
 
     /// Automatically selects production or development auth registry based on environment.
@@ -2107,8 +2113,11 @@ mod tests {
         assert_eq!(meta_body.project_id.as_deref(), Some("proj-from-body"));
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_production_auth_fails_on_missing_or_empty_env() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
         let res = AiGatewayAuthRegistry::new_production();
         assert!(res.is_err());
@@ -2123,6 +2132,22 @@ mod tests {
 
     #[test]
     fn test_production_auth_fails_on_incomplete_definition() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        // Pure string validation
+        let res_str = AiGatewayAuthRegistry::from_production_str("prod-key-1:tenant-1:proj-1");
+        assert!(res_str.is_err());
+        assert!(res_str
+            .unwrap_err()
+            .contains("Incomplete production key definition"));
+
+        let res_str_5 = AiGatewayAuthRegistry::from_production_str(
+            "prod-key-1:tenant-1:proj-1:proj-1:inference",
+        );
+        assert!(res_str_5.is_err());
+        assert!(res_str_5
+            .unwrap_err()
+            .contains("Incomplete production key definition"));
+
         // Only 3 parts provided instead of required explicit 6 parts
         std::env::set_var("NEXUSEDGE_AI_API_KEYS", "prod-key-1:tenant-1:proj-1");
         let res = AiGatewayAuthRegistry::new_production();
@@ -2146,6 +2171,15 @@ mod tests {
 
     #[test]
     fn test_production_auth_fails_on_duplicate_key() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let res_str = AiGatewayAuthRegistry::from_production_str(
+            "duplicate-key:t1:p1:p1:inference:GLOBAL;duplicate-key:t2:p2:p2:inference:BD",
+        );
+        assert!(res_str.is_err());
+        assert!(res_str
+            .unwrap_err()
+            .contains("Duplicate API key detected in production registry"));
+
         std::env::set_var(
             "NEXUSEDGE_AI_API_KEYS",
             "duplicate-key:t1:p1:p1:inference:GLOBAL;duplicate-key:t2:p2:p2:inference:BD",
@@ -2160,43 +2194,37 @@ mod tests {
 
     #[test]
     fn test_production_auth_fails_on_empty_allowlists() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // Empty allowed_projects
-        std::env::set_var(
-            "NEXUSEDGE_AI_API_KEYS",
-            "valid-key:t1:p1: :inference:GLOBAL",
-        );
-        let res_proj = AiGatewayAuthRegistry::new_production();
+        let res_proj =
+            AiGatewayAuthRegistry::from_production_str("valid-key:t1:p1: :inference:GLOBAL");
         assert!(res_proj.is_err());
         assert!(res_proj
             .unwrap_err()
             .contains("Allowed projects list cannot be empty"));
 
         // Empty scopes
-        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "valid-key:t1:p1:p1: :GLOBAL");
-        let res_scopes = AiGatewayAuthRegistry::new_production();
+        let res_scopes = AiGatewayAuthRegistry::from_production_str("valid-key:t1:p1:p1: :GLOBAL");
         assert!(res_scopes.is_err());
         assert!(res_scopes
             .unwrap_err()
             .contains("Scopes list cannot be empty"));
 
         // Empty jurisdictions
-        std::env::set_var("NEXUSEDGE_AI_API_KEYS", "valid-key:t1:p1:p1:inference: ");
-        let res_jur = AiGatewayAuthRegistry::new_production();
+        let res_jur = AiGatewayAuthRegistry::from_production_str("valid-key:t1:p1:p1:inference: ");
         assert!(res_jur.is_err());
         assert!(res_jur
             .unwrap_err()
             .contains("Jurisdictions list cannot be empty"));
-        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
     }
 
     #[test]
     fn test_production_auth_succeeds_on_explicit_policy() {
-        std::env::set_var(
-            "NEXUSEDGE_AI_API_KEYS",
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let reg = AiGatewayAuthRegistry::from_production_str(
             "prod-key-alpha:t-alpha:prj-alpha:prj-alpha,prj-shared:inference,analytics:BD,GLOBAL",
-        );
-        let reg =
-            AiGatewayAuthRegistry::new_production().expect("expected valid production registry");
+        )
+        .expect("expected valid production registry");
         assert!(!reg.is_empty());
         assert!(reg.initialization_error().is_none());
 
@@ -2215,6 +2243,5 @@ mod tests {
         assert!(identity.scopes.contains("analytics"));
         assert!(identity.allowed_jurisdictions.contains("BD"));
         assert!(identity.allowed_jurisdictions.contains("GLOBAL"));
-        std::env::remove_var("NEXUSEDGE_AI_API_KEYS");
     }
 }
