@@ -82,6 +82,9 @@ fi
 
 # 8. Docker Compose Manifest Gate
 echo "[8/8] Validating Docker Compose configurations..."
+if command -v go >/dev/null 2>&1; then
+  go run "${REPO_ROOT}/tools/release/generate_certs.go" "${REPO_ROOT}/deploy/envoy/certs" "${REPO_ROOT}/deploy/postgres/certs"
+fi
 if command -v docker >/dev/null 2>&1; then
   docker compose -f "${REPO_ROOT}/deploy/docker-compose.yml" config --quiet
   POSTGRES_USER="nexusedge" \

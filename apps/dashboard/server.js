@@ -13,7 +13,7 @@ const CONTROL_PLANE_URL = process.env.CONTROL_PLANE_URL || 'http://127.0.0.1:909
 const CONTROL_PLANE_TOKEN = process.env.CONTROL_PLANE_TOKEN || process.env.NEXUSEDGE_CP_AUTH_TOKEN || '';
 const EDGE_GATEWAY_URL = process.env.EDGE_GATEWAY_URL || 'http://127.0.0.1:8080';
 const EDGE_GATEWAY_AI_KEY = process.env.EDGE_GATEWAY_AI_KEY || process.env.NEXUSEDGE_AI_API_KEY || '';
-const OPERATOR_TOKEN = process.env.NEXUSEDGE_OPERATOR_TOKEN || CONTROL_PLANE_TOKEN || '';
+const OPERATOR_TOKEN = process.env.NEXUSEDGE_OPERATOR_TOKEN || '';
 const DEFAULT_PROJECT_ID = process.env.NEXUSEDGE_PROJECT_ID || 'proj-core';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -43,14 +43,27 @@ function generateSessionId() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-// Client IP extractor respecting reverse proxies
+// Client IP extractor strictly protecting against X-Forwarded-For spoofing
 function getClientIp(req) {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (forwarded) {
-    const first = forwarded.split(',')[0].trim();
-    if (first) return first;
+  const socketIp = (req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown';
+  const trustedProxies = (process.env.TRUSTED_PROXY_IPS || '')
+    .split(',')
+    .map(ip => ip.trim())
+    .filter(Boolean);
+
+  // Only inspect X-Forwarded-For if socket IP matches an explicitly configured trusted proxy
+  if (trustedProxies.length > 0 && trustedProxies.includes(socketIp)) {
+    const forwarded = req.headers['x-forwarded-for'];
+    if (forwarded && typeof forwarded === 'string') {
+      const parts = forwarded.split(',').map(s => s.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        return parts[parts.length - 1];
+      }
+    }
   }
-  return req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : 'unknown';
+
+  // Direct socket peer IP (immune to client-forged headers)
+  return socketIp;
 }
 
 // Check and record failed login attempt for rate limiting
@@ -134,29 +147,44 @@ function verifyCredentials(token) {
   return null;
 }
 
-// Parse cookies from request header
+// Parse cookies from request header safely without throwing on malformed percent encoding
 function parseCookies(req) {
   const list = {};
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) return list;
+  const cookieHeader = req.headers && req.headers.cookie;
+  if (!cookieHeader || typeof cookieHeader !== 'string') return list;
+
   cookieHeader.split(';').forEach(cookie => {
     const parts = cookie.split('=');
-    list[parts.shift().trim()] = decodeURI(parts.join('='));
+    if (parts.length < 2) return;
+    const key = parts.shift().trim();
+    const rawVal = parts.join('=').trim();
+    try {
+      list[key] = decodeURIComponent(rawVal);
+    } catch {
+      // Fallback safely to raw string to avoid URIError crashing the Node.js process
+      list[key] = rawVal;
+    }
   });
   return list;
 }
 
 // Authenticate session strictly via active server session
 function authenticateSession(req) {
-  const cookies = parseCookies(req);
+  let cookies;
+  try {
+    cookies = parseCookies(req);
+  } catch {
+    return null;
+  }
   let sessionId = cookies['nexusedge_session'];
 
-  const authHeader = req.headers['authorization'];
-  if (!sessionId && authHeader && authHeader.startsWith('Bearer ')) {
+  const authHeader = req.headers && req.headers['authorization'];
+  if (!sessionId && authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
     sessionId = authHeader.substring(7).trim();
   }
 
-  if (sessionId && sessions.has(sessionId)) {
+  // Session IDs must be 64-character hexadecimal strings
+  if (sessionId && typeof sessionId === 'string' && /^[0-9a-f]{64}$/i.test(sessionId) && sessions.has(sessionId)) {
     const session = sessions.get(sessionId);
     if (session.expiresAt > Date.now()) {
       return session;

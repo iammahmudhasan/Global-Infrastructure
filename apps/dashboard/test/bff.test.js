@@ -590,4 +590,167 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(server);
     }
   });
+
+  it('Requirement 3.2: Control Plane token cannot be used to log in as Dashboard Operator', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.CONTROL_PLANE_TOKEN = 'secret-cp-token-only';
+    delete process.env.NEXUSEDGE_OPERATOR_TOKEN;
+    delete process.env.NEXUSEDGE_DASHBOARD_USERS;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      const postData = JSON.stringify({
+        token: 'secret-cp-token-only'
+      });
+
+      const res = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(postData)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(postData);
+        req.end();
+      });
+
+      assert.strictEqual(res.statusCode, 401, 'Control Plane token must NOT be accepted for Operator login');
+      assert.strictEqual(
+        res.headers['set-cookie'],
+        undefined,
+        'No session cookie should be issued when logging in with Control Plane token'
+      );
+      res.resume();
+    } finally {
+      await safeClose(server);
+    }
+  });
+
+  it('Requirement 2.10: Login rate limiting cannot be bypassed via X-Forwarded-For header spoofing', async () => {
+    delete process.env.TRUSTED_PROXY_IPS;
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // Send 10 failed login requests, each with a different spoofed X-Forwarded-For
+      for (let i = 0; i < 10; i++) {
+        const invalidData = JSON.stringify({ token: `invalid-token-${i}` });
+        const res = await new Promise((resolve, reject) => {
+          const req = http.request({
+            hostname: '127.0.0.1',
+            port: port,
+            path: '/api/auth/login',
+            method: 'POST',
+            agent: false,
+            headers: {
+              'Connection': 'close',
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(invalidData),
+              'X-Forwarded-For': `203.0.113.${i + 1}, 198.51.100.1`
+            }
+          }, resolve);
+          req.on('error', reject);
+          req.write(invalidData);
+          req.end();
+        });
+        assert.strictEqual(res.statusCode, 401);
+        res.resume();
+      }
+
+      // The 11th attempt with yet another spoofed IP must STILL be rate-limited (429)
+      const eleventhData = JSON.stringify({ token: 'invalid-token-11' });
+      const resLimit = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(eleventhData),
+            'X-Forwarded-For': '192.0.2.99'
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(eleventhData);
+        req.end();
+      });
+
+      assert.strictEqual(
+        resLimit.statusCode,
+        429,
+        'Spoofed X-Forwarded-For must not bypass login rate limiting from same peer socket'
+      );
+      resLimit.resume();
+    } finally {
+      await safeClose(server);
+    }
+  });
+
+  it('Requirement 2.11: Malformed cookie (%E0%A4%A) does not crash the Node.js process and returns 401', async () => {
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // Send request with malformed percent-encoded cookie
+      const res1 = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/audit-logs',
+          method: 'GET',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': 'nexusedge_session=%E0%A4%A'
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.strictEqual(res1.statusCode, 401, 'Malformed cookie must safely return 401 Unauthorized');
+      res1.resume();
+
+      // Ensure server is still alive and responds to subsequent valid requests
+      const res2 = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.strictEqual(res2.statusCode, 200, 'Server must remain alive and responsive after malformed cookie');
+      res2.resume();
+    } finally {
+      await safeClose(server);
+    }
+  });
 });

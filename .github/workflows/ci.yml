@@ -135,16 +135,20 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Generate Ingress TLS Certificates
+      - name: Generate Ingress and Database TLS Certificates
         env:
           ENVOY_CERT_GID: "101"
         run: |
-          go run tools/release/generate_certs.go deploy/envoy/certs
+          go run tools/release/generate_certs.go deploy/envoy/certs deploy/postgres/certs
           sudo groupadd -g "$ENVOY_CERT_GID" envoy 2>/dev/null || true
           sudo chgrp -R "$ENVOY_CERT_GID" deploy/envoy/certs 2>/dev/null || true
           chmod 0775 deploy/envoy/certs
           chmod 0664 deploy/envoy/certs/server.crt deploy/envoy/certs/sds.json
           chmod 0660 deploy/envoy/certs/server.key
+          sudo chown -R 70:70 deploy/postgres/certs 2>/dev/null || true
+          chmod 0700 deploy/postgres/certs
+          chmod 0644 deploy/postgres/certs/postgres.crt deploy/postgres/certs/root.crt
+          chmod 0600 deploy/postgres/certs/postgres.key
 
       - name: Validate Compose Configs (Dev & Prod)
         env:
@@ -160,6 +164,34 @@ jobs:
         run: |
           docker compose -f deploy/docker-compose.yml config
           docker compose -f deploy/docker-compose.prod.yml config
+
+      - name: Verify Production PostgreSQL TLS Startup & Handshake
+        env:
+          POSTGRES_USER: "nexusedge"
+          POSTGRES_PASSWORD: "prodpassword123"
+          POSTGRES_DB: "nexusedge_edge"
+        run: |
+          echo "Starting Production PostgreSQL with server-side TLS..."
+          docker compose -f deploy/docker-compose.prod.yml up -d postgres
+          
+          echo "Waiting for PostgreSQL container to become healthy..."
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format='{{json .State.Health.Status}}' nexusedge-postgres-prod 2>/dev/null || echo '"unknown"')
+            if [ "$STATUS" = '"healthy"' ]; then
+              echo "Production PostgreSQL is healthy with TLS!"
+              break
+            fi
+            sleep 1
+          done
+
+          echo "Testing TLS connection handshake (sslmode=require)..."
+          docker compose -f deploy/docker-compose.prod.yml exec -T postgres psql "postgresql://nexusedge:prodpassword123@127.0.0.1:5432/nexusedge_edge?sslmode=require" -c "SHOW ssl;"
+
+          echo "Testing full TLS certificate verification (sslmode=verify-full)..."
+          docker compose -f deploy/docker-compose.prod.yml exec -T postgres psql "postgresql://nexusedge:prodpassword123@localhost:5432/nexusedge_edge?sslmode=verify-full&sslrootcert=/etc/ssl/certs/postgres.crt" -c "SELECT 'TLS_VERIFIED' as status, version();"
+
+          echo "Tearing down production test container..."
+          docker compose -f deploy/docker-compose.prod.yml down -v
 
       - name: Build and Start Single-PoP Stack
         env:

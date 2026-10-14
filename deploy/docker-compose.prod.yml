@@ -122,13 +122,13 @@ services:
       - "-c"
       - "ssl=on"
       - "-c"
-      - "ssl_cert_file=/etc/ssl/certs/server.crt"
+      - "ssl_cert_file=/etc/ssl/certs/postgres.crt"
       - "-c"
-      - "ssl_key_file=/etc/ssl/certs/server.key"
+      - "ssl_key_file=/etc/ssl/certs/postgres.key"
     volumes:
       - postgres-prod-data:/var/lib/postgresql/data
-      - ./envoy/certs/server.crt:/etc/ssl/certs/server.crt:ro
-      - ./envoy/certs/server.key:/etc/ssl/certs/server.key:ro
+      - ./postgres/certs/postgres.crt:/etc/ssl/certs/postgres.crt:ro
+      - ./postgres/certs/postgres.key:/etc/ssl/certs/postgres.key:ro
       - ../migrations/postgres/edge/0001_initial_edge_schema.sql:/docker-entrypoint-initdb.d/0001_initial_edge_schema.sql:ro
       - ../migrations/postgres/edge/0002_ai_providers_vault.sql:/docker-entrypoint-initdb.d/0002_ai_providers_vault.sql:ro
     healthcheck:

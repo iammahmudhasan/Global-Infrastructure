@@ -208,26 +208,39 @@ To test simulated placement offline, enable 'Offline Demo Mode' toggle.`;
           return;
         }
 
-        const provider = resp.headers.get('x-nexusedge-provider') || 'spot-coreweave';
-        const costPerM = resp.headers.get('x-nexusedge-cost-per-mtokens') || '0.50';
-        const ttft = resp.headers.get('x-nexusedge-ttft-ms') || '18';
-        const totalDuration = resp.headers.get('x-nexusedge-total-duration-ms') || '26';
-        const tokensTotal = resp.headers.get('x-nexusedge-tokens-total') || '512';
-        const savingsUSD = resp.headers.get('x-nexusedge-estimated-savings-usd') || '0.001024';
-        const failovers = resp.headers.get('x-nexusedge-failover-count') || '0';
+        let responseBody = '';
+        try {
+          const bodyJson = await resp.json();
+          if (bodyJson.choices && bodyJson.choices[0] && bodyJson.choices[0].message) {
+            responseBody = bodyJson.choices[0].message.content;
+          } else {
+            responseBody = JSON.stringify(bodyJson, null, 2);
+          }
+        } catch {
+          responseBody = await resp.text();
+        }
+
+        const provider = resp.headers.get('x-nexusedge-provider') || 'Not reported';
+        const costPerM = resp.headers.get('x-nexusedge-cost-per-mtokens');
+        const ttft = resp.headers.get('x-nexusedge-ttft-ms');
+        const totalDuration = resp.headers.get('x-nexusedge-total-duration-ms');
+        const tokensTotal = resp.headers.get('x-nexusedge-tokens-total');
+        const savingsUSD = resp.headers.get('x-nexusedge-estimated-savings-usd');
+        const failovers = resp.headers.get('x-nexusedge-failover-count');
 
         term.innerText += `\n< HTTP/1.1 ${resp.status} OK
 < X-NexusEdge-Provider: ${provider}
 < X-NexusEdge-Routing-Strategy: ${strategy}
-< X-NexusEdge-Cost-Per-MTokens: $${costPerM}
-< X-NexusEdge-Tokens-Total: ${tokensTotal}
-< X-NexusEdge-Estimated-Savings-USD: $${savingsUSD}
-< X-NexusEdge-TTFT-Ms: ${ttft} ms
-< X-NexusEdge-Failover-Count: ${failovers}
-< X-NexusEdge-Total-Duration-Ms: ${totalDuration} ms
+< X-NexusEdge-Cost-Per-MTokens: ${costPerM ? '$' + costPerM : 'Unavailable'}
+< X-NexusEdge-Tokens-Total: ${tokensTotal || 'Unavailable'}
+< X-NexusEdge-Estimated-Savings-USD: ${savingsUSD ? '$' + savingsUSD : 'Unavailable'}
+< X-NexusEdge-TTFT-Ms: ${ttft ? ttft + ' ms' : 'Unavailable'}
+< X-NexusEdge-Failover-Count: ${failovers || '0'}
+< X-NexusEdge-Total-Duration-Ms: ${totalDuration ? totalDuration + ' ms' : 'Unavailable'}
 
-Response payload delivered successfully with zero gateway overhead.`;
-        showToast(`Inference dispatched: routed to ${provider} ($${costPerM}/1M tokens)`);
+[LIVE INFERENCE RESPONSE]
+${responseBody || '(Empty response payload)'}`;
+        showToast(`Inference dispatched: routed to ${provider}`);
       } catch (err) {
         term.innerText += `\n[ERROR] Connection failed: Edge Gateway is unreachable or rejected connection.
 Details: ${err.message}
@@ -295,8 +308,9 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
 
           const tdValid = document.createElement('td');
           const validSpan = document.createElement('span');
-          validSpan.className = 'badge badge-bd';
-          validSpan.textContent = 'CRYPTOGRAPHICALLY VALID';
+          validSpan.className = 'badge badge-dim';
+          validSpan.dataset.auditRowBadge = 'true';
+          validSpan.textContent = 'UNVERIFIED';
           tdValid.appendChild(validSpan);
 
           tr.append(tdTime, tdActor, tdAction, tdResource, tdPrev, tdHash, tdValid);
@@ -327,13 +341,22 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         const resp = await fetch('/api/proxy/audit-logs/verify');
         if (resp.ok) {
           const data = await resp.json();
+          const rowBadges = document.querySelectorAll('[data-audit-row-badge="true"]');
           if (data.chain_valid) {
-            if (statusEl) statusEl.innerText = `Chain Integrity: VERIFIED (${data.total_records} records)`;
+            if (statusEl) statusEl.innerText = `Chain Integrity: VERIFIED (${data.total_records || data.total || 0} records)`;
             if (badge) badge.className = 'badge badge-bd';
+            rowBadges.forEach(b => {
+              b.className = 'badge badge-bd';
+              b.textContent = 'CRYPTOGRAPHICALLY VALID';
+            });
             showToast('Cryptographic Audit Chain verified: 100% valid SHA-256 HMAC integrity.');
           } else {
-            if (statusEl) statusEl.innerText = 'Chain Integrity: INVALID!';
+            if (statusEl) statusEl.innerText = 'Chain Integrity: INVALID / VERIFICATION FAILED!';
             if (badge) badge.className = 'badge badge-amber';
+            rowBadges.forEach(b => {
+              b.className = 'badge badge-amber';
+              b.textContent = 'VERIFICATION FAILED';
+            });
             showToast('Audit verification failed: hash chain broken!');
           }
         } else {

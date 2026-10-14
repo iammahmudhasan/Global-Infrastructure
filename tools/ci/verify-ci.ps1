@@ -147,6 +147,12 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 Write-Host "[8/8] Validating Docker Compose configurations..." -ForegroundColor Yellow
 $ComposeFile = Join-Path $RepoRoot "deploy/docker-compose.yml"
 $ComposeProdFile = Join-Path $RepoRoot "deploy/docker-compose.prod.yml"
+$CertGen = Join-Path $RepoRoot "tools/release/generate_certs.go"
+$EnvoyCertDir = Join-Path $RepoRoot "deploy/envoy/certs"
+$PgCertDir = Join-Path $RepoRoot "deploy/postgres/certs"
+if (Get-Command go -ErrorAction SilentlyContinue) {
+    & go run $CertGen $EnvoyCertDir $PgCertDir
+}
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     & docker compose -f $ComposeFile config --quiet
     if ($LASTEXITCODE -ne 0) {
