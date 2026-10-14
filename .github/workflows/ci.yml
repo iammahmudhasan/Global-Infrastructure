@@ -126,6 +126,17 @@ jobs:
   deploy-manifest-check:
     name: Single-PoP End-to-End Compose Runtime
     runs-on: ubuntu-latest
+    env:
+      ENVOY_CERT_GID: "101"
+      POSTGRES_USER: "nexusedge"
+      POSTGRES_PASSWORD: "prodpassword123"
+      POSTGRES_DB: "nexusedge_edge"
+      NEXUSEDGE_DATABASE_URL: "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
+      AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
+      NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
+      NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+      NEXUSEDGE_CP_POP_ID: "singapore"
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -136,8 +147,6 @@ jobs:
           go-version: '1.23'
 
       - name: Generate Ingress and Database TLS Certificates
-        env:
-          ENVOY_CERT_GID: "101"
         run: |
           go run tools/release/generate_certs.go deploy/envoy/certs deploy/postgres/certs
           sudo groupadd -g "$ENVOY_CERT_GID" envoy 2>/dev/null || true
@@ -151,25 +160,11 @@ jobs:
           sudo chown -R 70:70 deploy/postgres/certs 2>/dev/null || true
 
       - name: Validate Compose Configs (Dev & Prod)
-        env:
-          ENVOY_CERT_GID: "101"
-          POSTGRES_USER: "nexusedge"
-          POSTGRES_PASSWORD: "prodpassword123"
-          NEXUSEDGE_DATABASE_URL: "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
-          AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-          NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
-          NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
-          NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
-          NEXUSEDGE_CP_POP_ID: "singapore"
         run: |
           docker compose -f deploy/docker-compose.yml config
           docker compose -f deploy/docker-compose.prod.yml config
 
       - name: Verify Production PostgreSQL TLS Startup & Handshake
-        env:
-          POSTGRES_USER: "nexusedge"
-          POSTGRES_PASSWORD: "prodpassword123"
-          POSTGRES_DB: "nexusedge_edge"
         run: |
           echo "Starting Production PostgreSQL with server-side TLS..."
           docker compose -f deploy/docker-compose.prod.yml up -d postgres
@@ -183,6 +178,12 @@ jobs:
             fi
             sleep 1
           done
+
+          if [ "$STATUS" != '"healthy"' ]; then
+            echo "ERROR: PostgreSQL failed to become healthy. Container logs:"
+            docker compose -f deploy/docker-compose.prod.yml logs postgres
+            exit 1
+          fi
 
           echo "Testing TLS connection handshake (sslmode=require)..."
           docker compose -f deploy/docker-compose.prod.yml exec -T postgres psql "postgresql://nexusedge:prodpassword123@127.0.0.1:5432/nexusedge_edge?sslmode=require" -c "SHOW ssl;"
