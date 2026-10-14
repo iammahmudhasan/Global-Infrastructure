@@ -46,6 +46,8 @@ type APIHandler struct {
 	authenticator   *auth.Authenticator
 	limiter         *ControlPlaneLimiter
 	auditLogger     *security.AuditLogger
+	auditChainValid bool
+	auditChainErr   error
 	handlerChain    http.Handler
 	mux             *http.ServeMux
 }
@@ -66,9 +68,14 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	var allLogs []*model.AuditLog
 	offset := 0
 	batchSize := 1000
+	var auditLoadErr error
 	for {
 		batch, total, err := s.ListAuditLogs("", batchSize, offset)
-		if err != nil || len(batch) == 0 {
+		if err != nil {
+			auditLoadErr = fmt.Errorf("failed to list audit logs from database at offset %d: %w", offset, err)
+			break
+		}
+		if len(batch) == 0 {
 			break
 		}
 		allLogs = append(allLogs, batch...)
@@ -77,7 +84,17 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 			break
 		}
 	}
-	if len(allLogs) > 0 {
+
+	auditChainValid := true
+	var auditChainErr error
+	if auditLoadErr != nil {
+		auditChainValid = false
+		auditChainErr = auditLoadErr
+		log.Printf("[AUDIT ERROR] Historical audit log load failed at startup: %v", auditLoadErr)
+		if os.Getenv("NEXUSEDGE_DEV_MODE") == "false" || os.Getenv("NEXUSEDGE_ENV") == "production" {
+			panic(fmt.Sprintf("FATAL: AUDIT LOG LOAD FAILED IN PRODUCTION: %v", auditLoadErr))
+		}
+	} else if len(allLogs) > 0 {
 		records := make([]*security.AuditRecord, len(allLogs))
 		for i, l := range allLogs {
 			idx := len(allLogs) - 1 - i
@@ -98,7 +115,9 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		}
 		_ = auditLogger.LoadExistingRecords(records)
 		if valid, err := auditLogger.VerifyChain(); !valid {
-			log.Printf("[AUDIT WARNING] Historical audit chain verification failed at startup: %v", err)
+			auditChainValid = false
+			auditChainErr = err
+			log.Printf("[AUDIT ERROR] Historical audit chain verification failed at startup: %v", err)
 		}
 	}
 
@@ -116,6 +135,8 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		authenticator:   authenticator,
 		limiter:         NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
 		auditLogger:     auditLogger,
+		auditChainValid: auditChainValid,
+		auditChainErr:   auditChainErr,
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
 	}
@@ -189,6 +210,15 @@ func (h *APIHandler) SetStore(s store.Repository) {
 
 func (h *APIHandler) AuditLogger() *security.AuditLogger {
 	return h.auditLogger
+}
+
+func (h *APIHandler) SetAuditChainValid(valid bool, err error) {
+	h.auditChainValid = valid
+	h.auditChainErr = err
+}
+
+func (h *APIHandler) IsAuditChainValid() bool {
+	return h.auditChainValid
 }
 
 func (h *APIHandler) CertManager() *certificate.Manager {
@@ -283,6 +313,15 @@ func (h *APIHandler) registerRoutes() {
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.auditChainValid {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status":  "unready",
+			"error":   "audit chain integrity degraded or failed startup verification",
+			"details": fmt.Sprintf("%v", h.auditChainErr),
+			"service": "nexusedge-config-controller",
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -427,6 +466,9 @@ func (h *APIHandler) handleAuditLogsVerifyRoute(w http.ResponseWriter, r *http.R
 }
 
 func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, resourceType, resourceID string, details map[string]interface{}) error {
+	if !h.auditChainValid {
+		return errors.New("audit log operation blocked: control plane audit chain verification failed")
+	}
 	if h.auditLogger == nil {
 		return nil
 	}
@@ -1151,8 +1193,19 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusNotFound, "domain not found")
 			return
 		}
+		prevStatus := domain.Status
 		if err := h.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := h.recordAudit(r, "", domain.ProjectID, "domain.verified", "domain", domainID, map[string]interface{}{
+			"hostname":    domain.Hostname,
+			"method":      "force",
+			"prev_status": prevStatus,
+			"status":      model.DomainStatusActive,
+		}); err != nil {
+			_ = h.store.UpdateDomainStatus(domainID, prevStatus)
+			writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
 			return
 		}
 		domain.Status = model.DomainStatusActive
@@ -1173,6 +1226,16 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		writeError(w, http.StatusUnprocessableEntity, "domain verification failed: "+err.Error())
+		return
+	}
+
+	if err := h.recordAudit(r, "", domain.ProjectID, "domain.verified", "domain", domain.ID, map[string]interface{}{
+		"hostname": domain.Hostname,
+		"method":   "dns",
+		"status":   domain.Status,
+	}); err != nil {
+		_ = h.store.UpdateDomainStatus(domain.ID, model.DomainStatusPendingVerification)
+		writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
 		return
 	}
 
@@ -2533,6 +2596,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) handleRetrieveSecretForPoP(w http.ResponseWriter, r *http.Request, popID string) {
+	if !h.auditChainValid {
+		writeError(w, http.StatusServiceUnavailable, "secret retrieval denied: control plane audit chain verification failed")
+		return
+	}
 	release, ok := h.acquireControlPlaneSlot(w, r)
 	if !ok {
 		return

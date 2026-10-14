@@ -834,5 +834,209 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(mockEdgeGateway);
     }
   });
+
+  it('Requirement 4.1: Production mode strictly rejects development login fixtures (dev-operator-key, dev-viewer-key)', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    delete process.env.NEXUSEDGE_OPERATOR_TOKEN;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      for (const devKey of ['dev-operator-key', 'dev-viewer-key']) {
+        const postData = JSON.stringify({ token: devKey });
+        const res = await new Promise((resolve, reject) => {
+          const req = http.request({
+            hostname: '127.0.0.1',
+            port: port,
+            path: '/api/auth/login',
+            method: 'POST',
+            agent: false,
+            headers: {
+              'Connection': 'close',
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(postData)
+            }
+          }, resolve);
+          req.on('error', reject);
+          req.write(postData);
+          req.end();
+        });
+
+        assert.strictEqual(res.statusCode, 401, `Development fixture "${devKey}" must be rejected with 401 in production mode`);
+        assert.strictEqual(res.headers['set-cookie'], undefined, `No session cookie should be issued for "${devKey}" in production mode`);
+        res.resume();
+      }
+    } finally {
+      await safeClose(server);
+    }
+  });
+
+  it('Requirement 4.2: Dedicated Control Plane Service Token is segregated from operator login', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.CONTROL_PLANE_SERVICE_TOKEN = 'cp-dedicated-service-key-999';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'human-operator-key-111';
+
+    let capturedHeaders = null;
+    const mockControlPlane = http.createServer((req, res) => {
+      capturedHeaders = req.headers;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'healthy', version: '1.0.0' }));
+    });
+    await new Promise((resolve) => mockControlPlane.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockControlPlane.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Attempting login with CONTROL_PLANE_SERVICE_TOKEN must fail
+      const loginAttemptData = JSON.stringify({ token: 'cp-dedicated-service-key-999' });
+      const failLoginRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(loginAttemptData)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(loginAttemptData);
+        req.end();
+      });
+      assert.strictEqual(failLoginRes.statusCode, 401, 'Control Plane service token must not allow operator login');
+      failLoginRes.resume();
+
+      // 2. Control plane proxy call must use CONTROL_PLANE_SERVICE_TOKEN
+      const healthRes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/health',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(healthRes.statusCode, 200);
+      assert.strictEqual(capturedHeaders['x-api-key'], 'cp-dedicated-service-key-999');
+      assert.strictEqual(capturedHeaders['authorization'], 'Bearer cp-dedicated-service-key-999');
+      healthRes.resume();
+    } finally {
+      await safeClose(server);
+      await safeClose(mockControlPlane);
+    }
+  });
+
+  it('Requirement 4.3: Project-scoped AI credential mapping attaches correct key per project and rejects unmapped projects with 403', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.NEXUSEDGE_PROJECT_AI_KEYS = 'proj-fintech:ai-key-fintech-99,proj-core:ai-key-core-11';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'fintech-tok:user-fintech:TENANT_ADMIN:proj-fintech;core-tok:user-core:PLATFORM_OPERATOR:proj-core;unmapped-tok:user-guest:DEVELOPER:proj-unmapped';
+
+    let capturedHeaders = null;
+    const mockEdgeGateway = http.createServer((req, res) => {
+      capturedHeaders = req.headers;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }));
+    });
+    await new Promise((resolve) => mockEdgeGateway.listen(0, '127.0.0.1', resolve));
+    const edgePort = mockEdgeGateway.address().port;
+    process.env.EDGE_GATEWAY_URL = `http://127.0.0.1:${edgePort}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    const loginAndGetCookie = async (token) => {
+      const data = JSON.stringify({ token });
+      const res = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(res.statusCode, 200);
+      const cookie = res.headers['set-cookie'][0].split(';')[0];
+      res.resume();
+      return cookie;
+    };
+
+    const callInference = async (cookie) => {
+      return new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/inference',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': cookie,
+            'Content-Type': 'application/json'
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(JSON.stringify({ prompt: 'test' }));
+        req.end();
+      });
+    };
+
+    try {
+      // 1. proj-fintech gets ai-key-fintech-99
+      const fintechCookie = await loginAndGetCookie('fintech-tok');
+      const res1 = await callInference(fintechCookie);
+      assert.strictEqual(res1.statusCode, 200);
+      assert.strictEqual(capturedHeaders['authorization'], 'Bearer ai-key-fintech-99');
+      assert.strictEqual(capturedHeaders['x-nexusedge-project-id'], 'proj-fintech');
+      res1.resume();
+
+      // 2. proj-core gets ai-key-core-11
+      const coreCookie = await loginAndGetCookie('core-tok');
+      const res2 = await callInference(coreCookie);
+      assert.strictEqual(res2.statusCode, 200);
+      assert.strictEqual(capturedHeaders['authorization'], 'Bearer ai-key-core-11');
+      assert.strictEqual(capturedHeaders['x-nexusedge-project-id'], 'proj-core');
+      res2.resume();
+
+      // 3. proj-unmapped has no key configured -> 403 Forbidden in production
+      const unmappedCookie = await loginAndGetCookie('unmapped-tok');
+      const res3 = await callInference(unmappedCookie);
+      assert.strictEqual(res3.statusCode, 403, 'Unmapped project in production must receive 403 Forbidden');
+      res3.resume();
+    } finally {
+      await safeClose(server);
+      await safeClose(mockEdgeGateway);
+    }
+  });
 });
 

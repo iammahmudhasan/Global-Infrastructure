@@ -4038,3 +4038,87 @@ func TestAIProvider_DNSResolution_FailClosed(t *testing.T) {
 		t.Fatalf("expected 201 Created on valid public IP resolution, got %d: %s", legitW.Code, legitW.Body.String())
 	}
 }
+
+func TestAuditIntegrity_UnreadyAndDomainVerificationAudit(t *testing.T) {
+	handler := setupTestServer()
+	authenticator := auth.NewAuthenticator()
+	authenticator.RegisterTenantWithRole("key-audit-op", "ops-system", "proj-core", auth.RolePlatformOperator, "*")
+	handler.SetAuthenticator(authenticator)
+
+	// 1. Verify healthz returns 200 OK when audit chain is valid
+	healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	healthW := httptest.NewRecorder()
+	handler.ServeHTTP(healthW, healthReq)
+	if healthW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from healthz when valid, got %d: %s", healthW.Code, healthW.Body.String())
+	}
+
+	// 2. Force verify a domain and verify durable audit record is created
+	domBytes, _ := json.Marshal(map[string]interface{}{
+		"hostname":       "verify-audit-test.aeitron.com",
+		"origin_address": "93.184.216.34",
+	})
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/projects/proj-core/domains", bytes.NewReader(domBytes))
+	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("X-API-Key", "key-audit-op")
+	createW := httptest.NewRecorder()
+	handler.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("failed to create domain for audit test: %d: %s", createW.Code, createW.Body.String())
+	}
+	var domResp map[string]interface{}
+	_ = json.Unmarshal(createW.Body.Bytes(), &domResp)
+	domainID := domResp["domain_id"].(string)
+
+	verifyReq := httptest.NewRequest(http.MethodPost, "/v1/domains/"+domainID+"/verify?force=true", nil)
+	verifyReq.Header.Set("X-API-Key", "key-audit-op")
+	verifyW := httptest.NewRecorder()
+	handler.ServeHTTP(verifyW, verifyReq)
+	if verifyW.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on force-verify domain, got %d: %s", verifyW.Code, verifyW.Body.String())
+	}
+
+	logs, _, err := handler.Store().ListAuditLogs("proj-core", 10, 0)
+	if err != nil || len(logs) == 0 {
+		t.Fatalf("expected audit logs for domain verification, got error: %v, count: %d", err, len(logs))
+	}
+	foundVerifyAudit := false
+	for _, l := range logs {
+		if l.Action == "domain.verified" && l.ResourceID == domainID {
+			foundVerifyAudit = true
+			if l.Details["method"] != "force" {
+				t.Fatalf("expected audit details method=force, got %v", l.Details["method"])
+			}
+			break
+		}
+	}
+	if !foundVerifyAudit {
+		t.Fatalf("expected domain.verified audit log entry for domain %s", domainID)
+	}
+
+	// 3. Mark audit chain invalid (simulating corruption)
+	handler.SetAuditChainValid(false, errors.New("simulated audit chain hash mismatch"))
+
+	// 4. Verify healthz now returns 503 Service Unavailable (Unready)
+	unreadyReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	unreadyW := httptest.NewRecorder()
+	handler.ServeHTTP(unreadyW, unreadyReq)
+	if unreadyW.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when audit chain invalid, got %d: %s", unreadyW.Code, unreadyW.Body.String())
+	}
+
+	// 5. Verify secret retrieval returns 503 Service Unavailable when audit chain invalid
+	secretBody, _ := json.Marshal(map[string]string{
+		"secret_ref":  "vault://projects/proj-core/ai-providers/aip-test/key",
+		"project_id":  "proj-core",
+		"provider_id": "aip-test",
+	})
+	secReq := httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/secrets/retrieve", bytes.NewReader(secretBody))
+	secReq.Header.Set("Content-Type", "application/json")
+	secReq.Header.Set("X-API-Key", "key-audit-op")
+	secW := httptest.NewRecorder()
+	handler.ServeHTTP(secW, secReq)
+	if secW.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on secret retrieval when audit chain invalid, got %d: %s", secW.Code, secW.Body.String())
+	}
+}

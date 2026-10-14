@@ -158,6 +158,10 @@ jobs:
           AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
           NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
+          NEXUSEDGE_API_KEYS: "ci-operator-key:ci-tenant:proj-core:PLATFORM_OPERATOR,ci-node-key:ci-tenant:proj-core:EDGE_NODE:pop-sin-01:singapore"
+          NEXUSEDGE_OPERATOR_TOKEN: "ci-operator-token-test-2026"
+          CONTROL_PLANE_SERVICE_TOKEN: "ci-operator-key"
+          NEXUSEDGE_PROJECT_AI_KEYS: "proj-core:ci-key"
           NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
           NEXUSEDGE_CP_POP_ID: "singapore"
         run: |
@@ -173,6 +177,10 @@ jobs:
           AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
           NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
           NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
+          NEXUSEDGE_API_KEYS: "ci-operator-key:ci-tenant:proj-core:PLATFORM_OPERATOR,ci-node-key:ci-tenant:proj-core:EDGE_NODE:pop-sin-01:singapore"
+          NEXUSEDGE_OPERATOR_TOKEN: "ci-operator-token-test-2026"
+          CONTROL_PLANE_SERVICE_TOKEN: "ci-operator-key"
+          NEXUSEDGE_PROJECT_AI_KEYS: "proj-core:ci-key"
           NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
           NEXUSEDGE_CP_POP_ID: "singapore"
         run: |

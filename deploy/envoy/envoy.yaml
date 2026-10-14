@@ -33,17 +33,17 @@ static_resources:
             virtual_hosts:
             - name: dashboard_http_vhost
               domains: ["dashboard.aeitron.com", "dashboard.aeitron.com:*"]
-              request_headers_to_add:
-              - header:
-                  key: "x-forwarded-proto"
-                  value: "http"
-                append_action: OVERWRITE_IF_EXISTS_OR_ADD
               routes:
               - match:
-                  prefix: "/"
+                  prefix: "/.well-known/acme-challenge/"
                 route:
-                  cluster: dashboard_cluster
-                  timeout: 30s
+                  cluster: control_plane_cluster
+                  timeout: 5s
+              - match:
+                  prefix: "/"
+                redirect:
+                  https_redirect: true
+                  response_code: MOVED_PERMANENTLY
             - name: customer_http_vhost
               domains: ["*"]
               request_headers_to_add:

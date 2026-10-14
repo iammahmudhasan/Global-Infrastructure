@@ -318,7 +318,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let check_url = format!("{}{}", target.trim_end_matches('/'), path);
                     let start = std::time::Instant::now();
                     let is_healthy = match client.get(&check_url).send().await {
-                        Ok(resp) => resp.status().as_u16() < 500,
+                        Ok(resp) => {
+                            let status = resp.status();
+                            status.is_success() || status.is_redirection()
+                        }
                         Err(_) => false,
                     };
                     let latency_ms = start.elapsed().as_millis() as u64;

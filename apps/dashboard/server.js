@@ -10,12 +10,36 @@ const { URL } = require('url');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const CONTROL_PLANE_URL = process.env.CONTROL_PLANE_URL || 'http://127.0.0.1:9091';
-const CONTROL_PLANE_TOKEN = process.env.CONTROL_PLANE_TOKEN || process.env.NEXUSEDGE_CP_AUTH_TOKEN || '';
+const CONTROL_PLANE_TOKEN = process.env.CONTROL_PLANE_SERVICE_TOKEN || process.env.CONTROL_PLANE_TOKEN || process.env.NEXUSEDGE_CP_AUTH_TOKEN || '';
 const EDGE_GATEWAY_URL = process.env.EDGE_GATEWAY_URL || 'http://127.0.0.1:8080';
 const EDGE_GATEWAY_AI_KEY = process.env.EDGE_GATEWAY_AI_KEY || process.env.NEXUSEDGE_AI_API_KEY || '';
 const OPERATOR_TOKEN = process.env.NEXUSEDGE_OPERATOR_TOKEN || '';
 const DEFAULT_PROJECT_ID = process.env.NEXUSEDGE_PROJECT_ID || 'proj-core';
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// Resolve project-scoped AI key from NEXUSEDGE_PROJECT_AI_KEYS
+function resolveProjectAIKey(projectId) {
+  const raw = process.env.NEXUSEDGE_PROJECT_AI_KEYS || '';
+  if (raw) {
+    const delimiters = raw.includes(';') ? ';' : ',';
+    for (const item of raw.split(delimiters)) {
+      const trimmed = item.trim();
+      if (!trimmed) continue;
+      const sep = trimmed.includes('=') ? '=' : ':';
+      const [proj, key] = trimmed.split(sep);
+      if (proj && key && proj.trim() === projectId) {
+        return key.trim();
+      }
+    }
+  }
+  if (EDGE_GATEWAY_AI_KEY) {
+    const isProd = process.env.NODE_ENV === 'production' || process.env.NEXUSEDGE_ENV === 'production';
+    if (!isProd || projectId === DEFAULT_PROJECT_ID) {
+      return EDGE_GATEWAY_AI_KEY;
+    }
+  }
+  return null;
+}
 
 // Maximum allowed payload size for login requests (16 KB)
 const MAX_LOGIN_BODY_BYTES = 16384;
@@ -127,7 +151,8 @@ function verifyCredentials(token) {
   }
 
   // 3. In non-production development mode, allow explicit dev fixtures ONLY
-  if (process.env.NODE_ENV !== 'production' && process.env.NEXUSEDGE_ENV !== 'production') {
+  const isProd = process.env.NODE_ENV === 'production' || process.env.NEXUSEDGE_ENV === 'production';
+  if (!isProd) {
     if (safeCompare(token, 'dev-operator-key')) {
       return {
         user: 'dev-operator@nexusedge.local',
@@ -258,7 +283,7 @@ function proxyToControlPlane(upstreamPath, req, res, extraHeaders = {}) {
   req.pipe(proxyReq);
 }
 
-// Upstream Proxy Handler 2: Edge Gateway (Rust :8080)
+  // Upstream Proxy Handler 2: Edge Gateway (Rust :8080)
 // Strictly attaches project-scoped Edge Gateway AI credentials; NEVER leaks Control Plane token
 function proxyToEdgeGateway(upstreamPath, req, res, session, extraHeaders = {}) {
   const targetUrl = new URL(upstreamPath, EDGE_GATEWAY_URL);
@@ -271,9 +296,26 @@ function proxyToEdgeGateway(upstreamPath, req, res, session, extraHeaders = {}) 
     ...extraHeaders
   };
 
-  // Attach Edge Gateway AI Key (CRITICAL: Do NOT attach CONTROL_PLANE_TOKEN)
-  if (EDGE_GATEWAY_AI_KEY) {
-    forwardHeaders['Authorization'] = `Bearer ${EDGE_GATEWAY_AI_KEY}`;
+  // Attach project-scoped Edge Gateway AI key
+  const projectAIKey = resolveProjectAIKey(session.projectId);
+  if (projectAIKey) {
+    forwardHeaders['Authorization'] = `Bearer ${projectAIKey}`;
+  } else {
+    const isProd = process.env.NODE_ENV === 'production' || process.env.NEXUSEDGE_ENV === 'production';
+    if (isProd) {
+      return sendJSON(res, 403, {
+        code: 403,
+        error: `Forbidden: No AI Gateway credential configured for project "${session.projectId}". Wildcard or unauthenticated inference is blocked in production.`
+      });
+    }
+  }
+
+  // Double check: NEVER leak Control Plane token to Edge Gateway
+  if (CONTROL_PLANE_TOKEN && forwardHeaders['Authorization'] === `Bearer ${CONTROL_PLANE_TOKEN}`) {
+    return sendJSON(res, 500, {
+      code: 500,
+      error: 'Security boundary invariant violation: Control Plane service token cannot be sent to Edge Gateway'
+    });
   }
 
   const options = {

@@ -146,20 +146,21 @@ services:
     restart: always
 
   dashboard:
-    image: node:20-alpine
+    image: node:22-alpine
     container_name: nexusedge-dashboard-prod
     user: "1000:1000"
     working_dir: /app
     volumes:
       - ../apps/dashboard:/app:ro
-    ports:
-      - "3000:3000"
     environment:
       - "PORT=3000"
+      - "NODE_ENV=production"
+      - "NEXUSEDGE_ENV=production"
       - "CONTROL_PLANE_URL=http://config-controller:9091"
-      - "CONTROL_PLANE_TOKEN=${NEXUSEDGE_OPERATOR_TOKEN:-operator-mumbai-secret-key-2026}"
+      - "CONTROL_PLANE_SERVICE_TOKEN=${CONTROL_PLANE_SERVICE_TOKEN:?CONTROL_PLANE_SERVICE_TOKEN is required for dashboard service authentication}"
       - "EDGE_GATEWAY_URL=http://nexusedge-gateway:8080"
-      - "NEXUSEDGE_OPERATOR_TOKEN=${NEXUSEDGE_OPERATOR_TOKEN:-operator-mumbai-secret-key-2026}"
+      - "NEXUSEDGE_OPERATOR_TOKEN=${NEXUSEDGE_OPERATOR_TOKEN:?NEXUSEDGE_OPERATOR_TOKEN is required for dashboard operator authentication}"
+      - "NEXUSEDGE_PROJECT_AI_KEYS=${NEXUSEDGE_PROJECT_AI_KEYS:-}"
     command: ["node", "server.js"]
     depends_on:
       config-controller:
