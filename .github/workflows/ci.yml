@@ -128,15 +128,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       ENVOY_CERT_GID: "101"
-      POSTGRES_USER: "nexusedge"
-      POSTGRES_PASSWORD: "prodpassword123"
-      POSTGRES_DB: "nexusedge_edge"
-      NEXUSEDGE_DATABASE_URL: "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
-      AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
-      NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
-      NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
-      NEXUSEDGE_CP_POP_ID: "singapore"
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -160,11 +151,30 @@ jobs:
           sudo chown -R 70:70 deploy/postgres/certs 2>/dev/null || true
 
       - name: Validate Compose Configs (Dev & Prod)
+        env:
+          POSTGRES_USER: "nexusedge"
+          POSTGRES_PASSWORD: "prodpassword123"
+          NEXUSEDGE_DATABASE_URL: "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
+          AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
+          NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
+          NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+          NEXUSEDGE_CP_POP_ID: "singapore"
         run: |
           docker compose -f deploy/docker-compose.yml config
           docker compose -f deploy/docker-compose.prod.yml config
 
       - name: Verify Production PostgreSQL TLS Startup & Handshake
+        env:
+          POSTGRES_USER: "nexusedge"
+          POSTGRES_PASSWORD: "prodpassword123"
+          POSTGRES_DB: "nexusedge_edge"
+          NEXUSEDGE_DATABASE_URL: "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
+          AUDIT_HMAC_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
+          NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
+          NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+          NEXUSEDGE_CP_POP_ID: "singapore"
         run: |
           echo "Starting Production PostgreSQL with server-side TLS..."
           docker compose -f deploy/docker-compose.prod.yml up -d postgres
