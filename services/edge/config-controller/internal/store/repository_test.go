@@ -277,7 +277,7 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	}
 
 	recoveredSec := repo2.GetSecurityPolicy(dom.ID)
-	if recoveredSec == nil || !recoveredSec.WAFEnabled || !recoveredSec.OWASPProtection {
+	if recoveredSec == nil || !recoveredSec.WAFEnabled || recoveredSec.WAFMode != "BLOCK" {
 		t.Fatalf("Security policy not recovered correctly across restart: %+v", recoveredSec)
 	}
 
