@@ -32,6 +32,8 @@ services:
       - NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?Production failure: NEXUSEDGE_AI_API_KEYS is required for production auth registry}
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
+    group_add:
+      - "${ENVOY_CERT_GID:-101}"
     depends_on:
       postgres:
         condition: service_healthy

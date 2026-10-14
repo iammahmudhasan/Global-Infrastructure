@@ -24,6 +24,8 @@ services:
       - NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:-}
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
+    group_add:
+      - "${ENVOY_CERT_GID:-101}"
     depends_on:
       postgres:
         condition: service_healthy

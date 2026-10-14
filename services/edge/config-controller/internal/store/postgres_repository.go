@@ -1104,7 +1104,15 @@ func (r *PostgresRepository) GetSecurityPolicy(domainID string) *model.SecurityP
 func (r *PostgresRepository) AddWAFRule(domainID string, rule model.WAFRule) error {
 	sp := r.cache.GetSecurityPolicy(domainID)
 	if sp == nil {
-		return fmt.Errorf("security policy for domain %s not found", domainID)
+		dom, _ := r.cache.GetDomain(domainID)
+		if dom == nil {
+			return fmt.Errorf("domain %s not found", domainID)
+		}
+		sp = &model.SecurityPolicy{
+			ID:         "sec-" + domainID,
+			DomainID:   domainID,
+			WAFEnabled: true,
+		}
 	}
 	cloned := *sp
 	cloned.WAFRules = make([]model.WAFRule, len(sp.WAFRules), len(sp.WAFRules)+1)
@@ -1141,7 +1149,15 @@ func (r *PostgresRepository) DeleteWAFRule(domainID string, ruleID string) error
 func (r *PostgresRepository) SetRateLimitRules(domainID string, rules []model.RateLimitRule) error {
 	sp := r.cache.GetSecurityPolicy(domainID)
 	if sp == nil {
-		return fmt.Errorf("security policy for domain %s not found", domainID)
+		dom, _ := r.cache.GetDomain(domainID)
+		if dom == nil {
+			return fmt.Errorf("domain %s not found", domainID)
+		}
+		sp = &model.SecurityPolicy{
+			ID:         "sec-" + domainID,
+			DomainID:   domainID,
+			WAFEnabled: false,
+		}
 	}
 	cloned := *sp
 	cloned.RateLimitRules = rules

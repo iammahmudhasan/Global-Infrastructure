@@ -395,7 +395,10 @@ func (m *Manager) RenewCertificate(domainID string) (*model.Certificate, error) 
 		cert = m.store.GetPendingCertificate(domainID)
 	}
 	if cert == nil {
-		return nil, ErrCertNotFound
+		dom, err := m.store.GetDomain(domainID)
+		if err != nil || dom == nil {
+			return nil, ErrCertNotFound
+		}
 	}
 
 	// Trigger order & validation cycle

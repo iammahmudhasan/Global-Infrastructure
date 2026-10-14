@@ -193,6 +193,17 @@ func main() {
 				dataStore.SaveCertificate(devCert)
 				log.Printf("[INFO] Seeded and synchronized active TLS certificate for dom-dev-api via Envoy SDS")
 			}
+		} else if os.Getenv("NEXUSEDGE_DEV_MODE") == "true" {
+			log.Printf("[INFO] Ingress certificate files not readable in %s (certErr=%v, keyErr=%v); generating initial certificate for dom-dev-api", certsDir, errCert, errKey)
+			if _, challenge, err := handler.CertManager().OrderCertificate("dom-dev-api"); err == nil && challenge != nil {
+				if issuedCert, err := handler.CertManager().ValidateAndIssueCertificate(challenge.Token); err == nil {
+					log.Printf("[INFO] Issued initial self-signed certificate %s for dom-dev-api via CertManager", issuedCert.ID)
+				} else {
+					log.Printf("[WARN] Failed to issue initial certificate for dom-dev-api: %v", err)
+				}
+			} else {
+				log.Printf("[WARN] Failed to order initial certificate for dom-dev-api: %v", err)
+			}
 		}
 	}
 

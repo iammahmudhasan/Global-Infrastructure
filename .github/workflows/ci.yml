@@ -124,10 +124,10 @@ jobs:
         run: |
           go run tools/release/generate_certs.go deploy/envoy/certs
           sudo groupadd -g "$ENVOY_CERT_GID" envoy 2>/dev/null || true
-          sudo chgrp "$ENVOY_CERT_GID" deploy/envoy/certs/server.key 2>/dev/null || chgrp "$ENVOY_CERT_GID" deploy/envoy/certs/server.key 2>/dev/null || true
-          chmod 0755 deploy/envoy/certs
-          chmod 0644 deploy/envoy/certs/server.crt deploy/envoy/certs/sds.json
-          chmod 0640 deploy/envoy/certs/server.key
+          sudo chgrp -R "$ENVOY_CERT_GID" deploy/envoy/certs 2>/dev/null || true
+          chmod 0775 deploy/envoy/certs
+          chmod 0664 deploy/envoy/certs/server.crt deploy/envoy/certs/sds.json
+          chmod 0660 deploy/envoy/certs/server.key
 
       - name: Validate Compose Config
         env:

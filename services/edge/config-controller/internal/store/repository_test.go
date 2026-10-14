@@ -136,6 +136,19 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		t.Fatalf("failed to save TLS settings: %v", err)
 	}
 
+	secPolicy := &model.SecurityPolicy{
+		ID:               "sec-rec-" + testDomainID,
+		DomainID:         dom.ID,
+		WAFEnabled:       true,
+		WAFMode:          "BLOCK",
+		OWASPProtection:  true,
+		RateLimitEnabled: true,
+		RateLimitRPM:     6000,
+	}
+	if err := repo1.SaveSecurityPolicy(secPolicy); err != nil {
+		t.Fatalf("failed to save security policy: %v", err)
+	}
+
 	wafRule := model.WAFRule{
 		ID:          "waf-rec-" + testDomainID,
 		DomainID:    dom.ID,
@@ -249,6 +262,11 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	recoveredWAF := repo2.GetWAFRules(dom.ID)
 	if len(recoveredWAF) != 1 || recoveredWAF[0].Pattern != "/admin" {
 		t.Fatalf("WAF rules not recovered correctly across restart: %+v", recoveredWAF)
+	}
+
+	recoveredSec := repo2.GetSecurityPolicy(dom.ID)
+	if recoveredSec == nil || !recoveredSec.WAFEnabled || !recoveredSec.OWASPProtection {
+		t.Fatalf("Security policy not recovered correctly across restart: %+v", recoveredSec)
 	}
 
 	// 3.3 Verify Cache rules persistence across restart
