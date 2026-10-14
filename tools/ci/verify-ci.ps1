@@ -146,10 +146,23 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 # 8. Docker Compose Manifest Validation Gate
 Write-Host "[8/8] Validating Docker Compose configurations..." -ForegroundColor Yellow
 $ComposeFile = Join-Path $RepoRoot "deploy/docker-compose.yml"
+$ComposeProdFile = Join-Path $RepoRoot "deploy/docker-compose.prod.yml"
 if (Get-Command docker -ErrorAction SilentlyContinue) {
     & docker compose -f $ComposeFile config --quiet
     if ($LASTEXITCODE -ne 0) {
-        Write-Host "ERROR: Docker Compose configuration validation failed." -ForegroundColor Red
+        Write-Host "ERROR: Docker Compose dev configuration validation failed." -ForegroundColor Red
+        exit 1
+    }
+    $env:POSTGRES_USER = "nexusedge"
+    $env:POSTGRES_PASSWORD = "prodpassword123"
+    $env:NEXUSEDGE_DATABASE_URL = "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
+    $env:AUDIT_HMAC_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    $env:NEXUSEDGE_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef"
+    $env:NEXUSEDGE_CP_AUTH_TOKEN = "ci-token-01"
+    $env:NEXUSEDGE_AI_API_KEYS = "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+    & docker compose -f $ComposeProdFile config --quiet
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Docker Compose prod configuration validation failed." -ForegroundColor Red
         exit 1
     }
     Write-Host " -> Docker Compose validation passed." -ForegroundColor Green

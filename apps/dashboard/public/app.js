@@ -76,7 +76,7 @@
     function submitNewProject() {
       const name = document.getElementById('modal-proj-name').value || "New Tenant Project";
       closeModal('new-project-modal');
-      showToast(`Project '${name}' created with isolated Control Plane boundary.`);
+      showToast(`[DEMO / PROTOTYPE] Project '${name}' creation previewed. Use 'nexusedge project create' CLI for production provisioning.`);
     }
 
     async function submitNewDomain() {
@@ -103,19 +103,19 @@
       }
 
       addSimulatedDomain(domain);
-      showToast(`Domain '${domain}' registered in simulated mode (Control Plane offline).`);
+      showToast(`[DEMO / LOCAL] Domain '${domain}' added to local preview list (Control Plane offline).`);
     }
 
     function submitNewDns() {
       const name = document.getElementById('modal-dns-name').value || "sub";
       closeModal('new-dns-modal');
-      showToast(`DNS Record '${name}' published to all 5 Anycast PoPs.`);
+      showToast(`[DEMO / PROTOTYPE] DNS record '${name}' propagation simulated. Live BGP sync requires PowerDNS API.`);
     }
 
     function submitQuickDeploy() {
       const name = document.getElementById('modal-deploy-name').value || "Workload-01";
       closeModal('quick-deploy-modal');
-      showToast(`Workload '${name}' placed at optimal sovereign node.`);
+      showToast(`[DEMO / PROTOTYPE] Workload '${name}' placement previewed. Production workloads require gRPC Universal Scheduler.`);
     }
 
     // AI Director Simulator Execution
