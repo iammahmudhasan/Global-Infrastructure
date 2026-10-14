@@ -31,6 +31,19 @@ static_resources:
           route_config:
             name: customer_http_route
             virtual_hosts:
+            - name: dashboard_http_vhost
+              domains: ["dashboard.aeitron.com", "dashboard.aeitron.com:*"]
+              request_headers_to_add:
+              - header:
+                  key: "x-forwarded-proto"
+                  value: "http"
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: dashboard_cluster
+                  timeout: 30s
             - name: customer_http_vhost
               domains: ["*"]
               request_headers_to_add:
@@ -93,6 +106,19 @@ static_resources:
           route_config:
             name: customer_https_route
             virtual_hosts:
+            - name: dashboard_https_vhost
+              domains: ["dashboard.aeitron.com", "dashboard.aeitron.com:*"]
+              request_headers_to_add:
+              - header:
+                  key: "x-forwarded-proto"
+                  value: "https"
+                append_action: OVERWRITE_IF_EXISTS_OR_ADD
+              routes:
+              - match:
+                  prefix: "/"
+                route:
+                  cluster: dashboard_cluster
+                  timeout: 30s
             - name: customer_https_vhost
               domains: ["*"]
               request_headers_to_add:
@@ -149,6 +175,21 @@ static_resources:
               socket_address:
                 address: config-controller
                 port_value: 9091
+
+  # Upstream Cluster 3: NexusEdge Operator Dashboard (Authenticated BFF)
+  - name: dashboard_cluster
+    connect_timeout: 0.5s
+    type: STRICT_DNS
+    lb_policy: ROUND_ROBIN
+    load_assignment:
+      cluster_name: dashboard_cluster
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address:
+                address: dashboard
+                port_value: 3000
 
 admin:
   address:

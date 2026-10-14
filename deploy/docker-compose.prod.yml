@@ -30,6 +30,7 @@ services:
       - "AUDIT_HMAC_KEY=${AUDIT_HMAC_KEY:?AUDIT_HMAC_KEY is required for cryptographic tamper-evident audit logging}"
       - "NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:?NEXUSEDGE_SECRET_ENCRYPTION_KEY is required for AES-GCM-256 secret vault}"
       - "NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?NEXUSEDGE_AI_API_KEYS is required for production auth registry}"
+      - "NEXUSEDGE_API_KEYS=${NEXUSEDGE_API_KEYS:?NEXUSEDGE_API_KEYS is required for node and operator authentication}"
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
     group_add:
@@ -64,6 +65,8 @@ services:
         condition: service_started
       nexusedge-gateway:
         condition: service_healthy
+      dashboard:
+        condition: service_started
     networks:
       nexusedge-prod-net:
         ipv4_address: 172.30.0.2
@@ -139,6 +142,30 @@ services:
     networks:
       nexusedge-prod-net:
         ipv4_address: 172.30.0.5
+    restart: always
+
+  dashboard:
+    image: node:20-alpine
+    container_name: nexusedge-dashboard-prod
+    user: "1000:1000"
+    working_dir: /app
+    volumes:
+      - ../apps/dashboard:/app:ro
+    ports:
+      - "3000:3000"
+    environment:
+      - "PORT=3000"
+      - "CONTROL_PLANE_URL=http://config-controller:9091"
+      - "CONTROL_PLANE_TOKEN=${NEXUSEDGE_OPERATOR_TOKEN:-operator-mumbai-secret-key-2026}"
+      - "EDGE_GATEWAY_URL=http://nexusedge-gateway:8080"
+      - "NEXUSEDGE_OPERATOR_TOKEN=${NEXUSEDGE_OPERATOR_TOKEN:-operator-mumbai-secret-key-2026}"
+    command: ["node", "server.js"]
+    depends_on:
+      config-controller:
+        condition: service_started
+    networks:
+      nexusedge-prod-net:
+        ipv4_address: 172.30.0.6
     restart: always
 
 networks:

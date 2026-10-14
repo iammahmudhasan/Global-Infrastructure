@@ -5,37 +5,48 @@ server:
   trusted_proxies:
     - "127.0.0.1/32"
     - "::1/128"
-    - "172.28.0.2/32"
+    - "172.28.0.0/16"
+    - "172.30.0.0/16"
 
 upstream:
   origins:
-    - address: "172.28.0.10"
-      port: 8081
+    - address: "185.232.14.188"
+      port: 80
       protocol: "HTTP"
   routes:
+    - host: "edge.aeitron.com"
+      origins:
+        - address: "185.232.14.188"
+          port: 80
+          protocol: "HTTP"
+    - host: "api.aeitron.com"
+      origins:
+        - address: "185.232.14.188"
+          port: 80
+          protocol: "HTTP"
+    - host: "aeitron.com"
+      origins:
+        - address: "185.232.14.188"
+          port: 80
+          protocol: "HTTP"
     - host: "api.nexusedge.io"
       path_routes:
         - path_prefix: "/status/"
           priority: 10
           origins:
-            - address: "172.28.0.10"
-              port: 8082
+            - address: "185.232.14.188"
+              port: 80
               protocol: "HTTP"
         - path_prefix: "/"
           priority: 0
           origins:
-            - address: "172.28.0.10"
-              port: 8081
+            - address: "185.232.14.188"
+              port: 80
               protocol: "HTTP"
     - host: "app.nexusedge.io"
       origins:
-        - address: "172.28.0.10"
-          port: 8081
-          protocol: "HTTP"
-    - host: "customer-a.example.com"
-      origins:
-        - address: "172.28.0.10"
-          port: 8081
+        - address: "185.232.14.188"
+          port: 80
           protocol: "HTTP"
   health_check_path: "/healthz"
   timeout_ms: 5000
