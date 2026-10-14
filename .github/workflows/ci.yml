@@ -156,6 +156,7 @@ jobs:
           NEXUSEDGE_SECRET_ENCRYPTION_KEY: "0123456789abcdef0123456789abcdef"
           NEXUSEDGE_CP_AUTH_TOKEN: "ci-token-01"
           NEXUSEDGE_AI_API_KEYS: "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+          NEXUSEDGE_CP_POP_ID: "singapore"
         run: |
           docker compose -f deploy/docker-compose.yml config
           docker compose -f deploy/docker-compose.prod.yml config

@@ -160,6 +160,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     $env:NEXUSEDGE_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef"
     $env:NEXUSEDGE_CP_AUTH_TOKEN = "ci-token-01"
     $env:NEXUSEDGE_AI_API_KEYS = "ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL"
+    $env:NEXUSEDGE_CP_POP_ID = "singapore"
     & docker compose -f $ComposeProdFile config --quiet
     if ($LASTEXITCODE -ne 0) {
         Write-Host "ERROR: Docker Compose prod configuration validation failed." -ForegroundColor Red

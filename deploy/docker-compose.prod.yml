@@ -10,26 +10,26 @@ services:
       context: ../services/edge/config-controller
       dockerfile: Dockerfile
       args:
-        - GOLANG_IMAGE=${CC_GOLANG_IMAGE:-public.ecr.aws/docker/library/golang:1.23-alpine}
-        - RUNTIME_IMAGE=${CC_RUNTIME_IMAGE:-public.ecr.aws/docker/library/alpine:3.20}
+        - "GOLANG_IMAGE=${CC_GOLANG_IMAGE:-public.ecr.aws/docker/library/golang:1.23-alpine}"
+        - "RUNTIME_IMAGE=${CC_RUNTIME_IMAGE:-public.ecr.aws/docker/library/alpine:3.20}"
     container_name: nexusedge-config-controller-prod
     user: "10001:10001"
     ports:
       - "127.0.0.1:9091:9091"
     environment:
-      - PORT=9091
-      - NEXUSEDGE_DEV_MODE=false
-      - NEXUSEDGE_ENV=production
+      - "PORT=9091"
+      - "NEXUSEDGE_DEV_MODE=false"
+      - "NEXUSEDGE_ENV=production"
       # Enforce TLS-enabled database connection string in production
-      - NEXUSEDGE_DATABASE_URL=${NEXUSEDGE_DATABASE_URL:?Production failure: NEXUSEDGE_DATABASE_URL with TLS is required (e.g. sslmode=verify-full or sslmode=require)}
-      - NEXUSEDGE_ACME_HOST=config-controller
-      - NEXUSEDGE_ACME_PORT=9091
-      - NEXUSEDGE_CERTS_DIR=/etc/envoy/certs
-      - NEXUSEDGE_CERTS_GID=${ENVOY_CERT_GID:-101}
+      - "NEXUSEDGE_DATABASE_URL=${NEXUSEDGE_DATABASE_URL:?NEXUSEDGE_DATABASE_URL with TLS is required (e.g. sslmode=verify-full or sslmode=require)}"
+      - "NEXUSEDGE_ACME_HOST=config-controller"
+      - "NEXUSEDGE_ACME_PORT=9091"
+      - "NEXUSEDGE_CERTS_DIR=/etc/envoy/certs"
+      - "NEXUSEDGE_CERTS_GID=${ENVOY_CERT_GID:-101}"
       # Required production security keys — fail immediately if absent
-      - AUDIT_HMAC_KEY=${AUDIT_HMAC_KEY:?Production failure: AUDIT_HMAC_KEY is required for cryptographic tamper-evident audit logging}
-      - NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:?Production failure: NEXUSEDGE_SECRET_ENCRYPTION_KEY is required for AES-GCM-256 secret vault}
-      - NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?Production failure: NEXUSEDGE_AI_API_KEYS is required for production auth registry}
+      - "AUDIT_HMAC_KEY=${AUDIT_HMAC_KEY:?AUDIT_HMAC_KEY is required for cryptographic tamper-evident audit logging}"
+      - "NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:?NEXUSEDGE_SECRET_ENCRYPTION_KEY is required for AES-GCM-256 secret vault}"
+      - "NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?NEXUSEDGE_AI_API_KEYS is required for production auth registry}"
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
     group_add:
@@ -74,23 +74,23 @@ services:
       context: ../dataplane/edge/gateway
       dockerfile: Dockerfile
       args:
-        - RUST_IMAGE=${GW_RUST_IMAGE:-public.ecr.aws/docker/library/rust:1-bookworm}
-        - RUNTIME_IMAGE=${GW_RUNTIME_IMAGE:-public.ecr.aws/docker/library/debian:bookworm-slim}
+        - "RUST_IMAGE=${GW_RUST_IMAGE:-public.ecr.aws/docker/library/rust:1-bookworm}"
+        - "RUNTIME_IMAGE=${GW_RUNTIME_IMAGE:-public.ecr.aws/docker/library/debian:bookworm-slim}"
     container_name: nexusedge-pop-prod-01
     user: "10001:10001"
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      - RUST_LOG=info,nexusedge_gateway=info
-      - NEXUSEDGE_DEV_MODE=false
-      - NEXUSEDGE_ENV=production
-      - NEXUSEDGE_CP_ENABLED=true
-      - NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091
-      - NEXUSEDGE_CP_POP_ID=${NEXUSEDGE_CP_POP_ID:?Production failure: NEXUSEDGE_CP_POP_ID must be specified (e.g. singapore, dhaka)}
-      - NEXUSEDGE_CP_POLL_INTERVAL_SECS=10
-      - NEXUSEDGE_CP_AUTH_TOKEN=${NEXUSEDGE_CP_AUTH_TOKEN:?Production failure: NEXUSEDGE_CP_AUTH_TOKEN is strictly required for edge node authentication}
-      - NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?Production failure: NEXUSEDGE_AI_API_KEYS is required for production auth registry}
-      - NEXUSEDGE_ONPREM_ALLOWED_CIDRS=${NEXUSEDGE_ONPREM_ALLOWED_CIDRS:-}
+      - "RUST_LOG=info,nexusedge_gateway=info"
+      - "NEXUSEDGE_DEV_MODE=false"
+      - "NEXUSEDGE_ENV=production"
+      - "NEXUSEDGE_CP_ENABLED=true"
+      - "NEXUSEDGE_CP_ENDPOINT=http://config-controller:9091"
+      - "NEXUSEDGE_CP_POP_ID=${NEXUSEDGE_CP_POP_ID:-singapore}"
+      - "NEXUSEDGE_CP_POLL_INTERVAL_SECS=10"
+      - "NEXUSEDGE_CP_AUTH_TOKEN=${NEXUSEDGE_CP_AUTH_TOKEN:?NEXUSEDGE_CP_AUTH_TOKEN is strictly required for edge node authentication}"
+      - "NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?NEXUSEDGE_AI_API_KEYS is required for production auth registry}"
+      - "NEXUSEDGE_ONPREM_ALLOWED_CIDRS=${NEXUSEDGE_ONPREM_ALLOWED_CIDRS:-}"
     volumes:
       - ../dataplane/edge/gateway/gateway.yaml:/app/gateway.yaml:ro
     healthcheck:
@@ -114,9 +114,9 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     environment:
-      - POSTGRES_USER=${POSTGRES_USER:?Production failure: POSTGRES_USER must be set}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Production failure: Strong POSTGRES_PASSWORD must be set}
-      - POSTGRES_DB=${POSTGRES_DB:-nexusedge_edge}
+      - "POSTGRES_USER=${POSTGRES_USER:?POSTGRES_USER must be set}"
+      - "POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Strong POSTGRES_PASSWORD must be set}"
+      - "POSTGRES_DB=${POSTGRES_DB:-nexusedge_edge}"
     command:
       - "postgres"
       - "-c"

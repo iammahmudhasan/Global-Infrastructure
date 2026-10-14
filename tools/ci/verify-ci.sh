@@ -65,14 +65,34 @@ cargo test --manifest-path "${GATEWAY_CARGO}"
 echo " -> Rust check and tests passed."
 
 # 6. Python Intelligence Optimizer Gate
-echo "[6/7] Verifying Python Intelligence scheduler..."
+echo "[6/8] Verifying Python Intelligence scheduler..."
 python "${REPO_ROOT}/intelligence/scheduling/workload-scheduler/optimizer.py"
 echo " -> Python optimizer passed."
 
-# 7. Docker Compose Manifest Gate
-echo "[7/7] Validating Docker Compose configuration..."
+# 7. Dashboard Security & BFF Acceptance Gate
+echo "[7/8] Running Dashboard Security & BFF test suite..."
+if command -v node >/dev/null 2>&1; then
+  pushd "${REPO_ROOT}/apps/dashboard" > /dev/null
+  node --test test/bff.test.js
+  popd > /dev/null
+  echo " -> Dashboard security tests passed."
+else
+  echo " -> Node.js not found, skipping local dashboard check."
+fi
+
+# 8. Docker Compose Manifest Gate
+echo "[8/8] Validating Docker Compose configurations..."
 if command -v docker >/dev/null 2>&1; then
-  docker compose -f "${REPO_ROOT}/deploy/docker-compose.yml" config
+  docker compose -f "${REPO_ROOT}/deploy/docker-compose.yml" config --quiet
+  POSTGRES_USER="nexusedge" \
+  POSTGRES_PASSWORD="prodpassword123" \
+  NEXUSEDGE_DATABASE_URL="postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require" \
+  AUDIT_HMAC_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  NEXUSEDGE_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef" \
+  NEXUSEDGE_CP_AUTH_TOKEN="ci-token-01" \
+  NEXUSEDGE_AI_API_KEYS="ci-key:ci-tenant:proj-core:proj-core:inference:GLOBAL" \
+  NEXUSEDGE_CP_POP_ID="singapore" \
+  docker compose -f "${REPO_ROOT}/deploy/docker-compose.prod.yml" config --quiet
   echo " -> Docker Compose validation passed."
 else
   echo " -> Docker CLI not found, skipping local compose check."
