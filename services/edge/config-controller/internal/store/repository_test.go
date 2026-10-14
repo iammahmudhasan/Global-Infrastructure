@@ -164,6 +164,18 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 		t.Fatalf("failed to save WAF rule: %v", err)
 	}
 
+	cachePolicy := &model.CachePolicy{
+		ID:                   "cp-rec-" + testDomainID,
+		DomainID:             dom.ID,
+		CacheEnabled:         true,
+		DefaultTTLSeconds:    3600,
+		RespectOriginHeaders: true,
+		QueryHandling:        model.QueryStringIgnoreAll,
+	}
+	if err := repo1.SaveCachePolicy(cachePolicy); err != nil {
+		t.Fatalf("failed to save cache policy: %v", err)
+	}
+
 	cacheRule := model.CacheRule{
 		ID:          "cache-rec-" + testDomainID,
 		DomainID:    dom.ID,
@@ -273,6 +285,11 @@ func TestPostgresRepository_RestartRecovery(t *testing.T) {
 	recoveredCache := repo2.GetCacheRules(dom.ID)
 	if len(recoveredCache) != 1 || recoveredCache[0].PathPattern != "/static/*" || recoveredCache[0].TTLSeconds != 86400 {
 		t.Fatalf("Cache rules not recovered correctly across restart: %+v", recoveredCache)
+	}
+
+	recoveredCP := repo2.GetCachePolicy(dom.ID)
+	if recoveredCP == nil || !recoveredCP.CacheEnabled || recoveredCP.DefaultTTLSeconds != 3600 {
+		t.Fatalf("Cache policy not recovered correctly across restart: %+v", recoveredCP)
 	}
 
 	// 3.4 Verify Health Monitor persistence across restart

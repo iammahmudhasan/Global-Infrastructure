@@ -1220,7 +1220,18 @@ func (r *PostgresRepository) GetCachePolicy(domainID string) *model.CachePolicy 
 func (r *PostgresRepository) AddCacheRule(domainID string, rule model.CacheRule) error {
 	cp := r.cache.GetCachePolicy(domainID)
 	if cp == nil {
-		return fmt.Errorf("cache policy for domain %s not found", domainID)
+		dom, _ := r.cache.GetDomain(domainID)
+		if dom == nil {
+			return fmt.Errorf("domain %s not found", domainID)
+		}
+		cp = &model.CachePolicy{
+			ID:                   "cp-" + domainID,
+			DomainID:             domainID,
+			CacheEnabled:         true,
+			DefaultTTLSeconds:    3600,
+			RespectOriginHeaders: true,
+			QueryHandling:        model.QueryStringIgnoreAll,
+		}
 	}
 	cloned := *cp
 	cloned.CacheRules = make([]model.CacheRule, len(cp.CacheRules), len(cp.CacheRules)+1)
