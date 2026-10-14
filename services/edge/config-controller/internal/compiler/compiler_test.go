@@ -1589,3 +1589,81 @@ func TestUpstreamTLS_StagingRequiresCABundle(t *testing.T) {
 		t.Fatalf("expected non-nil dev TLS context")
 	}
 }
+
+func TestCompiler_HostRewriteLiteral_OriginSNI(t *testing.T) {
+	comp := compiler.NewCompiler(9901, 80, 443)
+
+	pool := &model.OriginPool{
+		ID:          "pool-edge-test",
+		Name:        "edge-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig-edge-test",
+				PoolID:   "pool-edge-test",
+				Address:  "185.232.14.188",
+				Port:     443,
+				Protocol: model.ProtocolHTTPS,
+				SNI:      "customer.com",
+				Weight:   1,
+				Healthy:  true,
+			},
+		},
+	}
+
+	topo := &store.DomainTopology{
+		Domain: &model.Domain{
+			ID:        "dom-edge-test",
+			Hostname:  "edge.customer.com",
+			Status:    model.DomainStatusActive,
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		},
+		Routes: []*model.Route{
+			{
+				ID:         "route-edge-test",
+				DomainID:   "dom-edge-test",
+				PoolID:     pool.ID,
+				PathPrefix: "/",
+				Priority:   0,
+			},
+		},
+		Pools: map[string]*model.OriginPool{
+			pool.ID: pool,
+		},
+	}
+
+	cfg, err := comp.Compile([]*store.DomainTopology{topo})
+	if err != nil {
+		t.Fatalf("failed to compile topology: %v", err)
+	}
+
+	foundRewrite := false
+	for _, l := range cfg.StaticResources.Listeners {
+		for _, fc := range l.FilterChains {
+			for _, f := range fc.Filters {
+				if f.Name == "envoy.filters.network.http_connection_manager" && f.TypedConfig != nil {
+					if rc, ok := f.TypedConfig["route_config"].(map[string]interface{}); ok {
+						if vhs, ok := rc["virtual_hosts"].([]compiler.VirtualHost); ok {
+							for _, vh := range vhs {
+								if vh.Name == "http_direct_edge_customer_com" {
+									for _, r := range vh.Routes {
+										if r.Match.Prefix == "/" && r.Route != nil {
+											if r.Route.HostRewriteLiteral == "customer.com" {
+												foundRewrite = true
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if !foundRewrite {
+		t.Fatalf("expected RouteAction to contain HostRewriteLiteral == 'customer.com'")
+	}
+}

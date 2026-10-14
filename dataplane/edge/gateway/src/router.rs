@@ -456,6 +456,10 @@ impl Router {
                 let target_url = format!("https://{}:{}", sni_host, origin.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
+            (false, Some(sni_host)) if sni_host != clean_addr => {
+                let target_url = format!("http://{}:{}", sni_host, origin.port);
+                (target_url, Some(sni_host.to_string()), dest_addr)
+            }
             _ => {
                 let target_url = format!("{}://{}:{}", proto, host_for_url, origin.port);
                 (target_url, None, dest_addr)
@@ -1806,6 +1810,10 @@ pub fn parse_pop_config_routes(json_str: &str) -> Result<Vec<DomainRoute>, Route
         let (url, sni, destination_addr) = match (is_https, sni_trimmed) {
             (true, Some(sni_host)) if sni_host != clean_addr => {
                 let target_url = format!("https://{}:{}", sni_host, o.port);
+                (target_url, Some(sni_host.to_string()), dest_addr)
+            }
+            (false, Some(sni_host)) if sni_host != clean_addr => {
+                let target_url = format!("http://{}:{}", sni_host, o.port);
                 (target_url, Some(sni_host.to_string()), dest_addr)
             }
             _ => {

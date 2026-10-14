@@ -937,7 +937,15 @@ pub async fn handle_request(
     client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
 
     // Forward the original customer Host header upstream (P1).
-    client_req = client_req.header(reqwest::header::HOST, &host);
+    // If the selected upstream defines an explicit SNI / origin host override (e.g. CDN virtual host routing),
+    // forward that host header upstream while strictly preserving the downstream tenant host in X-Forwarded-Host.
+    let upstream_host = selected_upstream
+        .tls_server_name
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&host);
+    client_req = client_req.header(reqwest::header::HOST, upstream_host);
 
     if !body_bytes.is_empty() {
         client_req = client_req.body(body_bytes.clone());

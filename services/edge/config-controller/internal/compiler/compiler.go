@@ -510,6 +510,12 @@ func (c *Compiler) Compile(topologies []*store.DomainTopology) (*EnvoyConfig, er
 					},
 				},
 			}
+			if len(pool.Origins) > 0 {
+				originSNI := strings.TrimSpace(pool.Origins[0].SNI)
+				if originSNI != "" && !strings.EqualFold(originSNI, hostname) {
+					routeObj.Route.HostRewriteLiteral = originSNI
+				}
+			}
 
 			// Apply path-specific rate limiting to matching route (Finding 6)
 			if topo.Security != nil && topo.Security.RateLimitEnabled && len(pathRules) > 0 {
