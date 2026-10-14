@@ -409,6 +409,22 @@ func (s *DomainService) VerifyDomain(domainID string) (*model.Domain, error) {
 		}
 	}
 
+	// Direct A / AAAA record check: verify if domain resolves to public edge ingress IP
+	publicIP := os.Getenv("NEXUSEDGE_PUBLIC_IP")
+	if publicIP != "" {
+		if ips, err := net.LookupIP(domain.Hostname); err == nil {
+			for _, ip := range ips {
+				if ip.String() == publicIP {
+					if err := s.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
+						return nil, err
+					}
+					domain.Status = model.DomainStatusActive
+					return domain, nil
+				}
+			}
+		}
+	}
+
 	// Fail closed by default: DNS proof must be verified
 	return nil, fmt.Errorf("domain verification failed: CNAME %s does not point to %s", domain.Hostname, domain.CNAMETarget)
 }

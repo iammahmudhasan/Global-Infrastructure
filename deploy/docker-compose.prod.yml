@@ -31,6 +31,7 @@ services:
       - "NEXUSEDGE_SECRET_ENCRYPTION_KEY=${NEXUSEDGE_SECRET_ENCRYPTION_KEY:?NEXUSEDGE_SECRET_ENCRYPTION_KEY is required for AES-GCM-256 secret vault}"
       - "NEXUSEDGE_AI_API_KEYS=${NEXUSEDGE_AI_API_KEYS:?NEXUSEDGE_AI_API_KEYS is required for production auth registry}"
       - "NEXUSEDGE_API_KEYS=${NEXUSEDGE_API_KEYS:?NEXUSEDGE_API_KEYS is required for node and operator authentication}"
+      - "NEXUSEDGE_PUBLIC_IP=${NEXUSEDGE_PUBLIC_IP:-80.225.241.129}"
     volumes:
       - ./envoy/certs:/etc/envoy/certs:rw
     group_add:

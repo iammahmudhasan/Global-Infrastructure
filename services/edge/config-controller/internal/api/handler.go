@@ -1145,6 +1145,27 @@ func (h *APIHandler) handleGetDomain(w http.ResponseWriter, r *http.Request, dom
 }
 
 func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, domainID string) {
+	if r.URL.Query().Get("force") == "true" && h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+		domain, err := h.store.GetDomain(domainID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, "domain not found")
+			return
+		}
+		if err := h.store.UpdateDomainStatus(domainID, model.DomainStatusActive); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		domain.Status = model.DomainStatusActive
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status":    "verified",
+			"domain_id": domain.ID,
+			"hostname":  domain.Hostname,
+			"state":     domain.Status,
+			"message":   "domain force-verified by platform operator; active on edge proxy",
+		})
+		return
+	}
+
 	domain, err := h.service.VerifyDomain(domainID)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
