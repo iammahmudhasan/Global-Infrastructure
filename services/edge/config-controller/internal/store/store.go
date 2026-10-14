@@ -645,6 +645,12 @@ func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.security[sp.DomainID] = cloneSecurityPolicy(sp)
+	if sp.WAFRules != nil {
+		s.wafRules[sp.DomainID] = append([]model.WAFRule(nil), sp.WAFRules...)
+	}
+	if sp.RateLimitRules != nil {
+		s.rateLimits[sp.DomainID] = append([]model.RateLimitRule(nil), sp.RateLimitRules...)
+	}
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -811,6 +817,9 @@ func (s *Store) SaveCachePolicy(cp *model.CachePolicy) error {
 		}
 	}
 	s.cache[cp.DomainID] = cloned
+	if cp.CacheRules != nil {
+		s.cacheRules[cp.DomainID] = append([]model.CacheRule(nil), cp.CacheRules...)
+	}
 	s.invalidateCachesLocked()
 	return nil
 }
