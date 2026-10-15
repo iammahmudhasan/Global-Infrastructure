@@ -78,6 +78,38 @@ func TestBroadcaster_WildcardDelivery(t *testing.T) {
 	}
 }
 
+func TestBroadcaster_GlobalWildcardBroadcast(t *testing.T) {
+	b := NewBroadcaster()
+	defer b.Close()
+
+	chSin, cancelSin := b.Subscribe("singapore")
+	defer cancelSin()
+
+	chDhk, cancelDhk := b.Subscribe("dhaka")
+	defer cancelDhk()
+
+	// Broadcast globally to "*"
+	b.BroadcastConfigUpdate("*", "sha256-global-01")
+
+	select {
+	case evt := <-chSin:
+		if evt.Checksum != "sha256-global-01" {
+			t.Errorf("chSin received wrong checksum: %s", evt.Checksum)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for event on chSin")
+	}
+
+	select {
+	case evt := <-chDhk:
+		if evt.Checksum != "sha256-global-01" {
+			t.Errorf("chDhk received wrong checksum: %s", evt.Checksum)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for event on chDhk")
+	}
+}
+
 func TestBroadcaster_UnsubscribeCleanup(t *testing.T) {
 	b := NewBroadcaster()
 	defer b.Close()

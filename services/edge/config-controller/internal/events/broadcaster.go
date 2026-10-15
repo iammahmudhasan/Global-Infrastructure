@@ -111,12 +111,14 @@ func (b *Broadcaster) Broadcast(popID string, evt Event) {
 		}
 	}
 
-	if subs, ok := b.subscribers[popID]; ok {
-		deliver(subs)
-	}
-
-	// Always deliver to wildcard subscribers unless the event was already targeting wildcard
-	if popID != "*" {
+	if popID == "*" {
+		for _, subs := range b.subscribers {
+			deliver(subs)
+		}
+	} else {
+		if subs, ok := b.subscribers[popID]; ok {
+			deliver(subs)
+		}
 		if subs, ok := b.subscribers["*"]; ok {
 			deliver(subs)
 		}
