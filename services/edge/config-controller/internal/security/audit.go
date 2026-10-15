@@ -71,7 +71,7 @@ func (l *AuditLogger) Record(actorID, orgID, projectID, action, resourceType, re
 	}
 	recordID := fmt.Sprintf("aud-%x", idBytes)
 
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := time.Now().UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
 	prevHash := l.lastHash
 
 	record := &AuditRecord{

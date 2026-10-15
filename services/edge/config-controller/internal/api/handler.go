@@ -108,7 +108,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 			idx := len(allLogs) - 1 - i
 			records[idx] = &security.AuditRecord{
 				ID:           l.ID,
-				Timestamp:    l.CreatedAt.Format(time.RFC3339Nano),
+				Timestamp:    l.CreatedAt.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano),
 				ActorID:      l.Actor,
 				OrgID:        l.OrgID,
 				ProjectID:    l.ProjectID,
