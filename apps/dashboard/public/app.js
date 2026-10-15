@@ -703,13 +703,15 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
               const popSet = new Set();
               routes.forEach(r => {
                 if (r.from_pop) popSet.add(r.from_pop);
-                if (r.to_pop) popSet.add(r.to_pop);
+                const target = r.to_pop || r.to_target;
+                if (target) popSet.add(target);
               });
               const popList = Array.from(popSet);
               const matrixMap = {};
               routes.forEach(r => {
+                const target = r.to_pop || r.to_target;
                 if (!matrixMap[r.from_pop]) matrixMap[r.from_pop] = {};
-                matrixMap[r.from_pop][r.to_pop] = r.latency_ms;
+                matrixMap[r.from_pop][target] = r.latency_ms;
               });
 
               tbody.innerHTML = '';
