@@ -26,6 +26,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/events"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
@@ -45,6 +46,7 @@ type APIHandler struct {
 	smartRouter     *health.SmartRouter
 	certManager     *certificate.Manager
 	stekManager     *stek.Manager
+	broadcaster     *events.Broadcaster
 	analyticsEngine *analytics.Engine
 	popManager      *pop.Manager
 	authenticator   *auth.Authenticator
@@ -141,6 +143,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		smartRouter:     health.NewSmartRouter(),
 		certManager:     certificate.NewManager(s),
 		stekManager:     stek.NewManager("", 0, stek.DefaultRotationInterval),
+		broadcaster:     events.NewBroadcaster(),
 		analyticsEngine: analytics.NewEngine(),
 		popManager:      pop.NewManager(),
 		authenticator:   authenticator,
@@ -258,6 +261,10 @@ func (h *APIHandler) CertManager() *certificate.Manager {
 
 func (h *APIHandler) STEKManager() *stek.Manager {
 	return h.stekManager
+}
+
+func (h *APIHandler) Broadcaster() *events.Broadcaster {
+	return h.broadcaster
 }
 
 // SetDNSLookupForTest temporarily overrides the DNS resolution function for testing and returns a restore function.
@@ -684,6 +691,7 @@ func (h *APIHandler) handleDomainsRoute(w http.ResponseWriter, r *http.Request) 
 				writeError(w, http.StatusInternalServerError, "failed to record required audit event: "+err.Error())
 				return
 			}
+			h.broadcaster.BroadcastConfigUpdate("*", "")
 			writeJSON(w, http.StatusOK, map[string]interface{}{
 				"status":    "deleted",
 				"domain_id": domainID,
@@ -1268,6 +1276,7 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		domain.Status = model.DomainStatusActive
+		h.broadcaster.BroadcastConfigUpdate("*", "")
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":    "verified",
 			"domain_id": domain.ID,
@@ -1301,6 +1310,7 @@ func (h *APIHandler) handleVerifyDomain(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	h.broadcaster.BroadcastConfigUpdate("*", "")
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    "verified",
 		"domain_id": domain.ID,
@@ -1396,6 +1406,7 @@ func (h *APIHandler) handleAddOrigin(w http.ResponseWriter, r *http.Request, dom
 		return
 	}
 
+	h.broadcaster.BroadcastConfigUpdate("*", "")
 	writeJSON(w, http.StatusCreated, origin)
 }
 
@@ -2696,8 +2707,71 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(resp)
 		return
 
+	case "events":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+			return
+		}
+		if !h.authenticator.AuthorizePoP(r.Context(), popID) {
+			writeError(w, http.StatusForbidden, "forbidden: node is not authorized for target pop "+popID)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed: must be GET")
+			return
+		}
+		h.handlePoPEventsStream(w, r, popID)
+		return
+
 	default:
 		writeError(w, http.StatusNotFound, "unknown pop action: "+action)
+	}
+}
+
+func (h *APIHandler) handlePoPEventsStream(w http.ResponseWriter, r *http.Request, popID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming unsupported by response writer")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	ch, cleanup := h.broadcaster.Subscribe(popID)
+	defer cleanup()
+
+	initData, _ := json.Marshal(map[string]interface{}{
+		"pop_id":    popID,
+		"status":    "connected",
+		"timestamp": time.Now().UTC(),
+	})
+	_, _ = fmt.Fprintf(w, "event: connected\ndata: %s\n\n", initData)
+	flusher.Flush()
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			_, _ = fmt.Fprintf(w, ": ping\n\n")
+			flusher.Flush()
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, err := json.Marshal(evt)
+			if err == nil {
+				_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Type, data)
+				flusher.Flush()
+			}
+		}
 	}
 }
 
@@ -3326,6 +3400,7 @@ func (h *APIHandler) handleAIProvidersRoute(w http.ResponseWriter, r *http.Reque
 			return
 		}
 
+		h.broadcaster.BroadcastConfigUpdate("*", "")
 		writeJSON(w, http.StatusCreated, p.ToResponse())
 
 	case http.MethodGet:
@@ -3442,6 +3517,7 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			return
 		}
 
+		h.broadcaster.BroadcastConfigUpdate("*", "")
 		writeJSON(w, http.StatusOK, update.ToResponse())
 
 	case http.MethodDelete:
@@ -3469,6 +3545,7 @@ func (h *APIHandler) handleAIProviderByIDRoute(w http.ResponseWriter, r *http.Re
 			return
 		}
 
+		h.broadcaster.BroadcastConfigUpdate("*", "")
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status": "deleted",
 			"id":     id,

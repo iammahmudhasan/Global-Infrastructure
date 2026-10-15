@@ -6,7 +6,9 @@ use nexusedge_gateway::proxy::{
 };
 use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{self, Router};
-use nexusedge_gateway::sync::fetch_and_apply_control_plane_snapshot_full;
+use nexusedge_gateway::sync::{
+    fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream, StreamSyncContext,
+};
 use nexusedge_gateway::waf::WafEngine;
 
 use hyper::service::service_fn;
@@ -208,6 +210,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+
+        if cp_cfg.enabled {
+            let sse_endpoint = cp_cfg.endpoint.clone();
+            let sse_pop_id = cp_cfg.pop_id.clone();
+            let sse_auth_token = cp_cfg.auth_token.clone();
+            let sse_client = HttpClient::builder()
+                .connect_timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            let sse_router = sync_router.clone();
+            let sse_dns = Arc::clone(&sync_dns);
+            let sse_ai = sync_ai.clone();
+            let sse_is_ready = Arc::clone(&sync_is_ready);
+
+            tokio::spawn(async move {
+                let mut backoff_secs = 1u64;
+                loop {
+                    tracing::info!(
+                        pop_id = %sse_pop_id,
+                        endpoint = %sse_endpoint,
+                        "Subscribing to Control Plane real-time SSE configuration stream..."
+                    );
+                    let ctx = StreamSyncContext {
+                        endpoint: &sse_endpoint,
+                        pop_id: &sse_pop_id,
+                        auth_token: &sse_auth_token,
+                        client: &sse_client,
+                        router: &sse_router,
+                        dns_resolver: &sse_dns,
+                        ai_director: sse_ai.as_deref(),
+                        is_ready: &sse_is_ready,
+                    };
+                    if let Err(e) = listen_and_apply_event_stream(&ctx).await {
+                        tracing::warn!(
+                            pop_id = %sse_pop_id,
+                            error = %e,
+                            backoff_secs = backoff_secs,
+                            "Real-time SSE stream disconnected; reconnecting after backoff"
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(30);
+                }
+            });
+        }
 
         tokio::spawn(async move {
             let interval_secs = cp_cfg.poll_interval_secs.max(5);

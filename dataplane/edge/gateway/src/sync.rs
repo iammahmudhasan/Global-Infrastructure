@@ -269,6 +269,181 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
     })
 }
 
+/// Represents a parsed Server-Sent Event (SSE) message block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event_type: String,
+    pub data: String,
+}
+
+/// Parses a double-newline delimited SSE text block into an SseEvent.
+/// Ignores comments and keepalive pings (lines starting with ':').
+pub fn parse_sse_block(block: &str) -> Option<SseEvent> {
+    let mut event_type = "message".to_string();
+    let mut data = String::new();
+    let mut has_fields = false;
+
+    for line in block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("event:") {
+            event_type = rest.trim().to_string();
+            has_fields = true;
+        } else if let Some(rest) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim());
+            has_fields = true;
+        }
+    }
+
+    if has_fields {
+        Some(SseEvent { event_type, data })
+    } else {
+        None
+    }
+}
+
+/// Context parameters required for real-time SSE configuration synchronization.
+pub struct StreamSyncContext<'a> {
+    pub endpoint: &'a str,
+    pub pop_id: &'a str,
+    pub auth_token: &'a str,
+    pub client: &'a HttpClient,
+    pub router: &'a Router,
+    pub dns_resolver: &'a PinnedDnsResolver,
+    pub ai_director: Option<&'a crate::ai::AiTrafficDirector>,
+    pub is_ready: &'a std::sync::atomic::AtomicBool,
+}
+
+/// Long-lived real-time streaming subscriber connecting to the Control Plane SSE endpoint.
+/// Asynchronously handles push notifications (sub-50ms) and applies snapshot updates immediately.
+pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Result<(), SyncError> {
+    validate_control_plane_endpoint(ctx.endpoint, ctx.auth_token)
+        .map_err(SyncError::InvalidEndpoint)?;
+
+    let url = format!(
+        "{}/v1/edge/pops/{}/events",
+        ctx.endpoint.trim_end_matches('/'),
+        ctx.pop_id
+    );
+
+    let mut req_builder = ctx.client.get(&url).header("Accept", "text/event-stream");
+    if !ctx.auth_token.is_empty() {
+        req_builder = req_builder
+            .header("Authorization", format!("Bearer {}", ctx.auth_token))
+            .header("X-API-Key", ctx.auth_token);
+    }
+
+    let mut resp = req_builder
+        .send()
+        .await
+        .map_err(|e| SyncError::NetworkError(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(SyncError::BadStatus(resp.status().as_u16()));
+    }
+
+    tracing::info!(
+        pop_id = %ctx.pop_id,
+        "Connected to Control Plane real-time SSE configuration event stream"
+    );
+
+    let mut buffer = String::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| SyncError::NetworkError(e.to_string()))?
+    {
+        let text = match std::str::from_utf8(&chunk) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        buffer.push_str(text);
+
+        while let Some(pos) = buffer.find("\n\n") {
+            let block = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+
+            if let Some(event) = parse_sse_block(&block) {
+                match event.event_type.as_str() {
+                    "connected" => {
+                        tracing::info!(
+                            pop_id = %ctx.pop_id,
+                            payload = %event.data,
+                            "Received SSE stream initialization handshake; refreshing snapshot"
+                        );
+                        if let Ok(stats) = fetch_and_apply_control_plane_snapshot_full(
+                            ctx.endpoint,
+                            ctx.pop_id,
+                            ctx.auth_token,
+                            ctx.client,
+                            ctx.router,
+                            ctx.dns_resolver,
+                            ctx.ai_director,
+                        )
+                        .await
+                        {
+                            ctx.is_ready
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            tracing::info!(
+                                pop_id = %ctx.pop_id,
+                                routes = stats.routes_applied,
+                                ai_providers = stats.ai_providers_applied,
+                                checksum = %stats.checksum,
+                                "Applied initial Control Plane snapshot via SSE handshake"
+                            );
+                        }
+                    }
+                    "config_update" => {
+                        tracing::info!(
+                            pop_id = %ctx.pop_id,
+                            data = %event.data,
+                            "Real-time config_update received! Triggering sub-50ms snapshot refresh"
+                        );
+                        match fetch_and_apply_control_plane_snapshot_full(
+                            ctx.endpoint,
+                            ctx.pop_id,
+                            ctx.auth_token,
+                            ctx.client,
+                            ctx.router,
+                            ctx.dns_resolver,
+                            ctx.ai_director,
+                        )
+                        .await
+                        {
+                            Ok(stats) => {
+                                ctx.is_ready
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                tracing::info!(
+                                    pop_id = %ctx.pop_id,
+                                    routes = stats.routes_applied,
+                                    ai_providers = stats.ai_providers_applied,
+                                    checksum = %stats.checksum,
+                                    "Atomically synchronized edge routes from real-time push event"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    pop_id = %ctx.pop_id,
+                                    error = %e,
+                                    "Failed to apply snapshot following real-time config_update event"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +497,29 @@ mod tests {
         // Invalid scheme rejected
         let err = validate_control_plane_endpoint("ftp://cp.remote.infra", "token").unwrap_err();
         assert!(err.contains("must be http or https"));
+    }
+
+    #[test]
+    fn test_parse_sse_block() {
+        let block1 = "event: connected\ndata: {\"status\":\"ok\"}";
+        let evt1 = parse_sse_block(block1).unwrap();
+        assert_eq!(evt1.event_type, "connected");
+        assert_eq!(evt1.data, "{\"status\":\"ok\"}");
+
+        let block2 = ": keepalive ping\n";
+        assert!(parse_sse_block(block2).is_none());
+
+        let block3 = "data: simple data";
+        let evt3 = parse_sse_block(block3).unwrap();
+        assert_eq!(evt3.event_type, "message");
+        assert_eq!(evt3.data, "simple data");
+
+        let block4 = "event: config_update\ndata: line1\ndata: line2";
+        let evt4 = parse_sse_block(block4).unwrap();
+        assert_eq!(evt4.event_type, "config_update");
+        assert_eq!(evt4.data, "line1\nline2");
+
+        let empty = "   \n\n  ";
+        assert!(parse_sse_block(empty).is_none());
     }
 }

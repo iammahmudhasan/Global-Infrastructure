@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -4193,5 +4194,82 @@ func TestPoPSTEKRetrieval(t *testing.T) {
 	handler.ServeHTTP(wUnauth, reqUnauth)
 	if wUnauth.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 Unauthorized for invalid auth, got %d", wUnauth.Code)
+	}
+}
+
+func TestPoPEventsStreaming(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	authInst.RegisterNodeWithPoP("key-edge-node", "tenant-edge", "prj-global", "node-sin-01", "singapore")
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-view", "prj-global", auth.RoleTenant, "singapore")
+
+	// 1. Unauthorized / invalid auth -> 401
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/events", nil)
+	reqUnauth.Header.Set("X-API-Key", "invalid-key")
+	wUnauth := httptest.NewRecorder()
+	handler.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for invalid auth, got %d", wUnauth.Code)
+	}
+
+	// 2. Tenant role -> 403 Forbidden
+	reqTenant := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/events", nil)
+	reqTenant.Header.Set("X-API-Key", "key-tenant")
+	wTenant := httptest.NewRecorder()
+	handler.ServeHTTP(wTenant, reqTenant)
+	if wTenant.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant, got %d", wTenant.Code)
+	}
+
+	// 3. Mismatched PoP -> 403 Forbidden
+	reqDhaka := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/events", nil)
+	reqDhaka.Header.Set("X-API-Key", "key-edge-node")
+	wDhaka := httptest.NewRecorder()
+	handler.ServeHTTP(wDhaka, reqDhaka)
+	if wDhaka.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for mismatched PoP, got %d", wDhaka.Code)
+	}
+
+	// 4. Authorized stream with real-time event delivery
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reqStream := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/events", nil).WithContext(ctx)
+	reqStream.Header.Set("X-API-Key", "key-edge-node")
+	wStream := httptest.NewRecorder()
+
+	doneCh := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(wStream, reqStream)
+		close(doneCh)
+	}()
+
+	// Wait briefly for connection and initial "connected" event
+	time.Sleep(50 * time.Millisecond)
+
+	// Broadcast an update
+	handler.Broadcaster().BroadcastConfigUpdate("singapore", "sha256-test-update-99")
+
+	time.Sleep(50 * time.Millisecond)
+	cancel() // Cancel context to stop streaming loop
+	<-doneCh
+
+	if wStream.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", wStream.Code)
+	}
+	if ct := wStream.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Fatalf("expected Content-Type text/event-stream, got %s", ct)
+	}
+
+	body := wStream.Body.String()
+	if !strings.Contains(body, "event: connected") {
+		t.Errorf("expected initial connected event, got: %s", body)
+	}
+	if !strings.Contains(body, "event: config_update") {
+		t.Errorf("expected config_update event, got: %s", body)
+	}
+	if !strings.Contains(body, "sha256-test-update-99") {
+		t.Errorf("expected checksum in event stream, got: %s", body)
 	}
 }
