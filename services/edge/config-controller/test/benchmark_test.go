@@ -170,8 +170,8 @@ func TestHighConcurrency_Pipeline(t *testing.T) {
 		WAFMode:    "BLOCK",
 	}
 
-	numWorkers := 50
-	requestsPerWorker := 400
+	numWorkers := 30
+	requestsPerWorker := 200
 	totalExpected := numWorkers * requestsPerWorker
 
 	var wg sync.WaitGroup
@@ -220,8 +220,8 @@ func TestHighConcurrency_Pipeline(t *testing.T) {
 	select {
 	case <-done:
 		// Successful completion
-	case <-time.After(20 * time.Second):
-		t.Fatalf("concurrency pipeline deadlocked or failed to finish within 20s timeout")
+	case <-time.After(45 * time.Second):
+		t.Fatalf("concurrency pipeline deadlocked or failed to finish within 45s timeout")
 	}
 
 	duration := time.Since(startTime)

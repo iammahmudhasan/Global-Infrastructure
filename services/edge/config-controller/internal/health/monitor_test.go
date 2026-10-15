@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -379,16 +380,38 @@ func TestMonitor_DevLoopbackEnvironmentBinding(t *testing.T) {
 }
 
 type mockAlertReceiver struct {
+	mu     sync.Mutex
 	events []string
 }
 
 func (m *mockAlertReceiver) SendAlert(ctx context.Context, event alert.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.events = append(m.events, event.Type)
 	return nil
 }
 
 func (m *mockAlertReceiver) IsConfigured() bool {
 	return true
+}
+
+func (m *mockAlertReceiver) hasEvent(eventType string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, ev := range m.events {
+		if ev == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mockAlertReceiver) getEvents() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := make([]string, len(m.events))
+	copy(cp, m.events)
+	return cp
 }
 
 func TestMonitor_AlertDispatching(t *testing.T) {
@@ -444,15 +467,8 @@ func TestMonitor_AlertDispatching(t *testing.T) {
 	_ = m.ProbeEndpoint(ctx, origin, monitorConfig, nil)
 	time.Sleep(50 * time.Millisecond) // Allow async alert goroutine to record
 
-	hasHighLatency := false
-	for _, ev := range mockAlerter.events {
-		if ev == "HIGH_LATENCY" {
-			hasHighLatency = true
-			break
-		}
-	}
-	if !hasHighLatency {
-		t.Errorf("expected HIGH_LATENCY alert to be dispatched, got %v", mockAlerter.events)
+	if !mockAlerter.hasEvent("HIGH_LATENCY") {
+		t.Errorf("expected HIGH_LATENCY alert to be dispatched, got %v", mockAlerter.getEvents())
 	}
 
 	// 2. Origin starts failing
@@ -470,15 +486,8 @@ func TestMonitor_AlertDispatching(t *testing.T) {
 	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
 	time.Sleep(50 * time.Millisecond)
 
-	hasOriginDown := false
-	for _, ev := range mockAlerter.events {
-		if ev == "ORIGIN_DOWN" {
-			hasOriginDown = true
-			break
-		}
-	}
-	if !hasOriginDown {
-		t.Errorf("expected ORIGIN_DOWN alert to be dispatched, got %v", mockAlerter.events)
+	if !mockAlerter.hasEvent("ORIGIN_DOWN") {
+		t.Errorf("expected ORIGIN_DOWN alert to be dispatched, got %v", mockAlerter.getEvents())
 	}
 
 	// 3. Origin recovers
@@ -489,14 +498,7 @@ func TestMonitor_AlertDispatching(t *testing.T) {
 	currentState = m.ProbeEndpoint(ctx, origin, monitorConfig, currentState)
 	time.Sleep(50 * time.Millisecond)
 
-	hasRecovered := false
-	for _, ev := range mockAlerter.events {
-		if ev == "ORIGIN_RECOVERED" {
-			hasRecovered = true
-			break
-		}
-	}
-	if !hasRecovered {
-		t.Errorf("expected ORIGIN_RECOVERED alert to be dispatched, got %v", mockAlerter.events)
+	if !mockAlerter.hasEvent("ORIGIN_RECOVERED") {
+		t.Errorf("expected ORIGIN_RECOVERED alert to be dispatched, got %v", mockAlerter.getEvents())
 	}
 }
