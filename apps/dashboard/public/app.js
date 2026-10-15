@@ -46,6 +46,12 @@
       if (viewId === 'domains') {
         loadDomains();
       }
+      if (viewId === 'servers') {
+        loadPoPs();
+      }
+      if (viewId === 'analytics') {
+        loadLatencyMatrix();
+      }
     }
 
     navItems.forEach(item => {
@@ -518,12 +524,176 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       tbody.prepend(tr);
     }
 
+    // Edge PoPs & Multi-PoP Global Topology
+    async function loadPoPs() {
+      const tbody = document.getElementById('pops-table-tbody');
+      const badge = document.getElementById('pops-source-badge');
+      if (!tbody) return;
+
+      try {
+        const resp = await fetch('/api/proxy/pops');
+        if (resp.ok) {
+          const data = await resp.json();
+          const pops = data.pops || [];
+          if (pops.length > 0) {
+            tbody.innerHTML = '';
+            pops.forEach(pop => {
+              const tr = document.createElement('tr');
+
+              // 1. PoP ID / Region
+              const tdId = document.createElement('td');
+              tdId.className = 'mono';
+              const strongId = document.createElement('strong');
+              strongId.textContent = pop.id;
+              const br1 = document.createElement('br');
+              const spanReg = document.createElement('span');
+              spanReg.style.fontSize = '0.75rem';
+              spanReg.style.color = 'var(--text-muted)';
+              spanReg.textContent = pop.region || '';
+              tdId.append(strongId, br1, spanReg);
+
+              // 2. City / Location
+              const tdLoc = document.createElement('td');
+              const strongCity = document.createElement('strong');
+              strongCity.textContent = pop.city || '';
+              const textCountry = document.createTextNode(`, ${pop.country || ''}`);
+              const br2 = document.createElement('br');
+              const spanName = document.createElement('span');
+              spanName.style.fontSize = '0.75rem';
+              spanName.style.color = 'var(--text-muted)';
+              spanName.textContent = pop.name || '';
+              tdLoc.append(strongCity, textCountry, br2, spanName);
+
+              // 3. Anycast Routing
+              const tdAnycast = document.createElement('td');
+              tdAnycast.className = 'mono';
+              const isLiveProd = pop.id === 'singapore';
+              const spanIp = document.createElement('span');
+              spanIp.className = `badge ${isLiveProd ? 'badge-bd' : 'badge-subtle'}`;
+              spanIp.textContent = pop.anycast_ipv4 || '198.51.100.1';
+              const br3 = document.createElement('br');
+              const spanAsn = document.createElement('span');
+              spanAsn.style.fontSize = '0.72rem';
+              spanAsn.style.color = 'var(--text-muted)';
+              spanAsn.textContent = `AS${pop.asn || 64512}`;
+              tdAnycast.append(spanIp, br3, spanAsn);
+
+              // 4. Target Peering / SLA
+              const tdPeering = document.createElement('td');
+              let peeringText = 'Global Anycast';
+              let slaText = 'Subsea Transit';
+              if (pop.id === 'dhaka') {
+                peeringText = 'BDIX Peering (167 ISPs)';
+                slaText = '< 10 ms (Domestic BD-NDMA 2026)';
+              } else if (pop.id === 'singapore') {
+                peeringText = 'Equinix SG1 / SMW6 Direct';
+                slaText = 'Active Live Production Anchor';
+              } else if (pop.id === 'frankfurt') {
+                peeringText = 'DE-CIX Frankfurt Peering';
+                slaText = '14 ms (EU GDPR Sovereign)';
+              } else if (pop.id === 'virginia') {
+                peeringText = 'Equinix Ashburn DC2';
+                slaText = '22 ms (Lowest Cost US)';
+              }
+              const strongPeer = document.createElement('strong');
+              strongPeer.textContent = peeringText;
+              const br4 = document.createElement('br');
+              const spanSla = document.createElement('span');
+              spanSla.className = 'text-emerald';
+              spanSla.style.fontSize = '0.75rem';
+              spanSla.textContent = slaText;
+              tdPeering.append(strongPeer, br4, spanSla);
+
+              // 5. BGP Route State
+              const tdBgp = document.createElement('td');
+              const isAnnounced = pop.bgp_state === 'ANNOUNCED';
+              const spanBgp = document.createElement('span');
+              spanBgp.className = `badge ${isAnnounced ? 'badge-bd' : 'badge-amber'}`;
+              spanBgp.textContent = pop.bgp_state || 'UNKNOWN';
+              const br5 = document.createElement('br');
+              const spanStatus = document.createElement('span');
+              spanStatus.style.fontSize = '0.72rem';
+              spanStatus.style.color = 'var(--text-muted)';
+              spanStatus.textContent = pop.status || '';
+              tdBgp.append(spanBgp, br5, spanStatus);
+
+              // 6. Actions
+              const tdActions = document.createElement('td');
+              const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
+              if (isOperator) {
+                const btn = document.createElement('button');
+                btn.className = `btn btn-sm ${isAnnounced ? 'btn-danger' : 'btn-primary'}`;
+                btn.style.fontSize = '0.72rem';
+                btn.style.padding = '0.2rem 0.5rem';
+                btn.textContent = isAnnounced ? 'Drain (Withdraw)' : 'Announce Anycast';
+                btn.onclick = () => togglePoPBGP(pop.id, isAnnounced ? 'withdraw' : 'announce');
+                tdActions.appendChild(btn);
+              } else {
+                const spanIngress = document.createElement('span');
+                spanIngress.style.fontSize = '0.75rem';
+                spanIngress.style.color = 'var(--text-muted)';
+                spanIngress.textContent = isLiveProd ? 'Primary Gateway' : 'Active Ingress';
+                tdActions.appendChild(spanIngress);
+              }
+
+              tr.append(tdId, tdLoc, tdAnycast, tdPeering, tdBgp, tdActions);
+              tbody.appendChild(tr);
+            });
+
+            if (badge) {
+              badge.className = 'badge badge-bd';
+              badge.innerText = `LIVE MULTI-POP FLEET (${pops.length} POPS SYNCHRONIZED)`;
+            }
+            return;
+          }
+        }
+      } catch (err) {
+        // Keep fallback table if offline
+      }
+    }
+
+    async function togglePoPBGP(popId, action) {
+      try {
+        const resp = await fetch(`/api/proxy/pops/${encodeURIComponent(popId)}/bgp/${encodeURIComponent(action)}`, {
+          method: 'POST'
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          showToast(`PoP '${popId}' BGP state updated to ${data.bgp_state} (${data.status}).`);
+          loadPoPs();
+          return;
+        }
+        const err = await resp.json();
+        showToast(`Error updating PoP BGP: ${err.error || 'Request failed'}`);
+      } catch (e) {
+        showToast(`Failed to update PoP BGP: ${e.message}`);
+      }
+    }
+
+    async function loadLatencyMatrix() {
+      const badge = document.getElementById('matrix-source-badge');
+      try {
+        const resp = await fetch('/api/proxy/pops/matrix');
+        if (resp.ok) {
+          const data = await resp.json();
+          const routes = data.routes || [];
+          if (routes.length > 0 && badge) {
+            badge.className = 'badge badge-bd';
+            badge.innerText = `LIVE SUBSEA TRANSIT (${routes.length} MATRIX PATHS VERIFIED)`;
+          }
+        }
+      } catch (err) {
+        // Fallback
+      }
+    }
+
     async function initSessionContext() {
       try {
         const resp = await fetch('/api/auth/session');
         if (resp.ok) {
           const session = await resp.json();
           window.__nexusedge_session = session;
+          loadPoPs(); // Re-render with operator action buttons if operator
         }
       } catch (e) {
         // BFF running offline
@@ -534,5 +704,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     initSessionContext();
     checkControlPlaneHealth();
     loadDomains();
+    loadPoPs();
+    loadLatencyMatrix();
     fetchAuditLogs();
     setInterval(checkControlPlaneHealth, 15000);

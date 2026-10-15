@@ -1,0 +1,57 @@
+# NexusEdge Global Infrastructure - Region Network Specification
+# Region: asia-south1 (Dhaka, Bangladesh)
+# Peering Authority: Bangladesh Internet Exchange (BDIX)
+# Compliance: Bangladesh National Data Management Act (NDMA) 2026
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: PeeringPolicy
+metadata:
+  name: bdix-peering-dhaka
+  region: asia-south1
+  city: Dhaka
+  country: BD
+  datacenter: BDIX-Connected Facility
+spec:
+  local_asn: 64512
+  route_servers:
+    - asn: 24180
+      name: "BDIX Route Server 01"
+      ipv4_peer: "198.51.100.254"
+      ipv6_peer: "2001:db8:bd::1"
+      status: ACTIVE
+      max_prefixes: 5000
+    - asn: 24180
+      name: "BDIX Route Server 02 (Redundant)"
+      ipv4_peer: "198.51.100.253"
+      ipv6_peer: "2001:db8:bd::2"
+      status: ACTIVE
+      max_prefixes: 5000
+
+  advertised_prefixes:
+    ipv4:
+      - "198.51.100.0/24"
+    ipv6:
+      - "2001:db8:bd::/48"
+
+  routing_policy:
+    local_preference: 200
+    med: 10
+    community_tags:
+      - "64512:1001" # National In-Country Traffic Only
+      - "64512:2001" # NDMA-2026 Sovereign Jurisdiction
+    target_domestic_latency_ms: 10.0
+    intra_metro_fiber_latency_ms: 3.8
+
+  subsea_transit_links:
+    - cable_system: "SEA-ME-WE 6 (SMW6)"
+      landing_station: "Cox's Bazar, Bangladesh"
+      remote_pop: "singapore"
+      capacity_gbps: 30000
+      sla_rtt_ms: 32.0
+      status: BACKUP_TRANSIT
+    - cable_system: "AAE-1 / SMW5"
+      landing_station: "Kuakata, Bangladesh"
+      remote_pop: "frankfurt"
+      capacity_gbps: 10000
+      sla_rtt_ms: 125.0
+      status: TERTIARY_TRANSIT

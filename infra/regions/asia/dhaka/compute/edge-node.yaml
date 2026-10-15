@@ -1,0 +1,37 @@
+# NexusEdge Global Infrastructure - Region Compute Specification
+# Region: asia-south1 (Dhaka, Bangladesh)
+# Node: bd-dhaka-edge01
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: EdgeNodeSpecification
+metadata:
+  name: bd-dhaka-edge01
+  pop_id: dhaka
+  region: asia-south1
+  jurisdiction: BD
+  compliance: BD-NDMA-2026-CII
+spec:
+  hostname: "bd-dhaka-edge01.nexusedge.internal"
+  management_ip: "198.51.100.11"
+  anycast_virtual_ip: "198.51.100.1"
+  role: EDGE_FAST_PATH_GATEWAY
+  hardware:
+    cpu_cores: 16
+    cpu_model: "AMD EPYC 7713P"
+    memory_gb: 64
+    nvme_cache_gb: 1024
+    network_interfaces:
+      - name: "eth0"
+        speed_gbps: 25
+        driver: "mlx5_core"
+        xdp_acceleration: ENABLED
+  runtime:
+    dataplane: "rust-line-rate-gateway"
+    ingress_proxy: "envoy-l7"
+    cache_engine: "rf9111-nvme-lru"
+    waf_engine: "ebpf-adaptive-shield"
+  sovereignty:
+    strict_data_residency: true
+    cryptographic_audit_logging: true
+    cross_border_egress_blocked: false
+    national_cii_registered: true

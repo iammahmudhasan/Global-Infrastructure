@@ -1,0 +1,60 @@
+# NexusEdge Global Infrastructure - Region Network Specification
+# Region: asia-southeast1 (Singapore)
+# Peering Authority: Equinix Internet Exchange Singapore (SG1)
+# Primary Production Anchor: Oracle Cloud Infrastructure VM (80.225.241.129)
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: PeeringPolicy
+metadata:
+  name: equinix-peering-singapore
+  region: asia-southeast1
+  city: Singapore
+  country: SG
+  datacenter: Equinix SG1 / Oracle OCI ap-singapore-1
+spec:
+  local_asn: 64512
+  route_servers:
+    - asn: 24115
+      name: "Equinix SG1 IX Route Server 01"
+      ipv4_peer: "198.51.100.250"
+      ipv6_peer: "2001:db8:sg::1"
+      status: ACTIVE
+      max_prefixes: 15000
+    - asn: 24115
+      name: "Equinix SG1 IX Route Server 02 (Redundant)"
+      ipv4_peer: "198.51.100.249"
+      ipv6_peer: "2001:db8:sg::2"
+      status: ACTIVE
+      max_prefixes: 15000
+
+  advertised_prefixes:
+    ipv4:
+      - "80.225.241.129/32"
+      - "198.51.100.0/24"
+    ipv6:
+      - "2001:db8:sg::/48"
+
+  routing_policy:
+    local_preference: 150
+    med: 20
+    community_tags:
+      - "64512:1002" # APAC Regional Transit
+      - "64512:3001" # Global Anycast Ingress
+    target_regional_latency_ms: 15.0
+
+  subsea_transit_links:
+    - cable_system: "SEA-ME-WE 6 (SMW6)"
+      remote_pop: "dhaka"
+      capacity_gbps: 30000
+      sla_rtt_ms: 32.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "Asia Africa Europe-1 (AAE-1)"
+      remote_pop: "frankfurt"
+      capacity_gbps: 20000
+      sla_rtt_ms: 145.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "Japan-U.S. / Trans-Pacific"
+      remote_pop: "virginia"
+      capacity_gbps: 40000
+      sla_rtt_ms: 180.0
+      status: ACTIVE_INTERCONNECT

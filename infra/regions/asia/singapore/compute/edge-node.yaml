@@ -1,0 +1,50 @@
+# NexusEdge Global Infrastructure - Region Compute Specification
+# Region: asia-southeast1 (Singapore)
+# Node: sg-singapore-gw01 (Live Production Edge)
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: EdgeNodeSpecification
+metadata:
+  name: sg-singapore-gw01
+  pop_id: singapore
+  region: asia-southeast1
+  jurisdiction: SG
+  production_anchor: "80.225.241.129"
+spec:
+  hostname: "sg-singapore-gw01.nexusedge.internal"
+  public_ip: "80.225.241.129"
+  management_ip: "10.0.0.125"
+  anycast_virtual_ip: "198.51.100.1"
+  role: ACTIVE_PRODUCTION_GATEWAY
+  hardware:
+    provider: "Oracle Cloud Infrastructure"
+    instance_shape: "VM.Standard.A1.Flex"
+    cpu_cores: 4
+    memory_gb: 24
+    boot_volume_gb: 50
+    network_interfaces:
+      - name: "enp0s3"
+        speed_gbps: 4
+        driver: "virtio_net"
+  runtime:
+    dataplane: "rust-line-rate-gateway"
+    ingress_proxy: "envoy-l7"
+    config_controller: "nexusedge-config-controller"
+    database: "postgres-18-alpine"
+    dashboard_bff: "nodejs-bff"
+  containers:
+    - name: "nexusedge-envoy-ingress-prod"
+      ports: ["80:80", "443:443"]
+      status: RUNNING
+    - name: "nexusedge-pop-prod-01"
+      ports: ["8080:8080"]
+      status: RUNNING
+    - name: "nexusedge-config-controller-prod"
+      ports: ["9091:9091"]
+      status: RUNNING
+    - name: "nexusedge-dashboard-prod"
+      ports: ["3000:3000"]
+      status: RUNNING
+    - name: "nexusedge-postgres-prod"
+      ports: ["5432:5432"]
+      status: RUNNING

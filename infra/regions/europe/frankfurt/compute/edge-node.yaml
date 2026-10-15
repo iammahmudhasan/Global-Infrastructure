@@ -1,0 +1,37 @@
+# NexusEdge Global Infrastructure - Region Compute Specification
+# Region: europe-west3 (Frankfurt, Germany)
+# Node: de-frankfurt-edge01
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: EdgeNodeSpecification
+metadata:
+  name: de-frankfurt-edge01
+  pop_id: frankfurt
+  region: europe-west3
+  jurisdiction: EU
+  compliance: EU-GDPR-Sovereign
+spec:
+  hostname: "de-frankfurt-edge01.nexusedge.internal"
+  management_ip: "198.51.100.21"
+  anycast_virtual_ip: "198.51.100.1"
+  role: EDGE_FAST_PATH_GATEWAY
+  hardware:
+    cpu_cores: 16
+    cpu_model: "Intel Xeon Platinum 8358"
+    memory_gb: 64
+    nvme_cache_gb: 2048
+    network_interfaces:
+      - name: "eth0"
+        speed_gbps: 25
+        driver: "ixgbe"
+        xdp_acceleration: ENABLED
+  runtime:
+    dataplane: "rust-line-rate-gateway"
+    ingress_proxy: "envoy-l7"
+    cache_engine: "rf9111-nvme-lru"
+    waf_engine: "ebpf-adaptive-shield"
+  sovereignty:
+    strict_data_residency: true
+    cryptographic_audit_logging: true
+    cross_border_egress_blocked: false
+    gdpr_article_44_compliant: true

@@ -1,0 +1,59 @@
+# NexusEdge Global Infrastructure - Region Network Specification
+# Region: europe-west3 (Frankfurt, Germany)
+# Peering Authority: Deutscher Commercial Internet Exchange (DE-CIX Frankfurt)
+# Compliance: European Union General Data Protection Regulation (GDPR) Art 44-50
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: PeeringPolicy
+metadata:
+  name: decix-peering-frankfurt
+  region: europe-west3
+  city: Frankfurt
+  country: DE
+  datacenter: Equinix FR5 / DE-CIX Frankfurt
+spec:
+  local_asn: 64512
+  route_servers:
+    - asn: 6695
+      name: "DE-CIX Route Server 01"
+      ipv4_peer: "198.51.100.245"
+      ipv6_peer: "2001:db8:de::1"
+      status: ACTIVE
+      max_prefixes: 30000
+    - asn: 6695
+      name: "DE-CIX Route Server 02 (Redundant)"
+      ipv4_peer: "198.51.100.244"
+      ipv6_peer: "2001:db8:de::2"
+      status: ACTIVE
+      max_prefixes: 30000
+
+  advertised_prefixes:
+    ipv4:
+      - "198.51.100.0/24"
+    ipv6:
+      - "2001:db8:de::/48"
+
+  routing_policy:
+    local_preference: 180
+    med: 15
+    community_tags:
+      - "64512:1003" # Pan-European Transit
+      - "64512:4001" # EU-GDPR Sovereign Zone
+    target_regional_latency_ms: 14.0
+
+  subsea_transit_links:
+    - cable_system: "TAT-14 / Transatlantic Subsea"
+      remote_pop: "virginia"
+      capacity_gbps: 50000
+      sla_rtt_ms: 78.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "Asia Africa Europe-1 (AAE-1)"
+      remote_pop: "singapore"
+      capacity_gbps: 20000
+      sla_rtt_ms: 145.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "SMW6 Terrestrial Extension"
+      remote_pop: "dhaka"
+      capacity_gbps: 15000
+      sla_rtt_ms: 125.0
+      status: ACTIVE_INTERCONNECT

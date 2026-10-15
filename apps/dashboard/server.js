@@ -595,6 +595,49 @@ const server = http.createServer((req, res) => {
       return proxyToControlPlane('/v1/alerts/test', req, res, session);
     }
 
+    // Proxy Edge PoPs: Global Latency Matrix (Authenticated session)
+    if (pathname === '/api/proxy/pops/matrix') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/routing/matrix', req, res, session);
+    }
+
+    // Proxy Edge PoPs: List all connected PoPs (Authenticated session)
+    if (pathname === '/api/proxy/pops') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/pops', req, res, session);
+    }
+
+    // Proxy Edge PoPs: Inspect single PoP (Authenticated session)
+    const popMatch = pathname.match(/^\/api\/proxy\/pops\/([a-zA-Z0-9_-]+)$/);
+    if (popMatch) {
+      const popId = popMatch[1];
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane(`/v1/edge/pops/${encodeURIComponent(popId)}`, req, res, session);
+    }
+
+    // Proxy Edge PoPs: BGP State Mutation (PLATFORM_OPERATOR only)
+    const popBgpMatch = pathname.match(/^\/api\/proxy\/pops\/([a-zA-Z0-9_-]+)\/bgp\/(announce|withdraw)$/);
+    if (popBgpMatch) {
+      const popId = popBgpMatch[1];
+      const bgpAction = popBgpMatch[2];
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      if (session.role !== 'PLATFORM_OPERATOR') {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to modify BGP route state. Only PLATFORM_OPERATOR can announce or withdraw PoP Anycast routes.`
+        });
+      }
+      return proxyToControlPlane(`/v1/edge/pops/${encodeURIComponent(popId)}/bgp/${encodeURIComponent(bgpAction)}`, req, res, session);
+    }
+
     return sendJSON(res, 404, { code: 404, error: 'Proxy route not found' });
   }
 

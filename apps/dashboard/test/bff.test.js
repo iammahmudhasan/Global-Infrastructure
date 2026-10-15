@@ -1358,6 +1358,244 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(server);
     }
   });
+
+  it('Requirement 12: Multi-PoP & BGP endpoints proxy correctly and enforce RBAC', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_ENV = 'production';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'prod-viewer-token:viewer@nexusedge.io:VIEWER:proj-test;prod-op-token:op@nexusedge.io:PLATFORM_OPERATOR:proj-test';
+    process.env.CONTROL_PLANE_SERVICE_TOKEN = 'cp-service-token';
+
+    // Mock Upstream Control Plane for PoP endpoints
+    const mockCP = http.createServer((req, res) => {
+      if (req.url === '/v1/edge/pops' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          total_pops: 4,
+          pops: [
+            { id: 'dhaka', name: 'Dhaka BDIX Edge 01', bgp_state: 'ANNOUNCED', status: 'ACTIVE' },
+            { id: 'singapore', name: 'Singapore Equinix SG1', bgp_state: 'ANNOUNCED', status: 'ACTIVE' },
+            { id: 'frankfurt', name: 'Frankfurt DE-CIX Edge 01', bgp_state: 'ANNOUNCED', status: 'ACTIVE' },
+            { id: 'virginia', name: 'Virginia Equinix Ashburn DC2', bgp_state: 'ANNOUNCED', status: 'ACTIVE' }
+          ]
+        }));
+      }
+      if (req.url === '/v1/edge/pops/dhaka' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'dhaka',
+          name: 'Dhaka BDIX Edge 01',
+          country: 'BD',
+          bgp_state: 'ANNOUNCED',
+          status: 'ACTIVE'
+        }));
+      }
+      if (req.url === '/v1/edge/routing/matrix' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          routes_count: 6,
+          routes: [
+            { from_pop: 'dhaka', to_target: 'singapore', latency_ms: 32.0, status: 'ACTIVE' },
+            { from_pop: 'dhaka', to_target: 'frankfurt', latency_ms: 125.0, status: 'ACTIVE' },
+            { from_pop: 'singapore', to_target: 'frankfurt', latency_ms: 145.0, status: 'ACTIVE' }
+          ]
+        }));
+      }
+      if (req.url === '/v1/edge/pops/dhaka/bgp/withdraw' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'dhaka',
+          bgp_state: 'WITHDRAWN',
+          status: 'POP_DRAINING'
+        }));
+      }
+      if (req.url === '/v1/edge/pops/dhaka/bgp/announce' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          id: 'dhaka',
+          bgp_state: 'ANNOUNCED',
+          status: 'POP_ACTIVE'
+        }));
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+
+    await new Promise((resolve) => mockCP.listen(0, '127.0.0.1', resolve));
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${mockCP.address().port}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Unauthenticated requests to /api/proxy/pops and /api/proxy/pops/matrix return 401
+      const resUnauthPops = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauthPops.statusCode, 401);
+      resUnauthPops.resume();
+
+      const resUnauthMatrix = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/matrix',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauthMatrix.statusCode, 401);
+      resUnauthMatrix.resume();
+
+      // 2. Login as VIEWER
+      const loginViewerRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'prod-viewer-token' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const viewerCookie = loginViewerRes.headers['set-cookie'][0].split(';')[0];
+      loginViewerRes.resume();
+
+      // 3. VIEWER can read /api/proxy/pops and /api/proxy/pops/matrix
+      const resViewerPops = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': viewerCookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerPops.statusCode, 200);
+      let viewerPopsBody = '';
+      resViewerPops.on('data', chunk => { viewerPopsBody += chunk; });
+      await new Promise(resolve => resViewerPops.on('end', resolve));
+      const parsedPops = JSON.parse(viewerPopsBody);
+      assert.strictEqual(parsedPops.total_pops, 4);
+
+      // 4. VIEWER attempting to mutate BGP route state gets 403 Forbidden
+      const resViewerBgp = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/dhaka/bgp/withdraw',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': viewerCookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerBgp.statusCode, 403, 'VIEWER role must be rejected from modifying BGP state');
+      resViewerBgp.resume();
+
+      // 5. Login as PLATFORM_OPERATOR
+      const loginOpRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'prod-op-token' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(data)
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const opCookie = loginOpRes.headers['set-cookie'][0].split(';')[0];
+      loginOpRes.resume();
+
+      // 6. PLATFORM_OPERATOR can withdraw and announce BGP routes
+      const resOpWithdraw = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/dhaka/bgp/withdraw',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': opCookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resOpWithdraw.statusCode, 200);
+      let withdrawBody = '';
+      resOpWithdraw.on('data', chunk => { withdrawBody += chunk; });
+      await new Promise(resolve => resOpWithdraw.on('end', resolve));
+      const withdrawData = JSON.parse(withdrawBody);
+      assert.strictEqual(withdrawData.bgp_state, 'WITHDRAWN');
+
+      const resOpAnnounce = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/dhaka/bgp/announce',
+          method: 'POST',
+          agent: false,
+          headers: {
+            'Connection': 'close',
+            'Cookie': opCookie
+          }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resOpAnnounce.statusCode, 200);
+      let announceBody = '';
+      resOpAnnounce.on('data', chunk => { announceBody += chunk; });
+      await new Promise(resolve => resOpAnnounce.on('end', resolve));
+      const announceData = JSON.parse(announceBody);
+      assert.strictEqual(announceData.bgp_state, 'ANNOUNCED');
+
+    } finally {
+      await safeClose(server);
+      await safeClose(mockCP);
+    }
+  });
 });
 
 

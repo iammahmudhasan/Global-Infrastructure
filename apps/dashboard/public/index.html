@@ -383,59 +383,52 @@
           <div class="table-card">
             <div class="table-header-bar">
               <div class="table-title">Connected Global PoPs & Sovereign Compute Nodes</div>
+              <span id="pops-source-badge" class="badge badge-bd">LIVE MULTI-POP FLEET</span>
             </div>
             <div class="table-responsive">
               <table>
                 <thead>
                   <tr>
-                    <th>Node ID</th>
-                    <th>Location / Region</th>
-                    <th>Hardware / Role</th>
-                    <th>BDIX / Subsea Latency</th>
-                    <th>Carbon & Power Grid</th>
-                    <th>Status</th>
+                    <th>PoP ID / Region</th>
+                    <th>City / Location</th>
+                    <th>Anycast Routing</th>
+                    <th>Target Peering / SLA</th>
+                    <th>BGP Route State</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody id="pops-table-tbody">
                   <tr>
-                    <td class="mono"><strong>bd-dhaka-dgx01</strong></td>
-                    <td>Dhaka, Bangladesh (ap-south-2)</td>
-                    <td>8x NVIDIA H100 SXM5 (Sovereign)</td>
-                    <td><span class="text-emerald">3.8 ms (Local BDIX)</span></td>
-                    <td>Standard Grid (480 gCO2/kWh)</td>
-                    <td><span class="text-emerald">HEALTHY (100% Sovereign)</span></td>
+                    <td class="mono"><strong>dhaka</strong><br><span style="font-size: 0.75rem; color: var(--text-muted);">asia-south1</span></td>
+                    <td><strong>Dhaka</strong>, BD<br><span style="font-size: 0.75rem; color: var(--text-muted);">Dhaka BDIX Edge 01</span></td>
+                    <td class="mono"><span class="badge badge-subtle">198.51.100.1</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">AS64512</span></td>
+                    <td><strong>BDIX Peering (167 ISPs)</strong><br><span class="text-emerald" style="font-size: 0.75rem;">&lt; 10 ms (Domestic BD-NDMA 2026)</span></td>
+                    <td><span class="badge badge-bd">ANNOUNCED</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">POP_ACTIVE</span></td>
+                    <td><span style="font-size: 0.75rem; color: var(--text-muted);">Active Ingress</span></td>
                   </tr>
                   <tr>
-                    <td class="mono"><strong>sg-singapore-gw01</strong></td>
-                    <td>Singapore (ap-se-1)</td>
-                    <td>Line-Rate Rust L7 Gateway Edge</td>
-                    <td><span class="text-emerald">8.4 ms (SMW6 Direct)</span></td>
-                    <td>Clean Grid (320 gCO2/kWh)</td>
-                    <td><span class="text-emerald">HEALTHY (Active Anycast)</span></td>
+                    <td class="mono"><strong>singapore</strong><br><span style="font-size: 0.75rem; color: var(--text-muted);">asia-southeast1</span></td>
+                    <td><strong>Singapore</strong>, SG<br><span style="font-size: 0.75rem; color: var(--text-muted);">Singapore Equinix SG1</span></td>
+                    <td class="mono"><span class="badge badge-bd">80.225.241.129</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">AS64512</span></td>
+                    <td><strong>Equinix SG1 / SMW6 Direct</strong><br><span class="text-emerald" style="font-size: 0.75rem;">Active Live Production Anchor</span></td>
+                    <td><span class="badge badge-bd">ANNOUNCED</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">POP_ACTIVE</span></td>
+                    <td><span style="font-size: 0.75rem; color: var(--text-muted);">Primary Gateway</span></td>
                   </tr>
                   <tr>
-                    <td class="mono"><strong>de-frankfurt-pop02</strong></td>
-                    <td>Frankfurt, Germany (eu-central-1)</td>
-                    <td>High-Density Compute & Envoy Mesh</td>
-                    <td>14.2 ms RTT</td>
-                    <td>EU Renewable (210 gCO2/kWh)</td>
-                    <td><span class="text-emerald">HEALTHY (GDPR Verified)</span></td>
+                    <td class="mono"><strong>frankfurt</strong><br><span style="font-size: 0.75rem; color: var(--text-muted);">europe-west3</span></td>
+                    <td><strong>Frankfurt</strong>, DE<br><span style="font-size: 0.75rem; color: var(--text-muted);">Frankfurt DE-CIX Edge 01</span></td>
+                    <td class="mono"><span class="badge badge-subtle">198.51.100.1</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">AS64512</span></td>
+                    <td><strong>DE-CIX Frankfurt Peering</strong><br><span class="text-emerald" style="font-size: 0.75rem;">14 ms (EU GDPR Sovereign)</span></td>
+                    <td><span class="badge badge-bd">ANNOUNCED</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">POP_ACTIVE</span></td>
+                    <td><span style="font-size: 0.75rem; color: var(--text-muted);">Active Ingress</span></td>
                   </tr>
                   <tr>
-                    <td class="mono"><strong>us-virginia-cluster</strong></td>
-                    <td>Northern Virginia (us-east-1)</td>
-                    <td>16x NVIDIA B200 / Spot Compute</td>
-                    <td>22.6 ms RTT</td>
-                    <td>Commercial Grid (380 gCO2/kWh)</td>
-                    <td><span class="text-emerald">HEALTHY (Lowest Cost)</span></td>
-                  </tr>
-                  <tr>
-                    <td class="mono"><strong>is-green-gpu01</strong></td>
-                    <td>Reykjavik, Iceland (is-north-1)</td>
-                    <td>Geothermal 100% Green AI Supernode</td>
-                    <td>35.1 ms RTT</td>
-                    <td><span class="text-emerald">100% Geothermal (12 gCO2/kWh)</span></td>
-                    <td><span class="text-emerald">HEALTHY ($1.45/h Spot)</span></td>
+                    <td class="mono"><strong>virginia</strong><br><span style="font-size: 0.75rem; color: var(--text-muted);">us-east1</span></td>
+                    <td><strong>Ashburn</strong>, US<br><span style="font-size: 0.75rem; color: var(--text-muted);">Virginia Equinix Ashburn DC2</span></td>
+                    <td class="mono"><span class="badge badge-subtle">198.51.100.1</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">AS64512</span></td>
+                    <td><strong>Equinix Ashburn DC2</strong><br><span class="text-emerald" style="font-size: 0.75rem;">22 ms (Lowest Cost US)</span></td>
+                    <td><span class="badge badge-bd">ANNOUNCED</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">POP_ACTIVE</span></td>
+                    <td><span style="font-size: 0.75rem; color: var(--text-muted);">Active Ingress</span></td>
                   </tr>
                 </tbody>
               </table>
@@ -699,6 +692,7 @@
           <div class="table-card">
             <div class="table-header-bar">
               <div class="table-title">Inter-PoP Latency Matrix (Round-Trip Time)</div>
+              <span id="matrix-source-badge" class="badge badge-bd">LIVE SUBSEA TRANSIT</span>
             </div>
             <div class="table-responsive">
               <table>
@@ -712,7 +706,7 @@
                     <th>Iceland (IS)</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody id="matrix-table-tbody">
                   <tr>
                     <td><strong>Dhaka (BD)</strong></td>
                     <td class="text-emerald"><strong>0 ms</strong></td>
