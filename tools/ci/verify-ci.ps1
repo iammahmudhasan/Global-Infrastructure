@@ -17,7 +17,8 @@ Write-Host "[1/7] Running Go format check (gofmt -l)..." -ForegroundColor Yellow
 $GoServices = @(
     "services/edge/config-controller",
     "services/network/global-router",
-    "apps/cli"
+    "apps/cli",
+    "benchmarks/packet"
 )
 
 foreach ($svc in $GoServices) {

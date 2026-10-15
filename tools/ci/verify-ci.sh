@@ -15,6 +15,7 @@ GO_SERVICES=(
   "services/edge/config-controller"
   "services/network/global-router"
   "apps/cli"
+  "benchmarks/packet"
 )
 
 # 1. Go Format Gate

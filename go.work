@@ -4,4 +4,5 @@ use (
 	./services/network/global-router
 	./services/edge/config-controller
 	./apps/cli
+	./benchmarks/packet
 )
