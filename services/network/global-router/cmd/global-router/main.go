@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/policy"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/telemetry"
@@ -32,10 +34,14 @@ type BackendSummary struct {
 }
 
 type Server struct {
-	auth        *auth.Authenticator
-	registry    *registry.Registry
-	evaluator   *scheduler.Evaluator
-	stopSweeper chan struct{}
+	auth            *auth.Authenticator
+	registry        *registry.Registry
+	evaluator       *scheduler.Evaluator
+	prefixSanitizer *policy.PrefixSanitizer
+	rpkiValidator   *policy.RPKIRouteOriginValidator
+	flapGuard       *policy.RouteFlapDampingGuard
+	maglevRing      *policy.MaglevConsistentHash
+	stopSweeper     chan struct{}
 }
 
 func NewServer() *Server {
@@ -47,11 +53,29 @@ func NewServer() *Server {
 		log.Println("[INFO] Zero preconfigured API keys loaded. Configure NEXUSEDGE_API_KEYS or set NEXUSEDGE_DEV_MODE=true.")
 	}
 
+	ps := policy.NewPrefixSanitizer()
+	rpki := policy.NewRPKIRouteOriginValidator()
+	_ = rpki.AddROA("103.144.180.0/24", 24, 202456)
+	_ = rpki.AddROA("1.1.1.0/24", 24, 13335)
+	_ = rpki.AddROA("8.8.8.0/24", 24, 15169)
+
+	flap, _ := policy.NewRouteFlapDampingGuard(policy.DefaultFlapDampingConfig())
+	maglev, _ := policy.NewMaglevConsistentHash(policy.DefaultMaglevTableSize, 120*time.Second)
+	_ = maglev.SetBackends([]*policy.BackendNode{
+		{ID: "pop-sin-gw-01", IP: net.ParseIP("172.30.0.3"), Port: 8080, Weight: 100},
+		{ID: "pop-sin-gw-02", IP: net.ParseIP("172.30.0.4"), Port: 8080, Weight: 100},
+		{ID: "pop-dha-gw-01", IP: net.ParseIP("172.30.0.5"), Port: 8080, Weight: 100},
+	})
+
 	s := &Server{
-		auth:        authenticator,
-		registry:    reg,
-		evaluator:   eval,
-		stopSweeper: make(chan struct{}),
+		auth:            authenticator,
+		registry:        reg,
+		evaluator:       eval,
+		prefixSanitizer: ps,
+		rpkiValidator:   rpki,
+		flapGuard:       flap,
+		maglevRing:      maglev,
+		stopSweeper:     make(chan struct{}),
 	}
 	s.StartSweeper(1*time.Minute, 15*time.Minute)
 	return s
@@ -398,6 +422,248 @@ func (s *Server) routes() http.Handler {
 			"status":           "RENEWED",
 			"workload_id":      req.WorkloadID,
 			"lease_expires_at": newExpiry.Format(time.RFC3339),
+		})
+	})
+
+	// 6. BGP DFZ Prefix Sanitization API (RFC 7454)
+	mux.HandleFunc("/api/v1/network/bgp/validate-prefix", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Prefix     string `json:"prefix"`
+			Simulation bool   `json:"simulation"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+		if req.Prefix == "" {
+			http.Error(w, `{"error":"prefix is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if err := s.prefixSanitizer.ValidateAdvertisedPrefix(req.Prefix, req.Simulation); err != nil {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "REJECTED",
+				"prefix": req.Prefix,
+				"error":  err.Error(),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "VALID",
+			"prefix": req.Prefix,
+		})
+	})
+
+	// 7. RPKI Route Origin Validation API (RFC 6811)
+	mux.HandleFunc("/api/v1/network/bgp/validate-rpki", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Prefix string `json:"prefix"`
+			ASN    uint32 `json:"asn"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+		if req.Prefix == "" || req.ASN == 0 {
+			http.Error(w, `{"error":"prefix and non-zero asn are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		status, err := s.rpkiValidator.ValidateRoute(req.Prefix, req.ASN)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": string(status),
+			"prefix": req.Prefix,
+			"asn":    req.ASN,
+		})
+	})
+
+	// 8. BGP Route Flap Damping Record API (RFC 2439) (Platform Operator Only)
+	mux.HandleFunc("/api/v1/network/bgp/record-flap", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			http.Error(w, `{"error":"forbidden: platform operator role required"}`, http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			Prefix string `json:"prefix"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+		if req.Prefix == "" {
+			http.Error(w, `{"error":"prefix is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		state, penalty := s.flapGuard.RecordFlap(req.Prefix, time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"prefix":  req.Prefix,
+			"state":   string(state),
+			"penalty": penalty,
+		})
+	})
+
+	// 9. BGP Route Flap Damping Evaluation API (RFC 2439)
+	mux.HandleFunc("/api/v1/network/bgp/damping-status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"Method not allowed. Use GET."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		prefix := r.URL.Query().Get("prefix")
+		if prefix == "" {
+			http.Error(w, `{"error":"query parameter 'prefix' is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		state, penalty := s.flapGuard.EvaluateState(prefix, time.Now())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"prefix":  prefix,
+			"state":   string(state),
+			"penalty": penalty,
+		})
+	})
+
+	// 10. BGP Graceful Shutdown Drain Plan API (RFC 8326) (Platform Operator Only)
+	mux.HandleFunc("/api/v1/network/bgp/drain-plan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			http.Error(w, `{"error":"forbidden: platform operator role required"}`, http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			PeerID            string `json:"peer_id"`
+			TargetAlternative string `json:"target_alternative"`
+			DwellSeconds      int    `json:"dwell_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+		if req.PeerID == "" {
+			http.Error(w, `{"error":"peer_id is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		dwell := 30 * time.Second
+		if req.DwellSeconds > 0 {
+			dwell = time.Duration(req.DwellSeconds) * time.Second
+		}
+
+		plan := policy.GenerateGracefulShutdownPlan(req.PeerID, req.TargetAlternative, dwell)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(plan)
+	})
+
+	// 11. Maglev Consistent Hash 5-Tuple L4 Flow Dispatch API
+	mux.HandleFunc("/api/v1/network/maglev/dispatch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			SrcIP    string `json:"src_ip"`
+			SrcPort  uint16 `json:"src_port"`
+			DstIP    string `json:"dst_ip"`
+			DstPort  uint16 `json:"dst_port"`
+			Protocol uint8  `json:"protocol"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		srcIP := net.ParseIP(req.SrcIP)
+		dstIP := net.ParseIP(req.DstIP)
+		if srcIP == nil || dstIP == nil {
+			http.Error(w, `{"error":"valid src_ip and dst_ip are required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.Protocol == 0 {
+			req.Protocol = 6
+		}
+
+		f := policy.FiveTuple{
+			SrcIP:    srcIP,
+			SrcPort:  req.SrcPort,
+			DstIP:    dstIP,
+			DstPort:  req.DstPort,
+			Protocol: req.Protocol,
+		}
+
+		backend, err := s.maglevRing.Dispatch(f, time.Now())
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error": err.Error(),
+			})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"backend_id":   backend.ID,
+			"backend_ip":   backend.IP.String(),
+			"backend_port": backend.Port,
+			"weight":       backend.Weight,
+		})
+	})
+
+	// 12. Maglev Consistent Hash Ring Stats API
+	mux.HandleFunc("/api/v1/network/maglev/stats", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"Method not allowed. Use GET."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		tableSize, backendCount, conntrackCount := s.maglevRing.Stats()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"table_size":        tableSize,
+			"backend_count":     backendCount,
+			"conntrack_entries": conntrackCount,
 		})
 	})
 

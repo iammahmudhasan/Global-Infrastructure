@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/iammahmudhasan/nexusedge-cli/internal/ai"
+	"github.com/iammahmudhasan/nexusedge-cli/internal/network"
 )
 
 func main() {
@@ -19,6 +20,12 @@ func main() {
 	case "ai":
 		client := ai.NewClient()
 		if err := ai.HandleAICommand(client, os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	case "network":
+		client := network.NewClient()
+		if err := network.HandleNetworkCommand(client, os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
@@ -74,6 +81,7 @@ func printHelp() {
 	fmt.Println("  ai        Manage AI compute providers, run spot arbitrage tests, and inspect token savings")
 	fmt.Println("  deploy    Deploy a universal workload to the global edge fabric")
 	fmt.Println("  dns       Manage Anycast DNS zones and records")
+	fmt.Println("  network   Manage BGP DFZ policies, RPKI validation, flap damping, and Maglev flow routing")
 	fmt.Println("  status    Inspect real-time health and token economics of global edge PoPs")
 	fmt.Println("  version   Print CLI version information")
 	fmt.Println()

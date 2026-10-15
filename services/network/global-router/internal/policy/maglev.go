@@ -110,6 +110,13 @@ func (ct *ConntrackTable) PurgeExpired(now time.Time) int {
 	return purged
 }
 
+// Count returns the current active conntrack entry count.
+func (ct *ConntrackTable) Count() int {
+	ct.mu.RLock()
+	defer ct.mu.RUnlock()
+	return len(ct.entries)
+}
+
 // MaglevConsistentHash implements the Google Maglev consistent hashing algorithm.
 type MaglevConsistentHash struct {
 	mu          sync.RWMutex
@@ -228,6 +235,22 @@ func (m *MaglevConsistentHash) Dispatch(f FiveTuple, now time.Time) (*BackendNod
 // Conntrack returns the underlying connection tracking table.
 func (m *MaglevConsistentHash) Conntrack() *ConntrackTable {
 	return m.conntrack
+}
+
+// Stats returns tableSize, backendCount, and active conntrack entry count.
+func (m *MaglevConsistentHash) Stats() (int, int, int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.tableSize, len(m.backends), m.conntrack.Count()
+}
+
+// Backends returns a copy of current registered backend nodes.
+func (m *MaglevConsistentHash) Backends() []*BackendNode {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := make([]*BackendNode, len(m.backends))
+	copy(cp, m.backends)
+	return cp
 }
 
 // Helper: FNV-1a 64-bit hash

@@ -642,3 +642,173 @@ func TestWorkloadDispatch_TenantQuotaEnforcement(t *testing.T) {
 		t.Errorf("expected error to mention tenant resource quota exceeded, got: %s", rec.Body.String())
 	}
 }
+
+func TestNetworkBGPPolicy_Endpoints(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant)
+	srv.auth.RegisterTenantWithRole("key-operator", "tenant-operator", "proj-core", auth.RolePlatformOperator)
+	handler := srv.routes()
+
+	// 1. Prefix Validation - Valid
+	validReq := map[string]interface{}{
+		"prefix": "103.144.180.0/24",
+	}
+	body, _ := json.Marshal(validReq)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/validate-prefix", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid prefix, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Prefix Validation - Bogon Rejected
+	bogonReq := map[string]interface{}{
+		"prefix": "10.0.0.0/8",
+	}
+	body, _ = json.Marshal(bogonReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/validate-prefix", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for bogon prefix, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 3. RPKI Validation - Valid
+	rpkiReq := map[string]interface{}{
+		"prefix": "103.144.180.0/24",
+		"asn":    202456,
+	}
+	body, _ = json.Marshal(rpkiReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/validate-rpki", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for RPKI validation, got %d", rec.Code)
+	}
+	var rpkiResp struct {
+		Status string `json:"status"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &rpkiResp)
+	if rpkiResp.Status != "VALID" {
+		t.Fatalf("expected RPKI status VALID, got: %s", rpkiResp.Status)
+	}
+
+	// 4. Flap Recording - Forbidden for Tenant, Allowed for Operator
+	flapReq := map[string]interface{}{
+		"prefix": "198.51.100.0/24",
+	}
+	body, _ = json.Marshal(flapReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/record-flap", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant recording flap, got: %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/record-flap", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-operator")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator recording flap, got: %d", rec.Code)
+	}
+
+	// 5. Flap Damping Status Check
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/network/bgp/damping-status?prefix=198.51.100.0/24", nil)
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for damping status, got: %d", rec.Code)
+	}
+
+	// 6. Graceful Drain Plan - Forbidden for Tenant, Allowed for Operator
+	drainReq := map[string]interface{}{
+		"peer_id":            "peer-gw-singapore-01",
+		"target_alternative": "pop-sin-gw-02",
+		"dwell_seconds":      45,
+	}
+	body, _ = json.Marshal(drainReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/drain-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant drain plan, got: %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/bgp/drain-plan", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-operator")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator drain plan, got: %d", rec.Code)
+	}
+}
+
+func TestNetworkMaglev_Endpoints(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant)
+	handler := srv.routes()
+
+	// 1. Maglev Stats
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/network/maglev/stats", nil)
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for maglev stats, got: %d", rec.Code)
+	}
+	var stats struct {
+		TableSize    int `json:"table_size"`
+		BackendCount int `json:"backend_count"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &stats)
+	if stats.TableSize != 65537 || stats.BackendCount != 3 {
+		t.Fatalf("unexpected maglev stats: %+v", stats)
+	}
+
+	// 2. Maglev 5-tuple flow dispatch
+	flowReq := map[string]interface{}{
+		"src_ip":   "203.0.113.10",
+		"src_port": 54321,
+		"dst_ip":   "103.144.180.1",
+		"dst_port": 443,
+		"protocol": 6,
+	}
+	body, _ := json.Marshal(flowReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/maglev/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for flow dispatch, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var dispatchResp struct {
+		BackendID string `json:"backend_id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &dispatchResp)
+	if dispatchResp.BackendID == "" {
+		t.Fatalf("expected non-empty backend_id from flow dispatch")
+	}
+
+	// 3. Repeat flow dispatch ensures conntrack flow affinity
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/maglev/dispatch", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for second flow dispatch, got: %d", rec.Code)
+	}
+	var dispatchResp2 struct {
+		BackendID string `json:"backend_id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &dispatchResp2)
+	if dispatchResp2.BackendID != dispatchResp.BackendID {
+		t.Fatalf("conntrack flow affinity broken: got %s vs %s", dispatchResp2.BackendID, dispatchResp.BackendID)
+	}
+}
