@@ -1,6 +1,6 @@
+use crate::body::GatewayResponseBody;
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::Full;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Response, StatusCode};
 use reqwest::Client as HttpClient;
@@ -1363,7 +1363,7 @@ pub async fn dispatch_ai_request_with_failover(
     req_headers: &hyper::HeaderMap,
     body_bytes: Bytes,
     client_ip: std::net::IpAddr,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<GatewayResponseBody>, hyper::Error> {
     let start_time = Instant::now();
 
     // 1. Authenticate caller credential against verified identity registry (Finding 1)
@@ -1382,7 +1382,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
                 .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1399,7 +1399,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
                 .header("WWW-Authenticate", "Bearer realm=\"NexusEdge-AI\"")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1419,7 +1419,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .status(StatusCode::FORBIDDEN)
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1429,7 +1429,7 @@ pub async fn dispatch_ai_request_with_failover(
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
             .header("Server", "NexusEdge-AI-Director/0.1.0")
-            .body(Full::new(Bytes::from(metrics_json.to_string())))
+            .body(GatewayResponseBody::from_string(metrics_json.to_string()))
             .unwrap();
         return Ok(resp);
     }
@@ -1447,7 +1447,7 @@ pub async fn dispatch_ai_request_with_failover(
             .status(StatusCode::FORBIDDEN)
             .header("Content-Type", "application/json")
             .header("Server", "NexusEdge-AI-Director/0.1.0")
-            .body(Full::new(Bytes::from(body.to_string())))
+            .body(GatewayResponseBody::from_string(body.to_string()))
             .unwrap();
         return Ok(resp);
     }
@@ -1467,7 +1467,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .status(StatusCode::BAD_REQUEST)
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1492,7 +1492,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .status(StatusCode::FORBIDDEN)
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1521,7 +1521,7 @@ pub async fn dispatch_ai_request_with_failover(
                 .status(StatusCode::FORBIDDEN)
                 .header("Content-Type", "application/json")
                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
+                .body(GatewayResponseBody::from_string(body.to_string()))
                 .unwrap();
             return Ok(resp);
         }
@@ -1549,7 +1549,7 @@ pub async fn dispatch_ai_request_with_failover(
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .header("Content-Type", "application/json")
             .header("Server", "NexusEdge-AI-Director/0.1.0")
-            .body(Full::new(Bytes::from(body.to_string())))
+            .body(GatewayResponseBody::from_string(body.to_string()))
             .unwrap();
         return Ok(resp);
     }
@@ -1664,7 +1664,7 @@ pub async fn dispatch_ai_request_with_failover(
                                 .status(StatusCode::BAD_REQUEST)
                                 .header("Content-Type", "application/json")
                                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                                .body(Full::new(Bytes::from(body.to_string())))
+                                .body(GatewayResponseBody::from_string(body.to_string()))
                                 .unwrap();
                             return Ok(resp);
                         }
@@ -1685,7 +1685,7 @@ pub async fn dispatch_ai_request_with_failover(
                                 .status(StatusCode::BAD_REQUEST)
                                 .header("Content-Type", "application/json")
                                 .header("Server", "NexusEdge-AI-Director/0.1.0")
-                                .body(Full::new(Bytes::from(body.to_string())))
+                                .body(GatewayResponseBody::from_string(body.to_string()))
                                 .unwrap();
                             return Ok(resp);
                         }
@@ -1778,6 +1778,23 @@ pub async fn dispatch_ai_request_with_failover(
                     }
                 }
 
+                if metadata.stream && caller_protocol == target_protocol {
+                    let (tx, rx) =
+                        tokio::sync::mpsc::channel::<Result<Bytes, crate::body::BodyError>>(32);
+                    let resp = builder.body(GatewayResponseBody::stream(rx)).unwrap();
+
+                    tokio::spawn(async move {
+                        let mut resp = upstream_resp;
+                        while let Ok(Some(chunk)) = resp.chunk().await {
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    return Ok(resp);
+                }
+
                 let resp_bytes = match upstream_resp.bytes().await {
                     Ok(b) => b,
                     Err(e) => {
@@ -1792,7 +1809,7 @@ pub async fn dispatch_ai_request_with_failover(
                             .status(StatusCode::BAD_GATEWAY)
                             .header("Content-Type", "application/json")
                             .header("Server", "NexusEdge-AI-Director/0.1.0")
-                            .body(Full::new(Bytes::from(body.to_string())))
+                            .body(GatewayResponseBody::from_string(body.to_string()))
                             .unwrap();
                         return Ok(resp);
                     }
@@ -1819,7 +1836,7 @@ pub async fn dispatch_ai_request_with_failover(
                                         .status(StatusCode::BAD_GATEWAY)
                                         .header("Content-Type", "application/json")
                                         .header("Server", "NexusEdge-AI-Director/0.1.0")
-                                        .body(Full::new(Bytes::from(body.to_string())))
+                                        .body(GatewayResponseBody::from_string(body.to_string()))
                                         .unwrap();
                                     return Ok(resp);
                                 }
@@ -1843,7 +1860,7 @@ pub async fn dispatch_ai_request_with_failover(
                                         .status(StatusCode::BAD_GATEWAY)
                                         .header("Content-Type", "application/json")
                                         .header("Server", "NexusEdge-AI-Director/0.1.0")
-                                        .body(Full::new(Bytes::from(body.to_string())))
+                                        .body(GatewayResponseBody::from_string(body.to_string()))
                                         .unwrap();
                                     return Ok(resp);
                                 }
@@ -1879,7 +1896,9 @@ pub async fn dispatch_ai_request_with_failover(
                         );
                 }
 
-                let resp = builder.body(Full::new(final_resp_bytes)).unwrap();
+                let resp = builder
+                    .body(GatewayResponseBody::from_bytes(final_resp_bytes))
+                    .unwrap();
                 return Ok(resp);
             }
             Err(e) => {
@@ -1914,7 +1933,7 @@ pub async fn dispatch_ai_request_with_failover(
         .header("Content-Type", "application/json")
         .header("Server", "NexusEdge-AI-Director/0.1.0")
         .header("X-NexusEdge-Failover-Count", failover_count.to_string())
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(GatewayResponseBody::from_string(body.to_string()))
         .unwrap();
     Ok(resp)
 }

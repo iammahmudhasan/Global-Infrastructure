@@ -1,10 +1,11 @@
+use crate::body::{BodyError, GatewayResponseBody};
 use crate::cache::{parse_cache_control, EdgeCache};
 use crate::config::GatewayConfig;
 use crate::rate_limit::RateLimiter;
 use crate::router::Router;
 use crate::waf::{WafEngine, WafResult};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
@@ -13,6 +14,28 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response<GatewayResponseBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Server", "NexusEdge/0.1.0")
+        .body(GatewayResponseBody::from_string(body.to_string()))
+        .unwrap()
+}
+
+fn plain_response(
+    status: StatusCode,
+    content_type: &'static str,
+    text: impl Into<Bytes>,
+) -> Response<GatewayResponseBody> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", content_type)
+        .header("Server", "NexusEdge/0.1.0")
+        .body(GatewayResponseBody::from_bytes(text.into()))
+        .unwrap()
+}
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -35,7 +58,6 @@ const STRIPPED_FORWARDING_HEADERS: &[&str] = &[
 
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
 const MAX_CACHEABLE_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB (Finding 4)
-const MAX_UPSTREAM_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MiB hard limit for origin responses
 pub const MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES: usize = 128 * 1024 * 1024; // 128 MiB aggregate limit (P1 Finding 5)
 pub const MAX_AGGREGATE_BUFFERED_REQUEST_BYTES: usize = 128 * 1024 * 1024; // 128 MiB aggregate limit for request bodies
 const MAX_CUSTOM_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days (Finding 2)
@@ -307,7 +329,7 @@ pub async fn handle_request(
     req: Request<Incoming>,
     client_ip: IpAddr,
     state: Arc<ProxyState>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> Result<Response<GatewayResponseBody>, hyper::Error> {
     let start_time = Instant::now();
     let method = req.method().clone();
     let uri_string = req.uri().to_string();
@@ -319,13 +341,7 @@ pub async fn handle_request(
             "status": "healthy",
             "uptime_secs": start_time.elapsed().as_secs(),
         });
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        return Ok(resp);
+        return Ok(json_response(StatusCode::OK, body));
     }
 
     if path == "/ready" {
@@ -345,13 +361,7 @@ pub async fn handle_request(
             "control_plane_synced": state.is_ready.load(std::sync::atomic::Ordering::Acquire),
             "auth_registry_healthy": ai_ready,
         });
-        let resp = Response::builder()
-            .status(status)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
-        return Ok(resp);
+        return Ok(json_response(status, body));
     }
 
     if path == "/metrics" {
@@ -374,23 +384,19 @@ pub async fn handle_request(
         let is_authenticated = !expected_token.is_empty() && token == expected_token;
 
         if !is_internal && !is_authenticated {
-            let resp = Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("Content-Type", "text/plain")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from("Forbidden: metrics endpoint restricted to internal network or authorized scraper\n")))
-                .unwrap();
-            return Ok(resp);
+            return Ok(plain_response(
+                StatusCode::FORBIDDEN,
+                "text/plain",
+                "Forbidden: metrics endpoint restricted to internal network or authorized scraper\n",
+            ));
         }
 
         let metrics_text = state.render_prometheus_metrics();
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-            .header("Server", "NexusEdge/0.1.0")
-            .body(Full::new(Bytes::from(metrics_text)))
-            .unwrap();
-        return Ok(resp);
+        return Ok(plain_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            metrics_text,
+        ));
     }
 
     state
@@ -410,13 +416,7 @@ pub async fn handle_request(
                 "message": "Host and authority mismatch or missing host header",
                 "status": status.as_u16(),
             });
-            let resp = Response::builder()
-                .status(status)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(status, body));
         }
     };
 
@@ -456,13 +456,9 @@ pub async fn handle_request(
             "error": "Rate limit exceeded",
             "status": 429,
         });
-        let resp = Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .header("Retry-After", "1")
-            .body(Full::new(Bytes::from(body.to_string())))
-            .unwrap();
+        let mut resp = json_response(StatusCode::TOO_MANY_REQUESTS, body);
+        resp.headers_mut()
+            .insert("Retry-After", HeaderValue::from_static("1"));
         return Ok(resp);
     }
 
@@ -490,13 +486,7 @@ pub async fn handle_request(
                     "status": 403,
                     "blocked_path": blocked_path,
                 });
-                let resp = Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header("Content-Type", "application/json")
-                    .header("Server", "NexusEdge/0.1.0")
-                    .body(Full::new(Bytes::from(body.to_string())))
-                    .unwrap();
-                return Ok(resp);
+                return Ok(json_response(StatusCode::FORBIDDEN, body));
             }
         }
     }
@@ -521,15 +511,10 @@ pub async fn handle_request(
                     len = len,
                     "Request rejected: Content-Length exceeds maximum 10 MB limit"
                 );
-                let resp = Response::builder()
-                    .status(StatusCode::PAYLOAD_TOO_LARGE)
-                    .header("Content-Type", "application/json")
-                    .header("Server", "NexusEdge/0.1.0")
-                    .body(Full::new(Bytes::from(
-                        r#"{"error":"Payload Too Large: maximum allowed body size is 10 MB"}"#,
-                    )))
-                    .unwrap();
-                return Ok(resp);
+                let body = serde_json::json!({
+                    "error": "Payload Too Large: maximum allowed body size is 10 MB"
+                });
+                return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, body));
             }
         }
     }
@@ -539,15 +524,13 @@ pub async fn handle_request(
         Ok(permit) => permit,
         Err(_) => {
             warn!("Global inflight request body buffer limit saturated");
-            let resp = Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .header("Retry-After", "1")
-                .body(Full::new(Bytes::from(
-                    r#"{"error":"Service Unavailable: Gateway concurrency limit reached","status":503}"#,
-                )))
-                .unwrap();
+            let body = serde_json::json!({
+                "error": "Service Unavailable: Gateway concurrency limit reached",
+                "status": 503
+            });
+            let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, body);
+            resp.headers_mut()
+                .insert("Retry-After", HeaderValue::from_static("1"));
             return Ok(resp);
         }
     };
@@ -590,28 +573,21 @@ pub async fn handle_request(
     }
 
     if budget_exceeded {
-        let resp = Response::builder()
-            .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .header("Retry-After", "1")
-            .body(Full::new(Bytes::from(
-                r#"{"error":"Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure","status":503}"#,
-            )))
-            .unwrap();
+        let body = serde_json::json!({
+            "error": "Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure",
+            "status": 503
+        });
+        let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, body);
+        resp.headers_mut()
+            .insert("Retry-After", HeaderValue::from_static("1"));
         return Ok(resp);
     }
 
     if payload_too_large {
-        let resp = Response::builder()
-            .status(StatusCode::PAYLOAD_TOO_LARGE)
-            .header("Content-Type", "application/json")
-            .header("Server", "NexusEdge/0.1.0")
-            .body(Full::new(Bytes::from(
-                r#"{"error":"Payload Too Large: request body exceeds 10 MB limit or is malformed"}"#,
-            )))
-            .unwrap();
-        return Ok(resp);
+        let body = serde_json::json!({
+            "error": "Payload Too Large: request body exceeds 10 MB limit or is malformed"
+        });
+        return Ok(json_response(StatusCode::PAYLOAD_TOO_LARGE, body));
     }
 
     let body_bytes = Bytes::from(body_buf);
@@ -633,15 +609,13 @@ pub async fn handle_request(
                         limit = MAX_AGGREGATE_BUFFERED_REQUEST_BYTES,
                         "Gateway aggregate request buffer budget saturated for lossy string conversion"
                     );
-                    let resp = Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .header("Content-Type", "application/json")
-                        .header("Server", "NexusEdge/0.1.0")
-                        .header("Retry-After", "1")
-                        .body(Full::new(Bytes::from(
-                            r#"{"error":"Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure","status":503}"#,
-                        )))
-                        .unwrap();
+                    let body = serde_json::json!({
+                        "error": "Service Unavailable: Gateway aggregate request buffer budget saturated under memory pressure",
+                        "status": 503
+                    });
+                    let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, body);
+                    resp.headers_mut()
+                        .insert("Retry-After", HeaderValue::from_static("1"));
                     return Ok(resp);
                 }
                 (
@@ -681,13 +655,7 @@ pub async fn handle_request(
                 "status": 403,
                 "rule": rule,
             });
-            let resp = Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(StatusCode::FORBIDDEN, body));
         }
         WafResult::Allowed => {}
     }
@@ -758,7 +726,9 @@ pub async fn handle_request(
                 builder = builder.header(k, v);
             }
 
-            let resp = builder.body(Full::new(cached.body)).unwrap();
+            let resp = builder
+                .body(GatewayResponseBody::from_bytes(cached.body))
+                .unwrap();
             return Ok(resp);
         }
     }
@@ -778,13 +748,7 @@ pub async fn handle_request(
                 "host": h,
                 "status": 421,
             });
-            let resp = Response::builder()
-                .status(StatusCode::MISDIRECTED_REQUEST)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(StatusCode::MISDIRECTED_REQUEST, body));
         }
         Err(crate::router::RoutingError::NoMatchingPath { host: h, path: p }) => {
             warn!(host = %h, path = %p, "No matching route configured for requested path");
@@ -794,13 +758,7 @@ pub async fn handle_request(
                 "path": p,
                 "status": 404,
             });
-            let resp = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(StatusCode::NOT_FOUND, body));
         }
         Err(crate::router::RoutingError::NoHealthyUpstreams(h)) => {
             warn!(host = %h, uri = %uri_string, "No healthy upstream origin nodes available for tenant host");
@@ -809,13 +767,7 @@ pub async fn handle_request(
                 "host": h,
                 "status": 503,
             });
-            let resp = Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, body));
         }
         Err(e) => {
             error!(error = %e, host = %host, "Routing resolution error");
@@ -824,13 +776,7 @@ pub async fn handle_request(
                 "details": e.to_string(),
                 "status": 502,
             });
-            let resp = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            return Ok(resp);
+            return Ok(json_response(StatusCode::BAD_GATEWAY, body));
         }
     };
 
@@ -870,15 +816,10 @@ pub async fn handle_request(
                 error = %err,
                 "Failed to create destination-pinned upstream client"
             );
-            let response = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(
-                    r#"{"error":"upstream connection configuration failed"}"#.to_string(),
-                )))
-                .unwrap();
-            return Ok(response);
+            let body = serde_json::json!({
+                "error": "upstream connection configuration failed"
+            });
+            return Ok(json_response(StatusCode::BAD_GATEWAY, body));
         }
     };
 
@@ -956,28 +897,6 @@ pub async fn handle_request(
             let status = StatusCode::from_u16(upstream_resp.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-            // Fast check on upstream Content-Length to avoid buffering excessive responses (P1 Finding 5)
-            if let Some(cl_val) = upstream_resp.headers().get("content-length") {
-                if let Ok(cl) = cl_val.to_str().unwrap_or("0").parse::<usize>() {
-                    if cl > MAX_UPSTREAM_RESPONSE_BYTES {
-                        warn!(
-                            cl = cl,
-                            limit = MAX_UPSTREAM_RESPONSE_BYTES,
-                            "Upstream response Content-Length exceeds maximum limit"
-                        );
-                        let resp = Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .header("Content-Type", "application/json")
-                            .header("Server", "NexusEdge/0.1.0")
-                            .body(Full::new(Bytes::from(
-                                r#"{"error":"Bad Gateway: Upstream response exceeds maximum allowed 10 MiB limit"}"#,
-                            )))
-                            .unwrap();
-                        return Ok(resp);
-                    }
-                }
-            }
-
             let mut headers_to_cache = hyper::HeaderMap::new();
             let mut builder = Response::builder()
                 .status(status)
@@ -1012,144 +931,6 @@ pub async fn handle_request(
                 }
             }
 
-            // Stream upstream response with hard 10 MiB bounded buffer and aggregate memory budgeting (P1 Finding 5)
-            let mut resp_buf = bytes::BytesMut::new();
-            let mut total_bytes = 0usize;
-            let mut stream_oversized = false;
-            let mut stream_error = false;
-            let mut aggregate_limit_exceeded = false;
-            let mut buffer_guard = BufferBudgetGuard::new(
-                Arc::clone(&state.aggregate_buffered_bytes),
-                MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
-            );
-
-            loop {
-                match upstream_resp.chunk().await {
-                    Ok(Some(chunk)) => {
-                        total_bytes += chunk.len();
-                        if total_bytes > MAX_UPSTREAM_RESPONSE_BYTES {
-                            warn!(
-                                total_bytes = total_bytes,
-                                limit = MAX_UPSTREAM_RESPONSE_BYTES,
-                                "Upstream response stream exceeded maximum allowed limit"
-                            );
-                            stream_oversized = true;
-                            break;
-                        }
-                        if buffer_guard.try_allocate(chunk.len()).is_err() {
-                            warn!(
-                                total_bytes = total_bytes,
-                                limit = MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
-                                "Gateway aggregate response buffer capacity exceeded"
-                            );
-                            aggregate_limit_exceeded = true;
-                            break;
-                        }
-                        resp_buf.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            "Upstream stream connection interrupted during response transfer"
-                        );
-                        stream_error = true;
-                        break;
-                    }
-                }
-            }
-
-            if stream_error {
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .header("Content-Type", "application/json")
-                    .header("Server", "NexusEdge/0.1.0")
-                    .body(Full::new(Bytes::from(
-                        r#"{"error":"Bad Gateway: Upstream connection interrupted during response transfer"}"#,
-                    )))
-                    .unwrap();
-                return Ok(resp);
-            }
-
-            if aggregate_limit_exceeded {
-                let resp = Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("Content-Type", "application/json")
-                    .header("Server", "NexusEdge/0.1.0")
-                    .body(Full::new(Bytes::from(
-                        r#"{"error":"Service Unavailable: Gateway response buffer capacity exceeded under memory pressure"}"#,
-                    )))
-                    .unwrap();
-                return Ok(resp);
-            }
-
-            if stream_oversized {
-                let resp = Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .header("Content-Type", "application/json")
-                    .header("Server", "NexusEdge/0.1.0")
-                    .body(Full::new(Bytes::from(
-                        r#"{"error":"Bad Gateway: Upstream response stream exceeded maximum allowed limit"}"#,
-                    )))
-                    .unwrap();
-                return Ok(resp);
-            }
-
-            let resp_bytes = resp_buf.freeze();
-
-            // 10. RFC 9111 Shared Cache Evaluation (Finding 6, P1 Finding 4, 6)
-            // Never cache if:
-            //   - Not GET
-            //   - Not 200 OK
-            //   - Request Cache-Control: no-store
-            //   - Authorization header present without explicit public / s-maxage directive
-            //   - Origin Cache-Control: no-store or private
-            //   - Origin Set-Cookie present
-            //   - Domain Cache Policy specifies bypass_cache
-            //   - Body exceeds MAX_CACHEABLE_RESPONSE_BYTES
-            let is_vary_star = headers_to_cache
-                .get("vary")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim() == "*")
-                .unwrap_or(false);
-
-            let can_cache = method == Method::GET
-                && status == StatusCode::OK
-                && !has_cookie
-                && !has_auth
-                && !bypass_cache
-                && !req_cc.no_store
-                && !req_cc.no_cache
-                && (!auth_header_present || resp_cc.public || resp_cc.s_maxage.is_some())
-                && !resp_cc.no_store
-                && !resp_cc.no_cache
-                && !resp_cc.private
-                && !has_set_cookie
-                && !is_vary_star
-                && resp_bytes.len() <= MAX_CACHEABLE_RESPONSE_BYTES;
-
-            if can_cache {
-                // Parse s-maxage or max-age for custom TTL if specified, or domain policy fallback bounded to 7 days
-                let custom_ttl = resp_cc
-                    .s_maxage
-                    .or(resp_cc.max_age)
-                    .map(Duration::from_secs)
-                    .or_else(|| {
-                        domain_cache_policy
-                            .as_ref()
-                            .map(|c| Duration::from_secs(c.default_ttl_seconds))
-                    })
-                    .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
-                state.cache.put(
-                    cache_key,
-                    status,
-                    headers_to_cache,
-                    resp_bytes.clone(),
-                    custom_ttl,
-                    Some(&req_headers),
-                );
-            }
-
             let latency_ms = start_time.elapsed().as_millis();
             info!(
                 uri = %uri_string,
@@ -1176,7 +957,132 @@ pub async fn handle_request(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
 
-            let resp = builder.body(Full::new(resp_bytes)).unwrap();
+            // 10. RFC 9111 Shared Cache Evaluation & Line-Rate Zero-Copy Streaming
+            let is_vary_star = headers_to_cache
+                .get("vary")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim() == "*")
+                .unwrap_or(false);
+
+            let upstream_cl = upstream_resp
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok());
+
+            let mut can_cache_candidate = method == Method::GET
+                && status == StatusCode::OK
+                && !has_cookie
+                && !has_auth
+                && !bypass_cache
+                && !req_cc.no_store
+                && !req_cc.no_cache
+                && (!auth_header_present || resp_cc.public || resp_cc.s_maxage.is_some())
+                && !resp_cc.no_store
+                && !resp_cc.no_cache
+                && !resp_cc.private
+                && !has_set_cookie
+                && !is_vary_star;
+
+            if let Some(cl) = upstream_cl {
+                if cl > MAX_CACHEABLE_RESPONSE_BYTES {
+                    can_cache_candidate = false;
+                }
+            }
+
+            let custom_ttl = resp_cc
+                .s_maxage
+                .or(resp_cc.max_age)
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    domain_cache_policy
+                        .as_ref()
+                        .map(|c| Duration::from_secs(c.default_ttl_seconds))
+                })
+                .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BodyError>>(32);
+            let state_clone = Arc::clone(&state);
+            let req_headers_clone = req_headers.clone();
+
+            tokio::spawn(async move {
+                if can_cache_candidate {
+                    let mut resp_buf = bytes::BytesMut::new();
+                    let mut buffer_guard = Some(BufferBudgetGuard::new(
+                        Arc::clone(&state_clone.aggregate_buffered_bytes),
+                        MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
+                    ));
+                    let mut cache_disabled_for_stream = false;
+
+                    loop {
+                        match upstream_resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                if !cache_disabled_for_stream {
+                                    let fits_cache = resp_buf.len().saturating_add(chunk.len())
+                                        <= MAX_CACHEABLE_RESPONSE_BYTES;
+                                    let budget_ok = buffer_guard
+                                        .as_mut()
+                                        .map(|g| g.try_allocate(chunk.len()).is_ok())
+                                        .unwrap_or(false);
+
+                                    if fits_cache && budget_ok {
+                                        resp_buf.extend_from_slice(&chunk);
+                                    } else {
+                                        cache_disabled_for_stream = true;
+                                        buffer_guard = None;
+                                        resp_buf.clear();
+                                    }
+                                }
+
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    // Downstream client disconnected or aborted stream
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                // Upstream completed successfully
+                                if !cache_disabled_for_stream && !resp_buf.is_empty() {
+                                    let resp_bytes = resp_buf.freeze();
+                                    state_clone.cache.put(
+                                        cache_key,
+                                        status,
+                                        headers_to_cache,
+                                        resp_bytes,
+                                        custom_ttl,
+                                        Some(&req_headers_clone),
+                                    );
+                                }
+                                break;
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Upstream stream interrupted during transfer");
+                                let _ = tx.send(Err(Box::new(e))).await;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    // Direct zero-copy streaming pass-through (SSE, WebSockets, large downloads, mutations)
+                    loop {
+                        match upstream_resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    // Downstream client disconnected
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                error!(error = %e, "Upstream stream interrupted during transfer");
+                                let _ = tx.send(Err(Box::new(e))).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            let resp = builder.body(GatewayResponseBody::stream(rx)).unwrap();
             Ok(resp)
         }
         Err(err) => {
@@ -1189,13 +1095,7 @@ pub async fn handle_request(
                 "error": "upstream unavailable",
                 "status": 502,
             });
-            let resp = Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .header("Content-Type", "application/json")
-                .header("Server", "NexusEdge/0.1.0")
-                .body(Full::new(Bytes::from(body.to_string())))
-                .unwrap();
-            Ok(resp)
+            Ok(json_response(StatusCode::BAD_GATEWAY, body))
         }
     }
 }

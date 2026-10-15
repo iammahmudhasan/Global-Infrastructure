@@ -88,6 +88,9 @@ static_resources:
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
           common_tls_context:
+            alpn_protocols:
+            - "h2"
+            - "http/1.1"
             tls_certificate_sds_secret_configs:
             - name: "dynamic_server_cert"
               sds_config:
@@ -101,6 +104,10 @@ static_resources:
           "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
           stat_prefix: ingress_https
           codec_type: AUTO
+          http2_protocol_options:
+            max_concurrent_streams: 100
+            initial_stream_window_size: 65536
+            initial_connection_window_size: 1048576
           use_remote_address: true
           xff_num_trusted_hops: 0
           route_config:
