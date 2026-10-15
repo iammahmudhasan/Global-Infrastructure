@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,10 +13,13 @@ import (
 )
 
 type mockAlerter struct {
+	mu     sync.Mutex
 	events []alert.Event
 }
 
 func (m *mockAlerter) SendAlert(ctx context.Context, event alert.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.events = append(m.events, event)
 	return nil
 }
