@@ -4273,3 +4273,69 @@ func TestPoPEventsStreaming(t *testing.T) {
 		t.Errorf("expected checksum in event stream, got: %s", body)
 	}
 }
+
+func TestPoPConfigConditionalETagCaching(t *testing.T) {
+	handler := setupTestServer()
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterTenantWithRole("key-operator", "tenant-ops", "proj-core", auth.RolePlatformOperator, "*")
+	handler.SetAuthenticator(authInst)
+
+	// 1. Initial GET request without If-None-Match -> returns 200 OK with ETag & X-Snapshot-Checksum
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req1.Header.Set("Authorization", "Bearer key-operator")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on initial config fetch, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	checksum := w1.Header().Get("X-Snapshot-Checksum")
+	etag := w1.Header().Get("ETag")
+	if checksum == "" {
+		t.Fatal("expected non-empty X-Snapshot-Checksum header")
+	}
+	if etag == "" {
+		t.Fatal("expected non-empty ETag header")
+	}
+
+	// 2. Second GET with matching If-None-Match (quoted) -> returns 304 Not Modified with empty body
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req2.Header.Set("Authorization", "Bearer key-operator")
+	req2.Header.Set("If-None-Match", etag)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified, got %d", w2.Code)
+	}
+	if w2.Body.Len() != 0 {
+		t.Fatalf("expected 0 bytes body on 304 Not Modified, got %d bytes", w2.Body.Len())
+	}
+
+	// 3. Third GET with matching If-None-Match unquoted -> returns 304 Not Modified
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req3.Header.Set("Authorization", "Bearer key-operator")
+	req3.Header.Set("If-None-Match", checksum)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req3)
+
+	if w3.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified for unquoted checksum, got %d", w3.Code)
+	}
+
+	// 4. Fourth GET with stale/mismatched If-None-Match -> returns 200 OK
+	req4 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/config", nil)
+	req4.Header.Set("Authorization", "Bearer key-operator")
+	req4.Header.Set("If-None-Match", `"stale-checksum-value"`)
+	w4 := httptest.NewRecorder()
+	handler.ServeHTTP(w4, req4)
+
+	if w4.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for mismatched If-None-Match, got %d", w4.Code)
+	}
+	if w4.Header().Get("X-Snapshot-Checksum") != checksum {
+		t.Fatalf("expected stable checksum across calls when configs unchanged, got %s vs %s",
+			w4.Header().Get("X-Snapshot-Checksum"), checksum)
+	}
+}

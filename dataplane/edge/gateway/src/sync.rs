@@ -13,6 +13,7 @@ pub struct SyncStats {
     pub routes_applied: usize,
     pub ai_providers_applied: usize,
     pub checksum: String,
+    pub modified: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -136,6 +137,16 @@ pub fn validate_control_plane_endpoint(
     Ok(parsed)
 }
 
+/// Parameters required to query and verify a declarative PoP snapshot.
+#[derive(Debug, Clone)]
+pub struct SnapshotFetchContext<'a> {
+    pub endpoint: &'a str,
+    pub pop_id: &'a str,
+    pub auth_token: &'a str,
+    pub if_none_match: Option<&'a str>,
+    pub snapshot_path: Option<&'a str>,
+}
+
 /// Fetches a declarative PoP configuration snapshot from the Control Plane,
 /// verifies cryptographic checksum authenticity, safely parses the routes,
 /// atomically replaces routing tables, and synchronizes DNS pinning maps.
@@ -147,45 +158,59 @@ pub async fn fetch_and_apply_control_plane_snapshot(
     router: &Router,
     dns_resolver: &PinnedDnsResolver,
 ) -> Result<SyncStats, SyncError> {
-    fetch_and_apply_control_plane_snapshot_full(
+    let ctx = SnapshotFetchContext {
         endpoint,
         pop_id,
         auth_token,
-        client,
-        router,
-        dns_resolver,
-        None,
-    )
-    .await
+        if_none_match: None,
+        snapshot_path: None,
+    };
+    fetch_and_apply_control_plane_snapshot_full(&ctx, client, router, dns_resolver, None).await
 }
 
-/// Extended snapshot sync including dynamic AI & compute provider pool updates.
+/// Extended snapshot sync including dynamic AI & compute provider pool updates,
+/// RFC 7232 If-None-Match conditional caching (304 Not Modified), and local disk cache persistence.
 pub async fn fetch_and_apply_control_plane_snapshot_full(
-    endpoint: &str,
-    pop_id: &str,
-    auth_token: &str,
+    ctx: &SnapshotFetchContext<'_>,
     client: &HttpClient,
     router: &Router,
     dns_resolver: &PinnedDnsResolver,
     ai_director: Option<&crate::ai::AiTrafficDirector>,
 ) -> Result<SyncStats, SyncError> {
-    validate_control_plane_endpoint(endpoint, auth_token).map_err(SyncError::InvalidEndpoint)?;
+    validate_control_plane_endpoint(ctx.endpoint, ctx.auth_token)
+        .map_err(SyncError::InvalidEndpoint)?;
 
     let url = format!(
         "{}/v1/edge/pops/{}/config",
-        endpoint.trim_end_matches('/'),
-        pop_id
+        ctx.endpoint.trim_end_matches('/'),
+        ctx.pop_id
     );
 
     let mut req_builder = client.get(&url);
-    if !auth_token.is_empty() {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", auth_token));
+    if !ctx.auth_token.is_empty() {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", ctx.auth_token));
+    }
+    if let Some(etag) = ctx.if_none_match {
+        let trimmed = etag.trim().trim_matches('"');
+        if !trimmed.is_empty() {
+            req_builder = req_builder.header("If-None-Match", format!("\"{}\"", trimmed));
+        }
     }
 
     let resp = req_builder
         .send()
         .await
         .map_err(|e| SyncError::NetworkError(e.to_string()))?;
+
+    // Fast-path: RFC 7232 304 Not Modified (zero memory allocation, zero route swapping)
+    if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(SyncStats {
+            routes_applied: 0,
+            ai_providers_applied: 0,
+            checksum: ctx.if_none_match.unwrap_or("").to_string(),
+            modified: false,
+        });
+    }
 
     if !resp.status().is_success() {
         return Err(SyncError::BadStatus(resp.status().as_u16()));
@@ -242,6 +267,17 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
         SyncError::ParseError(format!("Snapshot payload is not valid UTF-8: {}", e))
     })?;
 
+    // Persist raw snapshot to autonomous local store if configured (Shared-Nothing Edge Autonomy)
+    if let Some(path) = ctx.snapshot_path {
+        if let Err(e) = persist_snapshot_to_disk(path, body_str) {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "Failed to write snapshot to autonomous local store"
+            );
+        }
+    }
+
     let new_routes = router::parse_pop_config_routes(body_str)
         .map_err(|e| SyncError::ParseError(e.to_string()))?;
 
@@ -266,7 +302,27 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
         routes_applied: routes_count,
         ai_providers_applied,
         checksum: computed_hash,
+        modified: true,
     })
+}
+
+/// Persists the raw snapshot string atomically to disk using a temporary file and rename.
+pub fn persist_snapshot_to_disk(path: &str, payload: &str) -> Result<(), std::io::Error> {
+    let p = std::path::Path::new(path);
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+    std::fs::write(&tmp_path, payload.as_bytes())?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+/// Reads the local autonomous snapshot cache from disk.
+pub fn load_snapshot_from_disk(path: &str) -> Result<String, std::io::Error> {
+    std::fs::read_to_string(path)
 }
 
 /// Represents a parsed Server-Sent Event (SSE) message block.
@@ -312,6 +368,7 @@ pub struct StreamSyncContext<'a> {
     pub endpoint: &'a str,
     pub pop_id: &'a str,
     pub auth_token: &'a str,
+    pub snapshot_path: Option<&'a str>,
     pub client: &'a HttpClient,
     pub router: &'a Router,
     pub dns_resolver: &'a PinnedDnsResolver,
@@ -376,10 +433,15 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                             payload = %event.data,
                             "Received SSE stream initialization handshake; refreshing snapshot"
                         );
+                        let fetch_ctx = SnapshotFetchContext {
+                            endpoint: ctx.endpoint,
+                            pop_id: ctx.pop_id,
+                            auth_token: ctx.auth_token,
+                            if_none_match: None,
+                            snapshot_path: ctx.snapshot_path,
+                        };
                         if let Ok(stats) = fetch_and_apply_control_plane_snapshot_full(
-                            ctx.endpoint,
-                            ctx.pop_id,
-                            ctx.auth_token,
+                            &fetch_ctx,
                             ctx.client,
                             ctx.router,
                             ctx.dns_resolver,
@@ -404,10 +466,15 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                             data = %event.data,
                             "Real-time config_update received! Triggering sub-50ms snapshot refresh"
                         );
+                        let fetch_ctx = SnapshotFetchContext {
+                            endpoint: ctx.endpoint,
+                            pop_id: ctx.pop_id,
+                            auth_token: ctx.auth_token,
+                            if_none_match: None,
+                            snapshot_path: ctx.snapshot_path,
+                        };
                         match fetch_and_apply_control_plane_snapshot_full(
-                            ctx.endpoint,
-                            ctx.pop_id,
-                            ctx.auth_token,
+                            &fetch_ctx,
                             ctx.client,
                             ctx.router,
                             ctx.dns_resolver,
@@ -521,5 +588,24 @@ mod tests {
 
         let empty = "   \n\n  ";
         assert!(parse_sse_block(empty).is_none());
+    }
+
+    #[test]
+    fn test_persist_and_load_snapshot_to_disk() {
+        let temp_dir = std::env::temp_dir();
+        let file_path = temp_dir.join(format!("nexusedge_test_snap_{}.json", std::process::id()));
+        let file_path_str = file_path.to_str().unwrap();
+
+        let raw_payload = r#"{"pop_id":"singapore","routes":[],"ai_providers":[]}"#;
+
+        // Persist
+        assert!(persist_snapshot_to_disk(file_path_str, raw_payload).is_ok());
+
+        // Load and verify exact string parity
+        let loaded = load_snapshot_from_disk(file_path_str).unwrap();
+        assert_eq!(loaded, raw_payload);
+
+        // Clean up
+        let _ = std::fs::remove_file(&file_path);
     }
 }

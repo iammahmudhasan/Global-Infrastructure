@@ -36,6 +36,11 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
+type poPSnapshotCacheEntry struct {
+	contentHash string
+	bodyBytes   []byte
+}
+
 type APIHandler struct {
 	store           store.Repository
 	service         *onboarding.DomainService
@@ -58,6 +63,8 @@ type APIHandler struct {
 	alerter         alert.Alerter
 	handlerChain    http.Handler
 	mux             *http.ServeMux
+	snapshotCacheMu sync.RWMutex
+	snapshotCache   map[string]poPSnapshotCacheEntry
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -154,6 +161,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		alerter:         alerter,
 		mux:             mux,
 		handlerChain:    authenticator.Middleware(mux),
+		snapshotCache:   make(map[string]poPSnapshotCacheEntry),
 	}
 	h.registerRoutes()
 	return h
@@ -2637,29 +2645,65 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		canonicalSum := sha256.Sum256(canonicalBytes)
 		canonicalHash := hex.EncodeToString(canonicalSum[:])
 
-		syncResult := model.PoPConfigSync{
-			PoPID:           pop.ID,
-			ConfigVersion:   "v1.0.0-" + checksum[:8],
-			ChecksumSHA256:  checksum,
-			CanonicalSHA256: canonicalHash,
-			CompiledAt:      time.Now().UTC(),
-			TopologiesCount: len(topologies),
-			EnvoyConfig:     envoyCfg,
-			Routes:          gatewayRoutes,
-			AIProviders:     gatewayAIProviders,
+		compositeKey := checksum + ":" + canonicalHash + ":" + fmt.Sprint(len(gatewayAIProviders))
+
+		h.snapshotCacheMu.RLock()
+		cached, exists := h.snapshotCache[popID]
+		h.snapshotCacheMu.RUnlock()
+
+		var finalBytes []byte
+		var bodyHash string
+
+		if exists && cached.contentHash == compositeKey {
+			finalBytes = cached.bodyBytes
+			bodySum := sha256.Sum256(finalBytes)
+			bodyHash = hex.EncodeToString(bodySum[:])
+		} else {
+			syncResult := model.PoPConfigSync{
+				PoPID:           pop.ID,
+				ConfigVersion:   "v1.0.0-" + checksum[:8],
+				ChecksumSHA256:  checksum,
+				CanonicalSHA256: canonicalHash,
+				CompiledAt:      time.Now().UTC().Truncate(time.Second),
+				TopologiesCount: len(topologies),
+				EnvoyConfig:     envoyCfg,
+				Routes:          gatewayRoutes,
+				AIProviders:     gatewayAIProviders,
+			}
+
+			respBytes, err := json.Marshal(syncResult)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to marshal pop config: "+err.Error())
+				return
+			}
+			bodySum := sha256.Sum256(respBytes)
+			bodyHash = hex.EncodeToString(bodySum[:])
+			finalBytes = respBytes
+
+			h.snapshotCacheMu.Lock()
+			h.snapshotCache[popID] = poPSnapshotCacheEntry{
+				contentHash: compositeKey,
+				bodyBytes:   respBytes,
+			}
+			h.snapshotCacheMu.Unlock()
 		}
 
-		respBytes, err := json.Marshal(syncResult)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to marshal pop config: "+err.Error())
-			return
-		}
-		bodySum := sha256.Sum256(respBytes)
-		bodyHash := hex.EncodeToString(bodySum[:])
 		w.Header().Set("X-Snapshot-Checksum", bodyHash)
+		w.Header().Set("ETag", fmt.Sprintf(`"%s"`, bodyHash))
+
+		// RFC 7232: Conditional Request handling (304 Not Modified)
+		ifNoneMatch := r.Header.Get("If-None-Match")
+		if ifNoneMatch != "" {
+			trimmed := strings.Trim(ifNoneMatch, `"`)
+			if trimmed == bodyHash || trimmed == "*" {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(respBytes)
+		_, _ = w.Write(finalBytes)
 
 	case "secrets":
 		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {

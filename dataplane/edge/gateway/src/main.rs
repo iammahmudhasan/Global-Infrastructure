@@ -7,7 +7,8 @@ use nexusedge_gateway::proxy::{
 use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{self, Router};
 use nexusedge_gateway::sync::{
-    fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream, StreamSyncContext,
+    fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream,
+    SnapshotFetchContext, StreamSyncContext,
 };
 use nexusedge_gateway::waf::WafEngine;
 
@@ -17,7 +18,7 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use reqwest::Client as HttpClient;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -168,6 +169,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+    let autonomous_snapshot_path = config
+        .control_plane
+        .snapshot_file
+        .clone()
+        .unwrap_or_else(|| "data/pop_snapshot.json".to_string());
+
+    // Cold-Boot Autonomy (Shared-Nothing Edge Autonomy):
+    // If local autonomous snapshot cache exists on disk, load routes immediately (0ms WAN dependency).
+    if let Ok(cached_content) = tokio::fs::read_to_string(&autonomous_snapshot_path).await {
+        let parsed_routes = router::parse_pop_config_routes(&cached_content);
+        let parsed_ai = router::parse_pop_config_ai_providers(&cached_content);
+        if let (Ok(new_routes), Ok(maybe_ai)) = (parsed_routes, parsed_ai) {
+            let ai_ref = maybe_ai.as_deref();
+            if let Err(e) =
+                router.update_routes_with_dns_and_ai(new_routes, vec![], ai_ref, &dns_resolver)
+            {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to restore routes from local autonomous snapshot"
+                );
+            } else {
+                if let (Some(director), Some(new_ai)) = (ai_director.as_ref(), maybe_ai) {
+                    director.update_providers(new_ai);
+                }
+                is_ready.store(true, Ordering::SeqCst);
+                tracing::info!(
+                    path = %autonomous_snapshot_path,
+                    "Cold-booted autonomous edge routes from local disk snapshot (Zero-WAN Ready)"
+                );
+            }
+        }
+    }
 
     let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {
@@ -223,6 +256,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let sse_dns = Arc::clone(&sync_dns);
             let sse_ai = sync_ai.clone();
             let sse_is_ready = Arc::clone(&sync_is_ready);
+            let sse_snapshot_path = autonomous_snapshot_path.clone();
 
             tokio::spawn(async move {
                 let mut backoff_secs = 1u64;
@@ -236,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         endpoint: &sse_endpoint,
                         pop_id: &sse_pop_id,
                         auth_token: &sse_auth_token,
+                        snapshot_path: Some(&sse_snapshot_path),
                         client: &sse_client,
                         router: &sse_router,
                         dns_resolver: &sse_dns,
@@ -256,50 +291,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             });
         }
 
+        let last_checksum: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let watchdog_checksum = Arc::clone(&last_checksum);
+        let watchdog_snapshot_path = autonomous_snapshot_path.clone();
+
         tokio::spawn(async move {
-            let interval_secs = cp_cfg.poll_interval_secs.max(5);
+            let interval_secs = cp_cfg.poll_interval_secs.max(15);
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
 
-                // Option A: Synchronize from local/mounted snapshot file
-                if let Some(ref snapshot_path) = cp_cfg.snapshot_file {
-                    if let Ok(content) = tokio::fs::read_to_string(snapshot_path).await {
-                        let parsed_routes = router::parse_pop_config_routes(&content);
-                        let parsed_ai = router::parse_pop_config_ai_providers(&content);
-                        if let (Ok(new_routes), Ok(maybe_ai)) = (parsed_routes, parsed_ai) {
-                            let ai_ref = maybe_ai.as_deref();
-                            if let Err(e) = sync_router.update_routes_with_dns_and_ai(
-                                new_routes,
-                                vec![],
-                                ai_ref,
-                                &sync_dns,
-                            ) {
-                                tracing::warn!(
-                                    "Failed to atomically swap routes and AI DNS from snapshot file: {}",
-                                    e
-                                );
-                            } else {
-                                if let (Some(director), Some(new_ai)) = (sync_ai.as_ref(), maybe_ai)
-                                {
-                                    director.update_providers(new_ai);
-                                }
-                                sync_is_ready.store(true, Ordering::SeqCst);
-                                tracing::info!(
-                                    "Atomically synchronized edge routes and AI DNS from snapshot file: {}",
-                                    snapshot_path
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Option B: Poll Control Plane /v1/edge/pops/{pop_id}/config (P1 Integrity & SSRF Hardening)
+                // Option B: Watchdog Poll Control Plane /v1/edge/pops/{pop_id}/config (RFC 7232 If-None-Match)
                 if cp_cfg.enabled {
+                    let etag_opt = watchdog_checksum
+                        .read()
+                        .ok()
+                        .and_then(|guard| guard.clone());
+                    let fetch_ctx = SnapshotFetchContext {
+                        endpoint: &cp_cfg.endpoint,
+                        pop_id: &cp_cfg.pop_id,
+                        auth_token: &cp_cfg.auth_token,
+                        if_none_match: etag_opt.as_deref(),
+                        snapshot_path: Some(&watchdog_snapshot_path),
+                    };
                     match fetch_and_apply_control_plane_snapshot_full(
-                        &cp_cfg.endpoint,
-                        &cp_cfg.pop_id,
-                        &cp_cfg.auth_token,
+                        &fetch_ctx,
                         &sync_client,
                         &sync_router,
                         &sync_dns,
@@ -309,13 +325,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     {
                         Ok(stats) => {
                             sync_is_ready.store(true, Ordering::SeqCst);
-                            tracing::info!(
-                                pop_id = %cp_cfg.pop_id,
-                                routes = stats.routes_applied,
-                                ai_providers = stats.ai_providers_applied,
-                                checksum = %stats.checksum,
-                                "Atomically refreshed PoP routes and AI compute providers from Control Plane"
-                            );
+                            if stats.modified {
+                                if let Ok(mut guard) = watchdog_checksum.write() {
+                                    *guard = Some(stats.checksum.clone());
+                                }
+                                tracing::info!(
+                                    pop_id = %cp_cfg.pop_id,
+                                    routes = stats.routes_applied,
+                                    ai_providers = stats.ai_providers_applied,
+                                    checksum = %stats.checksum,
+                                    "Atomically refreshed PoP routes and AI compute providers from Control Plane"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    pop_id = %cp_cfg.pop_id,
+                                    checksum = %stats.checksum,
+                                    "Watchdog verified PoP configuration unchanged (304 Not Modified)"
+                                );
+                            }
                         }
                         Err(e) => {
                             if sync_is_ready.load(Ordering::SeqCst) {
