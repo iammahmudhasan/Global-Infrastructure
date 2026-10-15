@@ -28,6 +28,10 @@ const (
 	EventTypeOriginRecovered = "ORIGIN_RECOVERED"
 	EventTypeHighLatency     = "HIGH_LATENCY"
 	EventTypeTest            = "TEST"
+	EventTypePoPDegraded     = "POP_DEGRADED"
+	EventTypePoPDown         = "POP_DOWN"
+	EventTypePoPRecovered    = "POP_RECOVERED"
+	EventTypePoPFailover     = "POP_FAILOVER"
 )
 
 // Event represents a structured infrastructure health or performance alert.

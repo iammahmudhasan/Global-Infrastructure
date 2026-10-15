@@ -100,11 +100,12 @@ type MaglevStatsResponse struct {
 	ConntrackEntries int `json:"conntrack_entries"`
 }
 
-// Client interacts with NexusEdge Global Router network plane APIs.
+// Client interacts with NexusEdge Global Router and Edge Config Controller network plane APIs.
 type Client struct {
-	RouterURL  string
-	AuthToken  string
-	HTTPClient *http.Client
+	RouterURL           string
+	ConfigControllerURL string
+	AuthToken           string
+	HTTPClient          *http.Client
 }
 
 // NewClient initializes a Client using environment variable defaults.
@@ -117,14 +118,23 @@ func NewClient() *Client {
 		endpoint = "http://127.0.0.1:9091"
 	}
 
+	ccEndpoint := os.Getenv("NEXUSEDGE_CONFIG_CONTROLLER_ENDPOINT")
+	if ccEndpoint == "" {
+		ccEndpoint = os.Getenv("NEXUSEDGE_EDGE_ENDPOINT")
+	}
+	if ccEndpoint == "" {
+		ccEndpoint = "http://127.0.0.1:8080"
+	}
+
 	token := os.Getenv("NEXUSEDGE_CP_AUTH_TOKEN")
 	if token == "" {
 		token = "dev-fixture-key-01"
 	}
 
 	return &Client{
-		RouterURL: strings.TrimRight(endpoint, "/"),
-		AuthToken: token,
+		RouterURL:           strings.TrimRight(endpoint, "/"),
+		ConfigControllerURL: strings.TrimRight(ccEndpoint, "/"),
+		AuthToken:           token,
 		HTTPClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -265,4 +275,135 @@ func (c *Client) GetMaglevStats(ctx context.Context) (*MaglevStatsResponse, erro
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// FailoverHop models an alternative PoP destination reached via subsea or terrestrial fiber transit.
+type FailoverHop struct {
+	TargetPoP             string  `json:"target_pop"`
+	SubseaCable           string  `json:"subsea_cable"`
+	SLARTTMs              float64 `json:"sla_rtt_ms"`
+	SovereigntyRestricted bool    `json:"sovereignty_restricted"`
+	Status                string  `json:"status"`
+}
+
+// MultiPoPRouteRule models edge ingress, primary transit, and ordered failover hops for a PoP.
+type MultiPoPRouteRule struct {
+	PoPID           string        `json:"pop_id"`
+	Region          string        `json:"region"`
+	PrimaryTarget   string        `json:"primary_target"`
+	PrimaryRTTMs    float64       `json:"primary_rtt_ms"`
+	FailoverTargets []FailoverHop `json:"failover_targets"`
+	ActiveTarget    string        `json:"active_target"`
+	Status          string        `json:"status"`
+	UpdatedAt       time.Time     `json:"updated_at"`
+}
+
+// PoPHealthState tracks real-time health, probe latencies, and failover state for a PoP.
+type PoPHealthState struct {
+	PoPID               string    `json:"pop_id"`
+	Name                string    `json:"name"`
+	Region              string    `json:"region"`
+	TargetEndpoint      string    `json:"target_endpoint"`
+	Status              string    `json:"status"`
+	Healthy             bool      `json:"healthy"`
+	ConsecutivePasses   int       `json:"consecutive_passes"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	LastRTTMs           float64   `json:"last_rtt_ms"`
+	EWMALatencyMs       float64   `json:"ewma_latency_ms"`
+	PacketLossPercent   float64   `json:"packet_loss_percent"`
+	LastProbedAt        time.Time `json:"last_probed_at"`
+	LastError           string    `json:"last_error,omitempty"`
+	FailoverPoPID       string    `json:"failover_pop_id,omitempty"`
+}
+
+// PoPProbeResult models the outcome of a single synthetic health probe cycle on a PoP.
+type PoPProbeResult struct {
+	PoPID      string    `json:"pop_id"`
+	Target     string    `json:"target"`
+	Success    bool      `json:"success"`
+	LatencyMs  float64   `json:"latency_ms"`
+	StatusCode int       `json:"status_code"`
+	Error      string    `json:"error,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+}
+
+func (c *Client) sendConfigControllerRequest(ctx context.Context, method, path string, body interface{}, out interface{}) error {
+	var bodyReader io.Reader
+	if body != nil {
+		buf, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("failed to encode request payload: %w", err)
+		}
+		bodyReader = bytes.NewReader(buf)
+	}
+
+	fullURL := fmt.Sprintf("%s%s", c.ConfigControllerURL, path)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
+	if err != nil {
+		return fmt.Errorf("failed to construct HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if c.AuthToken != "" {
+		req.Header.Set("X-API-Key", c.AuthToken)
+		req.Header.Set("Authorization", "Bearer "+c.AuthToken)
+	}
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("request to %s failed: %w", fullURL, err)
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	if out != nil {
+		if err := json.Unmarshal(respBytes, out); err != nil {
+			return fmt.Errorf("failed to decode response payload: %w", err)
+		}
+	}
+	return nil
+}
+
+// ListPoPHealth retrieves live health metrics for all 4 PoPs from Edge Config Controller.
+func (c *Client) ListPoPHealth(ctx context.Context) ([]PoPHealthState, error) {
+	var resp struct {
+		TotalPoPs int              `json:"total_pops"`
+		PoPs      []PoPHealthState `json:"pops"`
+	}
+	if err := c.sendConfigControllerRequest(ctx, http.MethodGet, "/v1/edge/pops/health", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.PoPs, nil
+}
+
+// GetPoPRoutes retrieves the global multi-region routing table from Edge Config Controller.
+func (c *Client) GetPoPRoutes(ctx context.Context) ([]MultiPoPRouteRule, error) {
+	var resp struct {
+		TotalRoutes int                 `json:"total_routes"`
+		Routes      []MultiPoPRouteRule `json:"routes"`
+	}
+	if err := c.sendConfigControllerRequest(ctx, http.MethodGet, "/v1/edge/pops/routes", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Routes, nil
+}
+
+// TriggerPoPProbe initiates an immediate synthetic health probe cycle across all PoPs.
+func (c *Client) TriggerPoPProbe(ctx context.Context) (map[string]PoPProbeResult, error) {
+	var resp struct {
+		TotalProbed int                       `json:"total_probed"`
+		Results     map[string]PoPProbeResult `json:"results"`
+	}
+	if err := c.sendConfigControllerRequest(ctx, http.MethodPost, "/v1/edge/pops/health/probe", nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Results, nil
 }

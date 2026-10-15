@@ -4339,3 +4339,125 @@ func TestPoPConfigConditionalETagCaching(t *testing.T) {
 			w4.Header().Get("X-Snapshot-Checksum"), checksum)
 	}
 }
+
+func TestPoP_MultiRegionRoutingAndHealthAPI(t *testing.T) {
+	h := setupTestServer()
+
+	h.Authenticator().RegisterTenantWithRole("key-pop-op", "tenant-admin", "proj-admin", auth.RolePlatformOperator, "*")
+	h.Authenticator().RegisterTenantWithRole("key-pop-user", "tenant-test", "proj-test", auth.RoleTenant, "")
+
+	// 1. GET /v1/edge/pops/routes (Operator)
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/routes", nil)
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/edge/pops/routes, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var routesResp struct {
+		TotalRoutes int                       `json:"total_routes"`
+		Routes      []model.MultiPoPRouteRule `json:"routes"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&routesResp); err != nil {
+		t.Fatalf("failed to decode routes: %v", err)
+	}
+	if routesResp.TotalRoutes != 4 || len(routesResp.Routes) != 4 {
+		t.Fatalf("expected 4 PoP routes, got %d", routesResp.TotalRoutes)
+	}
+
+	// 2. GET /v1/edge/pops/frankfurt/route
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops/frankfurt/route", nil)
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for frankfurt route, got %d", w.Code)
+	}
+	var fraRoute model.MultiPoPRouteRule
+	if err := json.NewDecoder(w.Body).Decode(&fraRoute); err != nil {
+		t.Fatalf("failed to decode frankfurt route: %v", err)
+	}
+	if fraRoute.PrimaryTarget != "decix-fra-direct" || len(fraRoute.FailoverTargets) == 0 {
+		t.Fatalf("unexpected frankfurt route: %+v", fraRoute)
+	}
+
+	// 3. GET /v1/edge/pops/health
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops/health", nil)
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /v1/edge/pops/health, got %d", w.Code)
+	}
+	var healthResp struct {
+		TotalPoPs int                    `json:"total_pops"`
+		PoPs      []model.PoPHealthState `json:"pops"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&healthResp); err != nil {
+		t.Fatalf("failed to decode health: %v", err)
+	}
+	if healthResp.TotalPoPs != 4 || len(healthResp.PoPs) != 4 {
+		t.Fatalf("expected 4 tracked PoPs, got %d", healthResp.TotalPoPs)
+	}
+
+	// 4. POST /v1/edge/pops/health/probe (Operator runs synthetic probe cycle)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/health/probe", nil)
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for probe run, got %d", w.Code)
+	}
+	var probeRunResp struct {
+		TotalProbed int                             `json:"total_probed"`
+		Results     map[string]model.PoPProbeResult `json:"results"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&probeRunResp); err != nil {
+		t.Fatalf("failed to decode probe results: %v", err)
+	}
+	if probeRunResp.TotalProbed != 4 {
+		t.Fatalf("expected 4 probed PoPs, got %d", probeRunResp.TotalProbed)
+	}
+
+	// 5. POST /v1/edge/pops/health/probe (TenantMember denied)
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/health/probe", nil)
+	req.Header.Set("X-API-Key", "key-pop-user")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant member trigger probe, got %d", w.Code)
+	}
+
+	// 6. GET & POST /v1/edge/pops/dhaka/health
+	req = httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/health", nil)
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for dhaka health, got %d", w.Code)
+	}
+
+	updatePayload := `{"healthy": false, "latency_ms": 0, "error": "BDIX route server maintenance"}`
+	req = httptest.NewRequest(http.MethodPost, "/v1/edge/pops/dhaka/health", strings.NewReader(updatePayload))
+	req.Header.Set("X-API-Key", "key-pop-op")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for dhaka health update, got %d", w.Code)
+	}
+	var updatedSt model.PoPHealthState
+	if err := json.NewDecoder(w.Body).Decode(&updatedSt); err != nil {
+		t.Fatalf("failed to decode updated state: %v", err)
+	}
+	if updatedSt.LastError != "BDIX route server maintenance" {
+		t.Fatalf("expected recorded error, got %s", updatedSt.LastError)
+	}
+}

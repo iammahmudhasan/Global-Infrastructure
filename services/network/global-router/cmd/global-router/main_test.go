@@ -768,7 +768,7 @@ func TestNetworkMaglev_Endpoints(t *testing.T) {
 		BackendCount int `json:"backend_count"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &stats)
-	if stats.TableSize != 65537 || stats.BackendCount != 3 {
+	if stats.TableSize != 65537 || stats.BackendCount != 5 {
 		t.Fatalf("unexpected maglev stats: %+v", stats)
 	}
 

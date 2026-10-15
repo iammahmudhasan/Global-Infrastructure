@@ -54,6 +54,7 @@ type APIHandler struct {
 	broadcaster     *events.Broadcaster
 	analyticsEngine *analytics.Engine
 	popManager      *pop.Manager
+	popProber       *health.PoPHealthProber
 	authenticator   *auth.Authenticator
 	limiter         *ControlPlaneLimiter
 	auditLogger     *security.AuditLogger
@@ -140,6 +141,9 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	mon := health.NewMonitor()
 	mon.SetAlerter(alerter)
 
+	popMgr := pop.NewManager()
+	popProber := health.NewPoPHealthProber(popMgr, alerter)
+
 	h := &APIHandler{
 		store:           s,
 		service:         svc,
@@ -152,7 +156,8 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		stekManager:     stek.NewManager("", 0, stek.DefaultRotationInterval),
 		broadcaster:     events.NewBroadcaster(),
 		analyticsEngine: analytics.NewEngine(),
-		popManager:      pop.NewManager(),
+		popManager:      popMgr,
+		popProber:       popProber,
 		authenticator:   authenticator,
 		limiter:         NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
 		auditLogger:     auditLogger,
@@ -229,6 +234,10 @@ func (h *APIHandler) Authenticator() *auth.Authenticator {
 
 func (h *APIHandler) PoPManager() *pop.Manager {
 	return h.popManager
+}
+
+func (h *APIHandler) PoPProber() *health.PoPHealthProber {
+	return h.popProber
 }
 
 func (h *APIHandler) Store() store.Repository {
@@ -350,6 +359,9 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/acme/validate", h.handleACMEValidate)
 	h.mux.HandleFunc("/v1/edge/telemetry", h.handleEdgeTelemetry)
 	h.mux.HandleFunc("/v1/edge/pops", h.handleListPoPs)
+	h.mux.HandleFunc("/v1/edge/pops/routes", h.handlePoPRoutes)
+	h.mux.HandleFunc("/v1/edge/pops/health", h.handlePoPHealth)
+	h.mux.HandleFunc("/v1/edge/pops/health/probe", h.handlePoPProbeRun)
 	h.mux.HandleFunc("/v1/edge/pops/", h.handlePoPsRoute)
 	h.mux.HandleFunc("/v1/pops/", h.handlePoPsRoute)
 	h.mux.HandleFunc("/v1/edge/routing/", h.handleRoutingRoute)
@@ -2453,6 +2465,19 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 	popID := strings.ToLower(parts[0])
 
+	if popID == "routes" {
+		h.handlePoPRoutes(w, r)
+		return
+	}
+	if popID == "health" {
+		if len(parts) >= 2 && parts[1] == "probe" {
+			h.handlePoPProbeRun(w, r)
+			return
+		}
+		h.handlePoPHealth(w, r)
+		return
+	}
+
 	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
 		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
 		return
@@ -2767,9 +2792,103 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		h.handlePoPEventsStream(w, r, popID)
 		return
 
+	case "health":
+		if r.Method == http.MethodGet {
+			st, err := h.popProber.GetHealthState(popID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, st)
+			return
+		}
+		if r.Method == http.MethodPost {
+			if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+				writeError(w, http.StatusForbidden, "forbidden: operator role required to update health state")
+				return
+			}
+			var payload struct {
+				Healthy   bool    `json:"healthy"`
+				LatencyMs float64 `json:"latency_ms"`
+				Error     string  `json:"error"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid payload: "+err.Error())
+				return
+			}
+			st := h.popProber.RecordManualProbe(popID, payload.Healthy, payload.LatencyMs, payload.Error)
+			writeJSON(w, http.StatusOK, st)
+			return
+		}
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+
+	case "route":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		route, err := h.popManager.GetPoPRoute(popID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, route)
+		return
+
 	default:
 		writeError(w, http.StatusNotFound, "unknown pop action: "+action)
 	}
+}
+
+func (h *APIHandler) handlePoPRoutes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+	routes := h.popManager.GetMultiPoPRoutes()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total_routes": len(routes),
+		"routes":       routes,
+	})
+}
+
+func (h *APIHandler) handlePoPHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+		return
+	}
+	states := h.popProber.GetHealthStates()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total_pops": len(states),
+		"pops":       states,
+		"timestamp":  time.Now().UTC(),
+	})
+}
+
+func (h *APIHandler) handlePoPProbeRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+		writeError(w, http.StatusForbidden, "forbidden: operator role required to trigger synthetic probes")
+		return
+	}
+	results := h.popProber.ExecuteProbeCycle(r.Context())
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total_probed": len(results),
+		"results":      results,
+		"timestamp":    time.Now().UTC(),
+	})
 }
 
 func (h *APIHandler) handlePoPEventsStream(w http.ResponseWriter, r *http.Request, popID string) {

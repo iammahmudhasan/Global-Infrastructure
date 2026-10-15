@@ -1,0 +1,41 @@
+# NexusEdge Global Infrastructure - Region Compute Specification
+# Region: us-east1 (Ashburn, Virginia)
+# Node: us-virginia-edge01
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: EdgeNodeSpecification
+metadata:
+  name: us-virginia-edge01
+  labels:
+    pop_id: virginia
+    region: us-east1
+    jurisdiction: us
+    compliance: us-fedramp-soc2
+spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
+  hostname: "us-virginia-edge01.nexusedge.internal"
+  management_ip: "198.51.100.31"
+  anycast_virtual_ip: "198.51.100.1"
+  role: EDGE_FAST_PATH_GATEWAY
+  hardware:
+    cpu_cores: 32
+    cpu_model: "AMD EPYC 7763"
+    memory_gb: 128
+    nvme_cache_gb: 4096
+    network_interfaces:
+      - name: "eth0"
+        speed_gbps: 25
+        driver: "mlx5_core"
+        xdp_acceleration: ENABLED
+  runtime:
+    dataplane: "rust-line-rate-gateway"
+    ingress_proxy: "envoy-l7"
+    cache_engine: "rf9111-nvme-lru"
+    waf_engine: "ebpf-adaptive-shield"
+  sovereignty:
+    strict_data_residency: false
+    cryptographic_audit_logging: true
+    cross_border_egress_blocked: false
+    fedramp_moderate_compliant: true

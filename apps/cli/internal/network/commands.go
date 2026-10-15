@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 )
@@ -26,6 +27,9 @@ func PrintNetworkHelp() {
 	fmt.Println("  flow dispatch <src-ip> <src-port> <dst-ip> <dst-port> [proto]")
 	fmt.Println("                                       Route 5-tuple flow using Maglev consistent hashing")
 	fmt.Println("  maglev stats                         Display Maglev lookup table size and conntrack metrics")
+	fmt.Println("  pop list                             List all 4 PoPs with live health and latency metrics")
+	fmt.Println("  pop routes                           Inspect multi-region primary and failover route table")
+	fmt.Println("  pop probe                            Execute real-time synthetic health probes across all PoPs")
 	fmt.Println()
 	fmt.Println("Flags:")
 	fmt.Println("  --sim                                Allow testbed documentation prefixes in RFC 7454 validation")
@@ -50,6 +54,8 @@ func HandleNetworkCommand(client *Client, args []string) error {
 		return handleFlow(client, rest)
 	case "maglev":
 		return handleMaglev(client, rest)
+	case "pop":
+		return handlePoP(client, rest)
 	case "help", "--help", "-h":
 		PrintNetworkHelp()
 		return nil
@@ -276,5 +282,99 @@ func handleMaglev(client *Client, args []string) error {
 	fmt.Fprintln(w, "RING SIZE (M)\tBACKENDS\tACTIVE CONNTRACK FLOWS\tALGORITHM")
 	fmt.Fprintf(w, "%d\t%d\t%d\tGoogle Maglev Consistent Hashing\n",
 		resp.TableSize, resp.BackendCount, resp.ConntrackEntries)
+	return w.Flush()
+}
+
+func handlePoP(client *Client, args []string) error {
+	if len(args) == 0 {
+		fmt.Println("Usage: nexusedge network pop <list|routes|probe> [args]")
+		return nil
+	}
+
+	action := args[0]
+	switch action {
+	case "list":
+		return handlePoPList(client)
+	case "routes":
+		return handlePoPRoutes(client)
+	case "probe":
+		return handlePoPProbe(client)
+	default:
+		return fmt.Errorf("unknown pop action %q; valid actions: list, routes, probe", action)
+	}
+}
+
+func handlePoPList(client *Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pops, err := client.ListPoPHealth(ctx)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "POP ID\tREGION\tTARGET ENDPOINT\tSTATUS\tHEALTHY\tLAST RTT\tEWMA RTT\tFAILOVER")
+	for _, p := range pops {
+		failover := p.FailoverPoPID
+		if failover == "" {
+			failover = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%t\t%.1f ms\t%.1f ms\t%s\n",
+			p.PoPID, p.Region, p.TargetEndpoint, p.Status, p.Healthy, p.LastRTTMs, p.EWMALatencyMs, failover)
+	}
+	return w.Flush()
+}
+
+func handlePoPRoutes(client *Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	routes, err := client.GetPoPRoutes(ctx)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "POP ID\tREGION\tPRIMARY TARGET\tSLA RTT\tACTIVE TARGET\tSTATUS\tFAILOVER HOPS")
+	for _, r := range routes {
+		var hops []string
+		for _, h := range r.FailoverTargets {
+			resTag := ""
+			if h.SovereigntyRestricted {
+				resTag = " [SOVEREIGNTY_LOCKED]"
+			}
+			hops = append(hops, fmt.Sprintf("%s (%s, %.0fms)%s", h.TargetPoP, h.SubseaCable, h.SLARTTMs, resTag))
+		}
+		failoverSummary := strings.Join(hops, "; ")
+		fmt.Fprintf(w, "%s\t%s\t%s\t%.1f ms\t%s\t%s\t%s\n",
+			r.PoPID, r.Region, r.PrimaryTarget, r.PrimaryRTTMs, r.ActiveTarget, r.Status, failoverSummary)
+	}
+	return w.Flush()
+}
+
+func handlePoPProbe(client *Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	results, err := client.TriggerPoPProbe(ctx)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "POP ID\tTARGET ENDPOINT\tPROBE RESULT\tLATENCY\tHTTP CODE\tERROR")
+	for popID, res := range results {
+		resStr := "PASS"
+		if !res.Success {
+			resStr = "FAIL"
+		}
+		errStr := res.Error
+		if errStr == "" {
+			errStr = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%.2f ms\t%d\t%s\n",
+			popID, res.Target, resStr, res.LatencyMs, res.StatusCode, errStr)
+	}
 	return w.Flush()
 }

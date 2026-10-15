@@ -1,0 +1,68 @@
+# NexusEdge Global Infrastructure - Region Network Specification
+# Region: us-east1 (Ashburn, Virginia)
+# Peering Authority: Equinix Internet Exchange Ashburn (DC2)
+# Compliance: US Commercial & FedRAMP Boundary Standards
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION (RFC 5737 / RFC 3849 / RFC 6996)
+
+apiVersion: infrastructure.nexusedge.io/v1alpha1
+kind: PeeringPolicy
+metadata:
+  name: ashburn-peering-virginia
+  labels:
+    region: us-east1
+    city: ashburn
+    country: us
+    datacenter: equinix-dc2
+    tier: simulation-testbed
+spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
+  rfc_disclaimer:
+    ipv4: "Prefix 198.51.100.0/24 is reserved for documentation/testbeds under RFC 5737 (TEST-NET-2); not routeable on public Internet."
+    ipv6: "Prefix 2001:db8:va::/48 is reserved for documentation under RFC 3849; not routeable on public Internet."
+    asn: "ASN 64512 is reserved for private use under RFC 6996; not a globally unique public ASN."
+  local_asn: 64512
+  route_servers:
+    - asn: 24115
+      name: "Equinix Ashburn DC2 IX Route Server 01"
+      ipv4_peer: "198.51.100.240"
+      ipv6_peer: "2001:db8:va::1"
+      status: SIMULATION_STANDBY
+      max_prefixes: 50000
+    - asn: 24115
+      name: "Equinix Ashburn DC2 IX Route Server 02 (Redundant)"
+      ipv4_peer: "198.51.100.239"
+      ipv6_peer: "2001:db8:va::2"
+      status: SIMULATION_STANDBY
+      max_prefixes: 50000
+
+  advertised_prefixes:
+    ipv4:
+      - "198.51.100.0/24"
+    ipv6:
+      - "2001:db8:va::/48"
+
+  routing_policy:
+    local_preference: 160
+    med: 25
+    community_tags:
+      - "64512:1004" # North American Transit
+      - "64512:5001" # US Domestic & Transatlantic
+    target_regional_latency_ms: 12.0
+
+  subsea_transit_links:
+    - cable_system: "TAT-14 / Transatlantic Subsea"
+      remote_pop: "frankfurt"
+      capacity_gbps: 50000
+      sla_rtt_ms: 78.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "Japan-U.S. / Trans-Pacific"
+      remote_pop: "singapore"
+      capacity_gbps: 40000
+      sla_rtt_ms: 180.0
+      status: ACTIVE_INTERCONNECT
+    - cable_system: "Atlantic-Indian Terrestrial Route"
+      remote_pop: "dhaka"
+      capacity_gbps: 15000
+      sla_rtt_ms: 190.0
+      status: ACTIVE_INTERCONNECT

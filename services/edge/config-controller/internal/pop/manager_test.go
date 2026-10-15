@@ -144,3 +144,110 @@ func TestPoPManager_LatencyMatrixAndSteering(t *testing.T) {
 		t.Fatalf("expected ErrNoOrigins, got %v", err)
 	}
 }
+
+func TestPoPManager_MultiPoPRoutes(t *testing.T) {
+	mgr := NewManager()
+
+	routes := mgr.GetMultiPoPRoutes()
+	if len(routes) != 4 {
+		t.Fatalf("expected 4 PoP routes, got %d", len(routes))
+	}
+
+	expectedPoPs := map[string]string{
+		"dhaka":     "asia-south1",
+		"singapore": "asia-southeast1",
+		"frankfurt": "europe-west3",
+		"virginia":  "us-east1",
+	}
+
+	for _, r := range routes {
+		region, exists := expectedPoPs[r.PoPID]
+		if !exists {
+			t.Fatalf("unexpected route PoP %s", r.PoPID)
+		}
+		if r.Region != region {
+			t.Fatalf("expected region %s for %s, got %s", region, r.PoPID, r.Region)
+		}
+		if len(r.FailoverTargets) == 0 {
+			t.Fatalf("expected failover targets for %s", r.PoPID)
+		}
+		if r.Status != "OPTIMAL" {
+			t.Fatalf("expected status OPTIMAL, got %s", r.Status)
+		}
+	}
+
+	// Test specific PoP lookup
+	dhkRoute, err := mgr.GetPoPRoute("dhaka")
+	if err != nil {
+		t.Fatalf("failed to get dhaka route: %v", err)
+	}
+	if dhkRoute.PrimaryTarget != "bdix-dhaka-direct" || dhkRoute.PrimaryRTTMs != 4.0 {
+		t.Fatalf("unexpected dhaka route: %+v", dhkRoute)
+	}
+
+	// Non-existent PoP
+	_, err = mgr.GetPoPRoute("tokyo")
+	if err != ErrRouteNotFound {
+		t.Fatalf("expected ErrRouteNotFound, got %v", err)
+	}
+}
+
+func TestPoPManager_CalculatePoPFailover(t *testing.T) {
+	mgr := NewManager()
+
+	// 1. Frankfurt failover -> TAT-14 transatlantic to Virginia (78ms)
+	hop, err := mgr.CalculatePoPFailover("frankfurt", false)
+	if err != nil {
+		t.Fatalf("failed to calculate failover for frankfurt: %v", err)
+	}
+	if hop.TargetPoP != "virginia" || hop.SLARTTMs != 78.0 {
+		t.Fatalf("expected failover to virginia with 78ms, got %+v", hop)
+	}
+
+	// 2. Dhaka failover with strict sovereignty enabled -> should be blocked by NDMA-2026
+	_, err = mgr.CalculatePoPFailover("dhaka", true)
+	if err != ErrSovereigntyViolation {
+		t.Fatalf("expected ErrSovereigntyViolation for dhaka with strict sovereignty, got %v", err)
+	}
+
+	// 3. Dhaka failover without strict sovereignty -> should select Singapore via SMW6 (32ms)
+	hop, err = mgr.CalculatePoPFailover("dhaka", false)
+	if err != nil {
+		t.Fatalf("expected failover to singapore, got error %v", err)
+	}
+	if hop.TargetPoP != "singapore" || hop.SLARTTMs != 32.0 {
+		t.Fatalf("expected singapore failover with 32ms, got %+v", hop)
+	}
+}
+
+func TestPoPManager_FailoverAndRestore(t *testing.T) {
+	mgr := NewManager()
+
+	// 1. Set failover for Singapore to Dhaka
+	err := mgr.SetPoPRouteFailover("singapore", "dhaka")
+	if err != nil {
+		t.Fatalf("failed to set failover: %v", err)
+	}
+
+	route, err := mgr.GetPoPRoute("singapore")
+	if err != nil {
+		t.Fatalf("failed to get route: %v", err)
+	}
+	if route.ActiveTarget != "dhaka" || route.Status != "FAILOVER_ENGAGED" {
+		t.Fatalf("expected FAILOVER_ENGAGED to dhaka, got %+v", route)
+	}
+
+	// 2. Restore primary route
+	err = mgr.RestorePoPRoute("singapore")
+	if err != nil {
+		t.Fatalf("failed to restore route: %v", err)
+	}
+
+	route, err = mgr.GetPoPRoute("singapore")
+	if err != nil {
+		t.Fatalf("failed to get route: %v", err)
+	}
+	if route.ActiveTarget != route.PrimaryTarget || route.Status != "OPTIMAL" {
+		t.Fatalf("expected restored primary target, got %+v", route)
+	}
+}

@@ -14,10 +14,13 @@ import (
 )
 
 var (
-	ErrPoPNotFound  = errors.New("pop not found")
-	ErrNodeNotFound = errors.New("edge node not found")
-	ErrEmptyPoPID   = errors.New("pop_id is required")
-	ErrNoOrigins    = errors.New("no healthy origins available for steering")
+	ErrPoPNotFound          = errors.New("pop not found")
+	ErrNodeNotFound         = errors.New("edge node not found")
+	ErrEmptyPoPID           = errors.New("pop_id is required")
+	ErrNoOrigins            = errors.New("no healthy origins available for steering")
+	ErrRouteNotFound        = errors.New("pop route configuration not found")
+	ErrSovereigntyViolation = errors.New("failover blocked: cross-border transfer violates strict national data residency")
+	ErrNoFailoverAvailable  = errors.New("no healthy failover PoP available")
 )
 
 // Manager orchestrates Edge Points of Presence, Anycast BGP announcements, and node health
@@ -26,6 +29,7 @@ type Manager struct {
 	pops          map[string]*model.EdgePoP
 	nodes         map[string]map[string]*model.EdgeNode // popID -> nodeID -> Node
 	latencyMatrix map[string]map[string]float64         // fromPoP -> toTarget -> latencyMs
+	routes        map[string]*model.MultiPoPRouteRule   // popID -> MultiPoPRouteRule
 }
 
 func NewManager() *Manager {
@@ -33,9 +37,11 @@ func NewManager() *Manager {
 		pops:          make(map[string]*model.EdgePoP),
 		nodes:         make(map[string]map[string]*model.EdgeNode),
 		latencyMatrix: make(map[string]map[string]float64),
+		routes:        make(map[string]*model.MultiPoPRouteRule),
 	}
 	m.seedDefaultPoPs()
 	m.seedLatencyMatrix()
+	m.seedMultiPoPRoutes()
 	return m
 }
 
@@ -160,6 +166,243 @@ func (m *Manager) setLatencyPair(a, b string, ms float64) {
 	}
 	m.latencyMatrix[a][b] = ms
 	m.latencyMatrix[b][a] = ms
+}
+
+func (m *Manager) seedMultiPoPRoutes() {
+	now := time.Now().UTC()
+
+	m.routes["dhaka"] = &model.MultiPoPRouteRule{
+		PoPID:         "dhaka",
+		Region:        "asia-south1",
+		PrimaryTarget: "bdix-dhaka-direct",
+		PrimaryRTTMs:  4.0,
+		FailoverTargets: []model.FailoverHop{
+			{
+				TargetPoP:             "singapore",
+				SubseaCable:           "SEA-ME-WE 6 (SMW6)",
+				SLARTTMs:              32.0,
+				SovereigntyRestricted: true,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "frankfurt",
+				SubseaCable:           "AAE-1 / SMW5",
+				SLARTTMs:              125.0,
+				SovereigntyRestricted: true,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "virginia",
+				SubseaCable:           "Atlantic-Indian Transit",
+				SLARTTMs:              190.0,
+				SovereigntyRestricted: true,
+				Status:                "STANDBY",
+			},
+		},
+		ActiveTarget: "bdix-dhaka-direct",
+		Status:       "OPTIMAL",
+		UpdatedAt:    now,
+	}
+
+	m.routes["singapore"] = &model.MultiPoPRouteRule{
+		PoPID:         "singapore",
+		Region:        "asia-southeast1",
+		PrimaryTarget: "equinix-sg1-direct",
+		PrimaryRTTMs:  8.0,
+		FailoverTargets: []model.FailoverHop{
+			{
+				TargetPoP:             "dhaka",
+				SubseaCable:           "SEA-ME-WE 6 (SMW6)",
+				SLARTTMs:              32.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "frankfurt",
+				SubseaCable:           "Asia Africa Europe-1 (AAE-1)",
+				SLARTTMs:              145.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "virginia",
+				SubseaCable:           "Japan-U.S. / Trans-Pacific",
+				SLARTTMs:              180.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+		},
+		ActiveTarget: "equinix-sg1-direct",
+		Status:       "OPTIMAL",
+		UpdatedAt:    now,
+	}
+
+	m.routes["frankfurt"] = &model.MultiPoPRouteRule{
+		PoPID:         "frankfurt",
+		Region:        "europe-west3",
+		PrimaryTarget: "decix-fra-direct",
+		PrimaryRTTMs:  14.0,
+		FailoverTargets: []model.FailoverHop{
+			{
+				TargetPoP:             "virginia",
+				SubseaCable:           "TAT-14 / Transatlantic Subsea",
+				SLARTTMs:              78.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "dhaka",
+				SubseaCable:           "SMW6 Terrestrial Extension",
+				SLARTTMs:              125.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "singapore",
+				SubseaCable:           "Asia Africa Europe-1 (AAE-1)",
+				SLARTTMs:              145.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+		},
+		ActiveTarget: "decix-fra-direct",
+		Status:       "OPTIMAL",
+		UpdatedAt:    now,
+	}
+
+	m.routes["virginia"] = &model.MultiPoPRouteRule{
+		PoPID:         "virginia",
+		Region:        "us-east1",
+		PrimaryTarget: "equinix-dc2-direct",
+		PrimaryRTTMs:  12.0,
+		FailoverTargets: []model.FailoverHop{
+			{
+				TargetPoP:             "frankfurt",
+				SubseaCable:           "TAT-14 / Transatlantic Subsea",
+				SLARTTMs:              78.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "singapore",
+				SubseaCable:           "Japan-U.S. / Trans-Pacific",
+				SLARTTMs:              180.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+			{
+				TargetPoP:             "dhaka",
+				SubseaCable:           "Atlantic-Indian Terrestrial Route",
+				SLARTTMs:              190.0,
+				SovereigntyRestricted: false,
+				Status:                "STANDBY",
+			},
+		},
+		ActiveTarget: "equinix-dc2-direct",
+		Status:       "OPTIMAL",
+		UpdatedAt:    now,
+	}
+}
+
+// GetMultiPoPRoutes returns the global routing and failover policies for all active PoPs
+func (m *Manager) GetMultiPoPRoutes() []model.MultiPoPRouteRule {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	res := make([]model.MultiPoPRouteRule, 0, len(m.routes))
+	for _, r := range m.routes {
+		res = append(res, *r)
+	}
+
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].PoPID < res[j].PoPID
+	})
+	return res
+}
+
+// GetPoPRoute returns the routing and failover rule for a specific PoP
+func (m *Manager) GetPoPRoute(popID string) (*model.MultiPoPRouteRule, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	route, exists := m.routes[strings.ToLower(popID)]
+	if !exists {
+		return nil, ErrRouteNotFound
+	}
+	copy := *route
+	return &copy, nil
+}
+
+// CalculatePoPFailover selects the optimal healthy failover PoP respecting latency and data sovereignty
+func (m *Manager) CalculatePoPFailover(popID string, strictSovereignty bool) (*model.FailoverHop, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	popID = strings.ToLower(popID)
+	route, exists := m.routes[popID]
+	if !exists {
+		return nil, ErrRouteNotFound
+	}
+
+	for _, hop := range route.FailoverTargets {
+		if strictSovereignty && hop.SovereigntyRestricted {
+			continue // In-country residency prevents foreign failover
+		}
+
+		targetPoP, ok := m.pops[hop.TargetPoP]
+		if ok && targetPoP.Status == model.PoPStatusActive && targetPoP.BGPState == model.BGPStateAnnounced {
+			return &hop, nil
+		}
+	}
+
+	if strictSovereignty {
+		return nil, ErrSovereigntyViolation
+	}
+	return nil, ErrNoFailoverAvailable
+}
+
+// SetPoPRouteFailover updates the active route target of a PoP to an engaged failover destination
+func (m *Manager) SetPoPRouteFailover(popID, failoverTarget string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	popID = strings.ToLower(popID)
+	route, exists := m.routes[popID]
+	if !exists {
+		return ErrRouteNotFound
+	}
+
+	route.ActiveTarget = failoverTarget
+	route.Status = "FAILOVER_ENGAGED"
+	for i := range route.FailoverTargets {
+		if strings.EqualFold(route.FailoverTargets[i].TargetPoP, failoverTarget) {
+			route.FailoverTargets[i].Status = "ACTIVE_FAILOVER"
+		} else {
+			route.FailoverTargets[i].Status = "STANDBY"
+		}
+	}
+	route.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
+// RestorePoPRoute returns a PoP to its optimal primary route target
+func (m *Manager) RestorePoPRoute(popID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	popID = strings.ToLower(popID)
+	route, exists := m.routes[popID]
+	if !exists {
+		return ErrRouteNotFound
+	}
+
+	route.ActiveTarget = route.PrimaryTarget
+	route.Status = "OPTIMAL"
+	for i := range route.FailoverTargets {
+		route.FailoverTargets[i].Status = "STANDBY"
+	}
+	route.UpdatedAt = time.Now().UTC()
+	return nil
 }
 
 func (m *Manager) ListPoPs() []model.EdgePoP {

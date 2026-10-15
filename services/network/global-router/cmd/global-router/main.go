@@ -65,6 +65,8 @@ func NewServer() *Server {
 		{ID: "pop-sin-gw-01", IP: net.ParseIP("172.30.0.3"), Port: 8080, Weight: 100},
 		{ID: "pop-sin-gw-02", IP: net.ParseIP("172.30.0.4"), Port: 8080, Weight: 100},
 		{ID: "pop-dha-gw-01", IP: net.ParseIP("172.30.0.5"), Port: 8080, Weight: 100},
+		{ID: "pop-fra-gw-01", IP: net.ParseIP("172.30.0.6"), Port: 8080, Weight: 100},
+		{ID: "pop-iad-gw-01", IP: net.ParseIP("172.30.0.7"), Port: 8080, Weight: 100},
 	})
 
 	s := &Server{

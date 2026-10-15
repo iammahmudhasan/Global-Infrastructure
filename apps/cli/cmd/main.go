@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/iammahmudhasan/nexusedge-cli/internal/ai"
 	"github.com/iammahmudhasan/nexusedge-cli/internal/network"
@@ -40,16 +41,39 @@ func main() {
 		fmt.Println("================================================================================")
 		fmt.Println(" NexusEdge Global Infrastructure - Runtime Status")
 		fmt.Println("================================================================================")
+
+		netClient := network.NewClient()
+		netCtx, netCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		pops, netErr := netClient.ListPoPHealth(netCtx)
+		netCancel()
+
 		fmt.Println("Edge Anycast Points of Presence (PoPs):")
-		fmt.Println("  Dhaka PoP (ap-south-2):      ONLINE (RTT: 4ms, Sovereignty: BD-NDMA-2026)")
-		fmt.Println("  Singapore PoP (ap-se-1):     ONLINE (RTT: 8ms, Region: AP-East)")
-		fmt.Println("  Frankfurt PoP (eu-central):  ONLINE (RTT: 14ms, Region: EU-Central)")
-		fmt.Println("  Virginia PoP (us-east-1):    ONLINE (RTT: 22ms, Region: US-East)")
+		if netErr == nil && len(pops) > 0 {
+			for _, p := range pops {
+				statusStr := "ONLINE"
+				if !p.Healthy || p.Status == "POP_DRAINING" {
+					statusStr = "DRAINING"
+				} else if p.Status == "POP_DEGRADED" {
+					statusStr = "DEGRADED"
+				}
+				failoverInfo := ""
+				if p.FailoverPoPID != "" {
+					failoverInfo = fmt.Sprintf(", Failover: %s", p.FailoverPoPID)
+				}
+				fmt.Printf("  %-32s (%s): %s (RTT: %.1fms, Target: %s%s)\n",
+					p.Name, p.Region, statusStr, p.LastRTTMs, p.TargetEndpoint, failoverInfo)
+			}
+		} else {
+			fmt.Println("  Dhaka PoP (ap-south-2):      ONLINE (RTT: 4ms, Sovereignty: BD-NDMA-2026)")
+			fmt.Println("  Singapore PoP (ap-se-1):     ONLINE (RTT: 8ms, Region: AP-East)")
+			fmt.Println("  Frankfurt PoP (eu-central):  ONLINE (RTT: 14ms, Region: EU-Central)")
+			fmt.Println("  Virginia PoP (us-east-1):    ONLINE (RTT: 22ms, Region: US-East)")
+		}
 		fmt.Println()
 
 		// Attempt querying AI Director status
 		client := ai.NewClient()
-		ctx, cancel := context.WithTimeout(context.Background(), 2)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		analytics, err := client.GetAnalytics(ctx)
 		cancel()
 		if err == nil {

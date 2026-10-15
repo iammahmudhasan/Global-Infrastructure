@@ -617,3 +617,53 @@ type AuditLogListResponse struct {
 	ChainValid bool        `json:"chain_valid"`
 	LastHash   string      `json:"last_hash,omitempty"`
 }
+
+// FailoverHop models an alternative PoP destination reached via subsea or terrestrial fiber transit.
+type FailoverHop struct {
+	TargetPoP             string  `json:"target_pop"`
+	SubseaCable           string  `json:"subsea_cable"`
+	SLARTTMs              float64 `json:"sla_rtt_ms"`
+	SovereigntyRestricted bool    `json:"sovereignty_restricted"`
+	Status                string  `json:"status"` // "STANDBY", "ACTIVE_FAILOVER"
+}
+
+// MultiPoPRouteRule models edge ingress, primary transit, and ordered failover hops for a PoP.
+type MultiPoPRouteRule struct {
+	PoPID           string        `json:"pop_id"`
+	Region          string        `json:"region"`
+	PrimaryTarget   string        `json:"primary_target"`
+	PrimaryRTTMs    float64       `json:"primary_rtt_ms"`
+	FailoverTargets []FailoverHop `json:"failover_targets"`
+	ActiveTarget    string        `json:"active_target"`
+	Status          string        `json:"status"` // "OPTIMAL", "FAILOVER_ENGAGED", "DEGRADED"
+	UpdatedAt       time.Time     `json:"updated_at"`
+}
+
+// PoPHealthState tracks real-time health, probe latencies, and failover state for a PoP.
+type PoPHealthState struct {
+	PoPID               string    `json:"pop_id"`
+	Name                string    `json:"name"`
+	Region              string    `json:"region"`
+	TargetEndpoint      string    `json:"target_endpoint"`
+	Status              PoPStatus `json:"status"`
+	Healthy             bool      `json:"healthy"`
+	ConsecutivePasses   int       `json:"consecutive_passes"`
+	ConsecutiveFailures int       `json:"consecutive_failures"`
+	LastRTTMs           float64   `json:"last_rtt_ms"`
+	EWMALatencyMs       float64   `json:"ewma_latency_ms"`
+	PacketLossPercent   float64   `json:"packet_loss_percent"`
+	LastProbedAt        time.Time `json:"last_probed_at"`
+	LastError           string    `json:"last_error,omitempty"`
+	FailoverPoPID       string    `json:"failover_pop_id,omitempty"`
+}
+
+// PoPProbeResult models the outcome of a single synthetic health probe cycle on a PoP.
+type PoPProbeResult struct {
+	PoPID      string    `json:"pop_id"`
+	Target     string    `json:"target"`
+	Success    bool      `json:"success"`
+	LatencyMs  float64   `json:"latency_ms"`
+	StatusCode int       `json:"status_code"`
+	Error      string    `json:"error,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
+}
