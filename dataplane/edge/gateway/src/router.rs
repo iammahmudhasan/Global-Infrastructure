@@ -61,6 +61,15 @@ impl PartialEq<String> for SelectedUpstream {
     }
 }
 
+/// Target representation for synthetic health probes retaining URL, Host header, TLS SNI, and destination IP.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HealthProbeTarget {
+    pub url: String,
+    pub host_header: String,
+    pub sni: Option<String>,
+    pub destination_addr: Option<std::net::SocketAddr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouterError {
     UnknownHost(String),
@@ -1035,6 +1044,16 @@ impl Router {
         host: &str,
         path: &str,
     ) -> Result<SelectedUpstream, RoutingError> {
+        self.select_upstream_excluding(host, path, &[])
+    }
+
+    /// Selects lowest EWMA latency healthy upstream node excluding specified URLs (for dynamic failover).
+    pub fn select_upstream_excluding(
+        &self,
+        host: &str,
+        path: &str,
+        excluded_urls: &[&str],
+    ) -> Result<SelectedUpstream, RoutingError> {
         let norm_host = normalize_host(host);
 
         if self.is_multi_tenant.load(Ordering::Relaxed) {
@@ -1054,23 +1073,31 @@ impl Router {
                 });
 
                 if let Some(best) = matching.first() {
-                    select_from_nodes(&best.origins, &best.round_robin_index)
-                        .map(|node| SelectedUpstream {
-                            generation: gen,
-                            url: node.url.clone(),
-                            destination_addr: node.destination_addr,
-                            tls_server_name: node.sni.clone(),
-                        })
-                        .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
+                    select_from_nodes_excluding(
+                        &best.origins,
+                        &best.round_robin_index,
+                        excluded_urls,
+                    )
+                    .map(|node| SelectedUpstream {
+                        generation: gen,
+                        url: node.url.clone(),
+                        destination_addr: node.destination_addr,
+                        tls_server_name: node.sni.clone(),
+                    })
+                    .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else if !domain_route.origins.is_empty() {
-                    select_from_nodes(&domain_route.origins, &domain_route.round_robin_index)
-                        .map(|node| SelectedUpstream {
-                            generation: gen,
-                            url: node.url.clone(),
-                            destination_addr: node.destination_addr,
-                            tls_server_name: node.sni.clone(),
-                        })
-                        .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
+                    select_from_nodes_excluding(
+                        &domain_route.origins,
+                        &domain_route.round_robin_index,
+                        excluded_urls,
+                    )
+                    .map(|node| SelectedUpstream {
+                        generation: gen,
+                        url: node.url.clone(),
+                        destination_addr: node.destination_addr,
+                        tls_server_name: node.sni.clone(),
+                    })
+                    .ok_or_else(|| RoutingError::NoHealthyUpstreams(norm_host.clone()))
                 } else {
                     Err(RoutingError::NoMatchingPath {
                         host: norm_host,
@@ -1083,7 +1110,7 @@ impl Router {
         } else {
             let snap = self.snapshot.read().unwrap();
             let gen = snap.generation;
-            select_from_nodes(&snap.default_nodes, &self.default_index)
+            select_from_nodes_excluding(&snap.default_nodes, &self.default_index, excluded_urls)
                 .map(|node| SelectedUpstream {
                     generation: gen,
                     url: node.url.clone(),
@@ -1212,6 +1239,57 @@ impl Router {
             for pr in &dr.path_routes {
                 for n in &pr.origins {
                     set.insert(n.url.clone());
+                }
+            }
+        }
+
+        set.into_iter().collect()
+    }
+
+    /// Returns all unique upstream targets for active synthetic health probing,
+    /// retaining canonical target URL, proper virtual host header, TLS SNI,
+    /// and destination SocketAddr for DNS/IP-pinning parity.
+    pub fn health_probe_targets(&self) -> Vec<HealthProbeTarget> {
+        let mut set = HashSet::new();
+        let snap = self.snapshot.read().unwrap();
+
+        for n in snap.default_nodes.iter() {
+            let host_header = n
+                .sni
+                .clone()
+                .or_else(|| {
+                    reqwest::Url::parse(&n.url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_string()))
+                })
+                .unwrap_or_else(|| "localhost".to_string());
+            set.insert(HealthProbeTarget {
+                url: n.url.clone(),
+                host_header,
+                sni: n.sni.clone(),
+                destination_addr: n.destination_addr,
+            });
+        }
+
+        for dr in snap.routes.values() {
+            for n in &dr.origins {
+                let host_header = n.sni.clone().unwrap_or_else(|| dr.host.clone());
+                set.insert(HealthProbeTarget {
+                    url: n.url.clone(),
+                    host_header,
+                    sni: n.sni.clone().or_else(|| Some(dr.host.clone())),
+                    destination_addr: n.destination_addr,
+                });
+            }
+            for pr in &dr.path_routes {
+                for n in &pr.origins {
+                    let host_header = n.sni.clone().unwrap_or_else(|| dr.host.clone());
+                    set.insert(HealthProbeTarget {
+                        url: n.url.clone(),
+                        host_header,
+                        sni: n.sni.clone().or_else(|| Some(dr.host.clone())),
+                        destination_addr: n.destination_addr,
+                    });
                 }
             }
         }
@@ -2014,10 +2092,21 @@ fn select_from_nodes<'a>(
     nodes: &'a [UpstreamNode],
     index_counter: &AtomicUsize,
 ) -> Option<&'a UpstreamNode> {
-    // Pass 1: Find minimum EWMA latency among healthy nodes
+    select_from_nodes_excluding(nodes, index_counter, &[])
+}
+
+fn select_from_nodes_excluding<'a>(
+    nodes: &'a [UpstreamNode],
+    index_counter: &AtomicUsize,
+    excluded_urls: &[&str],
+) -> Option<&'a UpstreamNode> {
+    // Pass 1: Find minimum EWMA latency among healthy nodes NOT in excluded_urls
     let mut min_latency = f64::MAX;
     for node in nodes.iter() {
-        if node.healthy && node.ewma_latency_ms < min_latency {
+        if node.healthy
+            && !excluded_urls.contains(&node.url.as_str())
+            && node.ewma_latency_ms < min_latency
+        {
             min_latency = node.ewma_latency_ms;
         }
     }
@@ -2029,7 +2118,10 @@ fn select_from_nodes<'a>(
     // Pass 2: Count tied lowest-latency healthy nodes (within 1e-6 epsilon)
     let mut tied_count = 0;
     for node in nodes.iter() {
-        if node.healthy && (node.ewma_latency_ms - min_latency).abs() < 1e-6 {
+        if node.healthy
+            && !excluded_urls.contains(&node.url.as_str())
+            && (node.ewma_latency_ms - min_latency).abs() < 1e-6
+        {
             tied_count += 1;
         }
     }
@@ -2042,7 +2134,10 @@ fn select_from_nodes<'a>(
     let pick_index = index_counter.fetch_add(1, Ordering::Relaxed) % tied_count;
     let mut current_idx = 0;
     for node in nodes.iter() {
-        if node.healthy && (node.ewma_latency_ms - min_latency).abs() < 1e-6 {
+        if node.healthy
+            && !excluded_urls.contains(&node.url.as_str())
+            && (node.ewma_latency_ms - min_latency).abs() < 1e-6
+        {
             if current_idx == pick_index {
                 return Some(node);
             }
@@ -3095,5 +3190,85 @@ mod tests {
         assert!(router
             .select_upstream_for_host("api.candidate.com")
             .is_err());
+    }
+
+    #[test]
+    fn test_select_upstream_excluding_primary_fails_over_to_backup() {
+        let node_a = UpstreamNode {
+            url: "https://origin-a.aeitron.com:443".to_string(),
+            sni: Some("aeitron.com".to_string()),
+            destination_addr: Some("185.232.14.188:443".parse().unwrap()),
+            healthy: true,
+            latency_ms: 10,
+            ewma_latency_ms: 10.0,
+            consecutive_passes: 2,
+            consecutive_failures: 0,
+        };
+        let node_b = UpstreamNode {
+            url: "https://origin-b.aeitron.com:443".to_string(),
+            sni: Some("aeitron.com".to_string()),
+            destination_addr: Some("185.232.14.189:443".parse().unwrap()),
+            healthy: true,
+            latency_ms: 15,
+            ewma_latency_ms: 15.0,
+            consecutive_passes: 2,
+            consecutive_failures: 0,
+        };
+
+        let route = DomainRoute::new(
+            "aeitron.com".to_string(),
+            vec![node_a.clone(), node_b.clone()],
+        );
+        let router = Router::new_multi_tenant_with_nodes(vec![route], vec![], 5000).unwrap();
+
+        // 1. Without exclusions, node_a (lowest latency: 10.0ms) is selected
+        let initial = router
+            .select_upstream_with_generation("aeitron.com", "/")
+            .unwrap();
+        assert_eq!(initial.url, node_a.url);
+
+        // 2. Excluding node_a dynamically fails over to node_b
+        let failover = router
+            .select_upstream_excluding("aeitron.com", "/", &[&node_a.url])
+            .unwrap();
+        assert_eq!(failover.url, node_b.url);
+        assert_eq!(failover.tls_server_name, Some("aeitron.com".to_string()));
+        assert_eq!(
+            failover.destination_addr,
+            Some("185.232.14.189:443".parse().unwrap())
+        );
+
+        // 3. Excluding both returns NoHealthyUpstreams
+        let exhausted =
+            router.select_upstream_excluding("aeitron.com", "/", &[&node_a.url, &node_b.url]);
+        assert!(matches!(exhausted, Err(RouterError::NoHealthyUpstreams(_))));
+    }
+
+    #[test]
+    fn test_health_probe_targets_preserves_sni_host_and_destination() {
+        let node = UpstreamNode {
+            url: "https://185.232.14.188:443".to_string(),
+            sni: Some("aeitron.com".to_string()),
+            destination_addr: Some("185.232.14.188:443".parse().unwrap()),
+            healthy: true,
+            latency_ms: 20,
+            ewma_latency_ms: 20.0,
+            consecutive_passes: 2,
+            consecutive_failures: 0,
+        };
+
+        let route = DomainRoute::new("aeitron.com".to_string(), vec![node.clone()]);
+        let router = Router::new_multi_tenant_with_nodes(vec![route], vec![], 5000).unwrap();
+
+        let targets = router.health_probe_targets();
+        assert_eq!(targets.len(), 1);
+        let target = &targets[0];
+        assert_eq!(target.url, "https://185.232.14.188:443");
+        assert_eq!(target.host_header, "aeitron.com");
+        assert_eq!(target.sni, Some("aeitron.com".to_string()));
+        assert_eq!(
+            target.destination_addr,
+            Some("185.232.14.188:443".parse().unwrap())
+        );
     }
 }

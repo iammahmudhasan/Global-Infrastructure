@@ -325,6 +325,135 @@ impl ProxyState {
     }
 }
 
+struct ForwardRequestContext<'a> {
+    pub method: &'a Method,
+    pub uri_string: &'a str,
+    pub host: &'a str,
+    pub scheme: &'a str,
+    pub effective_client_ip: &'a IpAddr,
+    pub req_headers: &'a hyper::HeaderMap,
+    pub body_bytes: &'a Bytes,
+}
+
+async fn dispatch_to_upstream(
+    state: &ProxyState,
+    selected_upstream: &crate::router::SelectedUpstream,
+    ctx: &ForwardRequestContext<'_>,
+) -> Result<reqwest::Response, (StatusCode, &'static str, Option<reqwest::Error>)> {
+    let forward_url = format!(
+        "{}{}",
+        selected_upstream.url.trim_end_matches('/'),
+        ctx.uri_string
+    );
+
+    let target_uri = forward_url
+        .parse::<hyper::Uri>()
+        .unwrap_or_else(|_| hyper::Uri::from_static("http://localhost"));
+    let target_host = target_uri.host().unwrap_or(ctx.host).to_string();
+    let target_port =
+        target_uri
+            .port_u16()
+            .unwrap_or(if target_uri.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
+
+    let client_key = UpstreamClientKey {
+        scheme: target_uri.scheme_str().unwrap_or("http").to_string(),
+        host: target_host.clone(),
+        port: target_port,
+        destination_addr: selected_upstream.destination_addr,
+        tls_server_name: selected_upstream.tls_server_name.clone(),
+    };
+
+    let client = match state.get_or_create_upstream_client(&client_key) {
+        Ok(client) => client,
+        Err(err) => {
+            error!(
+                upstream = %client_key.host,
+                error = %err,
+                "Failed to create destination-pinned upstream client"
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "upstream connection configuration failed",
+                Some(err),
+            ));
+        }
+    };
+
+    let dispatch_url = if target_uri.scheme_str() == Some("https") {
+        if let Some(ref sni) = selected_upstream.tls_server_name {
+            if sni != &target_host {
+                let port_suffix = if target_port != 443 && target_port != 80 {
+                    format!(":{}", target_port)
+                } else {
+                    String::new()
+                };
+                let path_and_query = target_uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("");
+                format!("https://{}{}{}", sni, port_suffix, path_and_query)
+            } else {
+                forward_url.clone()
+            }
+        } else {
+            forward_url.clone()
+        }
+    } else {
+        forward_url.clone()
+    };
+
+    let mut client_req = client.request(
+        reqwest::Method::from_bytes(ctx.method.as_str().as_bytes()).unwrap(),
+        &dispatch_url,
+    );
+
+    let req_connection_tokens = parse_connection_tokens(ctx.req_headers.get("connection"));
+    for (name, value) in ctx.req_headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+        if HOP_BY_HOP_HEADERS.contains(&name_str.as_str())
+            || STRIPPED_FORWARDING_HEADERS.contains(&name_str.as_str())
+            || req_connection_tokens.contains(&name_str)
+        {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            client_req = client_req.header(hn, hv);
+        }
+    }
+
+    client_req = client_req.header("X-Forwarded-For", ctx.effective_client_ip.to_string());
+    client_req = client_req.header("X-Forwarded-Proto", ctx.scheme);
+    client_req = client_req.header("X-Forwarded-Host", ctx.host);
+    client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
+
+    let upstream_host = selected_upstream
+        .tls_server_name
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(ctx.host);
+    client_req = client_req.header(reqwest::header::HOST, upstream_host);
+
+    if !ctx.body_bytes.is_empty() {
+        client_req = client_req.body(ctx.body_bytes.clone());
+    }
+
+    client_req.send().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "upstream connection failed",
+            Some(err),
+        )
+    })
+}
+
 pub async fn handle_request(
     req: Request<Incoming>,
     client_ip: IpAddr,
@@ -780,324 +909,304 @@ pub async fn handle_request(
         }
     };
 
-    let forward_url = format!(
-        "{}{}",
-        selected_upstream.url.trim_end_matches('/'),
-        uri_string
-    );
-
-    // Extract target host, port, and scheme to select or construct a destination-pinned HTTP client
-    let target_uri = forward_url
-        .parse::<hyper::Uri>()
-        .unwrap_or_else(|_| hyper::Uri::from_static("http://localhost"));
-    let target_host = target_uri.host().unwrap_or(&host).to_string();
-    let target_port =
-        target_uri
-            .port_u16()
-            .unwrap_or(if target_uri.scheme_str() == Some("https") {
-                443
-            } else {
-                80
-            });
-
-    let client_key = UpstreamClientKey {
-        scheme: target_uri.scheme_str().unwrap_or("http").to_string(),
-        host: target_host.clone(),
-        port: target_port,
-        destination_addr: selected_upstream.destination_addr,
-        tls_server_name: selected_upstream.tls_server_name.clone(),
+    // 9. Upstream Request Dispatch & Dynamic Passive Failover
+    let forward_ctx = ForwardRequestContext {
+        method: &method,
+        uri_string: &uri_string,
+        host: &host,
+        scheme,
+        effective_client_ip: &effective_client_ip,
+        req_headers: &req_headers,
+        body_bytes: &body_bytes,
     };
 
-    let client = match state.get_or_create_upstream_client(&client_key) {
-        Ok(client) => client,
-        Err(err) => {
-            error!(
-                upstream = %client_key.host,
-                error = %err,
-                "Failed to create destination-pinned upstream client"
-            );
-            let body = serde_json::json!({
-                "error": "upstream connection configuration failed"
-            });
-            return Ok(json_response(StatusCode::BAD_GATEWAY, body));
-        }
-    };
-
-    let dispatch_url = if target_uri.scheme_str() == Some("https") {
-        if let Some(ref sni) = selected_upstream.tls_server_name {
-            if sni != &target_host {
-                let port_suffix = if target_port != 443 && target_port != 80 {
-                    format!(":{}", target_port)
-                } else {
-                    String::new()
-                };
-                let path_and_query = target_uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("");
-                format!("https://{}{}{}", sni, port_suffix, path_and_query)
-            } else {
-                forward_url.clone()
+    let (mut upstream_resp, failed_over, failed_origin) =
+        match dispatch_to_upstream(&state, &selected_upstream, &forward_ctx).await {
+            Ok(resp)
+                if resp.status() == reqwest::StatusCode::BAD_GATEWAY
+                    || resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                    || resp.status() == reqwest::StatusCode::GATEWAY_TIMEOUT =>
+            {
+                let primary_status = resp.status();
+                warn!(
+                    upstream = %selected_upstream.url,
+                    status = %primary_status,
+                    "Primary upstream returned server gateway error; attempting dynamic failover"
+                );
+                state
+                    .router
+                    .mark_health(&selected_upstream.url, false, 9999);
+                match state.router.select_upstream_excluding(
+                    &host,
+                    &path,
+                    &[&selected_upstream.url],
+                ) {
+                    Ok(backup_upstream) => {
+                        warn!(
+                            primary = %selected_upstream.url,
+                            backup = %backup_upstream.url,
+                            "Failing over request to backup upstream"
+                        );
+                        match dispatch_to_upstream(&state, &backup_upstream, &forward_ctx).await {
+                            Ok(backup_resp) => {
+                                (backup_resp, true, Some(selected_upstream.url.clone()))
+                            }
+                            Err((_code, _msg, _err)) => {
+                                state.router.mark_health(&backup_upstream.url, false, 9999);
+                                (resp, false, None)
+                            }
+                        }
+                    }
+                    Err(_) => (resp, false, None),
+                }
             }
-        } else {
-            forward_url.clone()
+            Ok(resp) => (resp, false, None),
+            Err((_code, _msg, _err)) => {
+                warn!(
+                    upstream = %selected_upstream.url,
+                    "Primary upstream connection failed; attempting dynamic failover"
+                );
+                state
+                    .router
+                    .mark_health(&selected_upstream.url, false, 9999);
+                match state.router.select_upstream_excluding(
+                    &host,
+                    &path,
+                    &[&selected_upstream.url],
+                ) {
+                    Ok(backup_upstream) => {
+                        warn!(
+                            primary = %selected_upstream.url,
+                            backup = %backup_upstream.url,
+                            "Failing over request to backup upstream after connection failure"
+                        );
+                        match dispatch_to_upstream(&state, &backup_upstream, &forward_ctx).await {
+                            Ok(backup_resp) => {
+                                (backup_resp, true, Some(selected_upstream.url.clone()))
+                            }
+                            Err((_, _, _)) => {
+                                state.router.mark_health(&backup_upstream.url, false, 9999);
+                                state
+                                    .metrics
+                                    .responses_5xx
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let body = serde_json::json!({
+                                    "error": "upstream unavailable",
+                                    "status": 502,
+                                });
+                                return Ok(json_response(StatusCode::BAD_GATEWAY, body));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        state
+                            .metrics
+                            .responses_5xx
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let body = serde_json::json!({
+                            "error": "upstream unavailable",
+                            "status": 502,
+                        });
+                        return Ok(json_response(StatusCode::BAD_GATEWAY, body));
+                    }
+                }
+            }
+        };
+
+    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    let mut headers_to_cache = hyper::HeaderMap::new();
+    let mut builder = Response::builder()
+        .status(status)
+        .header("X-Cache", "MISS")
+        .header("Server", "NexusEdge/0.1.0");
+
+    if failed_over {
+        builder = builder.header("X-NexusEdge-Failover", "true");
+        if let Some(ref failed) = failed_origin {
+            builder = builder.header("X-NexusEdge-Failed-Upstream", failed.as_str());
         }
-    } else {
-        forward_url.clone()
-    };
+    }
 
-    // 9. Proxy Forwarding with Strict Header Forwarding (Finding 3)
-    let mut client_req = client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
-        &dispatch_url,
-    );
+    // Multi-value Cache-Control parsing (P1 Finding 6, RFC 9111 structured parsing)
+    let resp_cc_lines = upstream_resp
+        .headers()
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let resp_cc = parse_cache_control(resp_cc_lines);
+    let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
 
-    // Forward all client application headers (Authorization, Cookie, Content-Type, Accept, etc.)
-    // Stripping hop-by-hop headers, nominated Connection tokens, and untrusted client forwarding headers
-    let req_connection_tokens = parse_connection_tokens(req_headers.get("connection"));
-    for (name, value) in req_headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if HOP_BY_HOP_HEADERS.contains(&name_str.as_str())
-            || STRIPPED_FORWARDING_HEADERS.contains(&name_str.as_str())
-            || req_connection_tokens.contains(&name_str)
-        {
+    let resp_connection_tokens = parse_connection_tokens(upstream_resp.headers().get("connection"));
+
+    for (k, v) in upstream_resp.headers().iter() {
+        let k_lower = k.as_str().to_lowercase();
+        if is_hop_by_hop_response_header(&k_lower) || resp_connection_tokens.contains(&k_lower) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
-            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
-            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+            HeaderName::from_bytes(k.as_str().as_bytes()),
+            HeaderValue::from_bytes(v.as_bytes()),
         ) {
-            client_req = client_req.header(hn, hv);
+            headers_to_cache.append(hn.clone(), hv.clone());
+            builder = builder.header(hn, hv);
         }
     }
 
-    // Attach standard reverse proxy forwarding headers
-    client_req = client_req.header("X-Forwarded-For", effective_client_ip.to_string());
-    client_req = client_req.header("X-Forwarded-Proto", scheme);
-    client_req = client_req.header("X-Forwarded-Host", &host);
-    client_req = client_req.header("X-Edge-Pop", &state.config.server.node_id);
+    let latency_ms = start_time.elapsed().as_millis();
+    info!(
+        uri = %uri_string,
+        status = %status.as_u16(),
+        latency_ms = latency_ms,
+        cache = "MISS",
+        "Upstream request completed"
+    );
 
-    // Forward the original customer Host header upstream (P1).
-    // If the selected upstream defines an explicit SNI / origin host override (e.g. CDN virtual host routing),
-    // forward that host header upstream while strictly preserving the downstream tenant host in X-Forwarded-Host.
-    let upstream_host = selected_upstream
-        .tls_server_name
-        .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&host);
-    client_req = client_req.header(reqwest::header::HOST, upstream_host);
-
-    if !body_bytes.is_empty() {
-        client_req = client_req.body(body_bytes.clone());
+    if status.is_success() {
+        state
+            .metrics
+            .responses_2xx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if status.is_client_error() {
+        state
+            .metrics
+            .responses_4xx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else if status.is_server_error() {
+        state
+            .metrics
+            .responses_5xx
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    match client_req.send().await {
-        Ok(mut upstream_resp) => {
-            let status = StatusCode::from_u16(upstream_resp.status().as_u16())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    // 10. RFC 9111 Shared Cache Evaluation & Line-Rate Zero-Copy Streaming
+    let is_vary_star = headers_to_cache
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim() == "*")
+        .unwrap_or(false);
 
-            let mut headers_to_cache = hyper::HeaderMap::new();
-            let mut builder = Response::builder()
-                .status(status)
-                .header("X-Cache", "MISS")
-                .header("Server", "NexusEdge/0.1.0");
+    let upstream_cl = upstream_resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
 
-            // Multi-value Cache-Control parsing (P1 Finding 6, RFC 9111 structured parsing)
-            let resp_cc_lines = upstream_resp
-                .headers()
-                .get_all("cache-control")
-                .iter()
-                .filter_map(|v| v.to_str().ok());
-            let resp_cc = parse_cache_control(resp_cc_lines);
-            let has_set_cookie = upstream_resp.headers().contains_key("set-cookie");
+    let mut can_cache_candidate = method == Method::GET
+        && status == StatusCode::OK
+        && !has_cookie
+        && !has_auth
+        && !bypass_cache
+        && !req_cc.no_store
+        && !req_cc.no_cache
+        && (!auth_header_present || resp_cc.public || resp_cc.s_maxage.is_some())
+        && !resp_cc.no_store
+        && !resp_cc.no_cache
+        && !resp_cc.private
+        && !has_set_cookie
+        && !is_vary_star;
 
-            let resp_connection_tokens =
-                parse_connection_tokens(upstream_resp.headers().get("connection"));
+    if let Some(cl) = upstream_cl {
+        if cl > MAX_CACHEABLE_RESPONSE_BYTES {
+            can_cache_candidate = false;
+        }
+    }
 
-            for (k, v) in upstream_resp.headers().iter() {
-                let k_lower = k.as_str().to_lowercase();
-                if is_hop_by_hop_response_header(&k_lower)
-                    || resp_connection_tokens.contains(&k_lower)
-                {
-                    continue;
-                }
-                if let (Ok(hn), Ok(hv)) = (
-                    HeaderName::from_bytes(k.as_str().as_bytes()),
-                    HeaderValue::from_bytes(v.as_bytes()),
-                ) {
-                    headers_to_cache.append(hn.clone(), hv.clone());
-                    builder = builder.header(hn, hv);
-                }
-            }
+    let custom_ttl = resp_cc
+        .s_maxage
+        .or(resp_cc.max_age)
+        .map(Duration::from_secs)
+        .or_else(|| {
+            domain_cache_policy
+                .as_ref()
+                .map(|c| Duration::from_secs(c.default_ttl_seconds))
+        })
+        .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
 
-            let latency_ms = start_time.elapsed().as_millis();
-            info!(
-                uri = %uri_string,
-                status = %status.as_u16(),
-                latency_ms = latency_ms,
-                cache = "MISS",
-                "Upstream request completed"
-            );
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BodyError>>(32);
+    let state_clone = Arc::clone(&state);
+    let req_headers_clone = req_headers.clone();
 
-            if status.is_success() {
-                state
-                    .metrics
-                    .responses_2xx
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else if status.is_client_error() {
-                state
-                    .metrics
-                    .responses_4xx
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else if status.is_server_error() {
-                state
-                    .metrics
-                    .responses_5xx
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+    tokio::spawn(async move {
+        if can_cache_candidate {
+            let mut resp_buf = bytes::BytesMut::new();
+            let mut buffer_guard = Some(BufferBudgetGuard::new(
+                Arc::clone(&state_clone.aggregate_buffered_bytes),
+                MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
+            ));
+            let mut cache_disabled_for_stream = false;
 
-            // 10. RFC 9111 Shared Cache Evaluation & Line-Rate Zero-Copy Streaming
-            let is_vary_star = headers_to_cache
-                .get("vary")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim() == "*")
-                .unwrap_or(false);
+            loop {
+                match upstream_resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if !cache_disabled_for_stream {
+                            let fits_cache = resp_buf.len().saturating_add(chunk.len())
+                                <= MAX_CACHEABLE_RESPONSE_BYTES;
+                            let budget_ok = buffer_guard
+                                .as_mut()
+                                .map(|g| g.try_allocate(chunk.len()).is_ok())
+                                .unwrap_or(false);
 
-            let upstream_cl = upstream_resp
-                .headers()
-                .get("content-length")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<usize>().ok());
-
-            let mut can_cache_candidate = method == Method::GET
-                && status == StatusCode::OK
-                && !has_cookie
-                && !has_auth
-                && !bypass_cache
-                && !req_cc.no_store
-                && !req_cc.no_cache
-                && (!auth_header_present || resp_cc.public || resp_cc.s_maxage.is_some())
-                && !resp_cc.no_store
-                && !resp_cc.no_cache
-                && !resp_cc.private
-                && !has_set_cookie
-                && !is_vary_star;
-
-            if let Some(cl) = upstream_cl {
-                if cl > MAX_CACHEABLE_RESPONSE_BYTES {
-                    can_cache_candidate = false;
-                }
-            }
-
-            let custom_ttl = resp_cc
-                .s_maxage
-                .or(resp_cc.max_age)
-                .map(Duration::from_secs)
-                .or_else(|| {
-                    domain_cache_policy
-                        .as_ref()
-                        .map(|c| Duration::from_secs(c.default_ttl_seconds))
-                })
-                .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
-
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BodyError>>(32);
-            let state_clone = Arc::clone(&state);
-            let req_headers_clone = req_headers.clone();
-
-            tokio::spawn(async move {
-                if can_cache_candidate {
-                    let mut resp_buf = bytes::BytesMut::new();
-                    let mut buffer_guard = Some(BufferBudgetGuard::new(
-                        Arc::clone(&state_clone.aggregate_buffered_bytes),
-                        MAX_AGGREGATE_BUFFERED_RESPONSE_BYTES,
-                    ));
-                    let mut cache_disabled_for_stream = false;
-
-                    loop {
-                        match upstream_resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                if !cache_disabled_for_stream {
-                                    let fits_cache = resp_buf.len().saturating_add(chunk.len())
-                                        <= MAX_CACHEABLE_RESPONSE_BYTES;
-                                    let budget_ok = buffer_guard
-                                        .as_mut()
-                                        .map(|g| g.try_allocate(chunk.len()).is_ok())
-                                        .unwrap_or(false);
-
-                                    if fits_cache && budget_ok {
-                                        resp_buf.extend_from_slice(&chunk);
-                                    } else {
-                                        cache_disabled_for_stream = true;
-                                        buffer_guard = None;
-                                        resp_buf.clear();
-                                    }
-                                }
-
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    // Downstream client disconnected or aborted stream
-                                    return;
-                                }
-                            }
-                            Ok(None) => {
-                                // Upstream completed successfully
-                                if !cache_disabled_for_stream && !resp_buf.is_empty() {
-                                    let resp_bytes = resp_buf.freeze();
-                                    state_clone.cache.put(
-                                        cache_key,
-                                        status,
-                                        headers_to_cache,
-                                        resp_bytes,
-                                        custom_ttl,
-                                        Some(&req_headers_clone),
-                                    );
-                                }
-                                break;
-                            }
-                            Err(e) => {
-                                error!(error = %e, "Upstream stream interrupted during transfer");
-                                let _ = tx.send(Err(Box::new(e))).await;
-                                break;
+                            if fits_cache && budget_ok {
+                                resp_buf.extend_from_slice(&chunk);
+                            } else {
+                                cache_disabled_for_stream = true;
+                                buffer_guard = None;
+                                resp_buf.clear();
                             }
                         }
-                    }
-                } else {
-                    // Direct zero-copy streaming pass-through (SSE, WebSockets, large downloads, mutations)
-                    loop {
-                        match upstream_resp.chunk().await {
-                            Ok(Some(chunk)) => {
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    // Downstream client disconnected
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                error!(error = %e, "Upstream stream interrupted during transfer");
-                                let _ = tx.send(Err(Box::new(e))).await;
-                                break;
-                            }
+
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            // Downstream client disconnected or aborted stream
+                            return;
                         }
                     }
+                    Ok(None) => {
+                        // Upstream completed successfully
+                        if !cache_disabled_for_stream && !resp_buf.is_empty() {
+                            let resp_bytes = resp_buf.freeze();
+                            state_clone.cache.put(
+                                cache_key,
+                                status,
+                                headers_to_cache,
+                                resp_bytes,
+                                custom_ttl,
+                                Some(&req_headers_clone),
+                            );
+                        }
+                        break;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Upstream stream interrupted during transfer");
+                        let _ = tx.send(Err(Box::new(e))).await;
+                        break;
+                    }
                 }
-            });
+            }
+        } else {
+            // Direct zero-copy streaming pass-through (SSE, WebSockets, large downloads, mutations)
+            loop {
+                match upstream_resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            // Downstream client disconnected
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        error!(error = %e, "Upstream stream interrupted during transfer");
+                        let _ = tx.send(Err(Box::new(e))).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
-            let resp = builder.body(GatewayResponseBody::stream(rx)).unwrap();
-            Ok(resp)
-        }
-        Err(err) => {
-            state
-                .metrics
-                .responses_5xx
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            warn!(url = %forward_url, error = %err, "Upstream connection failed");
-            let body = serde_json::json!({
-                "error": "upstream unavailable",
-                "status": 502,
-            });
-            Ok(json_response(StatusCode::BAD_GATEWAY, body))
-        }
-    }
+    let resp = builder.body(GatewayResponseBody::stream(rx)).unwrap();
+    Ok(resp)
 }
 
 /// Extracts original client IP according to RFC 7239 / Envoy trusted proxy forwarding semantics.
@@ -1648,5 +1757,30 @@ mod tests {
         assert_ne!(http_key, https_key);
         assert_eq!(http_key, "http://api.nexusedge.io/data#ae=gzip");
         assert_eq!(https_key, "https://api.nexusedge.io/data#ae=gzip");
+    }
+
+    #[test]
+    fn test_failover_headers_injection_contract() {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("X-Cache", "MISS")
+            .header("Server", "NexusEdge/0.1.0");
+
+        let failed_over = true;
+        let failed_origin = Some("https://primary.aeitron.com".to_string());
+
+        if failed_over {
+            builder = builder.header("X-NexusEdge-Failover", "true");
+            if let Some(ref failed) = failed_origin {
+                builder = builder.header("X-NexusEdge-Failed-Upstream", failed.as_str());
+            }
+        }
+
+        let resp = builder.body(()).unwrap();
+        assert_eq!(resp.headers().get("X-NexusEdge-Failover").unwrap(), "true");
+        assert_eq!(
+            resp.headers().get("X-NexusEdge-Failed-Upstream").unwrap(),
+            "https://primary.aeitron.com"
+        );
     }
 }

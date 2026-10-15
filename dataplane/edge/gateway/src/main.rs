@@ -339,49 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // 5. Autonomous Upstream Health Probing Loop (Findings 8, 9, 14, P1 Finding 2)
-    let health_router = router.clone();
-    let health_client = HttpClient::builder()
-        .timeout(Duration::from_millis(config.upstream.timeout_ms))
-        .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF / open-redirect attacks
-        .dns_resolver(Arc::clone(&dns_resolver))
-        .pool_max_idle_per_host(64)
-        .tcp_nodelay(true)
-        .build()?;
-    let health_path = config.upstream.health_check_path.clone();
-
-    tokio::spawn(async move {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        loop {
-            interval.tick().await;
-            let current_targets = health_router.all_targets();
-            let mut join_set = tokio::task::JoinSet::new();
-            for target in current_targets {
-                let client = health_client.clone();
-                let path = health_path.clone();
-                let permit = semaphore.clone();
-                join_set.spawn(async move {
-                    let _permit = permit.acquire().await;
-                    let check_url = format!("{}{}", target.trim_end_matches('/'), path);
-                    let start = std::time::Instant::now();
-                    let is_healthy = match client.get(&check_url).send().await {
-                        Ok(resp) => {
-                            let status = resp.status();
-                            status.is_success() || status.is_redirection()
-                        }
-                        Err(_) => false,
-                    };
-                    let latency_ms = start.elapsed().as_millis() as u64;
-                    (target, is_healthy, latency_ms)
-                });
-            }
-            while let Some(res) = join_set.join_next().await {
-                if let Ok((target, is_healthy, latency_ms)) = res {
-                    health_router.mark_health(&target, is_healthy, latency_ms);
-                }
-            }
-        }
-    });
+    nexusedge_gateway::health::spawn_active_health_prober(
+        router.clone(),
+        &config,
+        Arc::clone(&dns_resolver),
+    );
 
     // 6. Bind TCP Listener and accept connections
     let addr: SocketAddr = config.server.listen_addr.parse()?;

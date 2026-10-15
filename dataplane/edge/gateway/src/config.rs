@@ -152,6 +152,12 @@ pub struct UpstreamConfig {
     pub routes: Vec<DomainRouteConfig>,
     pub health_check_path: String,
     pub timeout_ms: u64,
+    #[serde(default = "default_health_check_interval_secs")]
+    pub health_check_interval_secs: u64,
+}
+
+fn default_health_check_interval_secs() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +258,7 @@ impl Default for GatewayConfig {
                 routes: vec![],
                 health_check_path: "/healthz".to_string(),
                 timeout_ms: 5000,
+                health_check_interval_secs: 10,
             },
             rate_limit: RateLimitConfig {
                 enabled: true,

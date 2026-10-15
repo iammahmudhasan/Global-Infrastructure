@@ -3,6 +3,7 @@ pub mod body;
 pub mod cache;
 pub mod config;
 pub mod dns;
+pub mod health;
 pub mod proxy;
 pub mod rate_limit;
 pub mod router;
