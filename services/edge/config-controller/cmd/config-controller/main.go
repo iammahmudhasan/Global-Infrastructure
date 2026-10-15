@@ -174,6 +174,14 @@ func main() {
 		handler.CertManager().SetCertsDir(certsDir)
 		log.Printf("[INFO] Configured Dynamic Envoy SDS Certificate directory: %s", certsDir)
 
+		handler.STEKManager().SetCertsDir(certsDir)
+		if err := handler.STEKManager().EnsureKeys(); err != nil {
+			log.Printf("[WARN] Failed to ensure STEK session ticket keys: %v", err)
+		} else {
+			handler.STEKManager().Start()
+			log.Printf("[INFO] Initialized and started automated STEK session ticket key rotation engine")
+		}
+
 		// If server.crt and server.key exist, sync active certificate for dev fixture domain
 		certBytes, errCert := os.ReadFile(filepath.Join(certsDir, "server.crt"))
 		keyBytes, errKey := os.ReadFile(filepath.Join(certsDir, "server.key"))

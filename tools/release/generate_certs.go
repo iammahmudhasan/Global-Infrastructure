@@ -137,7 +137,56 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 2. Generate Dedicated PostgreSQL Database TLS certificates
+	// 2. Generate Initial STEK (Session Ticket Encryption Keys) for Cross-PoP TLS Resumption
+	stekDir := filepath.Join(envoyDir, "stek")
+	if err := os.MkdirAll(stekDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create stek directory %s: %v\n", stekDir, err)
+		os.Exit(1)
+	}
+
+	currentKeyPath := filepath.Join(stekDir, "current.key")
+	previousKeyPath := filepath.Join(stekDir, "previous.key")
+
+	for _, kPath := range []string{currentKeyPath, previousKeyPath} {
+		if _, err := os.Stat(kPath); os.IsNotExist(err) {
+			rawKey := make([]byte, 80)
+			if _, err := rand.Read(rawKey); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to generate random 80-byte STEK key: %v\n", err)
+				os.Exit(1)
+			}
+			if err := os.WriteFile(kPath, rawKey, 0644); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write %s: %v\n", kPath, err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	sdsStekPath := filepath.Join(envoyDir, "sds_stek.json")
+	sdsStekContent := `{
+  "resources": [
+    {
+      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+      "name": "dynamic_session_ticket_keys",
+      "session_ticket_keys": {
+        "keys": [
+          {
+            "filename": "/etc/envoy/certs/stek/current.key"
+          },
+          {
+            "filename": "/etc/envoy/certs/stek/previous.key"
+          }
+        ]
+      }
+    }
+  ]
+}
+`
+	if err := os.WriteFile(sdsStekPath, []byte(sdsStekContent), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write sds_stek.json: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 3. Generate Dedicated PostgreSQL Database TLS certificates
 	pgCert, pgKey, err := generateCertPair(
 		postgresDir,
 		"postgres.crt",
@@ -159,7 +208,7 @@ func main() {
 		_ = os.WriteFile(rootCaPath, certData, 0644)
 	}
 
-	fmt.Printf("Generated NexusEdge TLS certificates:\n")
-	fmt.Printf("  [Envoy Ingress]\n    - Cert: %s\n    - Key:  %s\n    - SDS:  %s\n", envoyCert, envoyKey, sdsPath)
-	fmt.Printf("  [PostgreSQL Sovereign DB]\n    - Cert: %s\n    - Key:  %s\n    - Root: %s\n", pgCert, pgKey, rootCaPath)
+	fmt.Printf("Generated NexusEdge TLS certificates & secrets:\n")
+	fmt.Printf("  [Envoy Ingress]\n    - Cert:     %s\n    - Key:      %s\n    - SDS:      %s\n    - STEK Dir: %s\n    - STEK SDS: %s\n", envoyCert, envoyKey, sdsPath, stekDir, sdsStekPath)
+	fmt.Printf("  [PostgreSQL Sovereign DB]\n    - Cert:     %s\n    - Key:      %s\n    - Root:     %s\n", pgCert, pgKey, rootCaPath)
 }

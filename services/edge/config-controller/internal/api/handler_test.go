@@ -4122,3 +4122,76 @@ func TestAuditIntegrity_UnreadyAndDomainVerificationAudit(t *testing.T) {
 		t.Fatalf("expected 503 on secret retrieval when audit chain invalid, got %d: %s", secW.Code, secW.Body.String())
 	}
 }
+
+func TestPoPSTEKRetrieval(t *testing.T) {
+	handler := setupTestServer()
+	authInst := handler.Authenticator()
+
+	tmpDir, err := os.MkdirTemp("", "stek-api-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	handler.STEKManager().SetCertsDir(tmpDir)
+	if err := handler.STEKManager().EnsureKeys(); err != nil {
+		t.Fatalf("EnsureKeys failed: %v", err)
+	}
+
+	authInst.RegisterNodeWithPoP("key-edge-node", "tenant-edge", "prj-global", "node-sin-01", "singapore")
+	authInst.RegisterTenantWithRole("key-tenant", "tenant-view", "prj-global", auth.RoleTenant, "singapore")
+
+	// 1. Authorized Edge Node for Singapore PoP -> 200 OK
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/stek", nil)
+	req.Header.Set("X-API-Key", "key-edge-node")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for authorized edge node, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		CurrentKeyB64  string `json:"current_key_base64"`
+		PreviousKeyB64 string `json:"previous_key_base64"`
+		KeySizeBytes   int    `json:"key_size_bytes"`
+		Status         string `json:"status"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("failed to unmarshal stek response: %v", err)
+	}
+
+	if resp.KeySizeBytes != 80 {
+		t.Fatalf("expected key_size_bytes 80, got %d", resp.KeySizeBytes)
+	}
+	if len(resp.CurrentKeyB64) == 0 || len(resp.PreviousKeyB64) == 0 {
+		t.Fatalf("expected non-empty base64 keys")
+	}
+
+	// 2. Unauthorized tenant role -> 403 Forbidden
+	reqViewer := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/stek", nil)
+	reqViewer.Header.Set("X-API-Key", "key-tenant")
+	wViewer := httptest.NewRecorder()
+	handler.ServeHTTP(wViewer, reqViewer)
+	if wViewer.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for tenant, got %d", wViewer.Code)
+	}
+
+	// 3. Edge node for different PoP (dhaka vs singapore) -> 403 Forbidden
+	reqDhaka := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/stek", nil)
+	reqDhaka.Header.Set("X-API-Key", "key-edge-node")
+	wDhaka := httptest.NewRecorder()
+	handler.ServeHTTP(wDhaka, reqDhaka)
+	if wDhaka.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for mismatched PoP, got %d", wDhaka.Code)
+	}
+
+	// 4. Invalid auth -> 401 Unauthorized
+	reqUnauth := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/singapore/stek", nil)
+	reqUnauth.Header.Set("X-API-Key", "invalid-api-key")
+	wUnauth := httptest.NewRecorder()
+	handler.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for invalid auth, got %d", wUnauth.Code)
+	}
+}

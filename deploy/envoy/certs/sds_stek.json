@@ -1,0 +1,18 @@
+{
+  "resources": [
+    {
+      "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+      "name": "dynamic_session_ticket_keys",
+      "session_ticket_keys": {
+        "keys": [
+          {
+            "filename": "/etc/envoy/certs/stek/current.key"
+          },
+          {
+            "filename": "/etc/envoy/certs/stek/previous.key"
+          }
+        ]
+      }
+    }
+  ]
+}

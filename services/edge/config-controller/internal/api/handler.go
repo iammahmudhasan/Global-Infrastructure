@@ -31,6 +31,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/pop"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/stek"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
@@ -43,6 +44,7 @@ type APIHandler struct {
 	monitor         *health.Monitor
 	smartRouter     *health.SmartRouter
 	certManager     *certificate.Manager
+	stekManager     *stek.Manager
 	analyticsEngine *analytics.Engine
 	popManager      *pop.Manager
 	authenticator   *auth.Authenticator
@@ -138,6 +140,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		monitor:         mon,
 		smartRouter:     health.NewSmartRouter(),
 		certManager:     certificate.NewManager(s),
+		stekManager:     stek.NewManager("", 0, stek.DefaultRotationInterval),
 		analyticsEngine: analytics.NewEngine(),
 		popManager:      pop.NewManager(),
 		authenticator:   authenticator,
@@ -251,6 +254,10 @@ func (h *APIHandler) AuditChainStatus() (bool, error) {
 
 func (h *APIHandler) CertManager() *certificate.Manager {
 	return h.certManager
+}
+
+func (h *APIHandler) STEKManager() *stek.Manager {
+	return h.stekManager
 }
 
 // SetDNSLookupForTest temporarily overrides the DNS resolution function for testing and returns a restore function.
@@ -2661,6 +2668,32 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleRetrieveSecretForPoP(w, r, popID)
+		return
+
+	case "stek":
+		if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+			writeError(w, http.StatusForbidden, "forbidden: operator or edge node role required")
+			return
+		}
+		if !h.authenticator.AuthorizePoP(r.Context(), popID) {
+			writeError(w, http.StatusForbidden, "forbidden: node is not authorized for target pop "+popID)
+			return
+		}
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed: must be GET")
+			return
+		}
+		curB64, prevB64, rotatedAt := h.stekManager.GetKeysBase64()
+		resp := map[string]interface{}{
+			"current_key_base64":  curB64,
+			"previous_key_base64": prevB64,
+			"rotated_at":          rotatedAt,
+			"key_size_bytes":      stek.KeySize,
+			"status":              "active",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
 		return
 
 	default:

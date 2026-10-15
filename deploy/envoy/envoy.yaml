@@ -98,6 +98,13 @@ static_resources:
                   path: "/etc/envoy/certs/sds.json"
                   watched_directory:
                     path: "/etc/envoy/certs"
+          session_ticket_keys_sds_secret_config:
+            name: "dynamic_session_ticket_keys"
+            sds_config:
+              path_config_source:
+                path: "/etc/envoy/certs/sds_stek.json"
+                watched_directory:
+                  path: "/etc/envoy/certs"
       filters:
       - name: envoy.filters.network.http_connection_manager
         typed_config:
