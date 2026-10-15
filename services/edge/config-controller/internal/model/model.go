@@ -573,10 +573,12 @@ func (p *AIProvider) ToResponse() AIProviderResponse {
 
 // LatencyRoute models inter-PoP or PoP-to-Origin physical fiber RTT
 type LatencyRoute struct {
-	FromPoP   string  `json:"from_pop"`
-	ToTarget  string  `json:"to_target"` // PoP ID or Origin Region
-	LatencyMs float64 `json:"latency_ms"`
-	Status    string  `json:"status"` // "ACTIVE", "CONGESTED"
+	FromPoP     string  `json:"from_pop"`
+	ToTarget    string  `json:"to_target"` // PoP ID or Origin Region
+	LatencyMs   float64 `json:"latency_ms"`
+	Status      string  `json:"status"` // "SIMULATED", "ACTIVE", "CONGESTED"
+	IsSimulated bool    `json:"is_simulated"`
+	Source      string  `json:"source"` // "ESTIMATED_FIBER_TRANSIT"
 }
 
 // GeoSteeringDecision represents intelligent origin selection for a request at a specific PoP

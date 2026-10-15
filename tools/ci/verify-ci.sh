@@ -68,6 +68,8 @@ echo " -> Rust check and tests passed."
 echo "[6/8] Verifying Python Intelligence scheduler..."
 python "${REPO_ROOT}/intelligence/scheduling/workload-scheduler/optimizer.py"
 echo " -> Python optimizer passed."
+python "${REPO_ROOT}/tools/ci/validate_manifests.py"
+echo " -> Infrastructure manifests verified."
 
 # 7. Dashboard Security & BFF Acceptance Gate
 echo "[7/8] Running Dashboard Security & BFF test suite..."
@@ -89,7 +91,7 @@ if command -v docker >/dev/null 2>&1; then
   docker compose -f "${REPO_ROOT}/deploy/docker-compose.yml" config --quiet
   POSTGRES_USER="nexusedge" \
   POSTGRES_PASSWORD="prodpassword123" \
-  NEXUSEDGE_DATABASE_URL="postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require" \
+  NEXUSEDGE_DATABASE_URL="postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=verify-full&sslrootcert=/etc/ssl/certs/pg_root.crt" \
   AUDIT_HMAC_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
   NEXUSEDGE_SECRET_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef" \
   NEXUSEDGE_CP_AUTH_TOKEN="ci-token-01" \

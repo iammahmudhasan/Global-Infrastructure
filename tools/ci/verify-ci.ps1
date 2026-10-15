@@ -124,6 +124,14 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host " -> Python optimizer passed." -ForegroundColor Green
 
+$ManifestValidator = Join-Path $RepoRoot "tools/ci/validate_manifests.py"
+& $PythonExe $ManifestValidator
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Infrastructure manifest validation failed." -ForegroundColor Red
+    exit 1
+}
+Write-Host " -> Infrastructure manifests verified." -ForegroundColor Green
+
 # 7. Dashboard Security & BFF Acceptance Gate
 Write-Host "[7/8] Running Dashboard Security & BFF test suite..." -ForegroundColor Yellow
 $DashboardDir = Join-Path $RepoRoot "apps/dashboard"
@@ -161,7 +169,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     }
     $env:POSTGRES_USER = "nexusedge"
     $env:POSTGRES_PASSWORD = "prodpassword123"
-    $env:NEXUSEDGE_DATABASE_URL = "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=require"
+    $env:NEXUSEDGE_DATABASE_URL = "postgres://nexusedge:prodpassword123@172.30.0.5:5432/nexusedge_edge?sslmode=verify-full&sslrootcert=/etc/ssl/certs/pg_root.crt"
     $env:AUDIT_HMAC_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     $env:NEXUSEDGE_SECRET_ENCRYPTION_KEY = "0123456789abcdef0123456789abcdef"
     $env:NEXUSEDGE_CP_AUTH_TOKEN = "ci-token-01"

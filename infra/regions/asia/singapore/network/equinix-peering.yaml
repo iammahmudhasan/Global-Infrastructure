@@ -1,35 +1,44 @@
 # NexusEdge Global Infrastructure - Region Network Specification
 # Region: asia-southeast1 (Singapore)
 # Peering Authority: Equinix Internet Exchange Singapore (SG1)
-# Primary Production Anchor: Oracle Cloud Infrastructure VM (80.225.241.129)
+# Primary Host Unicast IP: 80.225.241.129 (Oracle OCI ap-singapore-1)
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION (RFC 5737 / RFC 3849 / RFC 6996)
 
 apiVersion: infrastructure.nexusedge.io/v1alpha1
 kind: PeeringPolicy
 metadata:
   name: equinix-peering-singapore
-  region: asia-southeast1
-  city: Singapore
-  country: SG
-  datacenter: Equinix SG1 / Oracle OCI ap-singapore-1
+  labels:
+    region: asia-southeast1
+    city: singapore
+    country: sg
+    datacenter: equinix-sg1
+    tier: simulation-testbed
 spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
+  host_unicast_ip: "80.225.241.129"
+  rfc_disclaimer:
+    ipv4: "Prefix 198.51.100.0/24 is reserved for documentation/testbeds under RFC 5737 (TEST-NET-2); not routeable on public Internet."
+    ipv6: "Prefix 2001:db8:sg::/48 is reserved for documentation under RFC 3849; not routeable on public Internet."
+    asn: "ASN 64512 is reserved for private use under RFC 6996; not a globally unique public ASN."
   local_asn: 64512
   route_servers:
     - asn: 24115
       name: "Equinix SG1 IX Route Server 01"
       ipv4_peer: "198.51.100.250"
       ipv6_peer: "2001:db8:sg::1"
-      status: ACTIVE
+      status: SIMULATION_STANDBY
       max_prefixes: 15000
     - asn: 24115
       name: "Equinix SG1 IX Route Server 02 (Redundant)"
       ipv4_peer: "198.51.100.249"
       ipv6_peer: "2001:db8:sg::2"
-      status: ACTIVE
+      status: SIMULATION_STANDBY
       max_prefixes: 15000
 
   advertised_prefixes:
     ipv4:
-      - "80.225.241.129/32"
       - "198.51.100.0/24"
     ipv6:
       - "2001:db8:sg::/48"
@@ -39,7 +48,7 @@ spec:
     med: 20
     community_tags:
       - "64512:1002" # APAC Regional Transit
-      - "64512:3001" # Global Anycast Ingress
+      - "64512:3001" # Global Anycast Ingress Testbed
     target_regional_latency_ms: 15.0
 
   subsea_transit_links:

@@ -1,16 +1,20 @@
 # NexusEdge Global Infrastructure - Region Compute Specification
 # Region: asia-south1 (Dhaka, Bangladesh)
 # Node: bd-dhaka-edge01
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION
 
 apiVersion: infrastructure.nexusedge.io/v1alpha1
 kind: EdgeNodeSpecification
 metadata:
   name: bd-dhaka-edge01
-  pop_id: dhaka
-  region: asia-south1
-  jurisdiction: BD
-  compliance: BD-NDMA-2026-CII
+  labels:
+    pop_id: dhaka
+    region: asia-south1
+    jurisdiction: bd
+    compliance: bd-ndma-2026-cii
 spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
   hostname: "bd-dhaka-edge01.nexusedge.internal"
   management_ip: "198.51.100.11"
   anycast_virtual_ip: "198.51.100.1"

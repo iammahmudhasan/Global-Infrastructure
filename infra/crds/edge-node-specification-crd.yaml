@@ -1,0 +1,115 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: edgenodespecifications.infrastructure.nexusedge.io
+spec:
+  group: infrastructure.nexusedge.io
+  names:
+    kind: EdgeNodeSpecification
+    listKind: EdgeNodeSpecificationList
+    plural: edgenodespecifications
+    singular: edgenodespecification
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - hostname
+                - role
+                - tier
+              properties:
+                tier:
+                  type: string
+                  enum: ["SIMULATION_TESTBED", "PROPOSED_SPECIFICATION", "PRODUCTION_ANCHOR"]
+                status:
+                  type: string
+                hostname:
+                  type: string
+                public_ip:
+                  type: string
+                management_ip:
+                  type: string
+                anycast_virtual_ip:
+                  type: string
+                role:
+                  type: string
+                hardware:
+                  type: object
+                  properties:
+                    provider:
+                      type: string
+                    instance_shape:
+                      type: string
+                    cpu_cores:
+                      type: integer
+                    cpu_model:
+                      type: string
+                    memory_gb:
+                      type: integer
+                    boot_volume_gb:
+                      type: integer
+                    nvme_cache_gb:
+                      type: integer
+                    network_interfaces:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          speed_gbps:
+                            type: integer
+                          driver:
+                            type: string
+                          xdp_acceleration:
+                            type: string
+                runtime:
+                  type: object
+                  properties:
+                    dataplane:
+                      type: string
+                    ingress_proxy:
+                      type: string
+                    config_controller:
+                      type: string
+                    database:
+                      type: string
+                    dashboard_bff:
+                      type: string
+                    cache_engine:
+                      type: string
+                    waf_engine:
+                      type: string
+                containers:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      ports:
+                        type: array
+                        items:
+                          type: string
+                      desired_state:
+                        type: string
+                sovereignty:
+                  type: object
+                  properties:
+                    strict_data_residency:
+                      type: boolean
+                    cryptographic_audit_logging:
+                      type: boolean
+                    cross_border_egress_blocked:
+                      type: boolean
+                    national_cii_registered:
+                      type: boolean
+                    gdpr_article_44_compliant:
+                      type: boolean

@@ -199,32 +199,39 @@ func (d *ThrottledDispatcher) IsConfigured() bool {
 // SendAlert evaluates throttling rules:
 // - CRITICAL state transitions (e.g. DOWN or RECOVERED) bypass cooldown and are delivered immediately.
 // - WARNING alerts (e.g. HIGH_LATENCY) are deduplicated per origin within the cooldown window.
+// - Timestamp is committed ONLY after successful delivery so failed attempts are eligible for retry.
 func (d *ThrottledDispatcher) SendAlert(ctx context.Context, event Event) error {
 	if d.inner == nil || !d.inner.IsConfigured() {
 		return nil
 	}
 
-	// Immediate bypass for state flip events
-	if event.Type == "ORIGIN_DOWN" || event.Type == "ORIGIN_RECOVERED" || event.Type == "TEST" {
-		d.mu.Lock()
-		key := fmt.Sprintf("%s:%s", event.Origin, event.Type)
-		d.lastSent[key] = time.Now()
-		d.mu.Unlock()
-		return d.inner.SendAlert(ctx, event)
+	key := fmt.Sprintf("%s:%s", event.Origin, event.Type)
+
+	// Check suppression under lock
+	d.mu.Lock()
+	if event.Type != "ORIGIN_DOWN" && event.Type != "ORIGIN_RECOVERED" && event.Type != "TEST" {
+		last, exists := d.lastSent[key]
+		if exists && time.Since(last) < d.cooldownMins {
+			d.mu.Unlock()
+			// Suppressed by cooldown window
+			return nil
+		}
+	}
+	d.mu.Unlock()
+
+	// Attempt delivery first
+	err := d.inner.SendAlert(ctx, event)
+	if err != nil {
+		// Delivery failed: do NOT commit lastSent timestamp so subsequent attempts are not suppressed
+		return err
 	}
 
+	// Commit timestamp only upon verified delivery
 	d.mu.Lock()
-	key := fmt.Sprintf("%s:%s", event.Origin, event.Type)
-	last, exists := d.lastSent[key]
-	if exists && time.Since(last) < d.cooldownMins {
-		d.mu.Unlock()
-		// Suppressed by cooldown window
-		return nil
-	}
 	d.lastSent[key] = time.Now()
 	d.mu.Unlock()
 
-	return d.inner.SendAlert(ctx, event)
+	return nil
 }
 
 // MultiAlerter dispatches events to all configured alerters concurrently.
@@ -253,6 +260,7 @@ func (m *MultiAlerter) IsConfigured() bool {
 
 func (m *MultiAlerter) SendAlert(ctx context.Context, event Event) error {
 	var errs []string
+	var errMu sync.Mutex
 	var wg sync.WaitGroup
 
 	for _, a := range m.alerters {
@@ -263,7 +271,9 @@ func (m *MultiAlerter) SendAlert(ctx context.Context, event Event) error {
 		go func(target Alerter) {
 			defer wg.Done()
 			if err := target.SendAlert(ctx, event); err != nil {
+				errMu.Lock()
 				errs = append(errs, err.Error())
+				errMu.Unlock()
 			}
 		}(a)
 	}

@@ -294,10 +294,12 @@ func (m *Manager) GetLatencyMatrix() []model.LatencyRoute {
 	for from, targets := range m.latencyMatrix {
 		for to, latency := range targets {
 			routes = append(routes, model.LatencyRoute{
-				FromPoP:   from,
-				ToTarget:  to,
-				LatencyMs: latency,
-				Status:    "ACTIVE",
+				FromPoP:     from,
+				ToTarget:    to,
+				LatencyMs:   latency,
+				Status:      "SIMULATED",
+				IsSimulated: true,
+				Source:      "ESTIMATED_FIBER_TRANSIT",
 			})
 		}
 	}

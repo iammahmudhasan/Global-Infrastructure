@@ -1,16 +1,20 @@
 # NexusEdge Global Infrastructure - Region Compute Specification
 # Region: europe-west3 (Frankfurt, Germany)
 # Node: de-frankfurt-edge01
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION
 
 apiVersion: infrastructure.nexusedge.io/v1alpha1
 kind: EdgeNodeSpecification
 metadata:
   name: de-frankfurt-edge01
-  pop_id: frankfurt
-  region: europe-west3
-  jurisdiction: EU
-  compliance: EU-GDPR-Sovereign
+  labels:
+    pop_id: frankfurt
+    region: europe-west3
+    jurisdiction: eu
+    compliance: eu-gdpr-sovereign
 spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
   hostname: "de-frankfurt-edge01.nexusedge.internal"
   management_ip: "198.51.100.21"
   anycast_virtual_ip: "198.51.100.1"

@@ -106,7 +106,7 @@ func main() {
 		"server.key",
 		"*.nexusedge.internal",
 		[]string{"NexusEdge Staging Ingress"},
-		[]string{"localhost", "*.nexusedge.internal", "api.nexusedge.io", "app.nexusedge.io", "customer-a.example.com"},
+		[]string{"localhost", "*.nexusedge.internal", "api.nexusedge.io", "app.nexusedge.io", "customer-a.example.com", "aeitron.com", "dashboard.aeitron.com", "api.aeitron.com"},
 		[]net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
 	)
 	if err != nil {

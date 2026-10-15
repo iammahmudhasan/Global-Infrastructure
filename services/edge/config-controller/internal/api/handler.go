@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,6 +242,13 @@ func (h *APIHandler) IsAuditChainValid() bool {
 	return h.auditChainValid
 }
 
+// AuditChainStatus returns both the validity and error of the cryptographic audit chain under lock.
+func (h *APIHandler) AuditChainStatus() (bool, error) {
+	h.auditWriteMu.Lock()
+	defer h.auditWriteMu.Unlock()
+	return h.auditChainValid, h.auditChainErr
+}
+
 func (h *APIHandler) CertManager() *certificate.Manager {
 	return h.certManager
 }
@@ -337,11 +345,12 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if !h.auditChainValid {
+	valid, chainErr := h.AuditChainStatus()
+	if !valid {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 			"status":  "unready",
 			"error":   "audit chain integrity degraded or failed startup verification",
-			"details": fmt.Sprintf("%v", h.auditChainErr),
+			"details": fmt.Sprintf("%v", chainErr),
 			"service": "nexusedge-config-controller",
 		})
 		return
@@ -501,9 +510,8 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 	actor := "system"
 	clientIP := ""
 	if r != nil {
-		if humanActor := r.Header.Get("X-Authenticated-Actor"); humanActor != "" {
-			actor = humanActor
-		} else if tc, ok := auth.FromContext(r.Context()); ok {
+		tc, ok := auth.FromContext(r.Context())
+		if ok {
 			if tc.TenantID != "" {
 				actor = tc.TenantID
 				if orgID == "" {
@@ -513,6 +521,15 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 			if projectID == "" && tc.ProjectID != "" {
 				projectID = tc.ProjectID
 			}
+			// Problem 8: Strictly validate caller's service authority before trusting human delegation header
+			if tc.Role == auth.RolePlatformOperator {
+				if humanActor := r.Header.Get("X-Authenticated-Actor"); humanActor != "" {
+					actor = humanActor
+				}
+			}
+		} else if humanActor := r.Header.Get("X-Authenticated-Actor"); humanActor != "" && (os.Getenv("NEXUSEDGE_DEV_MODE") == "true" || os.Getenv("ENV") == "test") {
+			// Permitted in explicit testbed or dev environments
+			actor = humanActor
 		}
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err == nil {
@@ -2524,8 +2541,14 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 				return
 			}
+			existingPop, err := h.popManager.GetPoP(popID)
+			if err != nil {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			prevState := existingPop.BGPState
+
 			var updated *model.EdgePoP
-			var err error
 			if bgpAction == "announce" {
 				updated, err = h.popManager.SetBGPState(popID, model.BGPStateAnnounced)
 			} else if bgpAction == "withdraw" {
@@ -2538,6 +2561,18 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
 			}
+
+			// Problem 4: Record cryptographic audit event for BGP state mutation
+			_ = h.recordAudit(r, "", "", "bgp.simulation_state_changed", "edge_pop", popID, map[string]interface{}{
+				"pop_id":                     popID,
+				"action":                     bgpAction,
+				"previous_state":             string(prevState),
+				"new_state":                  string(updated.BGPState),
+				"status":                     string(updated.Status),
+				"simulated":                  true,
+				"external_speaker_connected": false,
+			})
+
 			writeJSON(w, http.StatusOK, updated)
 			return
 		}
@@ -2634,8 +2669,9 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *APIHandler) handleRetrieveSecretForPoP(w http.ResponseWriter, r *http.Request, popID string) {
-	if !h.auditChainValid {
-		writeError(w, http.StatusServiceUnavailable, "secret retrieval denied: control plane audit chain verification failed")
+	valid, chainErr := h.AuditChainStatus()
+	if !valid {
+		writeError(w, http.StatusServiceUnavailable, fmt.Sprintf("secret retrieval denied: control plane audit chain verification failed: %v", chainErr))
 		return
 	}
 	release, ok := h.acquireControlPlaneSlot(w, r)
@@ -2744,6 +2780,9 @@ func (h *APIHandler) handleRoutingRoute(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"routes_count": len(matrix),
 			"routes":       matrix,
+			"is_simulated": true,
+			"source":       "ESTIMATED_FIBER_TRANSIT",
+			"notice":       "Inter-PoP latency matrix represents estimated physical fiber RTT (SMW6, AAE-1, TAT-14). Live probe verification requires external telemetry daemon.",
 		})
 
 	case "steer":
@@ -3599,9 +3638,12 @@ func (h *APIHandler) handleAlertsTestRoute(w http.ResponseWriter, r *http.Reques
 
 	err := h.alerter.SendAlert(r.Context(), event)
 	if err != nil {
+		sanitizedMsg := err.Error()
+		re := regexp.MustCompile(`(?i)(bot[0-9]+:)[a-zA-Z0-9_-]+`)
+		sanitizedMsg = re.ReplaceAllString(sanitizedMsg, "${1}<REDACTED_TOKEN>")
 		writeJSON(w, http.StatusBadGateway, map[string]interface{}{
 			"status":  "error",
-			"message": fmt.Sprintf("Failed to deliver test alert via Telegram: %v", err),
+			"message": fmt.Sprintf("Failed to deliver test alert via Telegram: %s", sanitizedMsg),
 		})
 		return
 	}

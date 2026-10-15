@@ -45,12 +45,28 @@ func ValidateProductionDatabaseURL(databaseURL string) error {
 		}
 	}
 
-	if sslmode == "" || sslmode == "disable" || sslmode == "allow" || sslmode == "prefer" {
-		return fmt.Errorf("production database connection strictly requires TLS encryption; sslmode=%q is forbidden (must be require, verify-ca, or verify-full)", sslmode)
+	if sslmode != "verify-full" {
+		return fmt.Errorf("production database connection strictly mandates sslmode=verify-full (rejecting %q) to guarantee server certificate and hostname verification (Rule 1, Rule 18)", sslmode)
 	}
 
-	if sslmode != "require" && sslmode != "verify-ca" && sslmode != "verify-full" {
-		return fmt.Errorf("unrecognized or insecure sslmode %q for production database; must be require, verify-ca, or verify-full", sslmode)
+	// Verify sslrootcert is provided in connection parameters or PGSSLROOTCERT env var
+	sslrootcert := ""
+	if strings.HasPrefix(raw, "postgres://") || strings.HasPrefix(raw, "postgresql://") {
+		if parsed, err := url.Parse(raw); err == nil {
+			sslrootcert = parsed.Query().Get("sslrootcert")
+		}
+	} else {
+		for _, part := range strings.Fields(raw) {
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) == 2 && strings.ToLower(strings.TrimSpace(kv[0])) == "sslrootcert" {
+				sslrootcert = strings.Trim(strings.TrimSpace(kv[1]), `'"'`)
+				break
+			}
+		}
+	}
+
+	if sslrootcert == "" && os.Getenv("PGSSLROOTCERT") == "" {
+		return errors.New("production database connection strictly requires sslrootcert parameter or PGSSLROOTCERT environment variable when using sslmode=verify-full")
 	}
 
 	return nil

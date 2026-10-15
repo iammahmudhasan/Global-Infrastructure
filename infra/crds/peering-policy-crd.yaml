@@ -1,0 +1,113 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: peeringpolicies.infrastructure.nexusedge.io
+spec:
+  group: infrastructure.nexusedge.io
+  names:
+    kind: PeeringPolicy
+    listKind: PeeringPolicyList
+    plural: peeringpolicies
+    singular: peeringpolicy
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - local_asn
+                - tier
+                - route_servers
+                - advertised_prefixes
+              properties:
+                tier:
+                  type: string
+                  enum: ["SIMULATION_TESTBED", "PROPOSED_SPECIFICATION", "PRODUCTION_VERIFIED"]
+                status:
+                  type: string
+                local_asn:
+                  type: integer
+                host_unicast_ip:
+                  type: string
+                rfc_disclaimer:
+                  type: object
+                  properties:
+                    ipv4:
+                      type: string
+                    ipv6:
+                      type: string
+                    asn:
+                      type: string
+                route_servers:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - asn
+                      - name
+                      - ipv4_peer
+                      - ipv6_peer
+                    properties:
+                      asn:
+                        type: integer
+                      name:
+                        type: string
+                      ipv4_peer:
+                        type: string
+                      ipv6_peer:
+                        type: string
+                      status:
+                        type: string
+                      max_prefixes:
+                        type: integer
+                advertised_prefixes:
+                  type: object
+                  properties:
+                    ipv4:
+                      type: array
+                      items:
+                        type: string
+                    ipv6:
+                      type: array
+                      items:
+                        type: string
+                routing_policy:
+                  type: object
+                  properties:
+                    local_preference:
+                      type: integer
+                    med:
+                      type: integer
+                    community_tags:
+                      type: array
+                      items:
+                        type: string
+                    target_domestic_latency_ms:
+                      type: number
+                    target_regional_latency_ms:
+                      type: number
+                    intra_metro_fiber_latency_ms:
+                      type: number
+                subsea_transit_links:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      cable_system:
+                        type: string
+                      landing_station:
+                        type: string
+                      remote_pop:
+                        type: string
+                      capacity_gbps:
+                        type: integer
+                      sla_rtt_ms:
+                        type: number
+                      status:
+                        type: string

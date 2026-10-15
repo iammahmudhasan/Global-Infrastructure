@@ -525,6 +525,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     }
 
     // Edge PoPs & Multi-PoP Global Topology
+    // Edge PoPs & Multi-PoP Global Topology
     async function loadPoPs() {
       const tbody = document.getElementById('pops-table-tbody');
       const badge = document.getElementById('pops-source-badge');
@@ -537,7 +538,11 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
           const pops = data.pops || [];
           if (pops.length > 0) {
             tbody.innerHTML = '';
+            let hasSimulated = false;
+
             pops.forEach(pop => {
+              const isSimulated = pop.is_simulated || pop.mode === 'SIMULATION' || pop.source === 'SIMULATED';
+              if (isSimulated) hasSimulated = true;
               const tr = document.createElement('tr');
 
               // 1. PoP ID / Region
@@ -564,42 +569,45 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
               spanName.textContent = pop.name || '';
               tdLoc.append(strongCity, textCountry, br2, spanName);
 
-              // 3. Anycast Routing
+              // 3. Anycast Routing (Explicitly distinguish RFC Testbed vs. Unicast Host)
               const tdAnycast = document.createElement('td');
               tdAnycast.className = 'mono';
-              const isLiveProd = pop.id === 'singapore';
               const spanIp = document.createElement('span');
-              spanIp.className = `badge ${isLiveProd ? 'badge-bd' : 'badge-subtle'}`;
-              spanIp.textContent = pop.anycast_ipv4 || '198.51.100.1';
+              spanIp.className = 'badge badge-subtle';
+              const isSingaporeHost = pop.id === 'singapore';
+              const ipLabel = pop.anycast_ipv4 || (isSingaporeHost ? '80.225.241.129' : '198.51.100.1');
+              spanIp.textContent = isSimulated
+                ? (isSingaporeHost ? `${ipLabel} (Host)` : `${ipLabel} (RFC 5737)`)
+                : ipLabel;
               const br3 = document.createElement('br');
               const spanAsn = document.createElement('span');
               spanAsn.style.fontSize = '0.72rem';
               spanAsn.style.color = 'var(--text-muted)';
-              spanAsn.textContent = `AS${pop.asn || 64512}`;
+              spanAsn.textContent = isSimulated ? `AS${pop.asn || 64512} (RFC 6996)` : `AS${pop.asn || 64512}`;
               tdAnycast.append(spanIp, br3, spanAsn);
 
-              // 4. Target Peering / SLA
+              // 4. Target Peering / SLA / Topology Truthfulness
               const tdPeering = document.createElement('td');
               let peeringText = 'Global Anycast';
               let slaText = 'Subsea Transit';
               if (pop.id === 'dhaka') {
                 peeringText = 'BDIX Peering (167 ISPs)';
-                slaText = '< 10 ms (Domestic BD-NDMA 2026)';
+                slaText = isSimulated ? 'Testbed Target (< 10 ms BD-NDMA 2026)' : '< 10 ms (Domestic BD-NDMA 2026)';
               } else if (pop.id === 'singapore') {
                 peeringText = 'Equinix SG1 / SMW6 Direct';
-                slaText = 'Active Live Production Anchor';
+                slaText = isSimulated ? 'Single-PoP Host Anchor (Simulation)' : 'Active Live Production Anchor';
               } else if (pop.id === 'frankfurt') {
                 peeringText = 'DE-CIX Frankfurt Peering';
-                slaText = '14 ms (EU GDPR Sovereign)';
+                slaText = isSimulated ? 'Testbed Target (14 ms EU GDPR)' : '14 ms (EU GDPR Sovereign)';
               } else if (pop.id === 'virginia') {
                 peeringText = 'Equinix Ashburn DC2';
-                slaText = '22 ms (Lowest Cost US)';
+                slaText = isSimulated ? 'Testbed Target (22 ms US East)' : '22 ms (Lowest Cost US)';
               }
               const strongPeer = document.createElement('strong');
               strongPeer.textContent = peeringText;
               const br4 = document.createElement('br');
               const spanSla = document.createElement('span');
-              spanSla.className = 'text-emerald';
+              spanSla.className = isSimulated ? 'text-amber' : 'text-emerald';
               spanSla.style.fontSize = '0.75rem';
               spanSla.textContent = slaText;
               tdPeering.append(strongPeer, br4, spanSla);
@@ -608,16 +616,17 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
               const tdBgp = document.createElement('td');
               const isAnnounced = pop.bgp_state === 'ANNOUNCED';
               const spanBgp = document.createElement('span');
-              spanBgp.className = `badge ${isAnnounced ? 'badge-bd' : 'badge-amber'}`;
-              spanBgp.textContent = pop.bgp_state || 'UNKNOWN';
+              spanBgp.className = `badge ${isAnnounced ? (isSimulated ? 'badge-amber' : 'badge-bd') : 'badge-subtle'}`;
+              spanBgp.textContent = isSimulated ? `SIMULATED_${pop.bgp_state || 'STANDBY'}` : (pop.bgp_state || 'UNKNOWN');
               const br5 = document.createElement('br');
               const spanStatus = document.createElement('span');
               spanStatus.style.fontSize = '0.72rem';
               spanStatus.style.color = 'var(--text-muted)';
-              spanStatus.textContent = pop.status || '';
+              const nodeInfo = (pop.node_count !== undefined) ? `${pop.node_count} Nodes` : '';
+              spanStatus.textContent = `${pop.status || ''} ${nodeInfo}`.trim();
               tdBgp.append(spanBgp, br5, spanStatus);
 
-              // 6. Actions
+              // 6. Actions (Reflect simulation boundaries clearly)
               const tdActions = document.createElement('td');
               const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
               if (isOperator) {
@@ -625,14 +634,16 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
                 btn.className = `btn btn-sm ${isAnnounced ? 'btn-danger' : 'btn-primary'}`;
                 btn.style.fontSize = '0.72rem';
                 btn.style.padding = '0.2rem 0.5rem';
-                btn.textContent = isAnnounced ? 'Drain (Withdraw)' : 'Announce Anycast';
+                btn.textContent = isSimulated
+                  ? (isAnnounced ? 'Simulate Drain' : 'Simulate Announce')
+                  : (isAnnounced ? 'Drain (Withdraw)' : 'Announce Anycast');
                 btn.onclick = () => togglePoPBGP(pop.id, isAnnounced ? 'withdraw' : 'announce');
                 tdActions.appendChild(btn);
               } else {
                 const spanIngress = document.createElement('span');
                 spanIngress.style.fontSize = '0.75rem';
                 spanIngress.style.color = 'var(--text-muted)';
-                spanIngress.textContent = isLiveProd ? 'Primary Gateway' : 'Active Ingress';
+                spanIngress.textContent = isSimulated ? 'Simulated Route' : (isSingaporeHost ? 'Primary Gateway' : 'Active Ingress');
                 tdActions.appendChild(spanIngress);
               }
 
@@ -641,14 +652,22 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
             });
 
             if (badge) {
-              badge.className = 'badge badge-bd';
-              badge.innerText = `LIVE MULTI-POP FLEET (${pops.length} POPS SYNCHRONIZED)`;
+              if (hasSimulated) {
+                badge.className = 'badge badge-amber';
+                badge.innerText = `SIMULATED TESTBED (${pops.length} POPS IN-MEMORY)`;
+              } else {
+                badge.className = 'badge badge-bd';
+                badge.innerText = `LIVE MULTI-POP FLEET (${pops.length} POPS SYNCHRONIZED)`;
+              }
             }
             return;
           }
         }
       } catch (err) {
-        // Keep fallback table if offline
+        if (badge) {
+          badge.className = 'badge badge-rose';
+          badge.innerText = 'TOPOLOGY CONTROL PLANE OFFLINE';
+        }
       }
     }
 
@@ -659,7 +678,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         });
         if (resp.ok) {
           const data = await resp.json();
-          showToast(`PoP '${popId}' BGP state updated to ${data.bgp_state} (${data.status}).`);
+          showToast(`PoP '${popId}' simulated BGP state updated to ${data.bgp_state} (${data.status}). External BGP speaker integration required for physical routing.`);
           loadPoPs();
           return;
         }
@@ -671,19 +690,73 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     }
 
     async function loadLatencyMatrix() {
+      const tbody = document.getElementById('matrix-table-tbody');
       const badge = document.getElementById('matrix-source-badge');
       try {
         const resp = await fetch('/api/proxy/pops/matrix');
         if (resp.ok) {
           const data = await resp.json();
           const routes = data.routes || [];
-          if (routes.length > 0 && badge) {
-            badge.className = 'badge badge-bd';
-            badge.innerText = `LIVE SUBSEA TRANSIT (${routes.length} MATRIX PATHS VERIFIED)`;
+          if (routes.length > 0) {
+            if (tbody) {
+              // Extract distinct PoPs dynamically from routes
+              const popSet = new Set();
+              routes.forEach(r => {
+                if (r.from_pop) popSet.add(r.from_pop);
+                if (r.to_pop) popSet.add(r.to_pop);
+              });
+              const popList = Array.from(popSet);
+              const matrixMap = {};
+              routes.forEach(r => {
+                if (!matrixMap[r.from_pop]) matrixMap[r.from_pop] = {};
+                matrixMap[r.from_pop][r.to_pop] = r.latency_ms;
+              });
+
+              tbody.innerHTML = '';
+              popList.forEach(fromPop => {
+                const tr = document.createElement('tr');
+                const tdHeader = document.createElement('td');
+                const strongFrom = document.createElement('strong');
+                strongFrom.textContent = fromPop.charAt(0).toUpperCase() + fromPop.slice(1);
+                tdHeader.appendChild(strongFrom);
+                tr.appendChild(tdHeader);
+
+                popList.forEach(toPop => {
+                  const td = document.createElement('td');
+                  if (fromPop === toPop) {
+                    td.className = 'text-emerald';
+                    const strongZero = document.createElement('strong');
+                    strongZero.textContent = '0 ms';
+                    td.appendChild(strongZero);
+                  } else {
+                    const lat = (matrixMap[fromPop] && matrixMap[fromPop][toPop] !== undefined)
+                      ? matrixMap[fromPop][toPop]
+                      : '-';
+                    td.textContent = typeof lat === 'number' ? `${lat} ms` : lat;
+                  }
+                  tr.appendChild(td);
+                });
+                tbody.appendChild(tr);
+              });
+            }
+
+            if (badge) {
+              if (data.is_simulated) {
+                badge.className = 'badge badge-amber';
+                badge.innerText = `SIMULATED FIBER TRANSIT (${routes.length} PATHS ESTIMATED)`;
+              } else {
+                badge.className = 'badge badge-bd';
+                badge.innerText = `LIVE SUBSEA TRANSIT (${routes.length} MATRIX PATHS VERIFIED)`;
+              }
+            }
+            return;
           }
         }
       } catch (err) {
-        // Fallback
+        if (badge) {
+          badge.className = 'badge badge-rose';
+          badge.innerText = 'TRANSIT METRICS UNAVAILABLE';
+        }
       }
     }
 

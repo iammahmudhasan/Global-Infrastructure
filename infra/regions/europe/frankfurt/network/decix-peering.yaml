@@ -2,29 +2,38 @@
 # Region: europe-west3 (Frankfurt, Germany)
 # Peering Authority: Deutscher Commercial Internet Exchange (DE-CIX Frankfurt)
 # Compliance: European Union General Data Protection Regulation (GDPR) Art 44-50
+# Status: SIMULATION_TESTBED / PROPOSED_SPECIFICATION (RFC 5737 / RFC 3849 / RFC 6996)
 
 apiVersion: infrastructure.nexusedge.io/v1alpha1
 kind: PeeringPolicy
 metadata:
   name: decix-peering-frankfurt
-  region: europe-west3
-  city: Frankfurt
-  country: DE
-  datacenter: Equinix FR5 / DE-CIX Frankfurt
+  labels:
+    region: europe-west3
+    city: frankfurt
+    country: de
+    datacenter: equinix-fr5
+    compliance: eu-gdpr
 spec:
+  tier: "SIMULATION_TESTBED"
+  status: "PROPOSED_SPECIFICATION"
+  rfc_disclaimer:
+    ipv4: "Prefix 198.51.100.0/24 is reserved for documentation/testbeds under RFC 5737 (TEST-NET-2); not routeable on public Internet."
+    ipv6: "Prefix 2001:db8:de::/48 is reserved for documentation under RFC 3849; not routeable on public Internet."
+    asn: "ASN 64512 is reserved for private use under RFC 6996; not a globally unique public ASN."
   local_asn: 64512
   route_servers:
     - asn: 6695
       name: "DE-CIX Route Server 01"
       ipv4_peer: "198.51.100.245"
       ipv6_peer: "2001:db8:de::1"
-      status: ACTIVE
+      status: SIMULATION_STANDBY
       max_prefixes: 30000
     - asn: 6695
       name: "DE-CIX Route Server 02 (Redundant)"
       ipv4_peer: "198.51.100.244"
       ipv6_peer: "2001:db8:de::2"
-      status: ACTIVE
+      status: SIMULATION_STANDBY
       max_prefixes: 30000
 
   advertised_prefixes:

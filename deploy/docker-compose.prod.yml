@@ -20,8 +20,8 @@ services:
       - "PORT=9091"
       - "NEXUSEDGE_DEV_MODE=false"
       - "NEXUSEDGE_ENV=production"
-      # Enforce TLS-enabled database connection string in production
-      - "NEXUSEDGE_DATABASE_URL=${NEXUSEDGE_DATABASE_URL:?NEXUSEDGE_DATABASE_URL with TLS is required (e.g. sslmode=verify-full or sslmode=require)}"
+      # Enforce TLS-enabled database connection string in production (mandating sslmode=verify-full)
+      - "NEXUSEDGE_DATABASE_URL=${NEXUSEDGE_DATABASE_URL:?NEXUSEDGE_DATABASE_URL with TLS is required (e.g. sslmode=verify-full&sslrootcert=/etc/ssl/certs/pg_root.crt)}"
       - "NEXUSEDGE_ACME_HOST=config-controller"
       - "NEXUSEDGE_ACME_PORT=9091"
       - "NEXUSEDGE_CERTS_DIR=/etc/envoy/certs"
