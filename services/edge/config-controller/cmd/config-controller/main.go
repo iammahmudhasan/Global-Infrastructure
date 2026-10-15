@@ -221,11 +221,10 @@ func main() {
 	}
 
 	server := &http.Server{
-		Addr:         fmt.Sprintf(":%s", port),
-		Handler:      handler,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              fmt.Sprintf(":%s", port),
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	// 5. Background Sweeper Task (Garbage-collect unverified pending domains older than 24h - Finding 4)

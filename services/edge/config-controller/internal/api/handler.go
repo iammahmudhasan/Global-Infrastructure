@@ -2735,6 +2735,9 @@ func (h *APIHandler) handlePoPEventsStream(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
