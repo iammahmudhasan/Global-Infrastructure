@@ -160,7 +160,21 @@ mod tests {
         };
 
         let (url, host) = construct_probe_request_params(&target, "/healthz");
-        assert_eq!(url, "https://aeitron.com:443/healthz");
+        assert_eq!(url, "https://aeitron.com/healthz");
+        assert_eq!(host, "aeitron.com");
+    }
+
+    #[test]
+    fn test_construct_probe_request_params_custom_port() {
+        let target = HealthProbeTarget {
+            url: "https://185.232.14.188:8443".to_string(),
+            host_header: "aeitron.com".to_string(),
+            sni: Some("aeitron.com".to_string()),
+            destination_addr: Some("185.232.14.188:8443".parse().unwrap()),
+        };
+
+        let (url, host) = construct_probe_request_params(&target, "/healthz");
+        assert_eq!(url, "https://aeitron.com:8443/healthz");
         assert_eq!(host, "aeitron.com");
     }
 
