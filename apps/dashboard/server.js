@@ -1105,6 +1105,30 @@ const server = http.createServer((req, res) => {
       return proxyToControlPlane(`/v1/edge/pops/${encodeURIComponent(popId)}/bgp/${encodeURIComponent(bgpAction)}`, req, res, session);
     }
 
+    // Proxy Sovereign Policy Evaluation (Authenticated session)
+    if (pathname === '/api/proxy/policies/sovereignty/evaluate') {
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/policies/sovereignty/evaluate', req, res, session);
+    }
+
+    // Proxy Universal Workload Placement Scheduler (Authenticated session)
+    if (pathname === '/api/proxy/workloads/schedule') {
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/workloads/schedule', req, res, session);
+    }
+
+    // Proxy Universal Workload Compute Nodes (Authenticated session)
+    if (pathname === '/api/proxy/workloads/nodes') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/workloads/nodes', req, res, session);
+    }
+
     return sendJSON(res, 404, { code: 404, error: 'Proxy route not found' });
   }
 

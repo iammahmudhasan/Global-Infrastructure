@@ -10,7 +10,8 @@
       security: { title: "Security", crumb: "Line-Rate WAF, DDoS, & Secret Vault" },
       analytics: { title: "Analytics", crumb: "Real-Time Observability & Latency Matrix" },
       billing: { title: "Billing", crumb: "Token Economics & Arbitrage Savings" },
-      developers: { title: "API & SDKs", crumb: "Developer Quickstart & Client Libraries" }
+      developers: { title: "API & SDKs", crumb: "Developer Quickstart & Client Libraries" },
+      sovereignty: { title: "Sovereignty & Placement", crumb: "Autonomous Workload Placement & Sovereign Law Enforcement" }
     };
 
     // Navigation Switcher
@@ -44,6 +45,9 @@
       if (viewId === 'developers') {
         populateQuickstartKeySelect();
         renderQuickstartSnippets();
+      }
+      if (viewId === 'sovereignty') {
+        loadSovereigntyData();
       }
       if (viewId === 'security') {
         fetchAuditLogs();
@@ -1735,6 +1739,188 @@ print(f"Cache Hit Ratio: {telemetry.cache_hit_ratio * 100:.1f}%")`;
       }
     }
     window.runQuickstartTest = runQuickstartTest;
+
+    // --- Engine 2 & 4: Sovereignty & Universal Workload Placement Engine ---
+    async function loadSovereigntyData() {
+      try {
+        const res = await fetch('/api/proxy/workloads/nodes');
+        if (!res.ok) return;
+        const data = await res.json();
+        const nodes = data.nodes || [];
+        const tbody = document.getElementById('table-compute-nodes-body');
+        if (tbody && nodes.length > 0) {
+          tbody.innerHTML = '';
+          nodes.forEach(n => {
+            const tr = document.createElement('tr');
+
+            const tdId = document.createElement('td');
+            const codeId = document.createElement('code');
+            codeId.textContent = n.node_id;
+            tdId.appendChild(codeId);
+
+            const tdProv = document.createElement('td');
+            tdProv.textContent = n.provider;
+
+            const tdReg = document.createElement('td');
+            tdReg.textContent = n.region;
+
+            const tdJuris = document.createElement('td');
+            const spanJuris = document.createElement('span');
+            spanJuris.className = n.jurisdiction === 'BD' ? 'badge badge-bd' : 'badge';
+            spanJuris.textContent = n.jurisdiction;
+            tdJuris.appendChild(spanJuris);
+
+            const tdGpu = document.createElement('td');
+            tdGpu.textContent = n.gpu_type;
+
+            const tdCap = document.createElement('td');
+            const spanCap = document.createElement('span');
+            spanCap.className = 'text-emerald';
+            spanCap.textContent = `${n.available_gpus} / ${n.total_gpus} GPUs`;
+            tdCap.appendChild(spanCap);
+
+            const tdCost = document.createElement('td');
+            tdCost.textContent = `$${Number(n.cost_per_gpu_hour).toFixed(2)}`;
+
+            const tdCarbon = document.createElement('td');
+            if (n.carbon_intensity < 50) {
+              const spanCarbon = document.createElement('span');
+              spanCarbon.className = 'text-emerald';
+              spanCarbon.textContent = `${n.carbon_intensity} gCO2/kWh (100% Green)`;
+              tdCarbon.appendChild(spanCarbon);
+            } else {
+              tdCarbon.textContent = `${n.carbon_intensity} gCO2/kWh`;
+            }
+
+            tr.appendChild(tdId);
+            tr.appendChild(tdProv);
+            tr.appendChild(tdReg);
+            tr.appendChild(tdJuris);
+            tr.appendChild(tdGpu);
+            tr.appendChild(tdCap);
+            tr.appendChild(tdCost);
+            tr.appendChild(tdCarbon);
+
+            tbody.appendChild(tr);
+          });
+        }
+        const totalNodesEl = document.getElementById('sov-total-nodes');
+        if (totalNodesEl && nodes.length > 0) {
+          const totalGPUs = nodes.reduce((sum, n) => sum + (n.total_gpus || 0), 0);
+          totalNodesEl.textContent = `${nodes.length} Nodes / ${totalGPUs} GPUs`;
+        }
+      } catch (err) {
+        console.warn('Failed to load compute nodes:', err);
+      }
+    }
+    window.loadSovereigntyData = loadSovereigntyData;
+
+    async function simulateWorkloadPlacement() {
+      const btn = document.getElementById('btn-simulate-placement');
+      const resultBox = document.getElementById('sim-result-box');
+      if (btn) btn.disabled = true;
+
+      const origin = document.getElementById('sim-client-origin')?.value || 'dhaka';
+      const workloadType = document.getElementById('sim-workload-type')?.value || 'BANKING_API';
+      const classification = document.getElementById('sim-classification')?.value || 'CII';
+      const jurisdiction = document.getElementById('sim-jurisdiction')?.value || 'BD';
+      const maxLatency = parseInt(document.getElementById('sim-max-latency')?.value || '150', 10);
+      const gpus = parseInt(document.getElementById('sim-gpus')?.value || '1', 10);
+      const strictSovereignty = document.getElementById('sim-strict-sovereignty')?.checked ?? true;
+      const greenEnergy = document.getElementById('sim-green-energy')?.checked ?? false;
+
+      const payload = {
+        tenant_id: 'tenant-simulator',
+        project_id: currentProjectId || 'proj-core',
+        workload_id: `sim-${Date.now()}`,
+        workload_type: workloadType,
+        client_origin: origin,
+        required_jurisdiction: jurisdiction === 'GLOBAL' ? '' : jurisdiction,
+        strict_sovereignty: strictSovereignty,
+        data_classification: classification,
+        max_latency_p95_ms: maxLatency,
+        max_cost_per_hour: 20.0,
+        gpus_requested: gpus,
+        prioritize_green_energy: greenEnergy
+      };
+
+      try {
+        const res = await fetch('/api/proxy/workloads/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const decision = await res.json();
+        if (resultBox) {
+          resultBox.style.display = 'block';
+
+          const badgeEl = document.getElementById('sim-res-badge');
+          const nodeEl = document.getElementById('sim-res-node');
+          const certEl = document.getElementById('sim-res-cert');
+          const rttEl = document.getElementById('sim-res-rtt');
+          const costEl = document.getElementById('sim-res-cost');
+          const carbonEl = document.getElementById('sim-res-carbon');
+          const jurisEl = document.getElementById('sim-res-jurisdiction');
+          const reasonEl = document.getElementById('sim-res-reason');
+
+          if (decision.status === 'SCHEDULED') {
+            if (badgeEl) {
+              badgeEl.className = 'badge';
+              badgeEl.style.background = 'rgba(16, 185, 129, 0.2)';
+              badgeEl.style.color = 'var(--accent-emerald)';
+              badgeEl.textContent = 'SCHEDULED';
+            }
+            if (nodeEl) nodeEl.textContent = decision.assigned_node || 'Assigned';
+            if (certEl) {
+              if (decision.jurisdiction === 'BD') {
+                certEl.className = 'badge badge-bd';
+                certEl.textContent = 'BD-CII SOVEREIGN PINNED';
+              } else if (decision.jurisdiction === 'EU' || decision.jurisdiction === 'IS') {
+                certEl.className = 'badge';
+                certEl.style.background = 'rgba(59, 130, 246, 0.2)';
+                certEl.style.color = 'var(--accent-cyan)';
+                certEl.textContent = 'EU-GDPR COMPLIANT';
+              } else {
+                certEl.className = 'badge';
+                certEl.style.background = 'rgba(148, 163, 184, 0.2)';
+                certEl.style.color = 'var(--text-muted)';
+                certEl.textContent = `${decision.jurisdiction || 'GLOBAL'} ANYCAST`;
+              }
+            }
+            if (rttEl) rttEl.textContent = `${decision.measured_rtt_ms || 0} ms`;
+            if (costEl) costEl.textContent = `$${Number(decision.hourly_cost || 0).toFixed(2)} / h`;
+            if (carbonEl) carbonEl.textContent = `${decision.carbon_gco2_kwh || 0} gCO2/kWh (${decision.carbon_classification || 'GRID'})`;
+            if (jurisEl) jurisEl.textContent = `${decision.jurisdiction || 'GLOBAL'} (${decision.region || 'Anycast'})`;
+            if (reasonEl) reasonEl.textContent = decision.reason || 'Placement calculated successfully.';
+          } else {
+            if (badgeEl) {
+              badgeEl.className = 'badge';
+              badgeEl.style.background = 'rgba(244, 63, 94, 0.2)';
+              badgeEl.style.color = 'var(--accent-rose)';
+              badgeEl.textContent = 'UNSCHEDULABLE';
+            }
+            if (nodeEl) nodeEl.textContent = 'NO NODE AVAILABLE';
+            if (certEl) {
+              certEl.className = 'badge';
+              certEl.style.background = 'rgba(244, 63, 94, 0.2)';
+              certEl.style.color = 'var(--accent-rose)';
+              certEl.textContent = 'SLA / SOVEREIGNTY BREACH';
+            }
+            if (rttEl) rttEl.textContent = 'FAIL';
+            if (costEl) costEl.textContent = 'N/A';
+            if (carbonEl) carbonEl.textContent = 'N/A';
+            if (jurisEl) jurisEl.textContent = 'REJECTED';
+            if (reasonEl) reasonEl.textContent = decision.reason || decision.error || 'No available compute node satisfies constraints or capacity exhausted.';
+          }
+        }
+      } catch (err) {
+        showToast(`Simulation error: ${err.message}`);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+    window.simulateWorkloadPlacement = simulateWorkloadPlacement;
 
     window.openDomainDnsModal = openDomainDnsModal;
     window.copyDnsWizardTarget = copyDnsWizardTarget;

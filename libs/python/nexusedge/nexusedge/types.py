@@ -133,3 +133,52 @@ class LatencyMatrixRoute:
 class LatencyMatrixResult:
     routes: List[LatencyMatrixRoute] = field(default_factory=list)
     timestamp: Optional[str] = None
+
+
+@dataclass
+class SovereignEvaluationResult:
+    allowed: bool
+    decision_code: str
+    reason: str
+    source_jurisdiction: str
+    target_jurisdiction: str
+    data_classification: str
+    enforced_law: Optional[str] = None
+    evaluated_at: Optional[str] = None
+
+
+@dataclass
+class SchedulingDecision:
+    workload_id: str
+    status: str
+    reason: str
+    assigned_node: Optional[str] = None
+    provider: Optional[str] = None
+    region: Optional[str] = None
+    jurisdiction: Optional[str] = None
+    measured_rtt_ms: Optional[int] = None
+    hourly_cost: Optional[float] = None
+    carbon_gco2_kwh: Optional[float] = None
+    carbon_classification: Optional[str] = None
+    remaining_node_gpus: Optional[int] = None
+    optimization_score: Optional[float] = None
+    evaluated_at: Optional[str] = None
+
+
+@dataclass
+class ComputeNodeRecord:
+    node_id: str
+    provider: str
+    region: str
+    jurisdiction: str
+    gpu_type: str
+    total_gpus: int
+    available_gpus: int
+    cost_per_gpu_hour: float
+    carbon_intensity: float
+    rtt_from_dhaka: int = 0
+    rtt_from_frankfurt: int = 0
+    rtt_from_virginia: int = 0
+    rtt_from_singapore: int = 0
+    kv_cache_warmth: float = 0.0
+

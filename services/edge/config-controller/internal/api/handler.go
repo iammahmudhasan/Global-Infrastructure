@@ -30,7 +30,9 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/policy"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/pop"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/scheduler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/stek"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
@@ -42,30 +44,32 @@ type poPSnapshotCacheEntry struct {
 }
 
 type APIHandler struct {
-	store           store.Repository
-	service         *onboarding.DomainService
-	compiler        *compiler.Compiler
-	wafEngine       *security.WAFEngine
-	cacheEngine     *cache.CacheEngine
-	monitor         *health.Monitor
-	smartRouter     *health.SmartRouter
-	certManager     *certificate.Manager
-	stekManager     *stek.Manager
-	broadcaster     *events.Broadcaster
-	analyticsEngine *analytics.Engine
-	popManager      *pop.Manager
-	popProber       *health.PoPHealthProber
-	authenticator   *auth.Authenticator
-	limiter         *ControlPlaneLimiter
-	auditLogger     *security.AuditLogger
-	auditWriteMu    sync.Mutex
-	auditChainValid bool
-	auditChainErr   error
-	alerter         alert.Alerter
-	handlerChain    http.Handler
-	mux             *http.ServeMux
-	snapshotCacheMu sync.RWMutex
-	snapshotCache   map[string]poPSnapshotCacheEntry
+	store              store.Repository
+	service            *onboarding.DomainService
+	compiler           *compiler.Compiler
+	wafEngine          *security.WAFEngine
+	cacheEngine        *cache.CacheEngine
+	monitor            *health.Monitor
+	smartRouter        *health.SmartRouter
+	certManager        *certificate.Manager
+	stekManager        *stek.Manager
+	broadcaster        *events.Broadcaster
+	analyticsEngine    *analytics.Engine
+	popManager         *pop.Manager
+	popProber          *health.PoPHealthProber
+	authenticator      *auth.Authenticator
+	limiter            *ControlPlaneLimiter
+	auditLogger        *security.AuditLogger
+	auditWriteMu       sync.Mutex
+	auditChainValid    bool
+	auditChainErr      error
+	alerter            alert.Alerter
+	handlerChain       http.Handler
+	mux                *http.ServeMux
+	snapshotCacheMu    sync.RWMutex
+	snapshotCache      map[string]poPSnapshotCacheEntry
+	policyEvaluator    *policy.Evaluator
+	universalScheduler *scheduler.UniversalScheduler
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -145,28 +149,30 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	popProber := health.NewPoPHealthProber(popMgr, alerter)
 
 	h := &APIHandler{
-		store:           s,
-		service:         svc,
-		compiler:        c,
-		wafEngine:       security.NewWAFEngine(),
-		cacheEngine:     cache.NewCacheEngine(100000),
-		monitor:         mon,
-		smartRouter:     health.NewSmartRouter(),
-		certManager:     certificate.NewManager(s),
-		stekManager:     stek.NewManager("", 0, stek.DefaultRotationInterval),
-		broadcaster:     events.NewBroadcaster(),
-		analyticsEngine: analytics.NewEngine(),
-		popManager:      popMgr,
-		popProber:       popProber,
-		authenticator:   authenticator,
-		limiter:         NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
-		auditLogger:     auditLogger,
-		auditChainValid: auditChainValid,
-		auditChainErr:   auditChainErr,
-		alerter:         alerter,
-		mux:             mux,
-		handlerChain:    authenticator.Middleware(mux),
-		snapshotCache:   make(map[string]poPSnapshotCacheEntry),
+		store:              s,
+		service:            svc,
+		compiler:           c,
+		wafEngine:          security.NewWAFEngine(),
+		cacheEngine:        cache.NewCacheEngine(100000),
+		monitor:            mon,
+		smartRouter:        health.NewSmartRouter(),
+		certManager:        certificate.NewManager(s),
+		stekManager:        stek.NewManager("", 0, stek.DefaultRotationInterval),
+		broadcaster:        events.NewBroadcaster(),
+		analyticsEngine:    analytics.NewEngine(),
+		popManager:         popMgr,
+		popProber:          popProber,
+		authenticator:      authenticator,
+		limiter:            NewControlPlaneLimiterWithClientConcurrency(100.0, 100, 200, 20),
+		auditLogger:        auditLogger,
+		auditChainValid:    auditChainValid,
+		auditChainErr:      auditChainErr,
+		alerter:            alerter,
+		mux:                mux,
+		handlerChain:       authenticator.Middleware(mux),
+		snapshotCache:      make(map[string]poPSnapshotCacheEntry),
+		policyEvaluator:    policy.NewEvaluator(),
+		universalScheduler: scheduler.NewUniversalScheduler(nil),
 	}
 	h.registerRoutes()
 	return h
@@ -238,6 +244,14 @@ func (h *APIHandler) PoPManager() *pop.Manager {
 
 func (h *APIHandler) PoPProber() *health.PoPHealthProber {
 	return h.popProber
+}
+
+func (h *APIHandler) PolicyEvaluator() *policy.Evaluator {
+	return h.policyEvaluator
+}
+
+func (h *APIHandler) UniversalScheduler() *scheduler.UniversalScheduler {
+	return h.universalScheduler
 }
 
 func (h *APIHandler) Store() store.Repository {
@@ -372,6 +386,9 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/audit-logs/verify", h.handleAuditLogsVerifyRoute)
 	h.mux.HandleFunc("/v1/alerts/test", h.handleAlertsTestRoute)
 	h.mux.HandleFunc("/v1/alerts/status", h.handleAlertsStatusRoute)
+	h.mux.HandleFunc("/v1/edge/policies/sovereignty/evaluate", h.handleSovereignPolicyEvaluate)
+	h.mux.HandleFunc("/v1/workloads/schedule", h.handleWorkloadSchedule)
+	h.mux.HandleFunc("/v1/workloads/nodes", h.handleWorkloadNodes)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -3946,5 +3963,99 @@ func (h *APIHandler) handleAlertsStatusRoute(w http.ResponseWriter, r *http.Requ
 		"target_origins": []string{
 			"aeitron.com (185.232.14.188:443)",
 		},
+	})
+}
+
+// POST /v1/edge/policies/sovereignty/evaluate
+func (h *APIHandler) handleSovereignPolicyEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var req policy.SovereignEvaluationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ProjectID != "" && !h.authenticator.AuthorizeProject(r.Context(), req.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+req.ProjectID)
+		return
+	}
+
+	result, err := h.policyEvaluator.Evaluate(&req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, result)
+}
+
+// POST /v1/workloads/schedule
+func (h *APIHandler) handleWorkloadSchedule(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	var req scheduler.WorkloadRequirement
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.ProjectID != "" && !h.authenticator.AuthorizeProject(r.Context(), req.ProjectID) {
+		writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+req.ProjectID)
+		return
+	}
+
+	// Ingest latest PoP health telemetry if prober is active
+	if h.popProber != nil {
+		for _, st := range h.popProber.GetHealthStates() {
+			h.universalScheduler.UpdatePoPTelemetry(st.PoPID, st.Healthy, string(st.Status), st.EWMALatencyMs, st.PacketLossPercent)
+		}
+	}
+
+	decision, err := h.universalScheduler.FindOptimalPlacement(req)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	statusCode := http.StatusOK
+	if decision.Status == "UNSCHEDULABLE" {
+		statusCode = http.StatusUnprocessableEntity
+	}
+	writeJSON(w, statusCode, decision)
+}
+
+// GET /v1/workloads/nodes
+func (h *APIHandler) handleWorkloadNodes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	nodes := h.universalScheduler.GetNodes()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"nodes": nodes,
+		"count": len(nodes),
 	})
 }

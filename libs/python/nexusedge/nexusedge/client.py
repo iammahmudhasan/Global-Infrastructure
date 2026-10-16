@@ -31,6 +31,9 @@ from .types import (
     TelemetryRateLimit,
     TelemetrySummary,
     VerifyDomainResult,
+    SovereignEvaluationResult,
+    SchedulingDecision,
+    ComputeNodeRecord,
 )
 
 
@@ -53,6 +56,8 @@ class NexusEdgeClient:
         self.inference = InferenceNamespace(self)
         self.domains = DomainsNamespace(self)
         self.telemetry = TelemetryNamespace(self)
+        self.scheduler = SchedulerNamespace(self)
+        self.policies = PoliciesNamespace(self)
 
     def request(
         self,
@@ -395,3 +400,138 @@ class TelemetryNamespace:
                 )
             )
         return records
+
+
+class PoliciesNamespace:
+    """Methods for evaluating data residency, sovereignty, and legal compliance."""
+
+    def __init__(self, client: NexusEdgeClient) -> None:
+        self._client = client
+
+    def evaluate_sovereignty(
+        self,
+        tenant_id: str,
+        project_id: str,
+        workload_id: str,
+        source_jurisdiction: str,
+        target_jurisdiction: str,
+        data_classification: str = "CONFIDENTIAL",
+        strict_sovereignty: bool = True,
+        target_node_id: Optional[str] = None,
+        target_region: Optional[str] = None,
+        export_permit_hash: Optional[str] = None,
+    ) -> SovereignEvaluationResult:
+        """Evaluates whether data flow complies with Bangladesh NDMA 2026, EU GDPR, or local sovereignty laws."""
+        payload: Dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workload_id": workload_id,
+            "data_classification": data_classification,
+            "source_jurisdiction": source_jurisdiction,
+            "target_jurisdiction": target_jurisdiction,
+            "strict_sovereignty": strict_sovereignty,
+        }
+        if target_node_id:
+            payload["target_node_id"] = target_node_id
+        if target_region:
+            payload["target_region"] = target_region
+        if export_permit_hash:
+            payload["export_permit_hash"] = export_permit_hash
+
+        endpoint = "/api/proxy/policies/sovereignty/evaluate"
+        data, _ = self._client.request(endpoint, method="POST", body=payload)
+        return SovereignEvaluationResult(
+            allowed=bool(data.get("allowed", False)),
+            decision_code=str(data.get("decision_code", "")),
+            reason=str(data.get("reason", "")),
+            source_jurisdiction=str(data.get("source_jurisdiction", source_jurisdiction)),
+            target_jurisdiction=str(data.get("target_jurisdiction", target_jurisdiction)),
+            data_classification=str(data.get("data_classification", data_classification)),
+            enforced_law=data.get("enforced_law"),
+            evaluated_at=data.get("evaluated_at"),
+        )
+
+
+class SchedulerNamespace:
+    """Methods for multi-objective universal workload scheduling and compute capacity."""
+
+    def __init__(self, client: NexusEdgeClient) -> None:
+        self._client = client
+
+    def find_optimal_placement(
+        self,
+        workload_type: str = "GPU_INFERENCE",
+        client_origin: str = "dhaka",
+        required_jurisdiction: Optional[str] = None,
+        strict_sovereignty: bool = False,
+        data_classification: str = "INTERNAL",
+        max_latency_p95_ms: int = 150,
+        max_cost_per_hour: float = 10.0,
+        gpus_requested: int = 1,
+        prioritize_green_energy: bool = False,
+        tenant_id: str = "tenant-default",
+        project_id: str = "proj-default",
+        workload_id: Optional[str] = None,
+    ) -> SchedulingDecision:
+        """Calculates optimal global placement balancing RTT latency, hourly compute cost, carbon, and sovereignty."""
+        payload: Dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "project_id": project_id,
+            "workload_id": workload_id or f"wl-sdk-{int(time.time() * 1000)}",
+            "workload_type": workload_type,
+            "client_origin": client_origin,
+            "required_jurisdiction": required_jurisdiction,
+            "strict_sovereignty": strict_sovereignty,
+            "data_classification": data_classification,
+            "max_latency_p95_ms": max_latency_p95_ms,
+            "max_cost_per_hour": max_cost_per_hour,
+            "gpus_requested": gpus_requested,
+            "prioritize_green_energy": prioritize_green_energy,
+        }
+
+        endpoint = "/api/proxy/workloads/schedule"
+        data, _ = self._client.request(endpoint, method="POST", body=payload)
+        return SchedulingDecision(
+            workload_id=str(data.get("workload_id", "")),
+            status=str(data.get("status", "UNSCHEDULABLE")),
+            reason=str(data.get("reason", "")),
+            assigned_node=data.get("assigned_node"),
+            provider=data.get("provider"),
+            region=data.get("region"),
+            jurisdiction=data.get("jurisdiction"),
+            measured_rtt_ms=data.get("measured_rtt_ms"),
+            hourly_cost=float(data["hourly_cost"]) if data.get("hourly_cost") is not None else None,
+            carbon_gco2_kwh=float(data["carbon_gco2_kwh"]) if data.get("carbon_gco2_kwh") is not None else None,
+            carbon_classification=data.get("carbon_classification"),
+            remaining_node_gpus=data.get("remaining_node_gpus"),
+            optimization_score=float(data["optimization_score"]) if data.get("optimization_score") is not None else None,
+            evaluated_at=data.get("evaluated_at"),
+        )
+
+    def list_nodes(self) -> List[ComputeNodeRecord]:
+        """Lists active global compute nodes and current GPU capacity."""
+        endpoint = "/api/proxy/workloads/nodes"
+        data, _ = self._client.request(endpoint, method="GET")
+        raw_nodes = data.get("nodes", []) if isinstance(data, dict) else []
+        nodes: List[ComputeNodeRecord] = []
+        for n in raw_nodes:
+            nodes.append(
+                ComputeNodeRecord(
+                    node_id=str(n.get("node_id", "")),
+                    provider=str(n.get("provider", "")),
+                    region=str(n.get("region", "")),
+                    jurisdiction=str(n.get("jurisdiction", "")),
+                    gpu_type=str(n.get("gpu_type", "")),
+                    total_gpus=int(n.get("total_gpus", 0)),
+                    available_gpus=int(n.get("available_gpus", 0)),
+                    cost_per_gpu_hour=float(n.get("cost_per_gpu_hour", 0.0)),
+                    carbon_intensity=float(n.get("carbon_intensity", 0.0)),
+                    rtt_from_dhaka=int(n.get("rtt_from_dhaka", 0)),
+                    rtt_from_frankfurt=int(n.get("rtt_from_frankfurt", 0)),
+                    rtt_from_virginia=int(n.get("rtt_from_virginia", 0)),
+                    rtt_from_singapore=int(n.get("rtt_from_singapore", 0)),
+                    kv_cache_warmth=float(n.get("kv_cache_warmth", 0.0)),
+                )
+            )
+        return nodes
+

@@ -129,6 +129,29 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
 
+        if self.path in ("/api/proxy/workloads/nodes", "/api/workloads/nodes"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "nodes": [
+                    {
+                        "node_id": "bd-dhaka-dgx01",
+                        "provider": "baremetal-bd",
+                        "region": "ap-south-2",
+                        "jurisdiction": "BD",
+                        "gpu_type": "H100",
+                        "total_gpus": 8,
+                        "available_gpus": 8,
+                        "cost_per_gpu_hour": 2.10,
+                        "carbon_intensity": 480.0,
+                    }
+                ],
+                "count": 1,
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -220,6 +243,45 @@ class MockServerHandler(BaseHTTPRequestHandler):
                 "hostname": "api.example.com",
                 "state": "ACTIVE",
                 "message": "CNAME and TLS verified",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path in ("/api/proxy/policies/sovereignty/evaluate", "/api/policies/sovereignty/evaluate"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            is_bd_breach = payload.get("source_jurisdiction") == "BD" and payload.get("target_jurisdiction") != "BD" and payload.get("data_classification") == "CII"
+            resp = {
+                "allowed": not is_bd_breach,
+                "decision_code": "BD_NDMA_2026_CII_BREACH" if is_bd_breach else "SOVEREIGN_POLICY_COMPLIANT",
+                "reason": "CII data cannot leave Bangladesh without export permit" if is_bd_breach else "Workload satisfies data residency policies",
+                "source_jurisdiction": payload.get("source_jurisdiction"),
+                "target_jurisdiction": payload.get("target_jurisdiction"),
+                "data_classification": payload.get("data_classification"),
+                "enforced_law": "Bangladesh NDMA 2026" if is_bd_breach else None,
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path in ("/api/proxy/workloads/schedule", "/api/workloads/schedule"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "workload_id": payload.get("workload_id", "wl-01"),
+                "status": "SCHEDULED",
+                "assigned_node": "bd-dhaka-dgx01",
+                "provider": "baremetal-bd",
+                "region": "ap-south-2",
+                "jurisdiction": "BD",
+                "measured_rtt_ms": 4,
+                "hourly_cost": 2.10,
+                "carbon_gco2_kwh": 480.0,
+                "carbon_classification": "STANDARD_GRID",
+                "remaining_node_gpus": 7,
+                "optimization_score": -28.0,
+                "reason": "Optimized via Universal Scheduler",
             }
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
@@ -408,7 +470,62 @@ class NexusEdgePythonSDKTests(unittest.TestCase):
         self.assertEqual(cm.exception.status, 504)
         self.assertEqual(cm.exception.code, "TIMEOUT")
 
+    def test_sovereign_policy_evaluation(self) -> None:
+        """Verifies Sovereign Policy Evaluator via Python SDK."""
+        # 1. BD CII to US breach
+        res = self.client.policies.evaluate_sovereignty(
+            tenant_id="tenant-fintech-bd",
+            project_id="proj-core",
+            workload_id="core-banking-01",
+            source_jurisdiction="BD",
+            target_jurisdiction="US",
+            data_classification="CII",
+            strict_sovereignty=True,
+        )
+        self.assertFalse(res.allowed)
+        self.assertEqual(res.decision_code, "BD_NDMA_2026_CII_BREACH")
+        self.assertIn("CII data cannot leave Bangladesh", res.reason)
+
+        # 2. BD CII within BD compliant
+        res_ok = self.client.policies.evaluate_sovereignty(
+            tenant_id="tenant-fintech-bd",
+            project_id="proj-core",
+            workload_id="core-banking-01",
+            source_jurisdiction="BD",
+            target_jurisdiction="BD",
+            data_classification="CII",
+            strict_sovereignty=True,
+        )
+        self.assertTrue(res_ok.allowed)
+        self.assertEqual(res_ok.decision_code, "SOVEREIGN_POLICY_COMPLIANT")
+
+    def test_workload_scheduler_and_nodes(self) -> None:
+        """Verifies Universal Workload Placement Scheduler via Python SDK."""
+        # 1. Optimal placement
+        decision = self.client.scheduler.find_optimal_placement(
+            workload_type="BANKING_API",
+            client_origin="dhaka",
+            required_jurisdiction="BD",
+            strict_sovereignty=True,
+            data_classification="CII",
+            max_latency_p95_ms=20,
+            max_cost_per_hour=5.0,
+            gpus_requested=1,
+        )
+        self.assertEqual(decision.status, "SCHEDULED")
+        self.assertEqual(decision.assigned_node, "bd-dhaka-dgx01")
+        self.assertEqual(decision.jurisdiction, "BD")
+        self.assertEqual(decision.measured_rtt_ms, 4)
+        self.assertEqual(decision.hourly_cost, 2.10)
+
+        # 2. Node listing
+        nodes = self.client.scheduler.list_nodes()
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].node_id, "bd-dhaka-dgx01")
+        self.assertEqual(nodes[0].provider, "baremetal-bd")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

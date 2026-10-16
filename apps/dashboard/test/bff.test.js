@@ -2669,7 +2669,39 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
     assert.strictEqual(appJsContent.includes('function copyQuickstartSnippet'), true, 'app.js must define copyQuickstartSnippet');
     assert.strictEqual(appJsContent.includes('async function runQuickstartTest'), true, 'app.js must define runQuickstartTest');
   });
+
+  it('Requirement 21: Sovereignty & Workload Placement UI, Simulator & BFF Proxy Endpoints', () => {
+    const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+    const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+    const serverJsContent = fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8');
+
+    // 1. Verify navigation and view containers
+    assert.strictEqual(indexHtmlContent.includes('data-view="sovereignty"'), true, 'index.html must define data-view="sovereignty"');
+    assert.strictEqual(indexHtmlContent.includes('id="view-sovereignty"'), true, 'index.html must define #view-sovereignty');
+
+    // 2. Verify interactive placement simulator elements
+    assert.strictEqual(indexHtmlContent.includes('id="sim-client-origin"'), true, 'index.html must define #sim-client-origin');
+    assert.strictEqual(indexHtmlContent.includes('id="sim-workload-type"'), true, 'index.html must define #sim-workload-type');
+    assert.strictEqual(indexHtmlContent.includes('id="sim-classification"'), true, 'index.html must define #sim-classification');
+    assert.strictEqual(indexHtmlContent.includes('id="sim-jurisdiction"'), true, 'index.html must define #sim-jurisdiction');
+    assert.strictEqual(indexHtmlContent.includes('id="sim-strict-sovereignty"'), true, 'index.html must define #sim-strict-sovereignty');
+    assert.strictEqual(indexHtmlContent.includes('id="btn-simulate-placement"'), true, 'index.html must define #btn-simulate-placement');
+    assert.strictEqual(indexHtmlContent.includes('id="sim-result-box"'), true, 'index.html must define #sim-result-box');
+    assert.strictEqual(indexHtmlContent.includes('id="table-compute-nodes-body"'), true, 'index.html must define #table-compute-nodes-body');
+
+    // 3. Verify JavaScript functions in app.js
+    assert.strictEqual(appJsContent.includes('async function loadSovereigntyData'), true, 'app.js must define loadSovereigntyData');
+    assert.strictEqual(appJsContent.includes('async function simulateWorkloadPlacement'), true, 'app.js must define simulateWorkloadPlacement');
+    assert.strictEqual(appJsContent.includes('window.loadSovereigntyData = loadSovereigntyData;'), true, 'app.js must export window.loadSovereigntyData');
+    assert.strictEqual(appJsContent.includes('window.simulateWorkloadPlacement = simulateWorkloadPlacement;'), true, 'app.js must export window.simulateWorkloadPlacement');
+
+    // 4. Verify BFF proxy routes in server.js
+    assert.strictEqual(serverJsContent.includes('/api/proxy/policies/sovereignty/evaluate'), true, 'server.js must define proxy for sovereignty evaluate');
+    assert.strictEqual(serverJsContent.includes('/api/proxy/workloads/schedule'), true, 'server.js must define proxy for workloads schedule');
+    assert.strictEqual(serverJsContent.includes('/api/proxy/workloads/nodes'), true, 'server.js must define proxy for workloads nodes');
+  });
 });
+
 
 
 

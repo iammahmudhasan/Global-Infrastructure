@@ -20,6 +20,9 @@ from .types import (
     TelemetryRateLimit,
     TelemetrySummary,
     VerifyDomainResult,
+    SovereignEvaluationResult,
+    SchedulingDecision,
+    ComputeNodeRecord,
 )
 
 __version__ = "0.1.0"
@@ -41,4 +44,8 @@ __all__ = [
     "TelemetryRateLimit",
     "TelemetrySummary",
     "VerifyDomainResult",
+    "SovereignEvaluationResult",
+    "SchedulingDecision",
+    "ComputeNodeRecord",
 ]
+

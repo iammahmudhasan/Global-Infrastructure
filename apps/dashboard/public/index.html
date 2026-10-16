@@ -83,6 +83,13 @@
           API & SDKs
           <span class="nav-badge" style="background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); border-color: rgba(16, 185, 129, 0.4);">v0.1.0</span>
         </div>
+
+        <div class="nav-category">Governance & Orchestration</div>
+        <div class="nav-item" data-view="sovereignty" id="nav-item-sovereignty">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+          Sovereignty & Placement
+          <span class="nav-badge" style="background: rgba(59, 130, 246, 0.2); color: var(--accent-cyan); border-color: rgba(59, 130, 246, 0.4);">Engine 2 & 4</span>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
@@ -1427,6 +1434,269 @@
               <div class="card-value" style="font-size: 1rem; font-family: 'JetBrains Mono', monospace; margin: 0.5rem 0;">pip install nexusedge</div>
               <div class="card-subtext">Zero external runtime dependencies. Compatible with Python 3.9 through 3.14, PyTorch, and vLLM agents.</div>
             </div>
+          </div>
+        </div>
+
+        <!-- VIEW 12: SOVEREIGNTY & WORKLOAD PLACEMENT ENGINE (ENGINES 2 & 4) -->
+        <div class="view-content" id="view-sovereignty">
+          <div class="kpi-grid">
+            <div class="card">
+              <div class="card-label">Bangladesh NDMA 2026 CII</div>
+              <div class="card-value text-emerald">ACTIVE & PINNED</div>
+              <div class="card-subtext">Section 14 Cryptographic Sovereign Pinning Enforced</div>
+            </div>
+            <div class="card">
+              <div class="card-label">EU GDPR Chapter V</div>
+              <div class="card-value text-cyan">EEA COMPLIANT</div>
+              <div class="card-subtext">Restricted Third-Country Transfer Guard Active</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Compute Substrate</div>
+              <div class="card-value text-indigo" id="sov-total-nodes">4 Nodes / 120 GPUs</div>
+              <div class="card-subtext">Dhaka, Singapore, Iceland, Virginia</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Power & Carbon Footprint</div>
+              <div class="card-value text-amber">12 - 480 gCO2/kWh</div>
+              <div class="card-subtext">Iceland Geothermal / Hydro 100% Green Priority</div>
+            </div>
+          </div>
+
+          <!-- SOVEREIGN JURISDICTION BOUNDARY TABLE -->
+          <div class="table-container" style="margin-bottom: 2rem;">
+            <div class="table-header">
+              <div>
+                <div class="table-title">Sovereign Jurisdiction & Legal Compliance Policies</div>
+                <div class="table-subtitle">Deterministic sub-millisecond legal residency validation (Proprietary IP Engine 4)</div>
+              </div>
+              <button class="btn btn-secondary" onclick="loadSovereigntyData()">Refresh Boundaries</button>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Jurisdiction</th>
+                  <th>Regulating Law</th>
+                  <th>Enforcement Mechanism</th>
+                  <th>Data Classification</th>
+                  <th>Default Node</th>
+                  <th>Boundary Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>BD (Bangladesh)</strong></td>
+                  <td>National Data Management Act 2026</td>
+                  <td>BDIX Subsea Cryptographic Lock (SMW6)</td>
+                  <td><span class="badge badge-bd">CII / BANKING</span></td>
+                  <td><code>bd-dhaka-dgx01</code></td>
+                  <td><span class="status-indicator status-active">ENFORCED (DOMESTIC)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>EU (European Union)</strong></td>
+                  <td>General Data Protection Reg (GDPR)</td>
+                  <td>EEA Sovereign Boundary & SCC Validation</td>
+                  <td><span class="badge" style="background: rgba(59, 130, 246, 0.15); color: var(--accent-cyan); border: 1px solid rgba(59, 130, 246, 0.3);">CONFIDENTIAL</span></td>
+                  <td><code>is-green-gpu01</code></td>
+                  <td><span class="status-indicator status-active">ENFORCED (EEA ONLY)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>US (United States)</strong></td>
+                  <td>FedRAMP High / EO 14028</td>
+                  <td>Isolated US Sovereign Fabric</td>
+                  <td><span class="badge" style="background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.3);">CII / DEFENSE</span></td>
+                  <td><code>us-cw-h100-iad</code></td>
+                  <td><span class="status-indicator status-active">ENFORCED (US DOMESTIC)</span></td>
+                </tr>
+                <tr>
+                  <td><strong>SG (Singapore / Global)</strong></td>
+                  <td>PDPA / Global Transit Standard</td>
+                  <td>Multi-Cloud Arbitrage & Dynamic Anycast</td>
+                  <td><span class="badge" style="background: rgba(148, 163, 184, 0.15); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.3);">PUBLIC / TRANSIT</span></td>
+                  <td><code>sg-aws-gpu01</code></td>
+                  <td><span class="status-indicator status-active">ACTIVE ANYCAST</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- INTERACTIVE WORKLOAD PLACEMENT SIMULATOR & POLICY INSPECTOR -->
+          <div class="card" style="margin-bottom: 2rem;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 1.25rem;">
+              <div>
+                <h3 style="font-size: 1.15rem; font-weight: 700; color: #fff; margin-bottom: 0.25rem;">Universal Workload Placement Simulator</h3>
+                <p style="color: var(--text-muted); font-size: 0.85rem;">Calculates live optimal placement across physical latency, power grid carbon, cost, and legal sovereignty (Proprietary IP Engine 2).</p>
+              </div>
+              <span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald); border: 1px solid rgba(16, 185, 129, 0.3);">Live Engine Connected</span>
+            </div>
+
+            <div class="code-toolbar" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; background: rgba(0,0,0,0.25); padding: 1.25rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.06); margin-bottom: 1.25rem;">
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Client Origin</label>
+                <select id="sim-client-origin" class="code-param-select" style="width: 100%;">
+                  <option value="dhaka">Dhaka (BDIX / Cox's Bazar SMW6)</option>
+                  <option value="singapore">Singapore (Equinix SG1)</option>
+                  <option value="frankfurt">Frankfurt (DE-CIX FRA)</option>
+                  <option value="virginia">Virginia (Ashburn IAD)</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Workload Type</label>
+                <select id="sim-workload-type" class="code-param-select" style="width: 100%;">
+                  <option value="BANKING_API">BANKING_API (Financial Transaction)</option>
+                  <option value="GPU_INFERENCE">GPU_INFERENCE (Real-Time Token Stream)</option>
+                  <option value="REASONING_AGENT">REASONING_AGENT (Batch Deep Workload)</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Data Classification</label>
+                <select id="sim-classification" class="code-param-select" style="width: 100%;">
+                  <option value="CII">CII (Critical Information Infrastructure)</option>
+                  <option value="CONFIDENTIAL">CONFIDENTIAL (PII / Sensitive)</option>
+                  <option value="INTERNAL">INTERNAL (Business Logic)</option>
+                  <option value="PUBLIC">PUBLIC (Unrestricted Web)</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Required Jurisdiction</label>
+                <select id="sim-jurisdiction" class="code-param-select" style="width: 100%;">
+                  <option value="BD">BD (Bangladesh Sovereign)</option>
+                  <option value="EU">EU (European Union)</option>
+                  <option value="US">US (United States)</option>
+                  <option value="SG">SG (Singapore)</option>
+                  <option value="GLOBAL">GLOBAL (Unrestricted)</option>
+                </select>
+              </div>
+
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">Max Latency SLA (ms)</label>
+                <input type="number" id="sim-max-latency" class="code-param-select" value="150" min="5" max="500" style="width: 100%;">
+              </div>
+
+              <div>
+                <label style="font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 0.35rem;">GPUs Requested</label>
+                <input type="number" id="sim-gpus" class="code-param-select" value="1" min="1" max="16" style="width: 100%;">
+              </div>
+            </div>
+
+            <div style="display: flex; gap: 1.5rem; align-items: center; margin-bottom: 1.25rem;">
+              <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.86rem; color: #fff; cursor: pointer;">
+                <input type="checkbox" id="sim-strict-sovereignty" checked>
+                <span>Strict Sovereign Data Pinning (No off-border exfiltration)</span>
+              </label>
+
+              <label style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.86rem; color: #fff; cursor: pointer;">
+                <input type="checkbox" id="sim-green-energy">
+                <span>Prioritize Low-Carbon Green Energy (Iceland Geothermal)</span>
+              </label>
+
+              <button class="btn btn-primary" id="btn-simulate-placement" onclick="simulateWorkloadPlacement()" style="margin-left: auto;">
+                <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                Calculate Optimal Placement
+              </button>
+            </div>
+
+            <!-- SIMULATION DECISION RESULT BOX -->
+            <div id="sim-result-box" style="display: none; background: rgba(15, 23, 42, 0.8); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 8px; padding: 1.25rem;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 0.75rem;">
+                <div style="display: flex; align-items: center; gap: 0.75rem;">
+                  <span id="sim-res-badge" class="badge" style="background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); font-weight: 700; font-size: 0.85rem;">SCHEDULED</span>
+                  <span id="sim-res-node" style="font-weight: 700; color: #fff; font-family: monospace; font-size: 1rem;">bd-dhaka-dgx01</span>
+                </div>
+                <div id="sim-res-cert" class="badge badge-bd">BD-CII COMPLIANT</div>
+              </div>
+
+              <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 1rem;">
+                <div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">RTT Latency</div>
+                  <div id="sim-res-rtt" style="font-size: 1.25rem; font-weight: 700; color: var(--accent-emerald);">4 ms</div>
+                </div>
+                <div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Hourly Cost</div>
+                  <div id="sim-res-cost" style="font-size: 1.25rem; font-weight: 700; color: var(--accent-cyan);">$2.10 / h</div>
+                </div>
+                <div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Carbon Rating</div>
+                  <div id="sim-res-carbon" style="font-size: 1.25rem; font-weight: 700; color: var(--accent-amber);">480 gCO2/kWh</div>
+                </div>
+                <div>
+                  <div style="font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;">Jurisdiction</div>
+                  <div id="sim-res-jurisdiction" style="font-size: 1.25rem; font-weight: 700; color: #fff;">BD (Dhaka)</div>
+                </div>
+              </div>
+
+              <div id="sim-res-reason" style="font-size: 0.85rem; color: var(--text-muted); line-height: 1.5; background: rgba(0,0,0,0.3); padding: 0.75rem 1rem; border-radius: 6px; font-family: monospace;">
+                Reasoning output
+              </div>
+            </div>
+          </div>
+
+          <!-- ACTIVE COMPUTE NODES TABLE -->
+          <div class="table-container">
+            <div class="table-header">
+              <div>
+                <div class="table-title">Managed Compute Nodes & Live Capacity</div>
+                <div class="table-subtitle">Physical GPU substrate governed by Universal Workload Placement Engine</div>
+              </div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Node ID</th>
+                  <th>Provider</th>
+                  <th>Region</th>
+                  <th>Jurisdiction</th>
+                  <th>GPU Architecture</th>
+                  <th>Available / Total</th>
+                  <th>Cost ($/h)</th>
+                  <th>Carbon Intensity</th>
+                </tr>
+              </thead>
+              <tbody id="table-compute-nodes-body">
+                <tr>
+                  <td><code>bd-dhaka-dgx01</code></td>
+                  <td>Baremetal BD</td>
+                  <td>ap-south-2</td>
+                  <td><span class="badge badge-bd">BD</span></td>
+                  <td>NVIDIA H100</td>
+                  <td><span class="text-emerald">8 / 8 GPUs</span></td>
+                  <td>$2.10</td>
+                  <td>480 gCO2/kWh</td>
+                </tr>
+                <tr>
+                  <td><code>sg-aws-gpu01</code></td>
+                  <td>AWS</td>
+                  <td>ap-southeast-1</td>
+                  <td><span class="badge">SG</span></td>
+                  <td>NVIDIA H100</td>
+                  <td><span class="text-emerald">16 / 16 GPUs</span></td>
+                  <td>$3.20</td>
+                  <td>390 gCO2/kWh</td>
+                </tr>
+                <tr>
+                  <td><code>is-green-gpu01</code></td>
+                  <td>Iceland Green DC</td>
+                  <td>is-north-1</td>
+                  <td><span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald);">IS (EEA)</span></td>
+                  <td>NVIDIA H100</td>
+                  <td><span class="text-emerald">32 / 32 GPUs</span></td>
+                  <td>$1.45</td>
+                  <td><span class="text-emerald">12 gCO2/kWh (100% Green)</span></td>
+                </tr>
+                <tr>
+                  <td><code>us-cw-h100-iad</code></td>
+                  <td>CoreWeave</td>
+                  <td>us-east-1</td>
+                  <td><span class="badge">US</span></td>
+                  <td>NVIDIA H100</td>
+                  <td><span class="text-emerald">64 / 64 GPUs</span></td>
+                  <td>$2.40</td>
+                  <td>340 gCO2/kWh</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
 
