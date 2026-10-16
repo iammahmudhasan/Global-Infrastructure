@@ -67,6 +67,7 @@ class NexusEdgeClient:
         self.policies = PoliciesNamespace(self)
         self.storage = StorageNamespace(self)
         self.network = NetworkNamespace(self)
+        self.cables = self.network
 
     def request(
         self,
