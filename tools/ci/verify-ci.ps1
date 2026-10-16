@@ -150,6 +150,9 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
         if (Test-Path (Join-Path $SdkDir "test/client.test.js")) {
             Push-Location $SdkDir
             try {
+                if (-not (Test-Path "dist/index.js")) {
+                    & npx -y typescript --project tsconfig.json
+                }
                 & node --test test/client.test.js
                 if ($LASTEXITCODE -ne 0) {
                     Write-Host "ERROR: TypeScript SDK test suite failed." -ForegroundColor Red

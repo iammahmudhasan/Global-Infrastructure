@@ -82,6 +82,9 @@ if command -v node >/dev/null 2>&1; then
 
   if [ -f "${REPO_ROOT}/libs/ts/api-client/test/client.test.js" ]; then
     pushd "${REPO_ROOT}/libs/ts/api-client" > /dev/null
+    if [ ! -f "dist/index.js" ]; then
+      npx -y typescript --project tsconfig.json
+    fi
     node --test test/client.test.js
     popd > /dev/null
     echo " -> TypeScript SDK tests passed."

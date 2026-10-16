@@ -9,8 +9,8 @@
     "src"
   ],
   "scripts": {
-    "build": "tsc",
-    "test": "tsc && node --test test/client.test.js"
+    "build": "npx -y typescript --project tsconfig.json",
+    "test": "npx -y typescript --project tsconfig.json && node --test test/client.test.js"
   },
   "keywords": [
     "nexusedge",

@@ -127,6 +127,11 @@ jobs:
           cd apps/dashboard
           node --test test/bff.test.js
 
+      - name: Build TypeScript SDK
+        run: |
+          cd libs/ts/api-client
+          npx -y typescript --project tsconfig.json
+
       - name: Run TypeScript SDK Tests
         run: |
           cd libs/ts/api-client
