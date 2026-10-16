@@ -252,3 +252,77 @@ buf breaking --against ".git#branch=main"
 > *Every implementation must ask:*  
 > **"Will this still make sense when this system operates across hundreds of PoPs, thousands of nodes, millions of workloads, multiple continents, and thousands of engineers?"**  
 > *If the answer is no, redesign it before merging.*
+
+---
+
+## 🛡️ 11. The 50 Constitutional Engineering Checklists & 7 Core Axioms
+
+### 🚨 The 7 Absolute Core Axioms
+1. **Never trust untrusted input.** প্রতিটি trust boundary-তে validation ও appropriate security checks থাকবে।
+2. **Never bypass authorization.** Authentication pass করলেই সব resource access করার অনুমতি পাওয়া যায় না।
+3. **Never expose secrets.** Secret leak হলে শুধু code থেকে মুছে ফেললেই হবে না; প্রয়োজনমতো revoke/rotate করতে হবে এবং Git history ও logs-ও পরীক্ষা করতে হবে।
+4. **Never ship unverified code.** Build pass মানেই security বা correctness প্রমাণিত নয়।
+5. **Never ignore failures.** Timeout, partial failure ও resource exhaustion-এর আচরণ আগে থেকেই নির্ধারিত থাকবে।
+6. **Never deploy without recovery planning.** Rollback এবং backup restore বাস্তবে পরীক্ষা করতে হবে।
+7. **Never claim 100% security.** Evidence, threat model, testing এবং continuous remediation দিয়ে risk পরিচালনা করতে হবে।
+
+### A. Architecture & Design
+- [ ] কোড লেখার আগে feature-এর requirement, scope এবং acceptance criteria নির্ধারণ করব।
+- [ ] প্রতিটি component-এর দায়িত্ব ও trust boundary স্পষ্ট রাখব।
+- [ ] Threat modeling করে সম্ভাব্য attack surface ও failure mode শনাক্ত করব।
+- [ ] অপ্রয়োজনীয় complexity, duplicate logic এবং tightly coupled modules এড়িয়ে চলব।
+- [ ] Architecture পরিবর্তনের কারণ ও trade-off documentation-এ লিখব।
+
+### B. Security & Access Control
+- [ ] সব untrusted input validate করব; শুধু frontend validation-এর ওপর নির্ভর করব না।
+- [ ] প্রতিটি protected operation-এ server-side authentication ও authorization নিশ্চিত করব।
+- [ ] Least privilege অনুসরণ করব; service বা process-কে প্রয়োজনের বেশি permission দেব না।
+- [ ] Tenant isolation নিশ্চিত করব, যাতে এক customer অন্য customer-এর data বা configuration access করতে না পারে।
+- [ ] SQL injection, XSS, CSRF, SSRF, path traversal ও request-smuggling-এর মতো প্রাসঙ্গিক attack class বিবেচনা করব।
+- [ ] Secrets, API keys, tokens ও private keys source code, logs বা Git history-তে প্রকাশ করব না।
+- [ ] Cryptography নিজে implement না করে প্রতিষ্ঠিত library ও protocol ব্যবহার করব।
+- [ ] TLS, certificate validation এবং secure transport configuration সঠিকভাবে প্রয়োগ করব।
+- [ ] Error message, logs বা API response-এ sensitive data প্রকাশ করব না।
+- [ ] Security-sensitive action-এর জন্য প্রয়োজনমতো audit logs ও accountability নিশ্চিত করব।
+
+### C. Code Quality & Maintainability
+- [ ] ছোট, cohesive এবং একক দায়িত্বসম্পন্ন function ও module লিখব।
+- [ ] Language-এর strict type checking, linting এবং consistent formatting ব্যবহার করব।
+- [ ] Magic values-এর পরিবর্তে validated configuration ও named constants ব্যবহার করব।
+- [ ] Error handling explicit রাখব; exception গিলে ফেলব না বা failure-কে success দেখাব না।
+- [ ] Input, output, side effects এবং public interfaces স্পষ্ট রাখব।
+- [ ] অপ্রয়োজনীয় dependency ও অজানা third-party package যোগ করব না।
+- [ ] Code duplication কমাব, কিন্তু premature abstraction তৈরি করব না।
+- [ ] Concurrency, shared state, race conditions ও resource ownership বিবেচনা করব।
+
+### D. Testing & Verification
+- [ ] প্রতিটি নতুন feature-এর সঙ্গে প্রয়োজনীয় automated tests লিখব।
+- [ ] Unit এবং integration tests চালিয়ে বাস্তব dependency interaction যাচাই করব।
+- [ ] Invalid input, unauthorized access ও negative scenarios test করব।
+- [ ] Security-critical logic-এ প্রয়োজনমতো property-based testing ও fuzzing ব্যবহার করব।
+- [ ] Concurrency, duplicate requests, retries ও idempotency test করব যেখানে প্রাসঙ্গিক।
+- [ ] Timeout, network failure, database failure ও partial failure test করব।
+- [ ] Load এবং soak tests দিয়ে performance ও resource consumption যাচাই করব।
+- [ ] Static analysis, secret scanning এবং dependency vulnerability scanning চালাব।
+
+### E. Infrastructure & Operations
+- [ ] Timeouts, request-size limits, rate limits ও bounded resource usage নির্ধারণ করব।
+- [ ] Retry policy-তে সীমা, backoff ও jitter রাখব; retry storm তৈরি হতে দেব না।
+- [ ] Logs, metrics, traces, health checks এবং actionable alerts তৈরি করব।
+- [ ] Production configuration ও secrets নিরাপদভাবে manage করব; development secrets reuse করব না।
+- [ ] Container ও process-কে non-root এবং সীমিত privilege-এ চালাব যেখানে সম্ভব।
+- [ ] Network access, firewall rules, origin access এবং outbound connections সীমিত রাখব।
+- [ ] Database migration, backup, restore, rollback ও recovery নিয়মিত পরীক্ষা করব।
+- [ ] CI/CD-তে required checks, protected branches এবং অনুমোদিত deployment workflow enforce করব।
+- [ ] Dependency ও container image update, vulnerability patching এবং release provenance যাচাই করব।
+- [ ] Production release-এর আগে staging verification, monitoring এবং rollback plan নিশ্চিত করব।
+
+### F. AI Coding & Release Discipline
+- [ ] AI-generated code review না করে production-এ merge করব না।
+- [ ] AI-কে বিদ্যমান repository, relevant files এবং architecture inspect করতে বলব; অনুমান করে code লিখতে দেব না।
+- [ ] AI-এর দেওয়া security claim, test result ও benchmark নিজে যাচাই করব।
+- [ ] Security control disable করে test pass করানো বা warning লুকানো গ্রহণ করব না।
+- [ ] প্রতিটি change-এর diff, regression risk এবং backward compatibility review করব।
+- [ ] Critical security issue থাকলে release block করব; unresolved risk document করব।
+- [ ] একটি component-এর acceptance criteria ও verification evidence পূরণ না হওয়া পর্যন্ত সেটিকে complete বলব না।
+
