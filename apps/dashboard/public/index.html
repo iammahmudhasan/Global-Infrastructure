@@ -146,6 +146,210 @@
             </div>
           </div>
 
+          <!-- Interactive Global Multi-PoP Fabric & Subsea Topology Map -->
+          <div class="topology-map-card">
+            <div class="topology-header-row">
+              <div class="topology-title-area">
+                <h3>Global Multi-PoP Fabric & Subsea Cable Topology</h3>
+                <p>Live Anycast edge nodes, SMW6 & TAT-14 subsea transit, and cryptographic data sovereignty</p>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;">
+                <span id="map-sync-badge" class="badge badge-bd">4 POPS SYNCHRONIZED</span>
+                <span id="map-probe-status" class="telemetry-status-text">Fleet Healthy</span>
+                <button class="btn btn-secondary btn-sm" onclick="loadPoPTelemetry()">
+                  <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                  Refresh
+                </button>
+                <button class="btn btn-primary btn-sm" id="map-probe-btn" onclick="triggerPoPProbes()">
+                  <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                  Run Synthetic Probes
+                </button>
+              </div>
+            </div>
+
+            <div class="topology-canvas-container">
+              <svg class="topology-svg" viewBox="0 0 1000 440" preserveAspectRatio="xMidYMid meet">
+                <defs>
+                  <!-- Glow Filters -->
+                  <filter id="glow-cyan" x="-20%" y="-20%" width="140%" height="140%">
+                    <feGaussianBlur stdDeviation="3.5" result="blur" />
+                    <feMerge>
+                      <feMergeNode in="blur" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                  <filter id="glow-indigo" x="-20%" y="-20%" width="140%" height="140%">
+                    <feGaussianBlur stdDeviation="3.5" result="blur" />
+                    <feMerge>
+                      <feMergeNode in="blur" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                  <filter id="glow-emerald" x="-20%" y="-20%" width="140%" height="140%">
+                    <feGaussianBlur stdDeviation="3.5" result="blur" />
+                    <feMerge>
+                      <feMergeNode in="blur" />
+                      <feMergeNode in="SourceGraphic" />
+                    </feMerge>
+                  </filter>
+                  <linearGradient id="grad-smw6" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stop-color="#06b6d4" stop-opacity="0.9" />
+                    <stop offset="50%" stop-color="#3b82f6" stop-opacity="0.8" />
+                    <stop offset="100%" stop-color="#6366f1" stop-opacity="0.9" />
+                  </linearGradient>
+                  <linearGradient id="grad-tat14" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stop-color="#6366f1" stop-opacity="0.9" />
+                    <stop offset="100%" stop-color="#a855f7" stop-opacity="0.9" />
+                  </linearGradient>
+                </defs>
+
+                <!-- Subtle Lat/Long Coordinate Grid -->
+                <g stroke="rgba(255, 255, 255, 0.04)" stroke-width="0.8" stroke-dasharray="4 6">
+                  <line x1="0" y1="110" x2="1000" y2="110" />
+                  <line x1="0" y1="220" x2="1000" y2="220" />
+                  <line x1="0" y1="330" x2="1000" y2="330" />
+                  <line x1="200" y1="0" x2="200" y2="440" />
+                  <line x1="400" y1="0" x2="400" y2="440" />
+                  <line x1="600" y1="0" x2="600" y2="440" />
+                  <line x1="800" y1="0" x2="800" y2="440" />
+                </g>
+
+                <!-- Simplified Continental Silhouettes (High-Tech Vector Coastlines) -->
+                <g fill="rgba(99, 102, 241, 0.06)" stroke="rgba(99, 102, 241, 0.16)" stroke-width="1.2">
+                  <!-- North America -->
+                  <path d="M 110 80 L 160 70 L 260 75 L 310 110 L 290 140 L 270 170 L 260 210 L 230 250 L 190 230 L 150 180 L 110 140 Z" />
+                  <!-- South America -->
+                  <path d="M 270 270 L 330 290 L 350 350 L 300 420 L 270 380 L 250 310 Z" />
+                  <!-- Europe -->
+                  <path d="M 460 90 L 530 80 L 570 110 L 550 160 L 490 170 L 460 140 Z" />
+                  <!-- Africa -->
+                  <path d="M 470 190 L 560 190 L 590 250 L 560 360 L 500 370 L 460 270 Z" />
+                  <!-- Asia -->
+                  <path d="M 580 80 L 780 70 L 890 120 L 870 210 L 820 270 L 770 290 L 730 210 L 650 160 Z" />
+                  <!-- Australia -->
+                  <path d="M 830 330 L 910 320 L 930 380 L 860 400 L 820 360 Z" />
+                </g>
+
+                <!-- Subsea Cable Paths -->
+                <!-- 1. SMW6 Subsea Cable: Singapore -> Dhaka -> Middle East -> Frankfurt -->
+                <path id="svg-cable-smw6" class="cable-path cable-primary"
+                      d="M 780 275 Q 755 235 735 200 Q 640 250 580 190 T 510 140"
+                      filter="url(#glow-cyan)" />
+
+                <!-- 2. TAT-14 Transatlantic Subsea Cable: Frankfurt -> Virginia -->
+                <path id="svg-cable-tat14" class="cable-path cable-transatlantic"
+                      d="M 510 140 Q 375 90 240 160"
+                      filter="url(#glow-indigo)" />
+
+                <!-- 3. Trans-Pacific Edge Route: Virginia -> West Coast -> Singapore -->
+                <path id="svg-cable-pacific-us" class="cable-path cable-failover"
+                      d="M 240 160 Q 140 180 10 220" />
+                <path id="svg-cable-pacific-asia" class="cable-path cable-failover"
+                      d="M 990 220 Q 880 250 780 275" />
+
+                <!-- 4. Dhaka BDIX Regional Peering Ring -->
+                <circle cx="735" cy="200" r="16" fill="none" stroke="rgba(16, 185, 129, 0.4)" stroke-width="1.5" stroke-dasharray="3 3" />
+
+                <!-- Cable Labels -->
+                <text x="350" y="105" fill="rgba(168, 85, 247, 0.85)" font-size="9" font-family="'JetBrains Mono', monospace" font-weight="600">TAT-14 TRANSATLANTIC (78ms SLA)</text>
+                <text x="600" y="235" fill="rgba(6, 182, 212, 0.85)" font-size="9" font-family="'JetBrains Mono', monospace" font-weight="600">SMW6 SUBSEA (30,000 Gbps)</text>
+                <text x="700" y="175" fill="rgba(16, 185, 129, 0.85)" font-size="9" font-family="'JetBrains Mono', monospace" font-weight="600">BDIX 2.27 Tbps</text>
+
+                <!-- Interactive PoP Nodes -->
+                <!-- Virginia PoP (Ashburn DC2) -->
+                <g class="map-pop-group" id="svg-node-virginia" onclick="selectMapPoP('virginia')">
+                  <circle class="map-pulse-circle" cx="240" cy="160" r="12" stroke="var(--accent-amber)" />
+                  <circle class="map-pop-core" cx="240" cy="160" r="7" fill="var(--accent-amber)" />
+                  <text class="map-node-label" x="240" y="190" text-anchor="middle">VIRGINIA</text>
+                  <text class="map-node-badge" x="240" y="204" text-anchor="middle" id="map-rtt-virginia">12.5 ms &bull; Ashburn DC2</text>
+                </g>
+
+                <!-- Frankfurt PoP (DE-CIX 01) -->
+                <g class="map-pop-group" id="svg-node-frankfurt" onclick="selectMapPoP('frankfurt')">
+                  <circle class="map-pulse-circle" cx="510" cy="140" r="12" stroke="var(--accent-indigo)" />
+                  <circle class="map-pop-core" cx="510" cy="140" r="7" fill="var(--accent-indigo)" />
+                  <text class="map-node-label" x="510" y="122" text-anchor="middle">FRANKFURT</text>
+                  <text class="map-node-badge" x="510" y="108" text-anchor="middle" id="map-rtt-frankfurt">14.0 ms &bull; EU GDPR</text>
+                </g>
+
+                <!-- Dhaka PoP (BDIX Edge 01) -->
+                <g class="map-pop-group" id="svg-node-dhaka" onclick="selectMapPoP('dhaka')">
+                  <circle class="map-pulse-circle" cx="735" cy="200" r="14" stroke="var(--accent-emerald)" />
+                  <circle class="map-pop-core" cx="735" cy="200" r="8" fill="var(--accent-emerald)" />
+                  <text class="map-node-label" x="735" y="232" text-anchor="middle">DHAKA</text>
+                  <text class="map-node-badge" x="735" y="246" text-anchor="middle" id="map-rtt-dhaka">4.2 ms &bull; BD-NDMA 2026</text>
+                </g>
+
+                <!-- Singapore PoP (Equinix SG1) -->
+                <g class="map-pop-group" id="svg-node-singapore" onclick="selectMapPoP('singapore')">
+                  <circle class="map-pulse-circle" cx="780" cy="275" r="14" stroke="var(--accent-cyan)" />
+                  <circle class="map-pop-core" cx="780" cy="275" r="8" fill="var(--accent-cyan)" />
+                  <text class="map-node-label" x="780" y="307" text-anchor="middle">SINGAPORE</text>
+                  <text class="map-node-badge" x="780" y="321" text-anchor="middle" id="map-rtt-singapore">8.1 ms &bull; SMW6 Anchor</text>
+                </g>
+              </svg>
+            </div>
+
+            <!-- Interactive HUD Detail Cards (4 PoPs) -->
+            <div class="topology-hud-grid">
+              <div class="topology-hud-item selected" id="hud-dhaka" onclick="selectMapPoP('dhaka')">
+                <div class="hud-title-row">
+                  <span class="hud-pop-name">Dhaka, Bangladesh</span>
+                  <span class="badge badge-emerald" id="hud-badge-dhaka">OPTIMAL</span>
+                </div>
+                <div class="hud-metric-row">
+                  <span class="hud-subsea-label">BDIX 167 ISPs &bull; asia-south1</span>
+                  <span class="hud-rtt-val text-emerald" id="hud-rtt-val-dhaka">4.2 ms</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--accent-purple); margin-top: 0.35rem; font-weight: 600;">
+                  Strict BD-NDMA 2026 Sovereign Lock
+                </div>
+              </div>
+
+              <div class="topology-hud-item" id="hud-singapore" onclick="selectMapPoP('singapore')">
+                <div class="hud-title-row">
+                  <span class="hud-pop-name">Singapore Equinix SG1</span>
+                  <span class="badge badge-emerald" id="hud-badge-singapore">OPTIMAL</span>
+                </div>
+                <div class="hud-metric-row">
+                  <span class="hud-subsea-label">SMW6 Direct &bull; asia-southeast1</span>
+                  <span class="hud-rtt-val text-emerald" id="hud-rtt-val-singapore">8.1 ms</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--accent-cyan); margin-top: 0.35rem; font-weight: 600;">
+                  Active Live Production Host Anchor
+                </div>
+              </div>
+
+              <div class="topology-hud-item" id="hud-frankfurt" onclick="selectMapPoP('frankfurt')">
+                <div class="hud-title-row">
+                  <span class="hud-pop-name">Frankfurt DE-CIX 01</span>
+                  <span class="badge badge-emerald" id="hud-badge-frankfurt">OPTIMAL</span>
+                </div>
+                <div class="hud-metric-row">
+                  <span class="hud-subsea-label">TAT-14 Failover &bull; europe-west3</span>
+                  <span class="hud-rtt-val text-emerald" id="hud-rtt-val-frankfurt">14.0 ms</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--accent-indigo); margin-top: 0.35rem; font-weight: 600;">
+                  EU GDPR Data Residency Compliant
+                </div>
+              </div>
+
+              <div class="topology-hud-item" id="hud-virginia" onclick="selectMapPoP('virginia')">
+                <div class="hud-title-row">
+                  <span class="hud-pop-name">Virginia Ashburn DC2</span>
+                  <span class="badge badge-emerald" id="hud-badge-virginia">OPTIMAL</span>
+                </div>
+                <div class="hud-metric-row">
+                  <span class="hud-subsea-label">Equinix Fabric &bull; us-east1</span>
+                  <span class="hud-rtt-val text-emerald" id="hud-rtt-val-virginia">12.5 ms</span>
+                </div>
+                <div style="font-size: 0.7rem; color: var(--accent-amber); margin-top: 0.35rem; font-weight: 600;">
+                  Lowest Cost US East Compute Anchor
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- Dual Section: Live Traffic Director Tester & Recent Edge Events -->
           <div class="dual-grid">
             <div class="card">

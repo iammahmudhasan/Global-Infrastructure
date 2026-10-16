@@ -801,3 +801,195 @@
       color: var(--text-muted);
       font-family: 'JetBrains Mono', monospace;
     }
+
+    /* Interactive Global Topology Map */
+    .topology-map-card {
+      background: var(--gradient-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.5rem;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4);
+    }
+
+    .topology-header-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+
+    .topology-title-area h3 {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .topology-title-area p {
+      font-size: 0.76rem;
+      color: var(--text-muted);
+      margin-top: 0.15rem;
+    }
+
+    .topology-canvas-container {
+      position: relative;
+      width: 100%;
+      background: #070b18;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+      border-radius: 8px;
+      overflow: hidden;
+      min-height: 360px;
+    }
+
+    .topology-svg {
+      width: 100%;
+      height: 100%;
+      min-height: 360px;
+      display: block;
+    }
+
+    /* Subsea Cables */
+    .cable-path {
+      fill: none;
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      transition: stroke 0.3s ease, stroke-width 0.3s ease;
+    }
+
+    .cable-primary {
+      stroke: rgba(6, 182, 212, 0.7);
+      stroke-dasharray: 6 3;
+      animation: cablePulse 2s linear infinite;
+    }
+
+    .cable-transatlantic {
+      stroke: rgba(99, 102, 241, 0.7);
+      stroke-dasharray: 6 3;
+      animation: cablePulse 2.2s linear infinite;
+    }
+
+    .cable-failover {
+      stroke: rgba(245, 158, 11, 0.6);
+      stroke-dasharray: 4 4;
+      animation: cablePulse 1.5s linear reverse infinite;
+    }
+
+    .cable-cut {
+      stroke: rgba(244, 63, 94, 0.85) !important;
+      stroke-dasharray: 3 6 !important;
+      animation: none !important;
+    }
+
+    @keyframes cablePulse {
+      from { stroke-dashoffset: 36; }
+      to { stroke-dashoffset: 0; }
+    }
+
+    /* PoP Map Nodes */
+    .map-pop-group {
+      cursor: pointer;
+      transition: transform 0.2s ease;
+    }
+
+    .map-pop-group:hover {
+      transform: scale(1.08);
+    }
+
+    .map-pop-core {
+      stroke: #070b18;
+      stroke-width: 2.5;
+      transition: stroke 0.2s, stroke-width 0.2s;
+    }
+
+    .map-pop-group.active-pop .map-pop-core {
+      stroke: #ffffff;
+      stroke-width: 3.5px;
+    }
+
+    .map-pulse-circle {
+      fill: none;
+      stroke-width: 1.5;
+      animation: mapNodePulse 2.4s cubic-bezier(0, 0.2, 0.8, 1) infinite;
+    }
+
+    @keyframes mapNodePulse {
+      0% { r: 6; opacity: 0.9; }
+      100% { r: 24; opacity: 0; }
+    }
+
+    .map-node-label {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 600;
+      fill: #ffffff;
+      paint-order: stroke;
+      stroke: #070b18;
+      stroke-width: 3px;
+      stroke-linejoin: round;
+    }
+
+    .map-node-badge {
+      font-family: 'Plus Jakarta Sans', sans-serif;
+      font-size: 9px;
+      font-weight: 600;
+      fill: var(--accent-cyan);
+      paint-order: stroke;
+      stroke: #070b18;
+      stroke-width: 2.5px;
+    }
+
+    /* Inspector HUD Box below map */
+    .topology-hud-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 0.85rem;
+      margin-top: 1rem;
+    }
+
+    .topology-hud-item {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0.85rem 1rem;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .topology-hud-item:hover, .topology-hud-item.selected {
+      border-color: rgba(99, 102, 241, 0.6);
+      background: rgba(30, 41, 59, 0.6);
+    }
+
+    .hud-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.35rem;
+    }
+
+    .hud-pop-name {
+      font-size: 0.88rem;
+      font-weight: 700;
+    }
+
+    .hud-metric-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-top: 0.25rem;
+    }
+
+    .hud-rtt-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .hud-subsea-label {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+    }

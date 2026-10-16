@@ -690,12 +690,38 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       }
     }
 
+    function selectMapPoP(popId) {
+      const pops = ['dhaka', 'singapore', 'frankfurt', 'virginia'];
+      pops.forEach(p => {
+        const hud = document.getElementById(`hud-${p}`);
+        const svgNode = document.getElementById(`svg-node-${p}`);
+        if (hud) {
+          if (p === popId) {
+            hud.classList.add('selected');
+          } else {
+            hud.classList.remove('selected');
+          }
+        }
+        if (svgNode) {
+          if (p === popId) {
+            svgNode.classList.add('active-pop');
+          } else {
+            svgNode.classList.remove('active-pop');
+          }
+        }
+      });
+    }
+    window.selectMapPoP = selectMapPoP;
+
     async function loadPoPTelemetry() {
       const probeStatus = document.getElementById('probe-status-text');
       const badge = document.getElementById('pop-telemetry-badge');
+      const mapSyncBadge = document.getElementById('map-sync-badge');
+      const mapProbeStatus = document.getElementById('map-probe-status');
       const routesBadge = document.getElementById('pop-routes-badge');
       const routesTbody = document.getElementById('pop-routes-tbody');
       const btnProbes = document.getElementById('btn-trigger-probes');
+      const mapProbeBtn = document.getElementById('map-probe-btn');
 
       const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
       if (btnProbes) {
@@ -705,6 +731,15 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         } else {
           btnProbes.title = 'Run live synthetic probe cycle across all PoPs';
           btnProbes.style.opacity = '1.0';
+        }
+      }
+      if (mapProbeBtn) {
+        if (!isOperator) {
+          mapProbeBtn.title = 'PLATFORM_OPERATOR role required to trigger synthetic probes';
+          mapProbeBtn.style.opacity = '0.6';
+        } else {
+          mapProbeBtn.title = 'Run live synthetic probe cycle across all PoPs';
+          mapProbeBtn.style.opacity = '1.0';
         }
       }
 
@@ -717,21 +752,25 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
           if (badge) {
             badge.innerText = `${pops.length} POPS SYNCHRONIZED`;
           }
+          if (mapSyncBadge) {
+            mapSyncBadge.innerText = `${pops.length} POPS SYNCHRONIZED`;
+          }
           pops.forEach(pop => {
             const ewmaElem = document.getElementById(`ewma-${pop.pop_id}`);
             const lossElem = document.getElementById(`loss-${pop.pop_id}`);
             const badgeElem = document.getElementById(`badge-status-${pop.pop_id}`);
 
+            const rtt = pop.ewma_latency_ms !== undefined ? pop.ewma_latency_ms.toFixed(1) : (pop.last_rtt_ms !== undefined ? pop.last_rtt_ms.toFixed(1) : '-');
+            const loss = pop.packet_loss_percent !== undefined ? pop.packet_loss_percent.toFixed(1) : '0.0';
+            const st = (pop.status || 'OPTIMAL').toUpperCase();
+
             if (ewmaElem) {
-              const rtt = pop.ewma_latency_ms !== undefined ? pop.ewma_latency_ms.toFixed(1) : (pop.last_rtt_ms !== undefined ? pop.last_rtt_ms.toFixed(1) : '-');
               ewmaElem.textContent = `${rtt} ms`;
             }
             if (lossElem) {
-              const loss = pop.packet_loss_percent !== undefined ? pop.packet_loss_percent.toFixed(1) : '0.0';
               lossElem.textContent = `${loss}%`;
             }
             if (badgeElem) {
-              const st = (pop.status || 'OPTIMAL').toUpperCase();
               badgeElem.textContent = st;
               if (st === 'OPTIMAL' || st === 'ACTIVE') {
                 badgeElem.className = 'badge badge-emerald';
@@ -741,16 +780,47 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
                 badgeElem.className = 'badge badge-rose';
               }
             }
+
+            // Update SVG map node badge
+            const mapRttElem = document.getElementById(`map-rtt-${pop.pop_id}`);
+            if (mapRttElem) {
+              const regionLabels = {
+                dhaka: 'BD-NDMA 2026',
+                singapore: 'SMW6 Anchor',
+                frankfurt: 'EU GDPR',
+                virginia: 'Ashburn DC2'
+              };
+              const regLabel = regionLabels[pop.pop_id] || pop.region || 'Edge';
+              mapRttElem.textContent = `${rtt} ms \u2022 ${regLabel}`;
+            }
+
+            // Update HUD card values
+            const hudRttElem = document.getElementById(`hud-rtt-val-${pop.pop_id}`);
+            if (hudRttElem) {
+              hudRttElem.textContent = `${rtt} ms`;
+            }
+            const hudBadgeElem = document.getElementById(`hud-badge-${pop.pop_id}`);
+            if (hudBadgeElem) {
+              hudBadgeElem.textContent = st;
+              if (st === 'OPTIMAL' || st === 'ACTIVE') {
+                hudBadgeElem.className = 'badge badge-emerald';
+              } else if (st === 'FAILOVER_ENGAGED' || st === 'DEGRADED') {
+                hudBadgeElem.className = 'badge badge-amber';
+              } else {
+                hudBadgeElem.className = 'badge badge-rose';
+              }
+            }
           });
-          if (probeStatus && healthData.timestamp) {
+          if (healthData.timestamp) {
             const d = new Date(healthData.timestamp);
-            probeStatus.textContent = `Last Probed: ${d.toLocaleTimeString()}`;
+            const timeStr = `Last Probed: ${d.toLocaleTimeString()}`;
+            if (probeStatus) probeStatus.textContent = timeStr;
+            if (mapProbeStatus) mapProbeStatus.textContent = timeStr;
           }
         }
       } catch (err) {
-        if (probeStatus) {
-          probeStatus.textContent = 'Telemetry Sync Error';
-        }
+        if (probeStatus) probeStatus.textContent = 'Telemetry Sync Error';
+        if (mapProbeStatus) mapProbeStatus.textContent = 'Telemetry Sync Error';
       }
 
       // 2. Fetch multi-PoP failover routes
@@ -833,14 +903,14 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
 
     async function triggerPoPProbes() {
       const probeStatus = document.getElementById('probe-status-text');
+      const mapProbeStatus = document.getElementById('map-probe-status');
       const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
       if (!isOperator) {
         showToast('Forbidden: PLATFORM_OPERATOR role required to trigger synthetic probes');
         return;
       }
-      if (probeStatus) {
-        probeStatus.textContent = 'Probing Global PoPs...';
-      }
+      if (probeStatus) probeStatus.textContent = 'Probing Global PoPs...';
+      if (mapProbeStatus) mapProbeStatus.textContent = 'Probing Global PoPs...';
       try {
         const resp = await fetch('/api/proxy/pops/health/probe', {
           method: 'POST'
@@ -854,9 +924,11 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         const err = await resp.json();
         showToast(`Probe execution failed: ${err.error || 'Request rejected'}`);
         if (probeStatus) probeStatus.textContent = 'Probe Failed';
+        if (mapProbeStatus) mapProbeStatus.textContent = 'Probe Failed';
       } catch (e) {
         showToast(`Probe network error: ${e.message}`);
         if (probeStatus) probeStatus.textContent = 'Probe Error';
+        if (mapProbeStatus) mapProbeStatus.textContent = 'Probe Error';
       }
     }
 

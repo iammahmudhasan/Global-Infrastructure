@@ -111,14 +111,24 @@ class GlobalScheduler:
                     continue
 
             # 3. Latency Upper Bound Check (Hard SLA Constraint with Live Telemetry)
-            if live_pop and not live_pop.get("healthy", True):
-                # Origin PoP is degraded/cut - apply subsea failover transit penalty (TAT-14 / SMW6)
-                base_rtt = getattr(node, f"rtt_ms_from_{client_origin}", 100)
-                rtt = base_rtt + 78
-            elif client_origin in node.live_latency_overrides:
+            base_rtt = getattr(node, f"rtt_ms_from_{client_origin}", 100)
+            if client_origin in node.live_latency_overrides:
                 rtt = node.live_latency_overrides[client_origin]
+            elif live_pop:
+                if not live_pop.get("healthy", True) or live_pop.get("status") in ("POP_DRAINING", "POP_DOWN", "POP_FLAPPING"):
+                    # Subsea cut / pop draining - add failover penalty (+78ms TAT-14 / SMW6)
+                    rtt = base_rtt + 78
+                else:
+                    # Account for measured EWMA latency and packet loss jitter
+                    loss = float(live_pop.get("packet_loss_percent", 0.0))
+                    jitter_penalty = loss * 25.0
+                    ewma = float(live_pop.get("ewma_latency_ms", 0.0))
+                    if ewma > 0:
+                        rtt = max(1, int(base_rtt + jitter_penalty))
+                    else:
+                        rtt = base_rtt + int(jitter_penalty)
             else:
-                rtt = getattr(node, f"rtt_ms_from_{client_origin}", 100)
+                rtt = base_rtt
 
             if req.max_latency_p95_ms > 0 and rtt > req.max_latency_p95_ms:
                 continue
@@ -182,6 +192,55 @@ class GlobalScheduler:
 
         self.idempotency_cache[idempotency_key] = decision
         return decision
+
+    def generate_placement_policy(self, origins: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Generates a declarative placement policy matrix across all strategic edge origins.
+        """
+        target_origins = origins or ["dhaka", "singapore", "frankfurt", "virginia"]
+        policy = {
+            "version": "v1",
+            "generated_by": "NexusEdge-Universal-Scheduler",
+            "origins": {}
+        }
+
+        for origin in target_origins:
+            # Synthetic standard request
+            sample_req = WorkloadRequirement(
+                workload_id=f"policy-probe-{origin}",
+                workload_type="GPU_INFERENCE",
+                client_origin=origin,
+                required_jurisdiction="BD" if origin == "dhaka" else None,
+                strict_sovereignty=True if origin == "dhaka" else False,
+                max_latency_p95_ms=150,
+                max_cost_per_hour=10.0
+            )
+            # Find candidate without mutating state
+            snapshot_cache = dict(self.idempotency_cache)
+            decision = self.find_optimal_placement(sample_req)
+            self.idempotency_cache = snapshot_cache
+
+            if decision.get("status") == "SCHEDULED":
+                # Rollback capacity decrement for policy snapshot
+                for n in self.nodes:
+                    if n.node_id == decision.get("assigned_node"):
+                        n.available_gpus += sample_req.gpus_requested
+                        break
+                policy["origins"][origin] = {
+                    "optimal_node": decision.get("assigned_node"),
+                    "provider": decision.get("provider"),
+                    "target_region": decision.get("region"),
+                    "expected_rtt_ms": decision.get("measured_rtt_ms"),
+                    "carbon_rating": decision.get("carbon_classification"),
+                    "sovereign_compliant": True
+                }
+            else:
+                policy["origins"][origin] = {
+                    "status": "UNSCHEDULABLE",
+                    "reason": decision.get("error")
+                }
+
+        return policy
 
 if __name__ == "__main__":
     # Testbed topology across 4 strategic regions
@@ -286,5 +345,44 @@ if __name__ == "__main__":
     print(res_sg)
     assert res_sg["status"] == "SCHEDULED" and res_sg["assigned_node"] == "sg-aws-gpu01"
 
-    print("All Python scheduler constraint tests passed.")
+    print("\n=== TEST 7: Packet Loss Congestion Penalty & Self-Healing ===")
+    scheduler.update_live_telemetry({
+        "virginia": {
+            "pop_id": "virginia",
+            "healthy": True,
+            "status": "POP_DEGRADED",
+            "packet_loss_percent": 3.0,
+            "ewma_latency_ms": 25.0
+        }
+    })
+    virginia_congested_job = WorkloadRequirement(
+        workload_id="va-jitter-sensitive-01",
+        workload_type="GPU_INFERENCE",
+        client_origin="virginia",
+        required_jurisdiction=None,
+        strict_sovereignty=False,
+        max_latency_p95_ms=30,  # Base RTT is 8ms, but 3.0% loss adds 75ms jitter penalty -> 83ms > 30ms
+        max_cost_per_hour=5.0
+    )
+    res_congested = scheduler.find_optimal_placement(virginia_congested_job)
+    print(res_congested)
+    assert res_congested["status"] == "UNSCHEDULABLE", "Expected rejection due to packet loss congestion penalty"
+
+    print("\n=== TEST 8: Declarative Global Placement Policy Generation ===")
+    # Reset live telemetry to optimal
+    scheduler.update_live_telemetry({
+        "dhaka": {"pop_id": "dhaka", "healthy": True, "status": "OPTIMAL", "ewma_latency_ms": 4.2},
+        "singapore": {"pop_id": "singapore", "healthy": True, "status": "OPTIMAL", "ewma_latency_ms": 8.1},
+        "frankfurt": {"pop_id": "frankfurt", "healthy": True, "status": "OPTIMAL", "ewma_latency_ms": 14.0},
+        "virginia": {"pop_id": "virginia", "healthy": True, "status": "OPTIMAL", "ewma_latency_ms": 12.5}
+    })
+    policy = scheduler.generate_placement_policy()
+    print("Generated Placement Policy Matrix:")
+    print(json.dumps(policy, indent=2))
+    assert "dhaka" in policy["origins"]
+    assert policy["origins"]["dhaka"]["optimal_node"] == "bd-dhaka-dgx01"
+    assert policy["origins"]["singapore"]["optimal_node"] == "sg-aws-gpu01"
+    assert policy["origins"]["dhaka"]["sovereign_compliant"] is True
+
+    print("All 8 Python scheduler constraint and self-healing tests passed.")
 

@@ -1697,6 +1697,68 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(mockCP);
     }
   });
+
+  it('Requirement 13: Interactive Global Multi-PoP Topology Map & Telemetry HUD are present in frontend bundle', () => {
+    const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+    const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+    const styleCssPath = path.join(publicDir, 'style.css');
+    const styleCssContent = fs.readFileSync(styleCssPath, 'utf8');
+
+    // 1. Verify SVG World Canvas and Subsea Cables in index.html
+    const requiredSvgElements = [
+      'topology-map-card',
+      'topology-svg',
+      'svg-cable-smw6',
+      'svg-cable-tat14',
+      'svg-node-dhaka',
+      'svg-node-singapore',
+      'svg-node-frankfurt',
+      'svg-node-virginia',
+      'map-sync-badge',
+      'map-probe-status',
+      'hud-dhaka',
+      'hud-singapore',
+      'hud-frankfurt',
+      'hud-virginia'
+    ];
+    for (const elemId of requiredSvgElements) {
+      assert.strictEqual(
+        indexHtmlContent.includes(elemId),
+        true,
+        `Expected index.html to contain element "${elemId}"`
+      );
+    }
+
+    // 2. Verify interactive JavaScript hooks in app.js
+    assert.strictEqual(
+      appJsContent.includes('function selectMapPoP(popId)'),
+      true,
+      'app.js must define selectMapPoP(popId)'
+    );
+    assert.strictEqual(
+      appJsContent.includes('mapSyncBadge'),
+      true,
+      'app.js loadPoPTelemetry must update mapSyncBadge'
+    );
+    assert.strictEqual(
+      appJsContent.includes('map-rtt-'),
+      true,
+      'app.js must dynamically bind EWMA RTT to map nodes'
+    );
+    assert.strictEqual(
+      appJsContent.includes('hud-rtt-val-'),
+      true,
+      'app.js must dynamically bind EWMA RTT to HUD cards'
+    );
+
+    // 3. Verify high-tech styling in style.css
+    assert.strictEqual(styleCssContent.includes('.topology-map-card'), true);
+    assert.strictEqual(styleCssContent.includes('.cable-primary'), true);
+    assert.strictEqual(styleCssContent.includes('.cable-transatlantic'), true);
+    assert.strictEqual(styleCssContent.includes('.map-pulse-circle'), true);
+    assert.strictEqual(styleCssContent.includes('.topology-hud-grid'), true);
+  });
 });
+
 
 
