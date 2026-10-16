@@ -689,3 +689,115 @@
       from { transform: translateY(16px); opacity: 0; }
       to { transform: translateY(0); opacity: 1; }
     }
+
+    /* Multi-PoP Live Telemetry Grid & Subsea Cards */
+    .pop-telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .pop-card {
+      background: var(--gradient-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 1.15rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+      transition: border-color 0.2s ease, transform 0.2s ease;
+    }
+
+    .pop-card:hover {
+      border-color: rgba(99, 102, 241, 0.4);
+      transform: translateY(-2px);
+    }
+
+    .pop-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .pop-card-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+    }
+
+    .pop-card-region {
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .pop-metrics-row {
+      display: flex;
+      align-items: baseline;
+      gap: 1.25rem;
+      margin: 0.35rem 0;
+      padding: 0.5rem 0.75rem;
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: 6px;
+    }
+
+    .pop-metric-item {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .pop-metric-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.15rem;
+      font-weight: 700;
+    }
+
+    .pop-metric-lbl {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .pop-subsea-box {
+      font-size: 0.74rem;
+      padding: 0.45rem 0.65rem;
+      background: rgba(6, 182, 212, 0.08);
+      border: 1px solid rgba(6, 182, 212, 0.2);
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.2rem;
+    }
+
+    .pop-subsea-label {
+      color: var(--accent-cyan);
+      font-weight: 600;
+      font-size: 0.72rem;
+    }
+
+    .pop-subsea-detail {
+      color: var(--text-muted);
+      font-size: 0.7rem;
+    }
+
+    .telemetry-controls-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 1rem;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+
+    .telemetry-controls-left {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .telemetry-status-text {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      font-family: 'JetBrains Mono', monospace;
+    }

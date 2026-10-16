@@ -176,3 +176,90 @@ func TestConntrackPurgeExpired(t *testing.T) {
 		t.Fatalf("expected at least 1 entry purged, got %d", purged)
 	}
 }
+
+// TestChaos_Maglev_GatewayDropoutConsistency verifies Google Maglev minimal disruption property
+// under unexpected node crash (e.g. Frankfurt edge gateway failure).
+func TestChaos_Maglev_GatewayDropoutConsistency(t *testing.T) {
+	maglev5, err := NewMaglevConsistentHash(DefaultMaglevTableSize, 0)
+	if err != nil {
+		t.Fatalf("failed to create Maglev ring: %v", err)
+	}
+
+	backends5 := []*BackendNode{
+		{ID: "pop-sin-gw-01", IP: net.ParseIP("172.30.0.3"), Port: 8080, Weight: 100},
+		{ID: "pop-sin-gw-02", IP: net.ParseIP("172.30.0.4"), Port: 8080, Weight: 100},
+		{ID: "pop-dha-gw-01", IP: net.ParseIP("172.30.0.5"), Port: 8080, Weight: 100},
+		{ID: "pop-fra-gw-01", IP: net.ParseIP("172.30.0.6"), Port: 8080, Weight: 100},
+		{ID: "pop-iad-gw-01", IP: net.ParseIP("172.30.0.7"), Port: 8080, Weight: 100},
+	}
+
+	if err := maglev5.SetBackends(backends5); err != nil {
+		t.Fatalf("failed to set 5 backends: %v", err)
+	}
+
+	now := time.Now()
+	numFlows := 5000
+	type flowRecord struct {
+		flow     FiveTuple
+		assigned string
+	}
+	records := make([]flowRecord, numFlows)
+
+	for i := 0; i < numFlows; i++ {
+		flow := FiveTuple{
+			SrcIP:    net.ParseIP(fmt.Sprintf("198.51.100.%d", (i%250)+1)),
+			DstIP:    net.ParseIP("103.144.180.1"),
+			SrcPort:  uint16(10000 + (i % 50000)),
+			DstPort:  443,
+			Protocol: 6,
+		}
+		node, err := maglev5.Dispatch(flow, now)
+		if err != nil {
+			t.Fatalf("dispatch error: %v", err)
+		}
+		records[i] = flowRecord{flow: flow, assigned: node.ID}
+	}
+
+	// CHAOS INJECTION: pop-fra-gw-01 abruptly crashes
+	backends4 := []*BackendNode{
+		{ID: "pop-sin-gw-01", IP: net.ParseIP("172.30.0.3"), Port: 8080, Weight: 100},
+		{ID: "pop-sin-gw-02", IP: net.ParseIP("172.30.0.4"), Port: 8080, Weight: 100},
+		{ID: "pop-dha-gw-01", IP: net.ParseIP("172.30.0.5"), Port: 8080, Weight: 100},
+		{ID: "pop-iad-gw-01", IP: net.ParseIP("172.30.0.7"), Port: 8080, Weight: 100},
+	}
+
+	maglev4, err := NewMaglevConsistentHash(DefaultMaglevTableSize, 0)
+	if err != nil {
+		t.Fatalf("failed to create second Maglev ring: %v", err)
+	}
+	if err := maglev4.SetBackends(backends4); err != nil {
+		t.Fatalf("failed to set 4 backends: %v", err)
+	}
+
+	var stableFlows, reassignedFromFailed, displacedFlows int
+	for _, r := range records {
+		newNode, err := maglev4.Dispatch(r.flow, now)
+		if err != nil {
+			t.Fatalf("dispatch error after crash: %v", err)
+		}
+
+		if r.assigned == "pop-fra-gw-01" {
+			reassignedFromFailed++
+			if newNode.ID == "pop-fra-gw-01" {
+				t.Fatalf("flow was reassigned to crashed node pop-fra-gw-01")
+			}
+		} else {
+			if newNode.ID == r.assigned {
+				stableFlows++
+			} else {
+				displacedFlows++
+			}
+		}
+	}
+
+	totalUnaffected := numFlows - reassignedFromFailed
+	disruptionRate := float64(displacedFlows) / float64(totalUnaffected)
+	if disruptionRate > 0.05 {
+		t.Fatalf("Maglev disruption rate excessive: %.2f%% displaced without reason", disruptionRate*100)
+	}
+}

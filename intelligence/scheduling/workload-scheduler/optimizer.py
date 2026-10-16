@@ -10,9 +10,13 @@ Objectives:
   5. Enforce Strict Data Sovereignty (e.g. Bangladesh NDMA 2026, EU GDPR)
 """
 
-from dataclasses import dataclass
-from typing import List, Optional, Dict
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any
+import json
 import math
+import os
+import urllib.request
+import urllib.error
 
 @dataclass
 class ComputeNode:
@@ -27,13 +31,15 @@ class ComputeNode:
     rtt_ms_from_dhaka: int
     rtt_ms_from_frankfurt: int
     rtt_ms_from_virginia: int
-    kv_cache_warmth: float   # 0.0 to 1.0 (is model/prefix already loaded)
+    rtt_ms_from_singapore: int = 100
+    kv_cache_warmth: float = 0.0  # 0.0 to 1.0 (is model/prefix already loaded)
+    live_latency_overrides: Dict[str, float] = field(default_factory=dict)
 
 @dataclass
 class WorkloadRequirement:
     workload_id: str
     workload_type: str       # "GPU_INFERENCE", "BANKING_API", "REASONING_AGENT"
-    client_origin: str       # "dhaka", "frankfurt", "virginia"
+    client_origin: str       # "dhaka", "frankfurt", "virginia", "singapore"
     required_jurisdiction: Optional[str] # e.g. "BD" for Bangladesh National Data Act
     strict_sovereignty: bool
     max_latency_p95_ms: int
@@ -48,6 +54,40 @@ class GlobalScheduler:
         self.nodes = nodes
         self.active_workloads: Dict[str, str] = {} # workload_id -> node_id
         self.idempotency_cache: Dict[str, Dict] = {} # tenant:proj:key -> decision
+        self.live_pop_health: Dict[str, Dict[str, Any]] = {}
+
+    def update_live_telemetry(self, pop_health: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Updates live PoP health states and measured EWMA latencies.
+        If a PoP is marked unhealthy or draining, origin routes may experience failover transit penalty.
+        """
+        self.live_pop_health = pop_health
+
+    def fetch_live_telemetry(self, control_plane_url: Optional[str] = None, auth_token: Optional[str] = None) -> bool:
+        """
+        Pulls live telemetry from Config Controller REST API (/v1/edge/pops/health).
+        Fails safely with deterministic fallback if the control plane is offline (Rules 28-30).
+        """
+        url = control_plane_url or os.getenv("NEXUSEDGE_CONFIG_CONTROLLER_ENDPOINT") or os.getenv("NEXUSEDGE_CP_ENDPOINT") or "http://127.0.0.1:9091"
+        token = auth_token or os.getenv("NEXUSEDGE_CP_AUTH_TOKEN") or "dev-fixture-key-01"
+        endpoint = f"{url.rstrip('/')}/v1/edge/pops/health"
+
+        try:
+            req = urllib.request.Request(endpoint, headers={
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "NexusEdge-Optimizer/1.0"
+            })
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    pops_list = data.get("pops", [])
+                    health_map = {p["pop_id"]: p for p in pops_list}
+                    self.update_live_telemetry(health_map)
+                    return True
+        except Exception:
+            # Deterministic offline fallback
+            pass
+        return False
 
     def find_optimal_placement(self, req: WorkloadRequirement) -> Dict:
         # 0. Scoped Idempotency Check (Finding 16)
@@ -56,6 +96,9 @@ class GlobalScheduler:
             return self.idempotency_cache[idempotency_key]
 
         candidates = []
+
+        client_origin = req.client_origin.lower()
+        live_pop = self.live_pop_health.get(client_origin)
 
         for node in self.nodes:
             # 1. Capacity check with requested GPUs (Finding 16)
@@ -67,8 +110,16 @@ class GlobalScheduler:
                 if node.jurisdiction != req.required_jurisdiction:
                     continue
 
-            # 3. Latency Upper Bound Check (Hard SLA Constraint)
-            rtt = getattr(node, f"rtt_ms_from_{req.client_origin}", 100)
+            # 3. Latency Upper Bound Check (Hard SLA Constraint with Live Telemetry)
+            if live_pop and not live_pop.get("healthy", True):
+                # Origin PoP is degraded/cut - apply subsea failover transit penalty (TAT-14 / SMW6)
+                base_rtt = getattr(node, f"rtt_ms_from_{client_origin}", 100)
+                rtt = base_rtt + 78
+            elif client_origin in node.live_latency_overrides:
+                rtt = node.live_latency_overrides[client_origin]
+            else:
+                rtt = getattr(node, f"rtt_ms_from_{client_origin}", 100)
+
             if req.max_latency_p95_ms > 0 and rtt > req.max_latency_p95_ms:
                 continue
 
@@ -133,12 +184,12 @@ class GlobalScheduler:
         return decision
 
 if __name__ == "__main__":
-    # Testbed topology
+    # Testbed topology across 4 strategic regions
     nodes = [
-        ComputeNode("bd-dhaka-dgx01", "baremetal-bd", "ap-south-2", "BD", "H100", 8, 2.10, 480.0, 4, 130, 210, 0.9),
-        ComputeNode("sg-aws-gpu01", "aws", "ap-southeast-1", "SG", "H100", 16, 3.20, 390.0, 32, 115, 180, 0.5),
-        ComputeNode("is-green-gpu01", "iceland-green-dc", "is-north-1", "IS", "H100", 32, 1.45, 12.0, 160, 35, 75, 0.2),
-        ComputeNode("us-cw-h100-iad", "coreweave", "us-east-1", "US", "H100", 64, 1.85, 340.0, 210, 85, 8, 0.8),
+        ComputeNode("bd-dhaka-dgx01", "baremetal-bd", "ap-south-2", "BD", "H100", 8, 2.10, 480.0, 4, 130, 210, 32, 0.9),
+        ComputeNode("sg-aws-gpu01", "aws", "ap-southeast-1", "SG", "H100", 16, 3.20, 390.0, 32, 115, 180, 8, 0.5),
+        ComputeNode("is-green-gpu01", "iceland-green-dc", "is-north-1", "IS", "H100", 32, 1.45, 12.0, 160, 35, 75, 145, 0.2),
+        ComputeNode("us-cw-h100-iad", "coreweave", "us-east-1", "US", "H100", 64, 1.85, 340.0, 210, 85, 8, 180, 0.8),
     ]
 
     scheduler = GlobalScheduler(nodes)
@@ -195,4 +246,45 @@ if __name__ == "__main__":
     res_sov = scheduler.find_optimal_placement(sovereign_violating_job)
     print(res_sov)
     assert res_sov["status"] == "UNSCHEDULABLE", f"Expected UNSCHEDULABLE, got {res_sov['status']}"
+
+    print("\n=== TEST 5: Live Telemetry Subsea Failover Rerouting ===")
+    # Simulate Frankfurt DE-CIX fiber cut in live telemetry
+    scheduler.update_live_telemetry({
+        "frankfurt": {
+            "pop_id": "frankfurt",
+            "healthy": False,
+            "status": "POP_DRAINING",
+            "failover_pop_id": "virginia",
+            "ewma_latency_ms": 140.0
+        }
+    })
+    # Client with tight 50ms SLA in Frankfurt must failover or reject based on subsea penalty
+    frankfurt_tight_sla = WorkloadRequirement(
+        workload_id="fra-ai-failover-01",
+        workload_type="GPU_INFERENCE",
+        client_origin="frankfurt",
+        required_jurisdiction=None,
+        strict_sovereignty=False,
+        max_latency_p95_ms=50, # Normally 35ms from is-green-gpu01, but +78ms TAT-14 penalty = 113ms > 50ms
+        max_cost_per_hour=5.0
+    )
+    res_failover = scheduler.find_optimal_placement(frankfurt_tight_sla)
+    print(res_failover)
+    assert res_failover["status"] == "UNSCHEDULABLE", "Expected SLA violation due to subsea cable failure"
+
+    print("\n=== TEST 6: Singapore Origin Workload Placement ===")
+    sg_job = WorkloadRequirement(
+        workload_id="sg-inference-01",
+        workload_type="GPU_INFERENCE",
+        client_origin="singapore",
+        required_jurisdiction=None,
+        strict_sovereignty=False,
+        max_latency_p95_ms=50,
+        max_cost_per_hour=5.0
+    )
+    res_sg = scheduler.find_optimal_placement(sg_job)
+    print(res_sg)
+    assert res_sg["status"] == "SCHEDULED" and res_sg["assigned_node"] == "sg-aws-gpu01"
+
     print("All Python scheduler constraint tests passed.")
+

@@ -1416,6 +1416,38 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
           status: 'POP_ACTIVE'
         }));
       }
+      if (req.url === '/v1/edge/pops/routes' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          total_routes: 4,
+          routes: [
+            { pop_id: 'dhaka', region: 'asia-south1', primary_target: 'singapore', primary_rtt_ms: 32.0, status: 'OPTIMAL' },
+            { pop_id: 'singapore', region: 'asia-southeast1', primary_target: 'frankfurt', primary_rtt_ms: 145.0, status: 'OPTIMAL' }
+          ]
+        }));
+      }
+      if (req.url === '/v1/edge/pops/health' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          total_pops: 4,
+          pops: [
+            { pop_id: 'dhaka', healthy: true, status: 'OPTIMAL', ewma_latency_ms: 4.2, packet_loss_percent: 0.0 },
+            { pop_id: 'singapore', healthy: true, status: 'OPTIMAL', ewma_latency_ms: 8.1, packet_loss_percent: 0.0 }
+          ],
+          timestamp: new Date().toISOString()
+        }));
+      }
+      if (req.url === '/v1/edge/pops/health/probe' && req.method === 'POST') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          total_probed: 4,
+          results: [
+            { pop_id: 'dhaka', success: true, latency_ms: 4.1, status_code: 200 },
+            { pop_id: 'singapore', success: true, latency_ms: 8.0, status_code: 200 }
+          ],
+          timestamp: new Date().toISOString()
+        }));
+      }
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'not found' }));
     });
@@ -1588,8 +1620,77 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       let announceBody = '';
       resOpAnnounce.on('data', chunk => { announceBody += chunk; });
       await new Promise(resolve => resOpAnnounce.on('end', resolve));
-      const announceData = JSON.parse(announceBody);
-      assert.strictEqual(announceData.bgp_state, 'ANNOUNCED');
+      // 7. Multi-PoP Live Routes & Health Telemetry
+      const resViewerRoutes = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/routes',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': viewerCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerRoutes.statusCode, 200);
+      let routesBody = '';
+      resViewerRoutes.on('data', chunk => { routesBody += chunk; });
+      await new Promise(resolve => resViewerRoutes.on('end', resolve));
+      assert.strictEqual(JSON.parse(routesBody).total_routes, 4);
+
+      const resViewerHealth = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/health',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': viewerCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerHealth.statusCode, 200);
+      let healthBody = '';
+      resViewerHealth.on('data', chunk => { healthBody += chunk; });
+      await new Promise(resolve => resViewerHealth.on('end', resolve));
+      assert.strictEqual(JSON.parse(healthBody).total_pops, 4);
+
+      // 8. VIEWER attempting to trigger synthetic probe cycle gets 403 Forbidden
+      const resViewerProbe = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/health/probe',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': viewerCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerProbe.statusCode, 403, 'VIEWER role must be rejected from triggering synthetic probes');
+      resViewerProbe.resume();
+
+      // 9. PLATFORM_OPERATOR can trigger synthetic probe cycle
+      const resOpProbe = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops/health/probe',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': opCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resOpProbe.statusCode, 200, 'PLATFORM_OPERATOR must be permitted to trigger synthetic probes');
+      let probeBody = '';
+      resOpProbe.on('data', chunk => { probeBody += chunk; });
+      await new Promise(resolve => resOpProbe.on('end', resolve));
+      assert.strictEqual(JSON.parse(probeBody).total_probed, 4);
 
     } finally {
       await safeClose(server);

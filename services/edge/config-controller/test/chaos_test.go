@@ -1,11 +1,14 @@
 package test_test
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/analytics"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/health"
@@ -209,5 +212,238 @@ func TestChaos_ZeroReloadCertificateRotation(t *testing.T) {
 	}
 	if parsedCert.NotAfter.Before(time.Now().Add(80 * 24 * time.Hour)) {
 		t.Fatalf("expected ~90 days validity on renewed certificate")
+	}
+}
+
+type chaosMockAlerter struct {
+	mu     sync.Mutex
+	events []alert.Event
+}
+
+func (m *chaosMockAlerter) SendAlert(ctx context.Context, event alert.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, event)
+	return nil
+}
+
+func (m *chaosMockAlerter) IsConfigured() bool {
+	return true
+}
+
+func (m *chaosMockAlerter) GetEvents() []alert.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copied := make([]alert.Event, len(m.events))
+	copy(copied, m.events)
+	return copied
+}
+
+// TestChaos_FrankfurtSubseaCut_TAT14TransatlanticFailover simulates a complete transatlantic fiber outage on DE-CIX Frankfurt,
+// asserting automated BGP withdrawal, subsea failover to Virginia via TAT-14 (78ms SLA), ops alert dispatch,
+// and automatic primary restoration once fiber transit is spliced.
+func TestChaos_FrankfurtSubseaCut_TAT14TransatlanticFailover(t *testing.T) {
+	popMgr := pop.NewManager()
+	alerter := &chaosMockAlerter{}
+	prober := health.NewPoPHealthProber(popMgr, alerter)
+	prober.SetThresholds(2, 3, 200.0)
+
+	// 1. Initial State Verification
+	initialRoute, err := popMgr.GetPoPRoute("frankfurt")
+	if err != nil {
+		t.Fatalf("failed to retrieve initial frankfurt route: %v", err)
+	}
+	if initialRoute.Status != "OPTIMAL" || initialRoute.ActiveTarget != "decix-fra-direct" {
+		t.Fatalf("expected initial state OPTIMAL pointing to decix-fra-direct, got %+v", initialRoute)
+	}
+
+	fraPoP, err := popMgr.GetPoP("frankfurt")
+	if err != nil {
+		t.Fatalf("failed to get frankfurt pop: %v", err)
+	}
+	if fraPoP.BGPState != model.BGPStateAnnounced {
+		t.Fatalf("expected initial BGP ANNOUNCED, got %s", fraPoP.BGPState)
+	}
+
+	// 2. CHAOS INJECTION: Subsea Fiber Cut (3 consecutive failed synthetic probes)
+	prober.RecordManualProbe("frankfurt", false, 0, "loss of carrier on DE-CIX port 4/1")
+	prober.RecordManualProbe("frankfurt", false, 0, "BGP keepalive timeout")
+	st := prober.RecordManualProbe("frankfurt", false, 0, "TAT-14 subsea optical amplifier power loss")
+
+	if st.Healthy {
+		t.Fatalf("expected Frankfurt to be declared unhealthy after 3 probe failures")
+	}
+	if st.Status != model.PoPStatusDraining {
+		t.Fatalf("expected POP_DRAINING status, got %s", st.Status)
+	}
+	if st.FailoverPoPID != "virginia" {
+		t.Fatalf("expected failover to virginia via TAT-14 subsea (78ms SLA), got %s", st.FailoverPoPID)
+	}
+
+	// 3. Verify Control Plane BGP Withdrawal & Route Failover State
+	fraPoP, _ = popMgr.GetPoP("frankfurt")
+	if fraPoP.BGPState != model.BGPStateWithdrawn {
+		t.Fatalf("expected BGP state WITHDRAWN during outage, got %s", fraPoP.BGPState)
+	}
+
+	activeRoute, _ := popMgr.GetPoPRoute("frankfurt")
+	if activeRoute.Status != "FAILOVER_ENGAGED" || activeRoute.ActiveTarget != "virginia" {
+		t.Fatalf("expected FAILOVER_ENGAGED targeting virginia, got %+v", activeRoute)
+	}
+
+	// 4. RESTORATION: Fiber repaired (2 consecutive successful synthetic probes)
+	prober.RecordManualProbe("frankfurt", true, 14.1, "")
+	stRecovered := prober.RecordManualProbe("frankfurt", true, 13.9, "")
+
+	if !stRecovered.Healthy {
+		t.Fatalf("expected Frankfurt to recover health after 2 successful probes")
+	}
+	if stRecovered.Status != model.PoPStatusActive {
+		t.Fatalf("expected POP_ACTIVE after recovery, got %s", stRecovered.Status)
+	}
+	if stRecovered.FailoverPoPID != "" {
+		t.Fatalf("expected empty failover PoP upon recovery, got %s", stRecovered.FailoverPoPID)
+	}
+
+	// 5. Verify Anycast BGP Re-announcement & Primary Route Restoration
+	fraPoP, _ = popMgr.GetPoP("frankfurt")
+	if fraPoP.BGPState != model.BGPStateAnnounced {
+		t.Fatalf("expected BGP state ANNOUNCED after recovery, got %s", fraPoP.BGPState)
+	}
+
+	restoredRoute, _ := popMgr.GetPoPRoute("frankfurt")
+	if restoredRoute.Status != "OPTIMAL" || restoredRoute.ActiveTarget != "decix-fra-direct" {
+		t.Fatalf("expected restored OPTIMAL primary target, got %+v", restoredRoute)
+	}
+
+	// Verify Operational Alerts fired (allow background goroutine dispatch)
+	var hasDown, hasRecovered bool
+	for start := time.Now(); time.Since(start) < 200*time.Millisecond; {
+		events := alerter.GetEvents()
+		hasDown = false
+		hasRecovered = false
+		for _, e := range events {
+			if e.Type == alert.EventTypePoPDown {
+				hasDown = true
+			}
+			if e.Type == alert.EventTypePoPRecovered {
+				hasRecovered = true
+			}
+		}
+		if hasDown && hasRecovered {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !hasDown || !hasRecovered {
+		t.Fatalf("expected both POP_DOWN and POP_RECOVERED alert events, got %+v", alerter.GetEvents())
+	}
+}
+
+// TestChaos_DhakaNDMA2026_StrictSovereigntyFailClosed simulates an edge disaster on Dhaka PoP,
+// verifying that under Bangladesh NDMA 2026 data sovereignty rules, sensitive workloads
+// fail closed rather than leaking across foreign borders to Singapore, Frankfurt, or Virginia.
+func TestChaos_DhakaNDMA2026_StrictSovereigntyFailClosed(t *testing.T) {
+	popMgr := pop.NewManager()
+
+	// 1. Strict Sovereignty Test (Financial / Critical Information Infrastructure)
+	_, err := popMgr.CalculatePoPFailover("dhaka", true)
+	if err != pop.ErrSovereigntyViolation {
+		t.Fatalf("expected ErrSovereigntyViolation for Dhaka under strict sovereignty, got: %v", err)
+	}
+
+	// 2. Non-Strict / Commercial Traffic Fallback Test
+	hop, err := popMgr.CalculatePoPFailover("dhaka", false)
+	if err != nil {
+		t.Fatalf("expected non-strict failover to succeed, got error: %v", err)
+	}
+	if hop.TargetPoP != "singapore" {
+		t.Fatalf("expected Singapore failover via SMW6 subsea (32ms SLA), got: %s", hop.TargetPoP)
+	}
+	if hop.SLARTTMs != 32.0 {
+		t.Fatalf("expected 32ms SLA RTT for SMW6 cable, got: %f", hop.SLARTTMs)
+	}
+}
+
+// TestChaos_SubseaFlapDamping_HysteresisProtection simulates route flapping (intermittent optical link oscillation),
+// verifying that the state machine does not thrash BGP announcements on every single transient failure.
+func TestChaos_SubseaFlapDamping_HysteresisProtection(t *testing.T) {
+	popMgr := pop.NewManager()
+	alerter := &chaosMockAlerter{}
+	prober := health.NewPoPHealthProber(popMgr, alerter)
+	prober.SetThresholds(2, 3, 200.0)
+
+	// Simulate Flapping: Fail, Pass, Fail, Pass, Fail, Pass
+	for i := 0; i < 5; i++ {
+		stFail := prober.RecordManualProbe("singapore", false, 0, "transient optical noise")
+		if !stFail.Healthy {
+			t.Fatalf("Singapore should not become unhealthy on single transient failure")
+		}
+		stPass := prober.RecordManualProbe("singapore", true, 8.2, "")
+		if !stPass.Healthy {
+			t.Fatalf("Singapore should remain healthy during minor flapping")
+		}
+	}
+
+	// Verify Singapore BGP was never withdrawn during transient flap
+	sinPoP, _ := popMgr.GetPoP("singapore")
+	if sinPoP.BGPState != model.BGPStateAnnounced {
+		t.Fatalf("expected Singapore BGP to remain ANNOUNCED, got %s", sinPoP.BGPState)
+	}
+
+	sinRoute, _ := popMgr.GetPoPRoute("singapore")
+	if sinRoute.Status != "OPTIMAL" {
+		t.Fatalf("expected Singapore route to remain OPTIMAL, got %s", sinRoute.Status)
+	}
+}
+
+// TestChaos_CascadingMultiPoPFailure_SovereigntyPreservation tests simultaneous multi-region outages.
+func TestChaos_CascadingMultiPoPFailure_SovereigntyPreservation(t *testing.T) {
+	popMgr := pop.NewManager()
+	alerter := &chaosMockAlerter{}
+	prober := health.NewPoPHealthProber(popMgr, alerter)
+	prober.SetThresholds(2, 3, 200.0)
+
+	var wg sync.WaitGroup
+	// Concurrently inject failures into Frankfurt and Singapore
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 3; i++ {
+			prober.RecordManualProbe("frankfurt", false, 0, "DE-CIX switch power failure")
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 3; i++ {
+			prober.RecordManualProbe("singapore", false, 0, "Equinix SG1 UPS fault")
+		}
+	}()
+
+	wg.Wait()
+
+	// Verify Frankfurt failed over to Virginia
+	fraRoute, err := popMgr.GetPoPRoute("frankfurt")
+	if err != nil || fraRoute.Status != "FAILOVER_ENGAGED" || fraRoute.ActiveTarget != "virginia" {
+		t.Fatalf("unexpected frankfurt route after cascading failure: %+v", fraRoute)
+	}
+
+	// Verify Singapore failed over to Dhaka
+	sinRoute, err := popMgr.GetPoPRoute("singapore")
+	if err != nil || sinRoute.Status != "FAILOVER_ENGAGED" || sinRoute.ActiveTarget != "dhaka" {
+		t.Fatalf("unexpected singapore route after cascading failure: %+v", sinRoute)
+	}
+
+	// Verify Virginia remains OPTIMAL and unaffected
+	iadRoute, err := popMgr.GetPoPRoute("virginia")
+	if err != nil || iadRoute.Status != "OPTIMAL" {
+		t.Fatalf("Virginia should remain unaffected: %+v", iadRoute)
+	}
+
+	// Verify Dhaka remains OPTIMAL and unaffected
+	dhaRoute, err := popMgr.GetPoPRoute("dhaka")
+	if err != nil || dhaRoute.Status != "OPTIMAL" {
+		t.Fatalf("Dhaka should remain unaffected: %+v", dhaRoute)
 	}
 }

@@ -2,6 +2,7 @@
 target/
 bin/
 *.exe
+apps/cli/nexusedge*
 **/*.rs.bk
 
 # Node / Web

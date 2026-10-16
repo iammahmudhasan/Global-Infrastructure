@@ -48,6 +48,7 @@
       }
       if (viewId === 'servers') {
         loadPoPs();
+        loadPoPTelemetry();
       }
       if (viewId === 'analytics') {
         loadLatencyMatrix();
@@ -689,6 +690,176 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       }
     }
 
+    async function loadPoPTelemetry() {
+      const probeStatus = document.getElementById('probe-status-text');
+      const badge = document.getElementById('pop-telemetry-badge');
+      const routesBadge = document.getElementById('pop-routes-badge');
+      const routesTbody = document.getElementById('pop-routes-tbody');
+      const btnProbes = document.getElementById('btn-trigger-probes');
+
+      const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
+      if (btnProbes) {
+        if (!isOperator) {
+          btnProbes.title = 'PLATFORM_OPERATOR role required to trigger synthetic probes';
+          btnProbes.style.opacity = '0.6';
+        } else {
+          btnProbes.title = 'Run live synthetic probe cycle across all PoPs';
+          btnProbes.style.opacity = '1.0';
+        }
+      }
+
+      // 1. Fetch live PoP health states
+      try {
+        const respHealth = await fetch('/api/proxy/pops/health');
+        if (respHealth.ok) {
+          const healthData = await respHealth.json();
+          const pops = healthData.pops || [];
+          if (badge) {
+            badge.innerText = `${pops.length} POPS SYNCHRONIZED`;
+          }
+          pops.forEach(pop => {
+            const ewmaElem = document.getElementById(`ewma-${pop.pop_id}`);
+            const lossElem = document.getElementById(`loss-${pop.pop_id}`);
+            const badgeElem = document.getElementById(`badge-status-${pop.pop_id}`);
+
+            if (ewmaElem) {
+              const rtt = pop.ewma_latency_ms !== undefined ? pop.ewma_latency_ms.toFixed(1) : (pop.last_rtt_ms !== undefined ? pop.last_rtt_ms.toFixed(1) : '-');
+              ewmaElem.textContent = `${rtt} ms`;
+            }
+            if (lossElem) {
+              const loss = pop.packet_loss_percent !== undefined ? pop.packet_loss_percent.toFixed(1) : '0.0';
+              lossElem.textContent = `${loss}%`;
+            }
+            if (badgeElem) {
+              const st = (pop.status || 'OPTIMAL').toUpperCase();
+              badgeElem.textContent = st;
+              if (st === 'OPTIMAL' || st === 'ACTIVE') {
+                badgeElem.className = 'badge badge-emerald';
+              } else if (st === 'FAILOVER_ENGAGED' || st === 'DEGRADED') {
+                badgeElem.className = 'badge badge-amber';
+              } else {
+                badgeElem.className = 'badge badge-rose';
+              }
+            }
+          });
+          if (probeStatus && healthData.timestamp) {
+            const d = new Date(healthData.timestamp);
+            probeStatus.textContent = `Last Probed: ${d.toLocaleTimeString()}`;
+          }
+        }
+      } catch (err) {
+        if (probeStatus) {
+          probeStatus.textContent = 'Telemetry Sync Error';
+        }
+      }
+
+      // 2. Fetch multi-PoP failover routes
+      try {
+        const respRoutes = await fetch('/api/proxy/pops/routes');
+        if (respRoutes.ok) {
+          const routesData = await respRoutes.json();
+          const routes = routesData.routes || [];
+          if (routesBadge) {
+            routesBadge.innerText = `${routes.length} DYNAMIC PATHS VERIFIED`;
+          }
+          if (routesTbody && routes.length > 0) {
+            routesTbody.innerHTML = '';
+            routes.forEach(r => {
+              const tr = document.createElement('tr');
+
+              // Origin PoP
+              const tdOrigin = document.createElement('td');
+              tdOrigin.className = 'mono';
+              const strongOrigin = document.createElement('strong');
+              strongOrigin.textContent = r.pop_id;
+              const br1 = document.createElement('br');
+              const spanReg = document.createElement('span');
+              spanReg.style.fontSize = '0.72rem';
+              spanReg.style.color = 'var(--text-muted)';
+              spanReg.textContent = r.region || '';
+              tdOrigin.append(strongOrigin, br1, spanReg);
+
+              // Primary Target
+              const tdPrimary = document.createElement('td');
+              tdPrimary.textContent = `${r.primary_target} (${r.primary_rtt_ms !== undefined ? r.primary_rtt_ms.toFixed(1) : '-'} ms)`;
+
+              // Active Target
+              const tdActive = document.createElement('td');
+              const spanActive = document.createElement('span');
+              const isLocal = r.active_target === r.pop_id;
+              spanActive.className = isLocal ? 'badge badge-emerald' : 'badge badge-amber';
+              spanActive.textContent = isLocal ? `${r.active_target} (LOCAL)` : `${r.active_target} (FAILOVER)`;
+              tdActive.appendChild(spanActive);
+
+              // Failover Hops
+              const tdHops = document.createElement('td');
+              if (r.failover_targets && r.failover_targets.length > 0) {
+                r.failover_targets.forEach((hop, idx) => {
+                  if (idx > 0) tdHops.appendChild(document.createElement('br'));
+                  const spanHop = document.createElement('span');
+                  spanHop.className = hop.status === 'ACTIVE_FAILOVER' ? 'badge badge-amber' : 'badge badge-subtle';
+                  spanHop.textContent = `${hop.subsea_cable || 'Fiber'} → ${hop.target_pop} (${hop.sla_rtt_ms} ms)`;
+                  tdHops.appendChild(spanHop);
+                  if (hop.sovereignty_restricted) {
+                    const brSov = document.createElement('br');
+                    const spanSov = document.createElement('span');
+                    spanSov.style.fontSize = '0.72rem';
+                    spanSov.style.color = 'var(--accent-purple)';
+                    spanSov.textContent = 'Strict Sovereign Invariant (Fail-Closed)';
+                    tdHops.append(brSov, spanSov);
+                  }
+                });
+              } else {
+                tdHops.textContent = 'None (Direct Ingress Only)';
+              }
+
+              // Route Status
+              const tdStatus = document.createElement('td');
+              const spanStatus = document.createElement('span');
+              const st = (r.status || 'OPTIMAL').toUpperCase();
+              spanStatus.className = st === 'OPTIMAL' ? 'badge badge-emerald' : (st === 'FAILOVER_ENGAGED' ? 'badge badge-amber' : 'badge badge-rose');
+              spanStatus.textContent = st;
+              tdStatus.appendChild(spanStatus);
+
+              tr.append(tdOrigin, tdPrimary, tdActive, tdHops, tdStatus);
+              routesTbody.appendChild(tr);
+            });
+          }
+        }
+      } catch (err) {
+        // BFF routes offline
+      }
+    }
+
+    async function triggerPoPProbes() {
+      const probeStatus = document.getElementById('probe-status-text');
+      const isOperator = window.__nexusedge_session && window.__nexusedge_session.role === 'PLATFORM_OPERATOR';
+      if (!isOperator) {
+        showToast('Forbidden: PLATFORM_OPERATOR role required to trigger synthetic probes');
+        return;
+      }
+      if (probeStatus) {
+        probeStatus.textContent = 'Probing Global PoPs...';
+      }
+      try {
+        const resp = await fetch('/api/proxy/pops/health/probe', {
+          method: 'POST'
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          showToast(`Synthetic probe cycle complete across ${data.total_probed || 4} PoPs.`);
+          await loadPoPTelemetry();
+          return;
+        }
+        const err = await resp.json();
+        showToast(`Probe execution failed: ${err.error || 'Request rejected'}`);
+        if (probeStatus) probeStatus.textContent = 'Probe Failed';
+      } catch (e) {
+        showToast(`Probe network error: ${e.message}`);
+        if (probeStatus) probeStatus.textContent = 'Probe Error';
+      }
+    }
+
     async function loadLatencyMatrix() {
       const tbody = document.getElementById('matrix-table-tbody');
       const badge = document.getElementById('matrix-source-badge');
@@ -769,6 +940,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
           const session = await resp.json();
           window.__nexusedge_session = session;
           loadPoPs(); // Re-render with operator action buttons if operator
+          loadPoPTelemetry();
         }
       } catch (e) {
         // BFF running offline
@@ -780,6 +952,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     checkControlPlaneHealth();
     loadDomains();
     loadPoPs();
+    loadPoPTelemetry();
     loadLatencyMatrix();
     fetchAuditLogs();
     setInterval(checkControlPlaneHealth, 15000);

@@ -603,6 +603,36 @@ const server = http.createServer((req, res) => {
       return proxyToControlPlane('/v1/edge/routing/matrix', req, res, session);
     }
 
+    // Proxy Edge PoPs: Multi-PoP Failover Routes (Authenticated session)
+    if (pathname === '/api/proxy/pops/routes') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/pops/routes', req, res, session);
+    }
+
+    // Proxy Edge PoPs: Multi-PoP Live Telemetry & Health States (Authenticated session)
+    if (pathname === '/api/proxy/pops/health') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/pops/health', req, res, session);
+    }
+
+    // Proxy Edge PoPs: Run Synthetic Latency & Health Probes (PLATFORM_OPERATOR only)
+    if (pathname === '/api/proxy/pops/health/probe') {
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      if (session.role !== 'PLATFORM_OPERATOR') {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to trigger synthetic probes. PLATFORM_OPERATOR role required.`
+        });
+      }
+      return proxyToControlPlane('/v1/edge/pops/health/probe', req, res, session);
+    }
+
     // Proxy Edge PoPs: List all connected PoPs (Authenticated session)
     if (pathname === '/api/proxy/pops') {
       if (req.method !== 'GET') {

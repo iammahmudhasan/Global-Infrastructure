@@ -380,6 +380,124 @@
             <span class="badge badge-bd" style="font-size: 0.85rem; padding: 0.4rem 0.8rem;">Fully Managed Fabric</span>
           </div>
 
+          <div class="telemetry-controls-bar">
+            <div class="telemetry-controls-left">
+              <h3 style="font-size: 1.05rem; font-weight: 700;">Live Multi-PoP Telemetry & Health</h3>
+              <span id="pop-telemetry-badge" class="badge badge-bd">4 POPS MONITORED</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 0.75rem;">
+              <span id="probe-status-text" class="telemetry-status-text">Ready</span>
+              <button class="btn btn-secondary btn-sm" onclick="loadPoPTelemetry()">
+                <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                Refresh
+              </button>
+              <button class="btn btn-primary btn-sm" id="btn-trigger-probes" onclick="triggerPoPProbes()">
+                <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                Run Synthetic Probes
+              </button>
+            </div>
+          </div>
+
+          <!-- Live Multi-PoP Telemetry Grid -->
+          <div class="pop-telemetry-grid" id="pop-telemetry-cards">
+            <!-- Populated dynamically via loadPoPTelemetry() -->
+            <div class="pop-card" id="card-pop-dhaka">
+              <div class="pop-card-header">
+                <div>
+                  <div class="pop-card-title">Dhaka (BDIX Edge 01)</div>
+                  <div class="pop-card-region">asia-south1 &bull; BD</div>
+                </div>
+                <span class="badge badge-emerald" id="badge-status-dhaka">OPTIMAL</span>
+              </div>
+              <div class="pop-metrics-row">
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-emerald" id="ewma-dhaka">4.2 ms</span>
+                  <span class="pop-metric-lbl">EWMA RTT</span>
+                </div>
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-cyan" id="loss-dhaka">0.0%</span>
+                  <span class="pop-metric-lbl">Packet Loss</span>
+                </div>
+              </div>
+              <div class="pop-subsea-box">
+                <div class="pop-subsea-label">Subsea SMW6 Transit &rarr; Singapore</div>
+                <div class="pop-subsea-detail">Failover SLA: 32 ms &bull; Strict BD-NDMA 2026 Lock</div>
+              </div>
+            </div>
+
+            <div class="pop-card" id="card-pop-singapore">
+              <div class="pop-card-header">
+                <div>
+                  <div class="pop-card-title">Singapore (Equinix SG1)</div>
+                  <div class="pop-card-region">asia-southeast1 &bull; SG</div>
+                </div>
+                <span class="badge badge-emerald" id="badge-status-singapore">OPTIMAL</span>
+              </div>
+              <div class="pop-metrics-row">
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-emerald" id="ewma-singapore">8.1 ms</span>
+                  <span class="pop-metric-lbl">EWMA RTT</span>
+                </div>
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-cyan" id="loss-singapore">0.0%</span>
+                  <span class="pop-metric-lbl">Packet Loss</span>
+                </div>
+              </div>
+              <div class="pop-subsea-box">
+                <div class="pop-subsea-label">Direct SMW6 & Indian Ocean Cable Hub</div>
+                <div class="pop-subsea-detail">Active Host Anchor &bull; Global Multi-Region</div>
+              </div>
+            </div>
+
+            <div class="pop-card" id="card-pop-frankfurt">
+              <div class="pop-card-header">
+                <div>
+                  <div class="pop-card-title">Frankfurt (DE-CIX 01)</div>
+                  <div class="pop-card-region">europe-west3 &bull; DE</div>
+                </div>
+                <span class="badge badge-emerald" id="badge-status-frankfurt">OPTIMAL</span>
+              </div>
+              <div class="pop-metrics-row">
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-emerald" id="ewma-frankfurt">14.0 ms</span>
+                  <span class="pop-metric-lbl">EWMA RTT</span>
+                </div>
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-cyan" id="loss-frankfurt">0.0%</span>
+                  <span class="pop-metric-lbl">Packet Loss</span>
+                </div>
+              </div>
+              <div class="pop-subsea-box">
+                <div class="pop-subsea-label">Transatlantic TAT-14 &rarr; Virginia</div>
+                <div class="pop-subsea-detail">Failover SLA: 78 ms &bull; EU GDPR Sovereign</div>
+              </div>
+            </div>
+
+            <div class="pop-card" id="card-pop-virginia">
+              <div class="pop-card-header">
+                <div>
+                  <div class="pop-card-title">Virginia (Ashburn DC2)</div>
+                  <div class="pop-card-region">us-east1 &bull; US</div>
+                </div>
+                <span class="badge badge-emerald" id="badge-status-virginia">OPTIMAL</span>
+              </div>
+              <div class="pop-metrics-row">
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-emerald" id="ewma-virginia">12.5 ms</span>
+                  <span class="pop-metric-lbl">EWMA RTT</span>
+                </div>
+                <div class="pop-metric-item">
+                  <span class="pop-metric-val text-cyan" id="loss-virginia">0.0%</span>
+                  <span class="pop-metric-lbl">Packet Loss</span>
+                </div>
+              </div>
+              <div class="pop-subsea-box">
+                <div class="pop-subsea-label">Equinix Ashburn Fabric Direct</div>
+                <div class="pop-subsea-detail">Lowest Cost US Compute Hub</div>
+              </div>
+            </div>
+          </div>
+
           <div class="table-card">
             <div class="table-header-bar">
               <div class="table-title">Connected Global PoPs & Sovereign Compute Nodes</div>
@@ -429,6 +547,57 @@
                     <td><strong>Equinix Ashburn DC2</strong><br><span class="text-amber" style="font-size: 0.75rem;">Testbed Standby (0 Nodes)</span></td>
                     <td><span class="badge badge-amber">STANDBY</span><br><span style="font-size: 0.72rem; color: var(--text-muted);">POP_SIMULATED</span></td>
                     <td><span style="font-size: 0.75rem; color: var(--text-muted);">Simulated Route</span></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Multi-PoP Failover & Subsea Cable Transit Table -->
+          <div class="table-card" style="margin-top: 1.5rem;">
+            <div class="table-header-bar">
+              <div class="table-title">Multi-PoP Failover & Subsea Cable Transit Paths</div>
+              <span id="pop-routes-badge" class="badge badge-bd">FIBER ROUTING ACTIVE</span>
+            </div>
+            <div class="table-responsive">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Origin PoP / Region</th>
+                    <th>Primary Target</th>
+                    <th>Active Target</th>
+                    <th>Ordered Failover Hops (Subsea / Terrestrial)</th>
+                    <th>Route Status</th>
+                  </tr>
+                </thead>
+                <tbody id="pop-routes-tbody">
+                  <tr>
+                    <td class="mono"><strong>dhaka</strong><br><span style="font-size: 0.72rem; color: var(--text-muted);">asia-south1</span></td>
+                    <td>Dhaka BDIX Local (3.8 ms)</td>
+                    <td><span class="badge badge-emerald">dhaka (LOCAL)</span></td>
+                    <td><span class="badge badge-subtle">SMW6 Subsea &rarr; singapore (32 ms)</span><br><span style="font-size: 0.72rem; color: var(--accent-purple);">Strict NDMA 2026 Sovereign Fail-Closed</span></td>
+                    <td><span class="badge badge-emerald">OPTIMAL</span></td>
+                  </tr>
+                  <tr>
+                    <td class="mono"><strong>singapore</strong><br><span style="font-size: 0.72rem; color: var(--text-muted);">asia-southeast1</span></td>
+                    <td>Singapore Equinix SG1 (8.0 ms)</td>
+                    <td><span class="badge badge-emerald">singapore (LOCAL)</span></td>
+                    <td><span class="badge badge-subtle">SMW6 / Terrestrial &rarr; frankfurt (145 ms)</span></td>
+                    <td><span class="badge badge-emerald">OPTIMAL</span></td>
+                  </tr>
+                  <tr>
+                    <td class="mono"><strong>frankfurt</strong><br><span style="font-size: 0.72rem; color: var(--text-muted);">europe-west3</span></td>
+                    <td>DE-CIX Frankfurt (14.0 ms)</td>
+                    <td><span class="badge badge-emerald">frankfurt (LOCAL)</span></td>
+                    <td><span class="badge badge-subtle">TAT-14 Transatlantic &rarr; virginia (78 ms)</span><br><span style="font-size: 0.72rem; color: var(--accent-purple);">EU GDPR Sovereign Failover</span></td>
+                    <td><span class="badge badge-emerald">OPTIMAL</span></td>
+                  </tr>
+                  <tr>
+                    <td class="mono"><strong>virginia</strong><br><span style="font-size: 0.72rem; color: var(--text-muted);">us-east1</span></td>
+                    <td>Equinix Ashburn (12.0 ms)</td>
+                    <td><span class="badge badge-emerald">virginia (LOCAL)</span></td>
+                    <td><span class="badge badge-subtle">TAT-14 &rarr; frankfurt (78 ms)</span></td>
+                    <td><span class="badge badge-emerald">OPTIMAL</span></td>
                   </tr>
                 </tbody>
               </table>
