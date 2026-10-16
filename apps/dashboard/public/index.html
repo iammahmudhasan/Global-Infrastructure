@@ -76,6 +76,13 @@
           <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
           Billing
         </div>
+
+        <div class="nav-category">Developer Ecosystem</div>
+        <div class="nav-item" data-view="developers" id="nav-item-developers">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+          API & SDKs
+          <span class="nav-badge" style="background: rgba(16, 185, 129, 0.2); color: var(--accent-emerald); border-color: rgba(16, 185, 129, 0.4);">v0.1.0</span>
+        </div>
       </nav>
 
       <div class="sidebar-footer">
@@ -1291,6 +1298,134 @@
                   </tr>
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- VIEW 11: DEVELOPER QUICKSTART & SDKs -->
+        <div class="view-content" id="view-developers">
+          <div class="kpi-grid">
+            <div class="card">
+              <div class="card-label">Official TypeScript SDK</div>
+              <div class="card-value text-indigo">@nexusedge/api-client</div>
+              <div class="card-subtext">v0.1.0 - Zero dependencies, NodeNext & Edge compatible</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Official Python SDK</div>
+              <div class="card-value text-emerald">nexusedge</div>
+              <div class="card-subtext">v0.1.0 - Pure standard library, Python 3.9+ ready</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Default Rate Limiting</div>
+              <div class="card-value text-cyan">60 req/min</div>
+              <div class="card-subtext">Token-bucket per key; Enterprise 300+ req/min</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Target Global Base URL</div>
+              <div class="card-value text-amber" style="font-size: 1.1rem; font-family: 'JetBrains Mono', monospace;">https://dashboard.aeitron.com</div>
+              <div class="card-subtext">Anycast Ingress & Sovereign Multi-Objective Engine</div>
+            </div>
+          </div>
+
+          <!-- Code Generator Card -->
+          <div class="table-card" style="padding: 0; overflow: hidden; margin-bottom: 1.5rem;">
+            <div class="table-header-bar" style="border-bottom: 1px solid var(--border-subtle); padding: 1.25rem;">
+              <div>
+                <div class="table-title">Interactive Quickstart & Code Generator</div>
+                <div class="card-subtext" style="margin-top: 0.2rem;">Choose your language, active API key, and routing parameters to generate production-ready code.</div>
+              </div>
+              <button class="btn btn-primary" id="qs-run-btn" onclick="runQuickstartTest()">
+                <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                Test Request in Browser
+              </button>
+            </div>
+
+            <!-- Parameters Bar -->
+            <div class="code-toolbar">
+              <div class="code-param-group">
+                <label class="code-param-label">API Key Credential</label>
+                <select id="qs-key-select" class="code-param-select" onchange="renderQuickstartSnippets()">
+                  <option value="nke_live_user_key">Loading active keys...</option>
+                </select>
+              </div>
+
+              <div class="code-param-group">
+                <label class="code-param-label">LLM Model</label>
+                <select id="qs-model-select" class="code-param-select" onchange="renderQuickstartSnippets()">
+                  <option value="meta-llama/Llama-3.3-70B-Instruct" selected>meta-llama/Llama-3.3-70B-Instruct</option>
+                  <option value="deepseek-ai/DeepSeek-R1">deepseek-ai/DeepSeek-R1</option>
+                  <option value="qwen/Qwen-2.5-Coder-32B">qwen/Qwen-2.5-Coder-32B</option>
+                  <option value="meta-llama/Llama-3.1-8B-Instant">meta-llama/Llama-3.1-8B-Instant</option>
+                </select>
+              </div>
+
+              <div class="code-param-group">
+                <label class="code-param-label">Routing Strategy</label>
+                <select id="qs-strategy-select" class="code-param-select" onchange="renderQuickstartSnippets()">
+                  <option value="LATENCY_OPTIMAL" selected>LATENCY_OPTIMAL</option>
+                  <option value="COST_MINIMAL">COST_MINIMAL</option>
+                  <option value="CARBON_NEUTRAL">CARBON_NEUTRAL</option>
+                  <option value="SOVEREIGN_PINNED">SOVEREIGN_PINNED</option>
+                </select>
+              </div>
+
+              <div class="code-param-group">
+                <label class="code-param-label">Jurisdiction</label>
+                <select id="qs-jurisdiction-select" class="code-param-select" onchange="renderQuickstartSnippets()">
+                  <option value="BD" selected>BD (Bangladesh NDMA 2026)</option>
+                  <option value="EU">EU (GDPR Compliance)</option>
+                  <option value="US">US (North America)</option>
+                  <option value="GLOBAL">GLOBAL (Unrestricted)</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Language Tabs & Copy Button -->
+            <div class="code-tab-nav">
+              <div class="code-tab-buttons">
+                <button class="code-tab-btn active" id="qs-tab-curl" onclick="switchQuickstartTab('curl')">
+                  cURL (REST)
+                </button>
+                <button class="code-tab-btn" id="qs-tab-ts" onclick="switchQuickstartTab('ts')">
+                  TypeScript SDK
+                </button>
+                <button class="code-tab-btn" id="qs-tab-python" onclick="switchQuickstartTab('python')">
+                  Python SDK
+                </button>
+              </div>
+              <button class="btn btn-secondary" id="qs-copy-btn" onclick="copyQuickstartSnippet()" style="padding: 0.35rem 0.85rem; font-size: 0.8rem;">
+                <svg width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span id="qs-copy-btn-text">Copy Code</span>
+              </button>
+            </div>
+
+            <!-- Snippet Pre -->
+            <pre class="code-snippet-pre"><code id="qs-code-output"># Loading quickstart snippet...</code></pre>
+          </div>
+
+          <!-- Live Console Output Box (Hidden by default) -->
+          <div class="card" id="qs-live-box" style="display: none; margin-bottom: 1.5rem; border-color: rgba(6, 182, 212, 0.4);">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem;">
+              <div style="display: flex; align-items: center; gap: 0.5rem;">
+                <div class="pulse-dot" style="background: var(--accent-cyan); box-shadow: 0 0 8px var(--accent-cyan);"></div>
+                <strong style="font-size: 0.88rem; text-transform: uppercase; letter-spacing: 0.05em;">Live Ingress Test Results</strong>
+              </div>
+              <div id="qs-live-badges" style="display: flex; gap: 0.5rem;"></div>
+            </div>
+            <pre class="live-console-box" id="qs-live-output" style="max-height: 250px; overflow-y: auto;"></pre>
+          </div>
+
+          <!-- SDK Installation Cards -->
+          <div class="detail-grid">
+            <div class="card">
+              <div class="card-label">TypeScript / Node.js Package</div>
+              <div class="card-value" style="font-size: 1rem; font-family: 'JetBrains Mono', monospace; margin: 0.5rem 0;">npm install @nexusedge/api-client</div>
+              <div class="card-subtext">Supports Node.js 18+, Bun, Deno, Next.js, and Cloudflare Workers. Types included out of the box.</div>
+            </div>
+            <div class="card">
+              <div class="card-label">Python 3 Package</div>
+              <div class="card-value" style="font-size: 1rem; font-family: 'JetBrains Mono', monospace; margin: 0.5rem 0;">pip install nexusedge</div>
+              <div class="card-subtext">Zero external runtime dependencies. Compatible with Python 3.9 through 3.14, PyTorch, and vLLM agents.</div>
             </div>
           </div>
         </div>

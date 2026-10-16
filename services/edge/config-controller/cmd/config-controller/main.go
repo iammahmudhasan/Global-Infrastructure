@@ -227,7 +227,22 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	// 5. Background Sweeper Task (Garbage-collect unverified pending domains older than 24h - Finding 4)
+	// 5. Automated Edge PoP Health Prober & Anycast BGP Watchdog
+	probeInterval := 30 * time.Second
+	if intervalEnv := os.Getenv("NEXUSEDGE_POP_PROBE_INTERVAL"); intervalEnv != "" {
+		if d, err := time.ParseDuration(intervalEnv); err == nil && d > 0 {
+			probeInterval = d
+		}
+	}
+	proberCtx, stopProber := context.WithCancel(context.Background())
+	defer stopProber()
+
+	if handler.PoPProber() != nil && os.Getenv("NEXUSEDGE_POP_PROBE_DISABLED") != "true" {
+		handler.PoPProber().Start(proberCtx, probeInterval)
+		log.Printf("[INFO] Initialized and started automated Edge PoP Health Prober & Anycast BGP Watchdog (interval=%v)", probeInterval)
+	}
+
+	// 6. Background Sweeper Task (Garbage-collect unverified pending domains older than 24h - Finding 4)
 	sweeperCtx, stopSweeper := context.WithCancel(context.Background())
 	defer stopSweeper()
 
@@ -247,7 +262,7 @@ func main() {
 		}
 	}()
 
-	// 6. Run Server in Background
+	// 7. Run Server in Background
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -259,9 +274,14 @@ func main() {
 		}
 	}()
 
-	// 7. Graceful Shutdown
+	// 8. Graceful Shutdown
 	<-stopChan
 	log.Printf("[INFO] Shutting down NexusEdge Config Controller gracefully...")
+
+	if handler.PoPProber() != nil {
+		handler.PoPProber().Stop()
+	}
+	stopProber()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -133,6 +133,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host " -> Infrastructure manifests verified." -ForegroundColor Green
 
+$PythonSdkDir = Join-Path $RepoRoot "libs/python/nexusedge"
+if (Test-Path $PythonSdkDir) {
+    Push-Location $PythonSdkDir
+    try {
+        & $PythonExe -m unittest discover -s tests -p "test_*.py"
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Python SDK unit test suite failed." -ForegroundColor Red
+            exit 1
+        }
+        Write-Host " -> Python SDK tests passed." -ForegroundColor Green
+    } finally {
+        Pop-Location
+    }
+}
+
 # 7. Dashboard Security & BFF Acceptance Gate
 Write-Host "[7/8] Running Dashboard Security & BFF test suite..." -ForegroundColor Yellow
 $DashboardDir = Join-Path $RepoRoot "apps/dashboard"

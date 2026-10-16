@@ -65,12 +65,16 @@ cargo check --manifest-path "${GATEWAY_CARGO}"
 cargo test --manifest-path "${GATEWAY_CARGO}"
 echo " -> Rust check and tests passed."
 
-# 6. Python Intelligence Optimizer Gate
-echo "[6/8] Verifying Python Intelligence scheduler..."
+# 6. Python Intelligence Optimizer & SDK Gate
+echo "[6/8] Verifying Python Intelligence scheduler & SDK..."
 python "${REPO_ROOT}/intelligence/scheduling/workload-scheduler/optimizer.py"
 echo " -> Python optimizer passed."
 python "${REPO_ROOT}/tools/ci/validate_manifests.py"
 echo " -> Infrastructure manifests verified."
+if [ -d "${REPO_ROOT}/libs/python/nexusedge" ]; then
+  python -m unittest discover -s "${REPO_ROOT}/libs/python/nexusedge/tests" -p "test_*.py"
+  echo " -> Python SDK tests passed."
+fi
 
 # 7. Dashboard Security & BFF Acceptance Gate
 echo "[7/8] Running Dashboard Security & BFF test suite..."

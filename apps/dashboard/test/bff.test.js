@@ -2639,7 +2639,38 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
       await safeClose(server);
     }
   });
+
+  it('Requirement 20: Developer Quickstart, SDK Navigation & Code Generator Components', () => {
+    const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+    const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+
+    // 1. Verify navigation and view containers
+    assert.strictEqual(indexHtmlContent.includes('data-view="developers"'), true, 'index.html must define data-view="developers"');
+    assert.strictEqual(indexHtmlContent.includes('id="view-developers"'), true, 'index.html must define #view-developers');
+
+    // 2. Verify interactive generator controls
+    assert.strictEqual(indexHtmlContent.includes('id="qs-key-select"'), true, 'index.html must define #qs-key-select');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-model-select"'), true, 'index.html must define #qs-model-select');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-strategy-select"'), true, 'index.html must define #qs-strategy-select');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-jurisdiction-select"'), true, 'index.html must define #qs-jurisdiction-select');
+
+    // 3. Verify language tabs and action buttons
+    assert.strictEqual(indexHtmlContent.includes('id="qs-tab-curl"'), true, 'index.html must define #qs-tab-curl');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-tab-ts"'), true, 'index.html must define #qs-tab-ts');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-tab-python"'), true, 'index.html must define #qs-tab-python');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-copy-btn"'), true, 'index.html must define #qs-copy-btn');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-run-btn"'), true, 'index.html must define #qs-run-btn');
+    assert.strictEqual(indexHtmlContent.includes('id="qs-code-output"'), true, 'index.html must define #qs-code-output');
+
+    // 4. Verify JavaScript methods in app.js
+    assert.strictEqual(appJsContent.includes('function switchQuickstartTab'), true, 'app.js must define switchQuickstartTab');
+    assert.strictEqual(appJsContent.includes('function populateQuickstartKeySelect'), true, 'app.js must define populateQuickstartKeySelect');
+    assert.strictEqual(appJsContent.includes('function renderQuickstartSnippets'), true, 'app.js must define renderQuickstartSnippets');
+    assert.strictEqual(appJsContent.includes('function copyQuickstartSnippet'), true, 'app.js must define copyQuickstartSnippet');
+    assert.strictEqual(appJsContent.includes('async function runQuickstartTest'), true, 'app.js must define runQuickstartTest');
+  });
 });
+
 
 
 

@@ -993,3 +993,112 @@
       font-size: 0.68rem;
       color: var(--text-muted);
     }
+
+    /* Developer Quickstart & Code Generator */
+    .code-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem 1.25rem;
+      background: rgba(15, 23, 42, 0.75);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .code-param-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 170px;
+      flex: 1;
+    }
+
+    .code-param-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .code-param-select {
+      background: var(--bg-input);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      color: var(--text-main);
+      padding: 0.5rem 0.75rem;
+      font-size: 0.82rem;
+      font-family: 'JetBrains Mono', monospace;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .code-param-select:focus {
+      border-color: var(--accent-indigo);
+    }
+
+    .code-tab-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1.25rem;
+      background: rgba(10, 15, 30, 0.9);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .code-tab-buttons {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .code-tab-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      color: var(--text-muted);
+      padding: 0.4rem 0.85rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: all 0.2s ease;
+    }
+
+    .code-tab-btn:hover {
+      color: var(--text-main);
+      background: rgba(255, 255, 255, 0.05);
+    }
+
+    .code-tab-btn.active {
+      color: var(--accent-cyan);
+      background: rgba(6, 182, 212, 0.12);
+      border-color: rgba(6, 182, 212, 0.35);
+    }
+
+    .code-snippet-pre {
+      margin: 0;
+      padding: 1.25rem;
+      background: #050811;
+      color: #e2e8f0;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.82rem;
+      line-height: 1.6;
+      overflow-x: auto;
+      border-radius: 0 0 12px 12px;
+      max-height: 480px;
+      white-space: pre;
+    }
+
+    .live-console-box {
+      margin-top: 1rem;
+      padding: 1rem 1.25rem;
+      background: #02040a;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+    }
+

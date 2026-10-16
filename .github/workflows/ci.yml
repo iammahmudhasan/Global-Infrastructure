@@ -110,6 +110,9 @@ jobs:
       - name: Validate Infrastructure Manifests & CRDs
         run: python tools/ci/validate_manifests.py
 
+      - name: Run Python SDK Tests
+        run: python -m unittest discover -s libs/python/nexusedge/tests -p "test_*.py"
+
   dashboard-bff:
     name: Dashboard BFF Security & Acceptance
     runs-on: ubuntu-latest

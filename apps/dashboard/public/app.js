@@ -9,7 +9,8 @@
       storage: { title: "Storage", crumb: "S3 Object Store & Distributed NVMe" },
       security: { title: "Security", crumb: "Line-Rate WAF, DDoS, & Secret Vault" },
       analytics: { title: "Analytics", crumb: "Real-Time Observability & Latency Matrix" },
-      billing: { title: "Billing", crumb: "Token Economics & Arbitrage Savings" }
+      billing: { title: "Billing", crumb: "Token Economics & Arbitrage Savings" },
+      developers: { title: "API & SDKs", crumb: "Developer Quickstart & Client Libraries" }
     };
 
     // Navigation Switcher
@@ -40,6 +41,10 @@
         pageCrumb.innerText = titles[viewId].crumb;
       }
 
+      if (viewId === 'developers') {
+        populateQuickstartKeySelect();
+        renderQuickstartSnippets();
+      }
       if (viewId === 'security') {
         fetchAuditLogs();
         loadAPIKeys();
@@ -1313,6 +1318,8 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         if (resp.ok) {
           const data = await resp.json();
           const keys = data.keys || [];
+          window.__loaded_api_keys = keys;
+          populateQuickstartKeySelect();
           if (badge) {
             const activeCount = keys.filter(k => k.status === 'ACTIVE').length;
             badge.innerText = `${activeCount} ACTIVE KEYS`;
@@ -1412,8 +1419,10 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
           // Show revealed key modal
           const keyInput = document.getElementById('revealed-secret-key');
           if (keyInput) keyInput.value = data.secret_key;
+          window.__last_generated_api_key = data.secret_key;
           openModal('modal-key-revealed');
           loadAPIKeys();
+          populateQuickstartKeySelect();
           return;
         }
         const err = await resp.json();
@@ -1458,6 +1467,274 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       }
     }
     window.revokeAPIKey = revokeAPIKey;
+
+    // Developer Quickstart & Code Generator
+    let activeQuickstartTab = 'curl';
+
+    function switchQuickstartTab(lang) {
+      activeQuickstartTab = lang;
+      ['curl', 'ts', 'python'].forEach(tab => {
+        const btn = document.getElementById(`qs-tab-${tab}`);
+        if (btn) {
+          if (tab === lang) {
+            btn.classList.add('active');
+          } else {
+            btn.classList.remove('active');
+          }
+        }
+      });
+      renderQuickstartSnippets();
+    }
+    window.switchQuickstartTab = switchQuickstartTab;
+
+    function populateQuickstartKeySelect() {
+      const select = document.getElementById('qs-key-select');
+      if (!select) return;
+
+      const previousVal = select.value;
+      select.innerHTML = '';
+
+      if (window.__last_generated_api_key) {
+        const opt = document.createElement('option');
+        opt.value = window.__last_generated_api_key;
+        opt.textContent = `${window.__last_generated_api_key.substring(0, 16)}... (Newly Generated Key)`;
+        opt.selected = true;
+        select.appendChild(opt);
+      }
+
+      if (window.__loaded_api_keys && window.__loaded_api_keys.length > 0) {
+        window.__loaded_api_keys.forEach(k => {
+          if (window.__last_generated_api_key && k.prefix && window.__last_generated_api_key.startsWith(k.prefix)) {
+            return;
+          }
+          const opt = document.createElement('option');
+          opt.value = `${k.prefix || 'nke_live'}...`;
+          opt.textContent = `${k.name} (${k.prefix || 'key'}...) [${k.role}]`;
+          select.appendChild(opt);
+        });
+      }
+
+      if (select.children.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = 'nke_live_your_api_key_here';
+        opt.textContent = 'nke_live_your_api_key_here (Placeholder)';
+        select.appendChild(opt);
+      }
+
+      if (previousVal && Array.from(select.options).some(o => o.value === previousVal)) {
+        select.value = previousVal;
+      }
+    }
+    window.populateQuickstartKeySelect = populateQuickstartKeySelect;
+
+    function renderQuickstartSnippets() {
+      const outputElem = document.getElementById('qs-code-output');
+      if (!outputElem) return;
+
+      const keySelect = document.getElementById('qs-key-select');
+      const modelSelect = document.getElementById('qs-model-select');
+      const stratSelect = document.getElementById('qs-strategy-select');
+      const jurSelect = document.getElementById('qs-jurisdiction-select');
+
+      const apiKey = (keySelect && keySelect.value) || 'nke_live_your_api_key_here';
+      const model = (modelSelect && modelSelect.value) || 'meta-llama/Llama-3.3-70B-Instruct';
+      const strategy = (stratSelect && stratSelect.value) || 'LATENCY_OPTIMAL';
+      const jurisdiction = (jurSelect && jurSelect.value) || 'BD';
+      const baseUrl = window.location.origin.includes('localhost') ? window.location.origin : 'https://dashboard.aeitron.com';
+
+      let code = '';
+      if (activeQuickstartTab === 'curl') {
+        code = `# 1. Multi-Objective AI Inference (Zero-Cold-Start Ingress)
+curl -X POST "${baseUrl}/api/proxy/inference" \\
+  -H "Authorization: Bearer ${apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -H "X-NexusEdge-Routing-Strategy: ${strategy}" \\
+  -H "X-NexusEdge-Jurisdiction: ${jurisdiction}" \\
+  -d '{
+    "model": "${model}",
+    "messages": [
+      {"role": "system", "content": "You are a low-latency sovereign edge assistant."},
+      {"role": "user", "content": "What is the optimal compute route for my request?"}
+    ],
+    "temperature": 0.7,
+    "max_tokens": 512
+  }'
+
+# 2. Real-Time Telemetry & Rate Limit Inspection
+curl -s "${baseUrl}/api/proxy/analytics/summary" \\
+  -H "Authorization: Bearer ${apiKey}"`;
+      } else if (activeQuickstartTab === 'ts') {
+        code = `import { NexusEdgeClient } from '@nexusedge/api-client';
+
+// Initialize zero-dependency strictly typed client
+const client = new NexusEdgeClient({
+  apiKey: '${apiKey}',
+  baseUrl: '${baseUrl}',
+  timeoutMs: 30000
+});
+
+async function run() {
+  // 1. Multi-Objective AI Inference Placement
+  const completion = await client.inference.createCompletion({
+    model: '${model}',
+    messages: [
+      { role: 'system', content: 'You are a low-latency sovereign edge assistant.' },
+      { role: 'user', content: 'What is the optimal compute route for my request?' }
+    ],
+    routingStrategy: '${strategy}',
+    jurisdiction: '${jurisdiction}',
+    temperature: 0.7,
+    maxTokens: 512
+  });
+
+  console.log('Response Content:', completion.choices[0]?.message.content);
+  console.log('Provider:', completion.telemetry.provider);
+  console.log('TTFT:', completion.telemetry.ttftMs, 'ms');
+  console.log('Cost: $' + completion.telemetry.cost);
+
+  // 2. Query Real-Time Edge Telemetry
+  const telemetry = await client.telemetry.getSummary();
+  console.log('P99 Latency:', telemetry.p99_latency_ms, 'ms');
+  console.log('Cache Hit Ratio:', (telemetry.cache_hit_ratio * 100).toFixed(1) + '%');
+}
+
+run().catch(console.error);`;
+      } else if (activeQuickstartTab === 'python') {
+        code = `from nexusedge import NexusEdgeClient
+
+# Initialize zero-dependency standard-library client
+client = NexusEdgeClient(
+    api_key="${apiKey}",
+    base_url="${baseUrl}",
+    timeout_seconds=30.0
+)
+
+# 1. Multi-Objective AI Inference Placement
+response = client.inference.create_completion(
+    model="${model}",
+    messages=[
+        {"role": "system", "content": "You are a low-latency sovereign edge assistant."},
+        {"role": "user", "content": "What is the optimal compute route for my request?"}
+    ],
+    routing_strategy="${strategy}",
+    jurisdiction="${jurisdiction}",
+    temperature=0.7,
+    max_tokens=512
+)
+
+print("Response Content:", response.choices[0].message.content)
+print(f"Provider: {response.telemetry.provider}")
+print(f"TTFT: {response.telemetry.ttft_ms} ms")
+print(f"Cost: \${response.telemetry.cost:.6f}")
+
+# 2. Query Real-Time Edge Telemetry
+telemetry = client.telemetry.get_summary()
+print(f"P99 Latency: {telemetry.p99_latency_ms} ms")
+print(f"Cache Hit Ratio: {telemetry.cache_hit_ratio * 100:.1f}%")`;
+      }
+
+      outputElem.textContent = code;
+    }
+    window.renderQuickstartSnippets = renderQuickstartSnippets;
+
+    function copyQuickstartSnippet() {
+      const outputElem = document.getElementById('qs-code-output');
+      const btnText = document.getElementById('qs-copy-btn-text');
+      if (!outputElem) return;
+
+      const text = outputElem.textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        if (btnText) btnText.textContent = 'COPIED!';
+        showToast('Code snippet copied to clipboard');
+        setTimeout(() => {
+          if (btnText) btnText.textContent = 'Copy Code';
+        }, 2000);
+      }).catch(() => {
+        showToast('Code snippet copied');
+      });
+    }
+    window.copyQuickstartSnippet = copyQuickstartSnippet;
+
+    async function runQuickstartTest() {
+      const liveBox = document.getElementById('qs-live-box');
+      const liveOutput = document.getElementById('qs-live-output');
+      const liveBadges = document.getElementById('qs-live-badges');
+      const modelSelect = document.getElementById('qs-model-select');
+      const stratSelect = document.getElementById('qs-strategy-select');
+      const jurSelect = document.getElementById('qs-jurisdiction-select');
+      const runBtn = document.getElementById('qs-run-btn');
+
+      if (!liveBox || !liveOutput) return;
+
+      liveBox.style.display = 'block';
+      liveOutput.textContent = 'Connecting to NexusEdge Global Gateway via /api/proxy/inference...\\nStreaming headers and payload...';
+      if (liveBadges) liveBadges.innerHTML = '<span class="badge badge-bd">PROBING INGRESS...</span>';
+      if (runBtn) runBtn.disabled = true;
+
+      const startTime = performance.now();
+      const model = (modelSelect && modelSelect.value) || 'meta-llama/Llama-3.3-70B-Instruct';
+      const strategy = (stratSelect && stratSelect.value) || 'LATENCY_OPTIMAL';
+      const jurisdiction = (jurSelect && jurSelect.value) || 'BD';
+
+      try {
+        const resp = await fetch('/api/proxy/inference', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-NexusEdge-Routing-Strategy': strategy,
+            'X-NexusEdge-Jurisdiction': jurisdiction
+          },
+          body: JSON.stringify({
+            model: model,
+            messages: [
+              { role: 'system', content: 'You are an edge inference testing probe.' },
+              { role: 'user', content: 'Hello NexusEdge Edge Gateway! Verify routing.' }
+            ],
+            temperature: 0.7,
+            max_tokens: 256
+          })
+        });
+
+        const rtt = Math.round(performance.now() - startTime);
+        const data = await resp.json();
+
+        const provider = resp.headers.get('x-nexusedge-provider') || 'Autonomous Edge';
+        const cost = resp.headers.get('x-nexusedge-cost') || '0.000000';
+        const ttft = resp.headers.get('x-nexusedge-ttft-ms') || rtt;
+        const region = resp.headers.get('x-nexusedge-region') || 'dhaka-bdix';
+
+        if (liveBadges) {
+          liveBadges.innerHTML = `
+            <span class="badge badge-bd">\${region.toUpperCase()}</span>
+            <span class="badge" style="background: rgba(16, 185, 129, 0.15); color: var(--accent-emerald); border-color: rgba(16, 185, 129, 0.3);">\${resp.status} OK</span>
+            <span class="badge" style="background: rgba(6, 182, 212, 0.15); color: var(--accent-cyan); border-color: rgba(6, 182, 212, 0.3);">\${rtt} ms RTT</span>
+          `;
+        }
+
+        const out = {
+          status: resp.status,
+          rtt_ms: rtt,
+          model: data.model || model,
+          routing_telemetry: {
+            provider: provider,
+            region: region,
+            ttft_ms: Number(ttft),
+            estimated_cost_usd: Number(cost)
+          },
+          completion: data.choices?.[0]?.message?.content || data.message || '(No content returned)'
+        };
+
+        liveOutput.textContent = JSON.stringify(out, null, 2);
+      } catch (err) {
+        liveOutput.textContent = \`Request failed: \${err.message}\`;
+        if (liveBadges) {
+          liveBadges.innerHTML = '<span class="badge" style="background: rgba(244, 63, 94, 0.2); color: var(--accent-rose);">ERROR</span>';
+        }
+      } finally {
+        if (runBtn) runBtn.disabled = false;
+      }
+    }
+    window.runQuickstartTest = runQuickstartTest;
 
     window.openDomainDnsModal = openDomainDnsModal;
     window.copyDnsWizardTarget = copyDnsWizardTarget;
