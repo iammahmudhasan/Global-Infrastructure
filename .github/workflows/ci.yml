@@ -337,3 +337,41 @@ jobs:
       - name: Teardown Compose Stack
         if: always()
         run: docker compose -f deploy/docker-compose.yml down -v
+
+  security-and-devsecops:
+    name: DevSecOps (Secret Scan, SAST & Supply Chain Audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Automated Secret & Entropy Scanning (OWASP ASVS V2 / NIST SSDF PW.1.2)
+        run: python tools/ci/scan-secrets.py
+
+      - name: Node.js Supply Chain & Dependency Audit
+        run: |
+          npm audit --prefix apps/dashboard
+          npm audit --prefix libs/ts/api-client
+
+      - name: Install govulncheck & Audit Go Services
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          for svc in services/edge/config-controller services/network/global-router apps/cli benchmarks/packet; do
+            echo "Scanning $svc for known CVEs..."
+            (cd "$svc" && govulncheck ./...)
+          done

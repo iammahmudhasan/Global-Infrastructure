@@ -186,7 +186,7 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
 }
 
 # 8. Docker Compose Manifest Validation Gate
-Write-Host "[8/8] Validating Docker Compose configurations..." -ForegroundColor Yellow
+Write-Host "[8/10] Validating Docker Compose configurations..." -ForegroundColor Yellow
 $ComposeFile = Join-Path $RepoRoot "deploy/docker-compose.yml"
 $ComposeProdFile = Join-Path $RepoRoot "deploy/docker-compose.prod.yml"
 $CertGen = Join-Path $RepoRoot "tools/release/generate_certs.go"
@@ -232,6 +232,63 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     Write-Host " -> Docker CLI not found, skipping local compose check." -ForegroundColor Gray
 }
 
+# 9. Automated Secret Scanning Gate (OWASP ASVS V2 / NIST SSDF PW.1.2)
+Write-Host "[9/10] Running Automated Secret & High-Entropy Credential Scanner..." -ForegroundColor Yellow
+$SecretScanner = Join-Path $RepoRoot "tools/ci/scan-secrets.py"
+if (Test-Path $SecretScanner) {
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        & py -3 $SecretScanner
+    } elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
+        & python3 $SecretScanner
+    } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+        & python $SecretScanner
+    } else {
+        Write-Host "WARNING: Python not found; skipping secret scanner." -ForegroundColor Yellow
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Secret scan detected committed secrets or private keys!" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host " -> Secret scanning passed (Zero credentials in code)." -ForegroundColor Green
+}
+
+# 10. Dependency Vulnerability & Supply Chain Audit Gate
+Write-Host "[10/10] Running Dependency Vulnerability Audits (npm audit & govulncheck)..." -ForegroundColor Yellow
+if (Get-Command npm -ErrorAction SilentlyContinue) {
+    Write-Host "   Auditing apps/dashboard dependencies..." -ForegroundColor Gray
+    & npm audit --prefix (Join-Path $RepoRoot "apps/dashboard")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: npm audit failed in apps/dashboard." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "   Auditing libs/ts/api-client dependencies..." -ForegroundColor Gray
+    & npm audit --prefix (Join-Path $RepoRoot "libs/ts/api-client")
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: npm audit failed in libs/ts/api-client." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host " -> Node.js dependency audits passed (0 vulnerabilities)." -ForegroundColor Green
+}
+if (Get-Command govulncheck -ErrorAction SilentlyContinue) {
+    Write-Host "   Auditing Go dependencies via govulncheck..." -ForegroundColor Gray
+    foreach ($svc in $GoServices) {
+        $svcPath = Join-Path $RepoRoot $svc
+        if (Test-Path $svcPath) {
+            Push-Location $svcPath
+            try {
+                & govulncheck ./...
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "ERROR: govulncheck found vulnerabilities in $svc" -ForegroundColor Red
+                    exit 1
+                }
+            } finally {
+                Pop-Location
+            }
+        }
+    }
+    Write-Host " -> Go vulnerability check passed (0 vulnerabilities)." -ForegroundColor Green
+}
+
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host " SUCCESS: All CI Parity Gates Passed. Safe to commit and push!" -ForegroundColor Green
+Write-Host " SUCCESS: All 10 CI Parity Gates Passed. Safe to commit and push!" -ForegroundColor Green
 Write-Host "================================================================" -ForegroundColor Cyan

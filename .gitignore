@@ -22,8 +22,6 @@ __pycache__/
 *.pem
 *.key
 *.crt
-!deploy/envoy/certs/server.crt
-!deploy/envoy/certs/server.key
 
 # IDE
 .idea/
