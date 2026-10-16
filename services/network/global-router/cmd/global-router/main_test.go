@@ -10,6 +10,7 @@ import (
 
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/circuitbreaker"
+	"github.com/iammahmudhasan/nexusedge-control-plane/internal/policy"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/registry"
 	"github.com/iammahmudhasan/nexusedge-control-plane/internal/scheduler"
 )
@@ -810,5 +811,94 @@ func TestNetworkMaglev_Endpoints(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &dispatchResp2)
 	if dispatchResp2.BackendID != dispatchResp.BackendID {
 		t.Fatalf("conntrack flow affinity broken: got %s vs %s", dispatchResp2.BackendID, dispatchResp.BackendID)
+	}
+}
+
+func TestSteeringEndpoints(t *testing.T) {
+	srv := NewServer()
+	srv.auth.RegisterTenantWithRole("key-tenant", "tenant-user", "proj-user", auth.RoleTenant)
+	srv.auth.RegisterTenantWithRole("key-operator", "tenant-operator", "proj-core", auth.RolePlatformOperator)
+
+	handler := srv.auth.Middleware(srv.routes())
+
+	// 1. Check Steering Status
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/network/steering/status", nil)
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for steering status, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var statusResp map[string]interface{}
+	_ = json.Unmarshal(rec.Body.Bytes(), &statusResp)
+	if statusResp["smw6_severed"] != false {
+		t.Fatalf("expected smw6_severed to be false initially, got %v", statusResp["smw6_severed"])
+	}
+
+	// 2. Resolve Domestic BDIX Route (Grameenphone IP)
+	resolveReq := map[string]interface{}{
+		"source_ip":       "103.144.180.1",
+		"destination_ip":  "119.30.32.10",
+		"destination_asn": 24445,
+	}
+	body, _ := json.Marshal(resolveReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/steering/resolve", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for resolve steering, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var decision policy.SteeringDecision
+	_ = json.Unmarshal(rec.Body.Bytes(), &decision)
+	if decision.RouteClass != policy.RouteClassBDIXPeering || !decision.PinnedDomestic {
+		t.Fatalf("expected BDIX direct domestic steering, got: %+v", decision)
+	}
+
+	// 3. Resolve International Route over Subsea SMW6 (Singapore IP)
+	resolveReqIntl := map[string]interface{}{
+		"source_ip":       "103.144.180.1",
+		"destination_ip":  "1.1.1.1",
+		"destination_asn": 13335,
+	}
+	bodyIntl, _ := json.Marshal(resolveReqIntl)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/steering/resolve", bytes.NewReader(bodyIntl))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for intl resolve, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var decisionIntl policy.SteeringDecision
+	_ = json.Unmarshal(rec.Body.Bytes(), &decisionIntl)
+	if decisionIntl.RouteClass != policy.RouteClassSubseaTransit || decisionIntl.EstimatedLatency > 40.0 {
+		t.Fatalf("expected SMW6 subsea transit, got: %+v", decisionIntl)
+	}
+
+	// 4. Operator toggles SMW6 cable cut simulation
+	cableCutReq := map[string]interface{}{
+		"smw6_severed": true,
+	}
+	bodyCut, _ := json.Marshal(cableCutReq)
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/steering/cable-state", bytes.NewReader(bodyCut))
+	req.Header.Set("Authorization", "Bearer key-operator")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for operator cable state update, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 5. Tenant resolve intl route now fails over to terrestrial backup
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/network/steering/resolve", bytes.NewReader(bodyIntl))
+	req.Header.Set("Authorization", "Bearer key-tenant")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for failover resolve, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var decisionFailover policy.SteeringDecision
+	_ = json.Unmarshal(rec.Body.Bytes(), &decisionFailover)
+	if decisionFailover.RouteClass != policy.RouteClassTerrestrialBackup {
+		t.Fatalf("expected terrestrial backup failover, got: %+v", decisionFailover)
 	}
 }

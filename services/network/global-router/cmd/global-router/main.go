@@ -41,6 +41,7 @@ type Server struct {
 	rpkiValidator   *policy.RPKIRouteOriginValidator
 	flapGuard       *policy.RouteFlapDampingGuard
 	maglevRing      *policy.MaglevConsistentHash
+	bdixSteering    *policy.BDIXSteeringEngine
 	stopSweeper     chan struct{}
 }
 
@@ -69,6 +70,8 @@ func NewServer() *Server {
 		{ID: "pop-iad-gw-01", IP: net.ParseIP("172.30.0.7"), Port: 8080, Weight: 100},
 	})
 
+	bdix := policy.NewBDIXSteeringEngine()
+
 	s := &Server{
 		auth:            authenticator,
 		registry:        reg,
@@ -77,6 +80,7 @@ func NewServer() *Server {
 		rpkiValidator:   rpki,
 		flapGuard:       flap,
 		maglevRing:      maglev,
+		bdixSteering:    bdix,
 		stopSweeper:     make(chan struct{}),
 	}
 	s.StartSweeper(1*time.Minute, 15*time.Minute)
@@ -666,6 +670,85 @@ func (s *Server) routes() http.Handler {
 			"table_size":        tableSize,
 			"backend_count":     backendCount,
 			"conntrack_entries": conntrackCount,
+		})
+	})
+
+	// 13. BDIX & SMW6 Subsea Traffic Steering Resolver API
+	mux.HandleFunc("/api/v1/network/steering/resolve", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			SourceIP       string `json:"source_ip"`
+			DestinationIP  string `json:"destination_ip"`
+			DestinationASN uint32 `json:"destination_asn"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		if req.SourceIP == "" {
+			req.SourceIP = "103.1.1.1" // Default to edge gateway IP if omitted
+		}
+
+		decision, err := s.bdixSteering.ResolveSteering(req.SourceIP, req.DestinationIP, req.DestinationASN)
+		if err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Steering resolution failed: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(decision)
+	})
+
+	// 14. BDIX & SMW6 Infrastructure Status API
+	mux.HandleFunc("/api/v1/network/steering/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":"Method not allowed. Use GET."}`, http.StatusMethodNotAllowed)
+			return
+		}
+
+		severed := s.bdixSteering.IsSMW6Severed()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"smw6_severed":             severed,
+			"active_transits":          []string{"BDIX Dhaka Metro Fabric (167 peers)", "SMW4 Cox's Bazar", "SMW6 (30 Tbps Landing Cox's Bazar)"},
+			"bdix_peering_rtt":         "3.2ms",
+			"smw6_subsea_rtt":          "32.0ms",
+			"terrestrial_failover_rtt": "121.6ms",
+		})
+	})
+
+	// 15. SMW6 Cable Cut Simulation / Management API (Platform Operator Only)
+	mux.HandleFunc("/api/v1/network/steering/cable-state", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"Method not allowed. Use POST."}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.auth.AuthorizeRole(r.Context(), auth.RolePlatformOperator) {
+			http.Error(w, `{"error":"forbidden: platform operator role required"}`, http.StatusForbidden)
+			return
+		}
+
+		var req struct {
+			SMW6Severed bool `json:"smw6_severed"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf(`{"error":"Invalid request payload: %v"}`, err), http.StatusBadRequest)
+			return
+		}
+
+		s.bdixSteering.SetSMW6Status(req.SMW6Severed)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"smw6_severed": req.SMW6Severed,
+			"status":       "UPDATED",
 		})
 	})
 
