@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -45,6 +46,7 @@ class NexusEdgeClient:
         api_key: str,
         base_url: str = "https://dashboard.aeitron.com",
         timeout_seconds: float = 30.0,
+        verify_ssl: bool = True,
     ) -> None:
         if not api_key or not isinstance(api_key, str) or not api_key.strip():
             raise NexusEdgeError(400, "NexusEdgeClient requires a valid API key (e.g., nke_live_...)", "INVALID_API_KEY")
@@ -52,6 +54,7 @@ class NexusEdgeClient:
         self.api_key: str = api_key.strip()
         self.base_url: str = base_url.rstrip("/")
         self.timeout_seconds: float = max(0.1, float(timeout_seconds))
+        self.verify_ssl: bool = verify_ssl
 
         self.inference = InferenceNamespace(self)
         self.domains = DomainsNamespace(self)
@@ -85,9 +88,10 @@ class NexusEdgeClient:
             req_data = json.dumps(body).encode("utf-8")
 
         req = urllib.request.Request(full_url, data=req_data, headers=req_headers, method=method.upper())
+        ssl_ctx = None if self.verify_ssl else ssl._create_unverified_context()
 
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=ssl_ctx) as resp:
                 resp_bytes = resp.read()
                 raw_headers = dict(resp.headers.items())
                 norm_headers = {k.lower(): v for k, v in raw_headers.items()}

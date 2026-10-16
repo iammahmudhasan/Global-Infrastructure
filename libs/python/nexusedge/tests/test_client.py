@@ -524,6 +524,18 @@ class NexusEdgePythonSDKTests(unittest.TestCase):
         self.assertEqual(nodes[0].node_id, "bd-dhaka-dgx01")
         self.assertEqual(nodes[0].provider, "baremetal-bd")
 
+    def test_verify_ssl_option(self) -> None:
+        """Verifies verify_ssl flag configuration on client."""
+        custom_client = NexusEdgeClient(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            verify_ssl=False,
+        )
+        self.assertFalse(custom_client.verify_ssl)
+        # Execute request to confirm it succeeds with verify_ssl=False
+        nodes = custom_client.scheduler.list_nodes()
+        self.assertEqual(len(nodes), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
