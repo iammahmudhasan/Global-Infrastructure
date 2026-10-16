@@ -52,6 +52,7 @@
         loadPoPTelemetry();
       }
       if (viewId === 'analytics') {
+        loadAnalytics();
         loadLatencyMatrix();
       }
     }
@@ -1126,6 +1127,81 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       }
     }
 
+    async function loadAnalytics() {
+      try {
+        const resp = await fetch('/api/proxy/analytics/summary');
+        if (!resp.ok) {
+          return;
+        }
+        const data = await resp.json();
+
+        // Total requests & Success rate
+        const totalReqEl = document.getElementById('analytics-total-requests');
+        const successRateEl = document.getElementById('analytics-success-rate');
+        if (totalReqEl) totalReqEl.textContent = Number(data.total_requests || 0).toLocaleString();
+        if (successRateEl) {
+          const pct = ((data.success_rate !== undefined ? data.success_rate : 1.0) * 100).toFixed(1);
+          const successCount = Number((data.status_distribution && data.status_distribution['2xx']) || 0);
+          successRateEl.textContent = `Success: ${pct}% (${successCount.toLocaleString()} req)`;
+        }
+
+        // Latencies
+        const p50El = document.getElementById('analytics-latency-p50');
+        const p99El = document.getElementById('analytics-latency-p99');
+        if (p50El) p50El.textContent = `${Number(data.p50_latency_ms || 0).toFixed(1)} ms`;
+        if (p99El) p99El.textContent = `P95: ${Number(data.p95_latency_ms || 0).toFixed(1)} ms | P99: ${Number(data.p99_latency_ms || 0).toFixed(1)} ms`;
+
+        // Cache Hit Ratio
+        const cacheEl = document.getElementById('analytics-cache-hit-ratio');
+        if (cacheEl) {
+          const ratioPct = ((data.cache_hit_ratio !== undefined ? data.cache_hit_ratio : 1.0) * 100).toFixed(1);
+          cacheEl.textContent = `${ratioPct}%`;
+        }
+
+        // Threat Blocks
+        const threatEl = document.getElementById('analytics-threat-blocks');
+        if (threatEl) threatEl.textContent = Number(data.threat_blocks || 0).toLocaleString();
+
+        // Status code distribution
+        const s2 = Number((data.status_distribution && data.status_distribution['2xx']) || 0);
+        const s4 = Number((data.status_distribution && data.status_distribution['4xx']) || 0);
+        const s5 = Number((data.status_distribution && data.status_distribution['5xx']) || 0);
+        const total = Math.max(1, s2 + s4 + s5);
+
+        const s2Pct = ((s2 / total) * 100).toFixed(1);
+        const s4Pct = ((s4 / total) * 100).toFixed(1);
+        const s5Pct = ((s5 / total) * 100).toFixed(1);
+
+        const el2 = document.getElementById('analytics-status-2xx');
+        const el4 = document.getElementById('analytics-status-4xx');
+        const el5 = document.getElementById('analytics-status-5xx');
+        if (el2) el2.textContent = `${s2.toLocaleString()} req (${s2Pct}%)`;
+        if (el4) el4.textContent = `${s4.toLocaleString()} req (${s4Pct}%)`;
+        if (el5) el5.textContent = `${s5.toLocaleString()} req (${s5Pct}%)`;
+
+        const bar2 = document.getElementById('analytics-bar-2xx');
+        const bar4 = document.getElementById('analytics-bar-4xx');
+        const bar5 = document.getElementById('analytics-bar-5xx');
+        if (bar2) bar2.style.width = `${s2Pct}%`;
+        if (bar4) bar4.style.width = `${s4Pct}%`;
+        if (bar5) bar5.style.width = `${s5Pct}%`;
+
+        // PoP distribution
+        const popDist = data.pop_distribution || {};
+        const popTotal = Math.max(1, Object.values(popDist).reduce((sum, v) => sum + Number(v), 0));
+        ['dhaka', 'singapore', 'frankfurt', 'virginia'].forEach(region => {
+          const cell = document.getElementById(`pop-traffic-${region}`);
+          if (cell) {
+            const count = Number(popDist[region] || 0);
+            const pct = ((count / popTotal) * 100).toFixed(1);
+            cell.textContent = `${count.toLocaleString()} req (${pct}%)`;
+          }
+        });
+      } catch (err) {
+        console.error('Failed to load telemetry summary:', err);
+      }
+    }
+
     async function loadLatencyMatrix() {
       const tbody = document.getElementById('matrix-table-tbody');
       const badge = document.getElementById('matrix-source-badge');
@@ -1389,6 +1465,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     window.triggerWizardVerify = triggerWizardVerify;
     window.verifyDomain = verifyDomain;
     window.deleteDomain = deleteDomain;
+    window.loadAnalytics = loadAnalytics;
 
     // Initial Dashboard Bootstrap
     initSessionContext();
@@ -1397,6 +1474,7 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     loadPoPs();
     loadPoPTelemetry();
     loadLatencyMatrix();
+    loadAnalytics();
     fetchAuditLogs();
     loadAPIKeys();
     setInterval(checkControlPlaneHealth, 15000);

@@ -6,6 +6,8 @@
   "scripts": {
     "dev:dashboard": "pnpm --filter @nexusedge/dashboard dev",
     "build:dashboard": "pnpm --filter @nexusedge/dashboard build",
+    "build:sdk": "npx -y typescript --project libs/ts/api-client/tsconfig.json",
+    "test:sdk": "node --test libs/ts/api-client/test/client.test.js",
     "lint": "pnpm -r lint",
     "test": "pnpm -r test"
   },

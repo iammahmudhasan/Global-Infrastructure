@@ -127,6 +127,12 @@ jobs:
           cd apps/dashboard
           node --test test/bff.test.js
 
+      - name: Run TypeScript SDK Tests
+        run: |
+          cd libs/ts/api-client
+          node --test test/client.test.js
+
+
   deploy-manifest-check:
     name: Single-PoP End-to-End Compose Runtime
     runs-on: ubuntu-latest

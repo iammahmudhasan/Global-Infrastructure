@@ -1083,24 +1083,95 @@
         <div class="view-content" id="view-analytics">
           <div class="kpi-grid">
             <div class="card">
-              <div class="card-label">Global P50 Latency</div>
-              <div class="card-value text-emerald">4.2 ms</div>
-              <div class="card-subtext">Measured at nearest edge PoP</div>
+              <div class="card-label">Total Edge Requests (24h)</div>
+              <div class="card-value text-indigo" id="analytics-total-requests">0</div>
+              <div class="card-subtext" id="analytics-success-rate">Success: 100.0% (0 req)</div>
             </div>
             <div class="card">
-              <div class="card-label">Global P95 Latency</div>
-              <div class="card-value text-cyan">18.5 ms</div>
-              <div class="card-subtext">Across transatlantic & transpacific transit</div>
+              <div class="card-label">Edge Latency (P50)</div>
+              <div class="card-value text-emerald" id="analytics-latency-p50">0.0 ms</div>
+              <div class="card-subtext" id="analytics-latency-p99">P95: 0.0 ms | P99: 0.0 ms</div>
             </div>
             <div class="card">
               <div class="card-label">Cache Hit Ratio</div>
-              <div class="card-value text-indigo">94.8%</div>
+              <div class="card-value text-cyan" id="analytics-cache-hit-ratio">100.0%</div>
               <div class="card-subtext">RFC 9111 In-Memory Edge Cache</div>
             </div>
             <div class="card">
-              <div class="card-label">Ingress Bandwidth</div>
-              <div class="card-value text-purple">1.82 Gbps</div>
-              <div class="card-subtext">Peak burst capacity: 200 Gbps</div>
+              <div class="card-label">Mitigated Threats & Limits</div>
+              <div class="card-value text-purple" id="analytics-threat-blocks">0</div>
+              <div class="card-subtext">WAF & Token-Bucket Rate Limiter (403/429)</div>
+            </div>
+          </div>
+
+          <div class="dual-grid">
+            <div class="card">
+              <div class="table-header-bar" style="margin-bottom: 1rem;">
+                <div class="table-title">HTTP Status Code Distribution</div>
+                <button class="btn btn-secondary btn-sm" id="btn-refresh-analytics" onclick="loadAnalytics()">
+                  <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                  Refresh
+                </button>
+              </div>
+              <div style="display: flex; flex-direction: column; gap: 0.9rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 0.85rem; color: var(--text-muted);">2xx Success</span>
+                  <span id="analytics-status-2xx" class="badge badge-emerald">0 req (100%)</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 0.85rem; color: var(--text-muted);">4xx Client & Rate Limit Errors</span>
+                  <span id="analytics-status-4xx" class="badge badge-amber">0 req (0%)</span>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <span style="font-size: 0.85rem; color: var(--text-muted);">5xx Upstream & Gateway Errors</span>
+                  <span id="analytics-status-5xx" class="badge badge-rose">0 req (0%)</span>
+                </div>
+                <div style="background: rgba(255,255,255,0.06); height: 8px; border-radius: 4px; overflow: hidden; display: flex; margin-top: 0.5rem;">
+                  <div id="analytics-bar-2xx" style="background: var(--accent-emerald); width: 100%; height: 100%; transition: width 0.3s ease;"></div>
+                  <div id="analytics-bar-4xx" style="background: var(--accent-amber); width: 0%; height: 100%; transition: width 0.3s ease;"></div>
+                  <div id="analytics-bar-5xx" style="background: var(--accent-rose); width: 0%; height: 100%; transition: width 0.3s ease;"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="table-header-bar" style="margin-bottom: 0.75rem;">
+                <div class="table-title">Global Edge Ingress by PoP</div>
+                <span class="badge badge-indigo">REAL-TIME TELEMETRY</span>
+              </div>
+              <div class="table-responsive">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>PoP Region</th>
+                      <th>Traffic Ingress</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="analytics-pop-breakdown">
+                    <tr>
+                      <td><strong>Dhaka (BD)</strong></td>
+                      <td id="pop-traffic-dhaka">0 req (0%)</td>
+                      <td><span class="badge badge-emerald">ACTIVE</span></td>
+                    </tr>
+                    <tr>
+                      <td><strong>Singapore (SG)</strong></td>
+                      <td id="pop-traffic-singapore">0 req (0%)</td>
+                      <td><span class="badge badge-emerald">ACTIVE</span></td>
+                    </tr>
+                    <tr>
+                      <td><strong>Frankfurt (DE)</strong></td>
+                      <td id="pop-traffic-frankfurt">0 req (0%)</td>
+                      <td><span class="badge badge-emerald">ACTIVE</span></td>
+                    </tr>
+                    <tr>
+                      <td><strong>Virginia (US)</strong></td>
+                      <td id="pop-traffic-virginia">0 req (0%)</td>
+                      <td><span class="badge badge-emerald">ACTIVE</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 

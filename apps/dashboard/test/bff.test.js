@@ -2351,6 +2351,294 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
     assert.strictEqual(appJsContent.includes('function verifyDomain('), true, 'app.js must define verifyDomain()');
     assert.strictEqual(appJsContent.includes('function deleteDomain('), true, 'app.js must define deleteDomain()');
   });
+
+  it('Requirement 18: Real-Time Telemetry Aggregation & API Key Token-Bucket Rate Limiting', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'prod-op-token';
+
+    const mockCP = http.createServer((cReq, cRes) => {
+      if (cReq.url === '/v1/edge/pops') {
+        cRes.writeHead(200, { 'Content-Type': 'application/json' });
+        cRes.end(JSON.stringify({ pops: [] }));
+        return;
+      }
+      cRes.writeHead(404);
+      cRes.end();
+    });
+
+    await new Promise((resolve) => mockCP.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockCP.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server')];
+    const server = require('../server');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Setup a valid API Key for DEVELOPER (capacity: 60)
+      const crypto = require('crypto');
+      const secretKey = 'nke_live_test_ratelimit_secret_abc123';
+      const keyId = 'key-test-ratelimit-01';
+      const hashedSecret = crypto.createHash('sha256').update(secretKey).digest('hex');
+
+      server.apiKeys.set(keyId, {
+        id: keyId,
+        projectId: 'proj-alpha',
+        name: 'Rate Limit Test Key',
+        prefix: 'nke_live_test...',
+        hashedSecret,
+        role: 'DEVELOPER',
+        scopes: ['inference'],
+        createdAt: new Date().toISOString(),
+        lastUsedAt: null,
+        status: 'ACTIVE'
+      });
+
+      // 2. Initial request must succeed and return standard rate limit headers
+      const resInit = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Authorization': `Bearer ${secretKey}` }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resInit.statusCode, 200);
+      assert.strictEqual(resInit.headers['x-ratelimit-limit'], '60');
+      assert.strictEqual(Number(resInit.headers['x-ratelimit-remaining']) <= 59, true);
+      resInit.resume();
+
+      // 3. Exhaust bucket tokens to test 429 Too Many Requests
+      const bucket = server.apiKeyBuckets.get(keyId);
+      assert.notStrictEqual(bucket, undefined);
+      bucket.tokens = 0.2; // Insufficient for next request
+
+      const res429 = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Authorization': `Bearer ${secretKey}` }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.strictEqual(res429.statusCode, 429, 'Exhausted token bucket must return HTTP 429');
+      assert.strictEqual(res429.headers['retry-after'], '1');
+      assert.strictEqual(res429.headers['x-ratelimit-limit'], '60');
+      assert.strictEqual(res429.headers['x-ratelimit-remaining'], '0');
+
+      let body429 = '';
+      res429.on('data', c => { body429 += c; });
+      await new Promise(r => res429.on('end', r));
+      const json429 = JSON.parse(body429);
+      assert.strictEqual(json429.code, 429);
+      assert.strictEqual(json429.error.includes('Rate limit exceeded'), true);
+
+      // 4. Refill bucket tokens and verify subsequent request succeeds
+      bucket.tokens = 10;
+      const resRecover = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Authorization': `Bearer ${secretKey}` }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resRecover.statusCode, 200);
+      assert.strictEqual(Number(resRecover.headers['x-ratelimit-remaining']), 9);
+      resRecover.resume();
+
+      // 5. Test Sliding-Window Telemetry Calculations
+      server.telemetryBuffer.length = 0; // Clear buffer
+      const now = Date.now();
+
+      // 7 successful requests with varied latencies
+      [5, 10, 15, 20, 25, 30, 35].forEach(lat => {
+        server.recordTelemetry({
+          timestamp: now,
+          projectId: 'proj-alpha',
+          path: '/api/proxy/pops',
+          method: 'GET',
+          statusCode: 200,
+          durationMs: lat,
+          clientIp: '127.0.0.1',
+          pop: 'dhaka',
+          cacheHit: true
+        });
+      });
+
+      // 2 blocked requests (403 and 429)
+      [40, 50].forEach(lat => {
+        server.recordTelemetry({
+          timestamp: now,
+          projectId: 'proj-alpha',
+          path: '/api/proxy/pops',
+          method: 'GET',
+          statusCode: 403,
+          durationMs: lat,
+          clientIp: '127.0.0.1',
+          pop: 'singapore',
+          cacheHit: false
+        });
+      });
+
+      // 1 gateway failure (502)
+      server.recordTelemetry({
+        timestamp: now,
+        projectId: 'proj-alpha',
+        path: '/api/proxy/pops',
+        method: 'GET',
+        statusCode: 502,
+        durationMs: 100,
+        clientIp: '127.0.0.1',
+        pop: 'frankfurt',
+        cacheHit: false
+      });
+
+      const summary = server.getTelemetrySummary('proj-alpha');
+      assert.strictEqual(summary.total_requests, 10);
+      assert.strictEqual(summary.status_distribution['2xx'], 7);
+      assert.strictEqual(summary.status_distribution['4xx'], 2);
+      assert.strictEqual(summary.status_distribution['5xx'], 1);
+      assert.strictEqual(summary.threat_blocks, 2);
+      assert.strictEqual(summary.cache_hit_ratio, 0.7);
+      assert.strictEqual(summary.success_rate, 0.7);
+      assert.strictEqual(summary.p50_latency_ms, 25);
+      assert.strictEqual(summary.p95_latency_ms, 50);
+      assert.strictEqual(summary.p99_latency_ms, 100);
+      assert.strictEqual(summary.pop_distribution.dhaka, 7);
+      assert.strictEqual(summary.pop_distribution.singapore, 2);
+      assert.strictEqual(summary.pop_distribution.frankfurt, 1);
+      assert.strictEqual(summary.pop_distribution.virginia, 0);
+
+    } finally {
+      await safeClose(server);
+      await safeClose(mockCP);
+    }
+  });
+
+  it('Requirement 19: Analytics Summary Multi-Tenant Scoping & UI Wiring', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'prod-op-token';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'token-alice:alice@client.com:TENANT_ADMIN:proj-alpha;token-bob:bob@client.com:TENANT_ADMIN:proj-beta';
+
+    delete require.cache[require.resolve('../server')];
+    const server = require('../server');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Unauthenticated request to /api/proxy/analytics/summary returns 401
+      const resUnauth = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/analytics/summary',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauth.statusCode, 401);
+      resUnauth.resume();
+
+      // Login as Alice (proj-alpha)
+      const loginAliceRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-alice' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const aliceCookie = loginAliceRes.headers['set-cookie'][0].split(';')[0];
+      loginAliceRes.resume();
+
+      // 2. Alice cannot query Bob's project telemetry (403 Forbidden)
+      const resCrossTenant = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/analytics/summary?project_id=proj-beta',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resCrossTenant.statusCode, 403);
+      resCrossTenant.resume();
+
+      // 3. Seed telemetry for both Alice (proj-alpha) and Bob (proj-beta)
+      server.telemetryBuffer.length = 0;
+      server.recordTelemetry({ timestamp: Date.now(), projectId: 'proj-alpha', path: '/api/v1', method: 'GET', statusCode: 200, durationMs: 12, clientIp: '127.0.0.1', pop: 'dhaka', cacheHit: true });
+      server.recordTelemetry({ timestamp: Date.now(), projectId: 'proj-beta', path: '/api/v1', method: 'GET', statusCode: 500, durationMs: 99, clientIp: '127.0.0.1', pop: 'singapore', cacheHit: false });
+
+      // Alice queries her own analytics summary
+      const resAliceSummary = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/analytics/summary',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAliceSummary.statusCode, 200);
+      let aliceBody = '';
+      resAliceSummary.on('data', c => { aliceBody += c; });
+      await new Promise(r => resAliceSummary.on('end', r));
+      const aliceJson = JSON.parse(aliceBody);
+      assert.strictEqual(aliceJson.project_id, 'proj-alpha');
+      assert.strictEqual(aliceJson.total_requests, 1);
+      assert.strictEqual(aliceJson.status_distribution['2xx'], 1);
+      assert.strictEqual(aliceJson.status_distribution['5xx'], 0); // Bob's 5xx error must NOT leak to Alice!
+
+      // 4. Verify UI HTML & JS Components
+      const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+      const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+
+      assert.strictEqual(indexHtmlContent.includes('analytics-total-requests'), true, 'index.html must define #analytics-total-requests');
+      assert.strictEqual(indexHtmlContent.includes('analytics-latency-p50'), true, 'index.html must define #analytics-latency-p50');
+      assert.strictEqual(indexHtmlContent.includes('analytics-latency-p99'), true, 'index.html must define #analytics-latency-p99');
+      assert.strictEqual(indexHtmlContent.includes('analytics-cache-hit-ratio'), true, 'index.html must define #analytics-cache-hit-ratio');
+      assert.strictEqual(indexHtmlContent.includes('analytics-threat-blocks'), true, 'index.html must define #analytics-threat-blocks');
+      assert.strictEqual(indexHtmlContent.includes('analytics-status-2xx'), true, 'index.html must define #analytics-status-2xx');
+      assert.strictEqual(indexHtmlContent.includes('analytics-pop-breakdown'), true, 'index.html must define #analytics-pop-breakdown');
+      assert.strictEqual(indexHtmlContent.includes('btn-refresh-analytics'), true, 'index.html must define #btn-refresh-analytics');
+
+      assert.strictEqual(appJsContent.includes('async function loadAnalytics()'), true, 'app.js must define async function loadAnalytics()');
+      assert.strictEqual(appJsContent.includes('window.loadAnalytics = loadAnalytics;'), true, 'app.js must expose window.loadAnalytics');
+
+    } finally {
+      await safeClose(server);
+    }
+  });
 });
 
 

@@ -79,6 +79,13 @@ if command -v node >/dev/null 2>&1; then
   node --test test/bff.test.js
   popd > /dev/null
   echo " -> Dashboard security tests passed."
+
+  if [ -f "${REPO_ROOT}/libs/ts/api-client/test/client.test.js" ]; then
+    pushd "${REPO_ROOT}/libs/ts/api-client" > /dev/null
+    node --test test/client.test.js
+    popd > /dev/null
+    echo " -> TypeScript SDK tests passed."
+  fi
 else
   echo " -> Node.js not found, skipping local dashboard check."
 fi

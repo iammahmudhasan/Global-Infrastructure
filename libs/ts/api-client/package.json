@@ -1,0 +1,28 @@
+{
+  "name": "@nexusedge/api-client",
+  "version": "0.1.0",
+  "description": "Official Lightweight TypeScript SDK for NexusEdge Global Infrastructure & AI Orchestration",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test test/client.test.js"
+  },
+  "keywords": [
+    "nexusedge",
+    "edge",
+    "infrastructure",
+    "ai-inference",
+    "global-routing",
+    "sdk"
+  ],
+  "author": "NexusEdge Core Engineering",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

@@ -145,6 +145,21 @@ if (Get-Command node -ErrorAction SilentlyContinue) {
             exit 1
         }
         Write-Host " -> Dashboard security tests passed." -ForegroundColor Green
+
+        $SdkDir = Join-Path $RepoRoot "libs/ts/api-client"
+        if (Test-Path (Join-Path $SdkDir "test/client.test.js")) {
+            Push-Location $SdkDir
+            try {
+                & node --test test/client.test.js
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "ERROR: TypeScript SDK test suite failed." -ForegroundColor Red
+                    exit 1
+                }
+                Write-Host " -> TypeScript SDK tests passed." -ForegroundColor Green
+            } finally {
+                Pop-Location
+            }
+        }
     } finally {
         Pop-Location
     }

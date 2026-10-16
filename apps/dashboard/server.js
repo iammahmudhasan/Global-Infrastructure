@@ -111,6 +111,147 @@ function validateAPIKey(token) {
   return null;
 }
 
+// In-Memory Token-Bucket Rate Limiter per API Key
+const apiKeyBuckets = new Map();
+const RATE_LIMIT_TIERS = {
+  DEVELOPER: { capacity: 60, refillPerMs: 60 / 60000 },
+  TENANT_ADMIN: { capacity: 300, refillPerMs: 300 / 60000 },
+  PLATFORM_OPERATOR: { capacity: 1000, refillPerMs: 1000 / 60000 },
+  VIEWER: { capacity: 30, refillPerMs: 30 / 60000 }
+};
+
+function checkAndConsumeAPIKeyRateLimit(keyId, role) {
+  const now = Date.now();
+  const tier = RATE_LIMIT_TIERS[role] || RATE_LIMIT_TIERS.DEVELOPER;
+  let bucket = apiKeyBuckets.get(keyId);
+
+  if (!bucket) {
+    bucket = {
+      tokens: tier.capacity - 1,
+      lastRefill: now,
+      capacity: tier.capacity,
+      refillPerMs: tier.refillPerMs
+    };
+    apiKeyBuckets.set(keyId, bucket);
+    return {
+      allowed: true,
+      remaining: tier.capacity - 1,
+      capacity: tier.capacity,
+      resetAt: Math.ceil(now / 1000) + 60
+    };
+  }
+
+  const elapsedMs = Math.max(0, now - bucket.lastRefill);
+  const refillTokens = elapsedMs * bucket.refillPerMs;
+  bucket.tokens = Math.min(bucket.capacity, bucket.tokens + refillTokens);
+  bucket.lastRefill = now;
+
+  if (bucket.tokens < 1.0) {
+    return {
+      allowed: false,
+      remaining: 0,
+      capacity: bucket.capacity,
+      resetAt: Math.ceil(now / 1000) + 1
+    };
+  }
+
+  bucket.tokens -= 1.0;
+  return {
+    allowed: true,
+    remaining: Math.floor(bucket.tokens),
+    capacity: bucket.capacity,
+    resetAt: Math.ceil(now / 1000) + 60
+  };
+}
+
+// In-Memory Sliding-Window Real-Time Telemetry Ring Buffer
+const MAX_TELEMETRY_RECORDS = 10000;
+const telemetryBuffer = [];
+let telemetryIndex = 0;
+
+function recordTelemetry(entry) {
+  if (telemetryBuffer.length < MAX_TELEMETRY_RECORDS) {
+    telemetryBuffer.push(entry);
+  } else {
+    telemetryBuffer[telemetryIndex % MAX_TELEMETRY_RECORDS] = entry;
+    telemetryIndex++;
+  }
+}
+
+function getTelemetrySummary(targetProject = 'ALL') {
+  const now = Date.now();
+  const windowStart = now - (24 * 60 * 60 * 1000);
+
+  const filtered = [];
+  for (let i = 0; i < telemetryBuffer.length; i++) {
+    const item = telemetryBuffer[i];
+    if (item && item.timestamp >= windowStart) {
+      if (targetProject === 'ALL' || item.projectId === targetProject) {
+        filtered.push(item);
+      }
+    }
+  }
+
+  if (filtered.length === 0) {
+    return {
+      project_id: targetProject,
+      total_requests: 0,
+      p50_latency_ms: 0,
+      p95_latency_ms: 0,
+      p99_latency_ms: 0,
+      cache_hit_ratio: 1.0,
+      threat_blocks: 0,
+      success_rate: 1.0,
+      status_distribution: { '2xx': 0, '4xx': 0, '5xx': 0 },
+      pop_distribution: { dhaka: 0, singapore: 0, frankfurt: 0, virginia: 0 }
+    };
+  }
+
+  let c2 = 0;
+  let c4 = 0;
+  let c5 = 0;
+  let threatBlocks = 0;
+  let cacheHits = 0;
+  const durations = [];
+  const popDistribution = { dhaka: 0, singapore: 0, frankfurt: 0, virginia: 0 };
+
+  for (const r of filtered) {
+    if (r.statusCode >= 200 && r.statusCode < 300) c2++;
+    else if (r.statusCode >= 400 && r.statusCode < 500) c4++;
+    else if (r.statusCode >= 500) c5++;
+
+    if (r.statusCode === 403 || r.statusCode === 429) {
+      threatBlocks++;
+    }
+    if (r.cacheHit) {
+      cacheHits++;
+    }
+    if (r.pop && Object.prototype.hasOwnProperty.call(popDistribution, r.pop)) {
+      popDistribution[r.pop]++;
+    }
+    durations.push(r.durationMs || 0);
+  }
+
+  durations.sort((a, b) => a - b);
+  const total = filtered.length;
+  const p50 = durations[Math.floor(0.50 * (total - 1))] || 0;
+  const p95 = durations[Math.floor(0.95 * (total - 1))] || 0;
+  const p99 = durations[Math.min(total - 1, Math.ceil(0.99 * (total - 1)))] || 0;
+
+  return {
+    project_id: targetProject,
+    total_requests: total,
+    p50_latency_ms: p50,
+    p95_latency_ms: p95,
+    p99_latency_ms: p99,
+    cache_hit_ratio: total > 0 ? Number((cacheHits / total).toFixed(3)) : 1.0,
+    threat_blocks: threatBlocks,
+    success_rate: total > 0 ? Number((c2 / total).toFixed(3)) : 1.0,
+    status_distribution: { '2xx': c2, '4xx': c4, '5xx': c5 },
+    pop_distribution: popDistribution
+  };
+}
+
 // In-Memory Login Rate Limiter Store: ip -> { count, windowStart }
 const loginRateLimits = new Map();
 
@@ -512,8 +653,29 @@ const MIME_TYPES = {
 
 // Main HTTP Server
 const server = http.createServer((req, res) => {
+  const startTime = process.hrtime.bigint();
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathname = parsedUrl.pathname;
+
+  req.__projectId = null;
+  req.__pop = req.headers['x-nexusedge-pop'] || null;
+
+  res.on('finish', () => {
+    const durationMs = Number((process.hrtime.bigint() - startTime) / 1000000n);
+    const cacheHeader = res.getHeader ? res.getHeader('x-cache') : null;
+    const isCacheHit = cacheHeader === 'HIT' || Boolean(req.headers['x-cache-hit']);
+    recordTelemetry({
+      timestamp: Date.now(),
+      projectId: req.__projectId || 'unknown',
+      path: pathname,
+      method: req.method,
+      statusCode: res.statusCode,
+      durationMs,
+      clientIp: getClientIp(req),
+      pop: req.__pop,
+      cacheHit: isCacheHit
+    });
+  });
 
   // --- API Routes (BFF) ---
 
@@ -633,6 +795,40 @@ const server = http.createServer((req, res) => {
     const session = authenticateSession(req);
     if (!session) {
       return sendJSON(res, 401, { code: 401, error: 'Unauthorized: valid user session required' });
+    }
+    req.__projectId = session.projectId;
+
+    // Token-Bucket Rate Limiter per API Key
+    if (session.isAPIKey) {
+      const rateLimitResult = checkAndConsumeAPIKeyRateLimit(session.id, session.role);
+      if (!rateLimitResult.allowed) {
+        return sendJSON(res, 429, {
+          code: 429,
+          error: 'Too Many Requests: Rate limit exceeded for API key'
+        }, {
+          'Retry-After': '1',
+          'X-RateLimit-Limit': String(rateLimitResult.capacity),
+          'X-RateLimit-Remaining': '0',
+          'X-RateLimit-Reset': String(rateLimitResult.resetAt)
+        });
+      }
+      res.setHeader('X-RateLimit-Limit', String(rateLimitResult.capacity));
+      res.setHeader('X-RateLimit-Remaining', String(rateLimitResult.remaining));
+      res.setHeader('X-RateLimit-Reset', String(rateLimitResult.resetAt));
+    }
+
+    // --- Real-Time Telemetry & Observability Summary (Multi-Tenant boundary) ---
+    if (pathname === '/api/proxy/analytics/summary' && req.method === 'GET') {
+      const requestedProject = parsedUrl.searchParams.get('project_id');
+      if (requestedProject && requestedProject !== session.projectId && session.role !== 'PLATFORM_OPERATOR') {
+        return sendJSON(res, 403, { code: 403, error: 'Forbidden: Cross-tenant project access not permitted' });
+      }
+      const targetProject = session.role === 'PLATFORM_OPERATOR'
+        ? (requestedProject || 'ALL')
+        : session.projectId;
+
+      const summary = getTelemetrySummary(targetProject);
+      return sendJSON(res, 200, summary);
     }
 
     // --- Milestone 1.1: Cryptographic API Key Management Vault ---
@@ -948,5 +1144,10 @@ if (require.main === module) {
 
 server.apiKeys = apiKeys;
 server.sessions = sessions;
+server.apiKeyBuckets = apiKeyBuckets;
+server.telemetryBuffer = telemetryBuffer;
+server.recordTelemetry = recordTelemetry;
+server.getTelemetrySummary = getTelemetrySummary;
+server.checkAndConsumeAPIKeyRateLimit = checkAndConsumeAPIKeyRateLimit;
 
 module.exports = server;
