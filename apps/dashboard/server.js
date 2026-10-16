@@ -58,6 +58,59 @@ const MAX_RATE_LIMIT_ENTRIES = 10000;
 // In-Memory Active Session Store
 const sessions = new Map();
 
+// In-Memory Cryptographic API Key Vault: id -> { id, projectId, name, prefix, hashedSecret, role, scopes, createdAt, lastUsedAt, status }
+const apiKeys = new Map();
+
+function hashSecret(secret) {
+  return crypto.createHash('sha256').update(secret).digest('hex');
+}
+
+function generateAPIKey(projectId, name, role = 'DEVELOPER', scopes = ['inference', 'domains:read']) {
+  const randomHex = crypto.randomBytes(32).toString('hex');
+  const secretKey = `nke_live_${randomHex}`;
+  const prefix = `nke_live_${randomHex.substring(0, 8)}...`;
+  const hashedSecret = hashSecret(secretKey);
+  const id = `key-${crypto.randomBytes(6).toString('hex')}`;
+
+  const record = {
+    id,
+    projectId,
+    name: name || 'Default API Key',
+    prefix,
+    hashedSecret,
+    role: ALLOWED_ROLES.has(role) ? role : 'DEVELOPER',
+    scopes: Array.isArray(scopes) ? scopes : ['inference', 'domains:read'],
+    createdAt: new Date().toISOString(),
+    lastUsedAt: null,
+    status: 'ACTIVE'
+  };
+
+  apiKeys.set(id, record);
+  return { record, secretKey };
+}
+
+function validateAPIKey(token) {
+  if (!token || typeof token !== 'string') return null;
+  if (!token.startsWith('nke_live_') && !token.startsWith('nke_test_')) return null;
+
+  const tokenHash = hashSecret(token);
+  for (const record of apiKeys.values()) {
+    if (record.status === 'ACTIVE' && safeCompare(record.hashedSecret, tokenHash)) {
+      record.lastUsedAt = new Date().toISOString();
+      return {
+        id: record.id,
+        user: `apikey:${record.name}`,
+        role: record.role,
+        projectId: record.projectId,
+        scopes: record.scopes,
+        isAPIKey: true,
+        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000
+      };
+    }
+  }
+  return null;
+}
+
 // In-Memory Login Rate Limiter Store: ip -> { count, windowStart }
 const loginRateLimits = new Map();
 
@@ -230,7 +283,7 @@ function parseCookies(req) {
   return list;
 }
 
-// Authenticate session strictly via active server session
+// Authenticate session strictly via active server session or cryptographic API key
 function authenticateSession(req) {
   let cookies;
   try {
@@ -245,6 +298,18 @@ function authenticateSession(req) {
     sessionId = authHeader.substring(7).trim();
   }
 
+  // Check if token is an API key (nke_live_... or nke_test_...)
+  if (sessionId && (sessionId.startsWith('nke_live_') || sessionId.startsWith('nke_test_'))) {
+    return validateAPIKey(sessionId);
+  }
+
+  // Also check X-API-Key header
+  const apiKeyHeader = req.headers && req.headers['x-api-key'];
+  if (apiKeyHeader && typeof apiKeyHeader === 'string') {
+    const keySession = validateAPIKey(apiKeyHeader.trim());
+    if (keySession) return keySession;
+  }
+
   // Session IDs must be 64-character hexadecimal strings
   if (sessionId && typeof sessionId === 'string' && /^[0-9a-f]{64}$/i.test(sessionId) && sessions.has(sessionId)) {
     const session = sessions.get(sessionId);
@@ -255,6 +320,44 @@ function authenticateSession(req) {
   }
 
   return null;
+}
+
+// Safely parse JSON body up to maxBytes with strict error handling and resource bounds
+function parseJSONBody(req, res, maxBytes, callback) {
+  let body = '';
+  let bodyLength = 0;
+  let destroyed = false;
+
+  req.on('data', chunk => {
+    if (destroyed) return;
+    bodyLength += chunk.length;
+    if (bodyLength > maxBytes) {
+      destroyed = true;
+      sendJSON(res, 413, { error: 'Payload too large: maximum body size exceeded' });
+      req.destroy();
+      if (req.socket && !req.socket.destroyed) {
+        req.socket.destroy();
+      }
+      return;
+    }
+    body += chunk;
+  });
+
+  req.on('end', () => {
+    if (destroyed) return;
+    try {
+      const payload = JSON.parse(body || '{}');
+      callback(null, payload);
+    } catch {
+      callback(new Error('Invalid JSON payload'), null);
+    }
+  });
+
+  req.on('error', err => {
+    if (!destroyed) {
+      callback(err, null);
+    }
+  });
 }
 
 // Detect whether connection is TLS-secured
@@ -532,6 +635,108 @@ const server = http.createServer((req, res) => {
       return sendJSON(res, 401, { code: 401, error: 'Unauthorized: valid user session required' });
     }
 
+    // --- Milestone 1.1: Cryptographic API Key Management Vault ---
+
+    // 1. List API Keys (Strict multi-tenant project boundary)
+    if (pathname === '/api/proxy/api-keys' && req.method === 'GET') {
+      const requestedProject = parsedUrl.searchParams.get('project_id');
+      if (requestedProject && requestedProject !== session.projectId && session.role !== 'PLATFORM_OPERATOR') {
+        return sendJSON(res, 403, { code: 403, error: 'Forbidden: Cross-tenant project access not permitted' });
+      }
+      const targetProject = session.role === 'PLATFORM_OPERATOR' && requestedProject ? requestedProject : session.projectId;
+
+      const result = [];
+      for (const key of apiKeys.values()) {
+        if (key.projectId === targetProject) {
+          result.push({
+            id: key.id,
+            project_id: key.projectId,
+            name: key.name,
+            prefix: key.prefix,
+            role: key.role,
+            scopes: key.scopes,
+            created_at: key.createdAt,
+            last_used_at: key.lastUsedAt,
+            status: key.status
+          });
+        }
+      }
+      return sendJSON(res, 200, { keys: result });
+    }
+
+    // 2. Generate new API Key (PLATFORM_OPERATOR or TENANT_ADMIN)
+    if (pathname === '/api/proxy/api-keys' && req.method === 'POST') {
+      if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to generate API keys. PLATFORM_OPERATOR or TENANT_ADMIN role required.`
+        });
+      }
+
+      return parseJSONBody(req, res, 16384, (err, payload) => {
+        if (err) {
+          return sendJSON(res, 400, { error: 'Invalid JSON payload' });
+        }
+        const name = (payload && payload.name && typeof payload.name === 'string')
+          ? payload.name.trim().substring(0, 100)
+          : 'Default API Key';
+        const requestedRole = (payload && payload.role && ALLOWED_ROLES.has(payload.role))
+          ? payload.role
+          : 'DEVELOPER';
+
+        // Privilege escalation protection: only operator can create operator keys
+        if (requestedRole === 'PLATFORM_OPERATOR' && session.role !== 'PLATFORM_OPERATOR') {
+          return sendJSON(res, 403, { error: 'Forbidden: Only PLATFORM_OPERATOR can create operator-scoped API keys' });
+        }
+
+        const scopes = (payload && Array.isArray(payload.scopes))
+          ? payload.scopes.filter(s => typeof s === 'string').map(s => s.trim())
+          : ['inference', 'domains:read'];
+
+        const { record, secretKey } = generateAPIKey(session.projectId, name, requestedRole, scopes);
+        return sendJSON(res, 201, {
+          id: record.id,
+          project_id: record.projectId,
+          name: record.name,
+          prefix: record.prefix,
+          secret_key: secretKey,
+          role: record.role,
+          scopes: record.scopes,
+          created_at: record.createdAt,
+          warning: 'This secret key will never be displayed again. Please store it securely.'
+        });
+      });
+    }
+
+    // 3. Revoke API Key (PLATFORM_OPERATOR or TENANT_ADMIN)
+    const keyMatch = pathname.match(/^\/api\/proxy\/api-keys\/([a-zA-Z0-9_-]+)$/);
+    if (keyMatch && req.method === 'DELETE') {
+      const keyId = keyMatch[1];
+      if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to revoke API keys. PLATFORM_OPERATOR or TENANT_ADMIN role required.`
+        });
+      }
+
+      const keyRecord = apiKeys.get(keyId);
+      if (!keyRecord) {
+        return sendJSON(res, 404, { code: 404, error: 'API key not found' });
+      }
+
+      if (keyRecord.projectId !== session.projectId && session.role !== 'PLATFORM_OPERATOR') {
+        return sendJSON(res, 403, { code: 403, error: 'Forbidden: Cannot revoke API key of another project' });
+      }
+
+      keyRecord.status = 'REVOKED';
+      return sendJSON(res, 200, {
+        success: true,
+        id: keyRecord.id,
+        status: 'REVOKED',
+        revoked_at: new Date().toISOString()
+      });
+    }
+
     // Proxy Audit Verification (PLATFORM_OPERATOR only)
     if (pathname === '/api/proxy/audit-logs/verify') {
       if (session.role !== 'PLATFORM_OPERATOR') {
@@ -562,6 +767,42 @@ const server = http.createServer((req, res) => {
         }
       }
       return proxyToControlPlane(`/v1/projects/${encodeURIComponent(session.projectId)}/domains`, req, res, session);
+    }
+
+    // Proxy Domain DNS Verification (PLATFORM_OPERATOR or TENANT_ADMIN)
+    const domainVerifyMatch = pathname.match(/^\/api\/proxy\/domains\/([a-zA-Z0-9_-]+)\/verify$/);
+    if (domainVerifyMatch) {
+      if (req.method !== 'POST') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+        return sendJSON(res, 403, {
+          code: 403,
+          error: `Forbidden: Role "${session.role}" is not authorized to verify domains. PLATFORM_OPERATOR or TENANT_ADMIN role required.`
+        });
+      }
+      const domainId = domainVerifyMatch[1];
+      const forceQuery = (session.role === 'PLATFORM_OPERATOR' && parsedUrl.searchParams.get('force') === 'true') ? '?force=true' : '';
+      return proxyToControlPlane(`/v1/domains/${encodeURIComponent(domainId)}/verify${forceQuery}`, req, res, session);
+    }
+
+    // Proxy Single Domain Operations (GET details, DELETE domain)
+    const domainDetailMatch = pathname.match(/^\/api\/proxy\/domains\/([a-zA-Z0-9_-]+)$/);
+    if (domainDetailMatch) {
+      const domainId = domainDetailMatch[1];
+      if (req.method === 'DELETE') {
+        if (!DOMAIN_MUTATION_ROLES.has(session.role)) {
+          return sendJSON(res, 403, {
+            code: 403,
+            error: `Forbidden: Role "${session.role}" is not authorized to delete domains. PLATFORM_OPERATOR or TENANT_ADMIN role required.`
+          });
+        }
+        return proxyToControlPlane(`/v1/domains/${encodeURIComponent(domainId)}`, req, res, session);
+      }
+      if (req.method === 'GET') {
+        return proxyToControlPlane(`/v1/domains/${encodeURIComponent(domainId)}`, req, res, session);
+      }
+      return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
     }
 
     // Proxy AI Inference (Dedicated Edge Gateway handler; zero Control Plane credential leakage)
@@ -704,5 +945,8 @@ if (require.main === module) {
     console.log(`NexusEdge Dashboard BFF listening on port ${PORT}`);
   });
 }
+
+server.apiKeys = apiKeys;
+server.sessions = sessions;
 
 module.exports = server;

@@ -42,6 +42,7 @@
 
       if (viewId === 'security') {
         fetchAuditLogs();
+        loadAPIKeys();
       }
       if (viewId === 'domains') {
         loadDomains();
@@ -88,7 +89,29 @@
 
     async function submitNewDomain() {
       const domainInput = document.getElementById('modal-domain-fqdn');
-      const domain = (domainInput && domainInput.value.trim()) || "api.domain.com";
+      const originInput = document.getElementById('modal-domain-origin');
+      const portInput = document.getElementById('modal-domain-port');
+      const protoSelect = document.getElementById('modal-domain-proto');
+
+      const hostname = (domainInput && domainInput.value.trim()) || '';
+      if (!hostname) {
+        showToast('Please provide a valid fully qualified domain name (FQDN).');
+        return;
+      }
+
+      const origin = (originInput && originInput.value.trim()) || '203.0.113.195';
+      const port = parseInt((portInput && portInput.value) || '443', 10);
+      const proto = (protoSelect && protoSelect.value) || 'https';
+
+      const allowedPops = [];
+      ['pop-dhaka', 'pop-singapore', 'pop-frankfurt', 'pop-virginia'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el && el.checked) allowedPops.push(el.value);
+      });
+      if (allowedPops.length === 0) {
+        allowedPops.push('dhaka', 'singapore');
+      }
+
       closeModal('new-domain-modal');
 
       try {
@@ -96,21 +119,33 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            hostname: domain,
-            default_origin: '172.28.0.10:8081'
+            hostname: hostname,
+            origin_address: origin,
+            origin_port: port,
+            origin_protocol: proto,
+            allowed_pops: allowedPops
           })
         });
+
         if (resp.ok) {
-          showToast(`Domain '${domain}' registered in Control Plane database. TLS initiated.`);
+          const created = await resp.json();
+          showToast(`Domain '${created.hostname || hostname}' onboarded. Configure DNS to activate.`);
+          openDomainDnsModal({
+            id: created.domain_id || created.id,
+            hostname: created.hostname || hostname,
+            cname_target: created.cname_target,
+            verification_token: created.verification_token,
+            status: created.status || 'pending_verification'
+          });
           loadDomains();
           return;
         }
-      } catch (err) {
-        // Fallback simulated domain registration
-      }
 
-      addSimulatedDomain(domain);
-      showToast(`[DEMO / LOCAL] Domain '${domain}' added to local preview list (Control Plane offline).`);
+        const errData = await resp.json().catch(() => ({}));
+        showToast(`Onboarding failed: ${errData.error || resp.statusText}`);
+      } catch (err) {
+        showToast(`Domain onboarding network error: ${err.message}`);
+      }
     }
 
     function submitNewDns() {
@@ -414,7 +449,9 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
       return false;
     }
 
-    // Dynamic Domain Management
+    // Dynamic Domain Management & DNS Verification Wizard
+    let currentWizardDomain = null;
+
     async function loadDomains() {
       const tbody = document.getElementById('domains-table-tbody');
       const badge = document.getElementById('domains-source-badge');
@@ -439,25 +476,52 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
               tdOrigin.className = 'mono';
               tdOrigin.textContent = d.cname_target || d.default_origin || 'edge.nexusedge.net';
 
-              const tdCert = document.createElement('td');
-              const certSpan = document.createElement('span');
-              certSpan.className = 'badge badge-bd';
-              certSpan.textContent = "Auto Let's Encrypt (ECDSA)";
-              tdCert.appendChild(certSpan);
+              const tdStatus = document.createElement('td');
+              const statusSpan = document.createElement('span');
+              const isVerified = (d.status === 'active' || d.status === 'verified');
+              if (isVerified) {
+                statusSpan.className = 'badge badge-bd';
+                statusSpan.textContent = 'ACTIVE (VERIFIED)';
+              } else {
+                statusSpan.className = 'badge badge-amber';
+                statusSpan.textContent = 'PENDING DNS';
+              }
+              tdStatus.appendChild(statusSpan);
 
               const tdPops = document.createElement('td');
-              tdPops.textContent = (d.allowed_pops && d.allowed_pops.length > 0) ? d.allowed_pops.join(', ') : 'Dhaka, Singapore, Frankfurt, Virginia';
+              tdPops.textContent = (d.allowed_pops && d.allowed_pops.length > 0)
+                ? d.allowed_pops.join(', ')
+                : 'Dhaka, Singapore, Frankfurt, Virginia';
 
               const tdProject = document.createElement('td');
               tdProject.textContent = d.project_id || 'proj-core';
 
-              const tdStatus = document.createElement('td');
-              const statusSpan = document.createElement('span');
-              statusSpan.className = 'badge badge-bd';
-              statusSpan.textContent = 'LIVE (PostgreSQL)';
-              tdStatus.appendChild(statusSpan);
+              const tdActions = document.createElement('td');
+              tdActions.style.display = 'flex';
+              tdActions.style.gap = '0.4rem';
+              tdActions.style.alignItems = 'center';
 
-              tr.append(tdHost, tdOrigin, tdCert, tdPops, tdProject, tdStatus);
+              if (!isVerified) {
+                const verifyBtn = document.createElement('button');
+                verifyBtn.className = 'btn btn-primary btn-sm';
+                verifyBtn.textContent = 'Verify DNS';
+                verifyBtn.onclick = () => verifyDomain(d.id, d.hostname);
+
+                const setupBtn = document.createElement('button');
+                setupBtn.className = 'btn btn-secondary btn-sm';
+                setupBtn.textContent = 'DNS Setup';
+                setupBtn.onclick = () => openDomainDnsModal(d);
+
+                tdActions.append(verifyBtn, setupBtn);
+              }
+
+              const deleteBtn = document.createElement('button');
+              deleteBtn.className = 'btn btn-secondary btn-sm';
+              deleteBtn.textContent = 'Delete';
+              deleteBtn.onclick = () => deleteDomain(d.id, d.hostname);
+              tdActions.appendChild(deleteBtn);
+
+              tr.append(tdHost, tdOrigin, tdStatus, tdPops, tdProject, tdActions);
               tbody.appendChild(tr);
             });
             if (badge) {
@@ -486,43 +550,173 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
         <tr>
           <td><strong>api.nexusedge.io</strong></td>
           <td class="mono">edge.nexusedge.net</td>
-          <td><span class="badge badge-bd">Auto Let's Encrypt (ECDSA)</span></td>
+          <td><span class="badge badge-bd">ACTIVE (VERIFIED)</span></td>
           <td>Dhaka, Singapore, Frankfurt, Virginia</td>
           <td>Global Anycast</td>
-          <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+          <td><button class="btn btn-secondary btn-sm" onclick="showToast('Demo domain is managed by root operator')">Details</button></td>
         </tr>
         <tr>
           <td><strong>fintech.dhaka.bank</strong></td>
           <td class="mono">sovereign-bd.nexusedge.net</td>
-          <td><span class="badge badge-bd">Vault AES-256 Validated</span></td>
+          <td><span class="badge badge-bd">ACTIVE (VERIFIED)</span></td>
           <td>Dhaka PoP Only</td>
           <td>BD-NDMA-2026</td>
-          <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+          <td><button class="btn btn-secondary btn-sm" onclick="showToast('Demo domain is managed by root operator')">Details</button></td>
         </tr>
         <tr>
           <td><strong>models.deepcompute.ai</strong></td>
           <td class="mono">ai-router.nexusedge.net</td>
-          <td><span class="badge badge-spot">Auto Managed TLS</span></td>
+          <td><span class="badge badge-amber">PENDING DNS</span></td>
           <td>Iceland, Virginia, Frankfurt</td>
           <td>Low-Carbon Grid</td>
-          <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+          <td><button class="btn btn-primary btn-sm" onclick="openDomainDnsModal({ id: 'dom-demo-ai', hostname: 'models.deepcompute.ai', cname_target: 'ai-router.nexusedge.net', verification_token: 'nke-verify-ai-demo-token', status: 'pending_verification' })">DNS Setup</button></td>
         </tr>
       `;
     }
 
-    function addSimulatedDomain(domain) {
-      const tbody = document.getElementById('domains-table-tbody');
-      if (!tbody) return;
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td><strong>${domain}</strong></td>
-        <td class="mono">edge.nexusedge.net</td>
-        <td><span class="badge badge-bd">Auto Provisioning</span></td>
-        <td>Dhaka, Singapore, Frankfurt, Virginia</td>
-        <td>Global Anycast</td>
-        <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
-      `;
-      tbody.prepend(tr);
+    function openDomainDnsModal(domain) {
+      if (!domain) return;
+      currentWizardDomain = domain;
+
+      const hostInput = document.getElementById('dns-wizard-cname-host');
+      const targetInput = document.getElementById('dns-wizard-cname-target');
+      const txtNameInput = document.getElementById('dns-wizard-txt-name');
+      const txtTokenInput = document.getElementById('dns-wizard-txt-token');
+      const statusBox = document.getElementById('dns-wizard-status-box');
+      const verifyBtn = document.getElementById('btn-wizard-verify-now');
+
+      const hostname = domain.hostname || '';
+      const domainId = domain.id || domain.domain_id || 'dom';
+      const cnameTarget = domain.cname_target || `${domainId}.edge.nexusedge.net`;
+      const txtName = `_nexusedge-challenge.${hostname}`;
+      const txtToken = domain.verification_token || `nke-challenge-${domainId}`;
+
+      if (hostInput) hostInput.value = hostname;
+      if (targetInput) targetInput.value = cnameTarget;
+      if (txtNameInput) txtNameInput.value = txtName;
+      if (txtTokenInput) txtTokenInput.value = txtToken;
+
+      if (statusBox) {
+        if (domain.status === 'active' || domain.status === 'verified') {
+          statusBox.style.display = 'block';
+          statusBox.style.background = 'rgba(16, 185, 129, 0.15)';
+          statusBox.style.color = 'var(--accent-emerald)';
+          statusBox.innerText = 'Domain Active: DNS verified and live on Anycast Edge.';
+          if (verifyBtn) {
+            verifyBtn.disabled = true;
+            verifyBtn.innerText = 'Verified';
+          }
+        } else {
+          statusBox.style.display = 'none';
+          if (verifyBtn) {
+            verifyBtn.disabled = false;
+            verifyBtn.innerText = 'Verify DNS Now';
+          }
+        }
+      }
+
+      openModal('modal-domain-dns-instructions');
+    }
+
+    function copyDnsWizardTarget() {
+      const targetInput = document.getElementById('dns-wizard-cname-target');
+      if (targetInput && targetInput.value) {
+        navigator.clipboard.writeText(targetInput.value);
+        showToast('CNAME target copied to clipboard.');
+      }
+    }
+
+    function copyDnsWizardToken() {
+      const tokenInput = document.getElementById('dns-wizard-txt-token');
+      if (tokenInput && tokenInput.value) {
+        navigator.clipboard.writeText(tokenInput.value);
+        showToast('TXT challenge token copied to clipboard.');
+      }
+    }
+
+    async function triggerWizardVerify() {
+      if (!currentWizardDomain) return;
+      const domainId = currentWizardDomain.id || currentWizardDomain.domain_id;
+      const hostname = currentWizardDomain.hostname;
+      await verifyDomain(domainId, hostname, true);
+    }
+
+    async function verifyDomain(domainId, hostname, fromWizard = false) {
+      if (!domainId) return;
+      const statusBox = document.getElementById('dns-wizard-status-box');
+      const verifyBtn = document.getElementById('btn-wizard-verify-now');
+
+      if (fromWizard && verifyBtn) {
+        verifyBtn.disabled = true;
+        verifyBtn.innerText = 'Checking DNS...';
+      }
+
+      try {
+        const resp = await fetch(`/api/proxy/domains/${encodeURIComponent(domainId)}/verify`, {
+          method: 'POST'
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          showToast(`Domain '${hostname}' verified! Edge route is now active.`);
+          if (statusBox) {
+            statusBox.style.display = 'block';
+            statusBox.style.background = 'rgba(16, 185, 129, 0.15)';
+            statusBox.style.color = 'var(--accent-emerald)';
+            statusBox.innerText = `Verified: ${data.message || 'Domain active on edge proxy'}`;
+          }
+          if (verifyBtn) {
+            verifyBtn.disabled = true;
+            verifyBtn.innerText = 'Verified';
+          }
+          loadDomains();
+          return;
+        }
+
+        const errData = await resp.json().catch(() => ({}));
+        const errMsg = errData.error || `Verification returned HTTP ${resp.status}`;
+        showToast(`Verification check: ${errMsg}`);
+        if (statusBox) {
+          statusBox.style.display = 'block';
+          statusBox.style.background = 'rgba(239, 68, 68, 0.15)';
+          statusBox.style.color = 'var(--accent-rose)';
+          statusBox.innerText = `DNS Resolution Pending: ${errMsg}`;
+        }
+        if (verifyBtn) {
+          verifyBtn.disabled = false;
+          verifyBtn.innerText = 'Retry Verification';
+        }
+      } catch (err) {
+        showToast(`Network error during DNS verification: ${err.message}`);
+        if (verifyBtn) {
+          verifyBtn.disabled = false;
+          verifyBtn.innerText = 'Retry Verification';
+        }
+      }
+    }
+
+    async function deleteDomain(domainId, hostname) {
+      if (!domainId) return;
+      if (!confirm(`Are you sure you want to remove domain '${hostname}' from NexusEdge edge routes?`)) {
+        return;
+      }
+
+      try {
+        const resp = await fetch(`/api/proxy/domains/${encodeURIComponent(domainId)}`, {
+          method: 'DELETE'
+        });
+
+        if (resp.ok) {
+          showToast(`Domain '${hostname}' successfully removed.`);
+          loadDomains();
+          return;
+        }
+
+        const errData = await resp.json().catch(() => ({}));
+        showToast(`Delete failed: ${errData.error || resp.statusText}`);
+      } catch (err) {
+        showToast(`Network error while deleting domain: ${err.message}`);
+      }
     }
 
     // Edge PoPs & Multi-PoP Global Topology
@@ -1013,11 +1207,188 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
           window.__nexusedge_session = session;
           loadPoPs(); // Re-render with operator action buttons if operator
           loadPoPTelemetry();
+          loadAPIKeys();
         }
       } catch (e) {
         // BFF running offline
       }
     }
+
+    // --- Developer API Key Vault Operations ---
+
+    function openNewKeyModal() {
+      const isOperatorOrAdmin = window.__nexusedge_session &&
+        (window.__nexusedge_session.role === 'PLATFORM_OPERATOR' || window.__nexusedge_session.role === 'TENANT_ADMIN');
+      if (!isOperatorOrAdmin) {
+        showToast('Forbidden: PLATFORM_OPERATOR or TENANT_ADMIN role required to generate API keys');
+        return;
+      }
+      openModal('modal-new-api-key');
+    }
+    window.openNewKeyModal = openNewKeyModal;
+
+    async function loadAPIKeys() {
+      const tbody = document.getElementById('api-keys-tbody');
+      const badge = document.getElementById('api-keys-count-badge');
+      if (!tbody) return;
+
+      try {
+        const resp = await fetch('/api/proxy/api-keys');
+        if (resp.ok) {
+          const data = await resp.json();
+          const keys = data.keys || [];
+          if (badge) {
+            const activeCount = keys.filter(k => k.status === 'ACTIVE').length;
+            badge.innerText = `${activeCount} ACTIVE KEYS`;
+          }
+          if (keys.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">No API keys generated yet. Click \'+ Generate API Key\' to create a token for programmatic access.</td></tr>';
+            return;
+          }
+
+          tbody.innerHTML = '';
+          const isOperatorOrAdmin = window.__nexusedge_session &&
+            (window.__nexusedge_session.role === 'PLATFORM_OPERATOR' || window.__nexusedge_session.role === 'TENANT_ADMIN');
+
+          keys.forEach(k => {
+            const tr = document.createElement('tr');
+
+            // Name
+            const tdName = document.createElement('td');
+            const strongName = document.createElement('strong');
+            strongName.textContent = k.name;
+            tdName.appendChild(strongName);
+
+            // Prefix
+            const tdPrefix = document.createElement('td');
+            tdPrefix.className = 'mono';
+            tdPrefix.style.color = 'var(--accent-cyan)';
+            tdPrefix.textContent = k.prefix || '-';
+
+            // Role
+            const tdRole = document.createElement('td');
+            const spanRole = document.createElement('span');
+            spanRole.className = k.role === 'PLATFORM_OPERATOR' ? 'badge badge-rose' : (k.role === 'TENANT_ADMIN' ? 'badge badge-amber' : 'badge badge-indigo');
+            spanRole.textContent = k.role || 'DEVELOPER';
+            tdRole.appendChild(spanRole);
+
+            // Created At
+            const tdCreated = document.createElement('td');
+            tdCreated.className = 'mono';
+            tdCreated.style.fontSize = '0.78rem';
+            tdCreated.textContent = k.created_at ? new Date(k.created_at).toLocaleString() : '-';
+
+            // Last Used
+            const tdLastUsed = document.createElement('td');
+            tdLastUsed.className = 'mono';
+            tdLastUsed.style.fontSize = '0.78rem';
+            tdLastUsed.textContent = k.last_used_at ? new Date(k.last_used_at).toLocaleString() : 'Never';
+
+            // Status
+            const tdStatus = document.createElement('td');
+            const spanStatus = document.createElement('span');
+            spanStatus.className = k.status === 'ACTIVE' ? 'badge badge-emerald' : 'badge badge-rose';
+            spanStatus.textContent = k.status || 'ACTIVE';
+            tdStatus.appendChild(spanStatus);
+
+            // Actions
+            const tdActions = document.createElement('td');
+            if (k.status === 'ACTIVE' && isOperatorOrAdmin) {
+              const btnRevoke = document.createElement('button');
+              btnRevoke.className = 'btn btn-secondary btn-sm';
+              btnRevoke.style.color = 'var(--accent-rose)';
+              btnRevoke.style.borderColor = 'rgba(244, 63, 94, 0.4)';
+              btnRevoke.textContent = 'Revoke';
+              btnRevoke.onclick = () => revokeAPIKey(k.id);
+              tdActions.appendChild(btnRevoke);
+            } else {
+              tdActions.textContent = '-';
+            }
+
+            tr.append(tdName, tdPrefix, tdRole, tdCreated, tdLastUsed, tdStatus, tdActions);
+            tbody.appendChild(tr);
+          });
+          return;
+        }
+      } catch (err) {
+        // BFF offline
+      }
+    }
+    window.loadAPIKeys = loadAPIKeys;
+
+    async function submitNewAPIKey() {
+      const nameInput = document.getElementById('modal-key-name');
+      const roleSelect = document.getElementById('modal-key-role');
+      const name = (nameInput && nameInput.value.trim()) || 'Production API Key';
+      const role = (roleSelect && roleSelect.value) || 'DEVELOPER';
+
+      try {
+        const resp = await fetch('/api/proxy/api-keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, role })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          closeModal('modal-new-api-key');
+          if (nameInput) nameInput.value = '';
+
+          // Show revealed key modal
+          const keyInput = document.getElementById('revealed-secret-key');
+          if (keyInput) keyInput.value = data.secret_key;
+          openModal('modal-key-revealed');
+          loadAPIKeys();
+          return;
+        }
+        const err = await resp.json();
+        showToast(`Failed to generate key: ${err.error || 'Request rejected'}`);
+      } catch (e) {
+        showToast(`Network error generating key: ${e.message}`);
+      }
+    }
+    window.submitNewAPIKey = submitNewAPIKey;
+
+    function copyRevealedSecretKey() {
+      const keyInput = document.getElementById('revealed-secret-key');
+      if (keyInput && keyInput.value) {
+        navigator.clipboard.writeText(keyInput.value).then(() => {
+          showToast('API Secret Key copied to clipboard!');
+        }).catch(() => {
+          keyInput.select();
+          document.execCommand('copy');
+          showToast('API Secret Key copied to clipboard!');
+        });
+      }
+    }
+    window.copyRevealedSecretKey = copyRevealedSecretKey;
+
+    async function revokeAPIKey(keyId) {
+      if (!confirm('Are you sure you want to revoke this API key? Any applications using this key will immediately lose access.')) {
+        return;
+      }
+      try {
+        const resp = await fetch(`/api/proxy/api-keys/${encodeURIComponent(keyId)}`, {
+          method: 'DELETE'
+        });
+        if (resp.ok) {
+          showToast('API Key revoked successfully. Subsequent requests will be blocked.');
+          loadAPIKeys();
+          return;
+        }
+        const err = await resp.json();
+        showToast(`Revocation failed: ${err.error || 'Request rejected'}`);
+      } catch (e) {
+        showToast(`Network error revoking key: ${e.message}`);
+      }
+    }
+    window.revokeAPIKey = revokeAPIKey;
+
+    window.openDomainDnsModal = openDomainDnsModal;
+    window.copyDnsWizardTarget = copyDnsWizardTarget;
+    window.copyDnsWizardToken = copyDnsWizardToken;
+    window.triggerWizardVerify = triggerWizardVerify;
+    window.verifyDomain = verifyDomain;
+    window.deleteDomain = deleteDomain;
 
     // Initial Dashboard Bootstrap
     initSessionContext();
@@ -1027,4 +1398,5 @@ Ensure gateway is running on line-rate port :8080 or enable 'Offline Demo Mode' 
     loadPoPTelemetry();
     loadLatencyMatrix();
     fetchAuditLogs();
+    loadAPIKeys();
     setInterval(checkControlPlaneHealth, 15000);

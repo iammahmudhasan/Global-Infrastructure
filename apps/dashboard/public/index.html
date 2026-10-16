@@ -479,36 +479,42 @@
                   <tr>
                     <th>Hostname</th>
                     <th>CNAME Target</th>
-                    <th>SSL / TLS Status</th>
+                    <th>Status / Verification</th>
                     <th>Assigned PoPs</th>
                     <th>Jurisdiction</th>
-                    <th>Data Source</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody id="domains-table-tbody">
                   <tr>
                     <td><strong>api.nexusedge.io</strong></td>
                     <td class="mono">edge.nexusedge.net</td>
-                    <td><span class="badge badge-bd">Auto Let's Encrypt (ECDSA)</span></td>
+                    <td><span class="badge badge-bd">ACTIVE (VERIFIED)</span></td>
                     <td>Dhaka, Singapore, Frankfurt, Virginia</td>
                     <td>Global Anycast</td>
-                    <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+                    <td>
+                      <button class="btn btn-secondary btn-sm" onclick="showToast('Demo domain is managed by root operator')">Details</button>
+                    </td>
                   </tr>
                   <tr>
                     <td><strong>fintech.dhaka.bank</strong></td>
                     <td class="mono">sovereign-bd.nexusedge.net</td>
-                    <td><span class="badge badge-bd">Vault AES-256 Validated</span></td>
+                    <td><span class="badge badge-bd">ACTIVE (VERIFIED)</span></td>
                     <td>Dhaka PoP Only</td>
                     <td>BD-NDMA-2026</td>
-                    <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+                    <td>
+                      <button class="btn btn-secondary btn-sm" onclick="showToast('Demo domain is managed by root operator')">Details</button>
+                    </td>
                   </tr>
                   <tr>
                     <td><strong>models.deepcompute.ai</strong></td>
                     <td class="mono">ai-router.nexusedge.net</td>
-                    <td><span class="badge badge-spot">Auto Managed TLS</span></td>
+                    <td><span class="badge badge-amber">PENDING DNS</span></td>
                     <td>Iceland, Virginia, Frankfurt</td>
                     <td>Low-Carbon Grid</td>
-                    <td><span class="badge badge-amber">DEMO FIXTURE</span></td>
+                    <td>
+                      <button class="btn btn-primary btn-sm" onclick="openDomainDnsModal({ id: 'dom-demo-ai', hostname: 'models.deepcompute.ai', cname_target: 'ai-router.nexusedge.net', verification_token: 'nke-verify-ai-demo-token' })">DNS Setup</button>
+                    </td>
                   </tr>
                 </tbody>
               </table>
@@ -934,6 +940,42 @@
             </div>
           </div>
 
+          <!-- Developer API Key Management Vault -->
+          <div class="table-card">
+            <div class="table-header-bar">
+              <div>
+                <div class="table-title">Developer API Keys & Access Tokens</div>
+                <div class="card-subtext" style="margin-top: 0.2rem;">256-bit cryptographically generated credentials for edge inference and control plane automation</div>
+              </div>
+              <div style="display: flex; align-items: center; gap: 0.75rem;">
+                <span class="badge badge-bd" id="api-keys-count-badge">0 ACTIVE KEYS</span>
+                <button class="btn btn-primary" onclick="openNewKeyModal()">+ Generate API Key</button>
+              </div>
+            </div>
+            <div class="table-responsive">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Key Name</th>
+                    <th>Token Prefix</th>
+                    <th>Assigned Role</th>
+                    <th>Created At (UTC)</th>
+                    <th>Last Used</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="api-keys-tbody">
+                  <tr>
+                    <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 2rem;">
+                      Loading API keys...
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
           <div class="table-card">
             <div class="table-header-bar">
               <div class="table-title">Real-Time Security Event Logs</div>
@@ -1235,24 +1277,108 @@
           <input type="text" id="modal-domain-fqdn" placeholder="e.g. api.yourcompany.com">
         </div>
         <div class="form-group">
-          <label>Assigned Project</label>
-          <select>
-            <option>Fintech Sovereign Core (proj-bd-fintech)</option>
-            <option>AI Inference & Reasoning (proj-ai-inference)</option>
-            <option>Global CDN & Static Assets (proj-global-cdn)</option>
-          </select>
+          <label>Origin Server Address (IP or Hostname)</label>
+          <input type="text" id="modal-domain-origin" placeholder="e.g. 203.0.113.195 or backend.customer.com">
+          <div style="font-size: 0.74rem; color: var(--text-muted); margin-top: 0.25rem;">
+            Anti-SSRF enforced: RFC 1918 private subnets, loopback (127.0.0.1), and cloud metadata IPs (169.254.169.254) are strictly blocked.
+          </div>
+        </div>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+          <div class="form-group">
+            <label>Origin Port</label>
+            <input type="number" id="modal-domain-port" value="443" min="1" max="65535">
+          </div>
+          <div class="form-group">
+            <label>Origin Protocol</label>
+            <select id="modal-domain-proto">
+              <option value="https">HTTPS (Strict TLS)</option>
+              <option value="http">HTTP</option>
+            </select>
+          </div>
         </div>
         <div class="form-group">
-          <label>Edge SSL Certificate</label>
-          <select>
-            <option>Automated Let's Encrypt (0-Day Renewal)</option>
-            <option>Custom BYO Certificate (AES-256 Vault)</option>
-          </select>
+          <label>Edge PoP Deployment</label>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; font-size: 0.8rem; margin-top: 0.25rem;">
+            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer;">
+              <input type="checkbox" id="pop-dhaka" value="dhaka" checked> Dhaka (BD-IX Sovereign)
+            </label>
+            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer;">
+              <input type="checkbox" id="pop-singapore" value="singapore" checked> Singapore (APAC Hub)
+            </label>
+            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer;">
+              <input type="checkbox" id="pop-frankfurt" value="frankfurt" checked> Frankfurt (EU Central)
+            </label>
+            <label style="display: flex; align-items: center; gap: 0.4rem; cursor: pointer;">
+              <input type="checkbox" id="pop-virginia" value="virginia" checked> Virginia (US East)
+            </label>
+          </div>
         </div>
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('new-domain-modal')">Cancel</button>
         <button class="btn btn-primary" onclick="submitNewDomain()">Add Domain</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: DOMAIN DNS SETUP WIZARD & VERIFICATION -->
+  <div class="modal-backdrop" id="modal-domain-dns-instructions">
+    <div class="modal-dialog" style="max-width: 580px;">
+      <div class="modal-header">
+        <div class="modal-title">DNS Setup & Challenge Verification</div>
+        <button class="btn btn-secondary" onclick="closeModal('modal-domain-dns-instructions')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="margin-bottom: 0.85rem;">
+          <div style="font-size: 0.82rem; color: var(--text-muted);">
+            Configure your authoritative DNS records with either Option A or Option B. Once created, click <strong>Verify DNS Now</strong> to activate routing.
+          </div>
+        </div>
+
+        <!-- Option A: CNAME Delegation -->
+        <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 0.85rem;">
+          <div style="font-weight: 700; font-size: 0.84rem; color: var(--accent-cyan); margin-bottom: 0.35rem;">
+            Option A: CNAME Delegation (Recommended)
+          </div>
+          <div class="form-group" style="margin-bottom: 0.4rem;">
+            <label style="font-size: 0.72rem;">CNAME Host</label>
+            <input type="text" id="dns-wizard-cname-host" readonly class="mono" style="background: rgba(0,0,0,0.4); font-size: 0.8rem;">
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label style="font-size: 0.72rem;">CNAME Points To</label>
+            <div style="display: flex; gap: 0.5rem;">
+              <input type="text" id="dns-wizard-cname-target" readonly class="mono" style="background: rgba(0,0,0,0.4); font-size: 0.8rem;">
+              <button class="btn btn-secondary btn-sm" onclick="copyDnsWizardTarget()">Copy</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Option B: TXT Ownership Challenge -->
+        <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--border-color); border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 0.85rem;">
+          <div style="font-weight: 700; font-size: 0.84rem; color: var(--text-primary); margin-bottom: 0.35rem;">
+            Option B: TXT Ownership Challenge (Pre-Cutover Verification)
+          </div>
+          <div class="form-group" style="margin-bottom: 0.4rem;">
+            <label style="font-size: 0.72rem;">TXT Record Name</label>
+            <input type="text" id="dns-wizard-txt-name" readonly class="mono" style="background: rgba(0,0,0,0.4); font-size: 0.8rem;">
+          </div>
+          <div class="form-group" style="margin-bottom: 0;">
+            <label style="font-size: 0.72rem;">TXT Value / Verification Token</label>
+            <div style="display: flex; gap: 0.5rem;">
+              <input type="text" id="dns-wizard-txt-token" readonly class="mono" style="background: rgba(0,0,0,0.4); font-size: 0.8rem;">
+              <button class="btn btn-secondary btn-sm" onclick="copyDnsWizardToken()">Copy</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Status Diagnostics Box -->
+        <div id="dns-wizard-status-box" style="display: none; border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.82rem; margin-top: 0.5rem;">
+          <div id="dns-wizard-status-text"></div>
+        </div>
+      </div>
+      <div class="modal-footer" style="display: flex; justify-content: space-between;">
+        <button class="btn btn-secondary" onclick="closeModal('modal-domain-dns-instructions')">Close</button>
+        <button class="btn btn-primary" id="btn-wizard-verify-now" onclick="triggerWizardVerify()">Verify DNS Now</button>
       </div>
     </div>
   </div>
@@ -1322,6 +1448,68 @@
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('quick-deploy-modal')">Cancel</button>
         <button class="btn btn-primary" onclick="submitQuickDeploy()">Deploy Workload</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: GENERATE API KEY -->
+  <div class="modal-backdrop" id="modal-new-api-key">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title">Generate Developer API Key</div>
+        <button class="btn btn-secondary" onclick="closeModal('modal-new-api-key')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Key Name / Description</label>
+          <input type="text" id="modal-key-name" placeholder="e.g. Production Ingestion Service">
+        </div>
+        <div class="form-group">
+          <label>Role Scope</label>
+          <select id="modal-key-role">
+            <option value="DEVELOPER">DEVELOPER (Inference & Routing Access)</option>
+            <option value="TENANT_ADMIN">TENANT_ADMIN (Full Project Provisioning)</option>
+            <option value="VIEWER">VIEWER (Read-Only Observability)</option>
+          </select>
+        </div>
+        <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 0.5rem; line-height: 1.4;">
+          Your secret key will be generated using a 256-bit cryptographically secure random generator. It will only be displayed <strong>once</strong>.
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('modal-new-api-key')">Cancel</button>
+        <button class="btn btn-primary" onclick="submitNewAPIKey()">Generate Secret Key</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: VIEW-ONCE SECRET KEY REVEALED -->
+  <div class="modal-backdrop" id="modal-key-revealed">
+    <div class="modal-dialog" style="max-width: 540px;">
+      <div class="modal-header">
+        <div class="modal-title">API Secret Key Generated</div>
+        <button class="btn btn-secondary" onclick="closeModal('modal-key-revealed')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.3); border-radius: 8px; padding: 0.85rem 1rem; margin-bottom: 1rem;">
+          <div style="display: flex; align-items: center; gap: 0.5rem; color: var(--accent-amber); font-weight: 700; font-size: 0.88rem;">
+            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+            Save This Secret Key Now
+          </div>
+          <div style="color: var(--text-muted); font-size: 0.78rem; margin-top: 0.25rem;">
+            This secret key will never be displayed again. If you lose this key, you will need to revoke it and generate a new one.
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Secret API Key</label>
+          <div style="display: flex; gap: 0.5rem;">
+            <input type="text" id="revealed-secret-key" readonly class="mono" style="background: rgba(0,0,0,0.4); font-size: 0.84rem; letter-spacing: 0.02em;">
+            <button class="btn btn-secondary" onclick="copyRevealedSecretKey()">Copy</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closeModal('modal-key-revealed')">I Have Saved This Key</button>
       </div>
     </div>
   </div>

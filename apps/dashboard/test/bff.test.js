@@ -1758,7 +1758,602 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
     assert.strictEqual(styleCssContent.includes('.map-pulse-circle'), true);
     assert.strictEqual(styleCssContent.includes('.topology-hud-grid'), true);
   });
+
+  it('Requirement 14: Cryptographic API Key Management Vault & View-Once Lifecycle', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'prod-op-token';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'token-tenant-a:alice@client.com:TENANT_ADMIN:proj-alpha;token-tenant-b:bob@client.com:TENANT_ADMIN:proj-beta;token-viewer:charlie@client.com:VIEWER:proj-alpha';
+
+    // Mock Upstream Control Plane
+    const mockCP = http.createServer((cReq, cRes) => {
+      if (cReq.url === '/v1/edge/pops') {
+        cRes.writeHead(200, { 'Content-Type': 'application/json' });
+        cRes.end(JSON.stringify({ pops: [{ pop_id: 'dhaka' }] }));
+        return;
+      }
+      cRes.writeHead(404, { 'Content-Type': 'application/json' });
+      cRes.end(JSON.stringify({ error: 'Not found' }));
+    });
+
+    await new Promise((resolve) => mockCP.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockCP.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server.js')];
+    const server = require('../server.js');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Unauthenticated request to GET /api/proxy/api-keys is rejected with 401
+      const resUnauth = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/api-keys',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauth.statusCode, 401);
+      resUnauth.resume();
+
+      // Login as VIEWER (charlie) in proj-alpha
+      const loginViewerRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-viewer' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const viewerCookie = loginViewerRes.headers['set-cookie'][0].split(';')[0];
+      loginViewerRes.resume();
+
+      // 2. VIEWER cannot generate API keys (403 Forbidden)
+      const resViewerCreate = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ name: 'Hacker Key' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/api-keys',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': viewerCookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(resViewerCreate.statusCode, 403);
+      resViewerCreate.resume();
+
+      // Login as TENANT_ADMIN (alice) in proj-alpha
+      const loginAliceRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-tenant-a' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const aliceCookie = loginAliceRes.headers['set-cookie'][0].split(';')[0];
+      loginAliceRes.resume();
+
+      // 3. Non-operator cannot escalate role to PLATFORM_OPERATOR (403 Forbidden)
+      const resEscalate = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ name: 'Escalation Key', role: 'PLATFORM_OPERATOR' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/api-keys',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(resEscalate.statusCode, 403);
+      resEscalate.resume();
+
+      // 4. TENANT_ADMIN creates valid DEVELOPER API key
+      const resAliceCreate = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ name: 'Production Backend Ingestion', role: 'DEVELOPER' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/api-keys',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(resAliceCreate.statusCode, 201);
+      let createBody = '';
+      resAliceCreate.on('data', chunk => { createBody += chunk; });
+      await new Promise(resolve => resAliceCreate.on('end', resolve));
+      const createdKey = JSON.parse(createBody);
+      assert.strictEqual(createdKey.project_id, 'proj-alpha');
+      assert.strictEqual(createdKey.name, 'Production Backend Ingestion');
+      assert.strictEqual(createdKey.secret_key.startsWith('nke_live_'), true);
+      assert.strictEqual(createdKey.prefix.startsWith('nke_live_'), true);
+      assert.strictEqual(createdKey.secret_key.length, 73);
+
+      // Verify server vault only stores SHA-256 hash, NEVER plaintext secret key
+      const vaultRecord = server.apiKeys.get(createdKey.id);
+      assert.notStrictEqual(vaultRecord, undefined);
+      assert.strictEqual(vaultRecord.secretKey, undefined);
+      assert.strictEqual(vaultRecord.hashedSecret.length, 64);
+
+      // 5. List keys via GET /api/proxy/api-keys: secret_key must be absent!
+      const resAliceList = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/api-keys',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAliceList.statusCode, 200);
+      let listBody = '';
+      resAliceList.on('data', chunk => { listBody += chunk; });
+      await new Promise(resolve => resAliceList.on('end', resolve));
+      const keyList = JSON.parse(listBody).keys;
+      assert.strictEqual(keyList.length, 1);
+      assert.strictEqual(keyList[0].secret_key, undefined);
+      assert.strictEqual(keyList[0].id, createdKey.id);
+      assert.strictEqual(keyList[0].status, 'ACTIVE');
+
+      // 6. Authenticate request using generated API Key in Authorization Bearer header
+      const resAuthBearer = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Authorization': `Bearer ${createdKey.secret_key}` }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAuthBearer.statusCode, 200);
+      resAuthBearer.resume();
+
+      // 7. Authenticate request using X-API-Key header
+      const resAuthHeader = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'X-API-Key': createdKey.secret_key }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAuthHeader.statusCode, 200);
+      resAuthHeader.resume();
+
+      // Login as TENANT_ADMIN (bob) in proj-beta
+      const loginBobRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-tenant-b' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const bobCookie = loginBobRes.headers['set-cookie'][0].split(';')[0];
+      loginBobRes.resume();
+
+      // 8. Multi-tenant isolation: Bob in proj-beta cannot revoke Alice's key in proj-alpha (403 Forbidden)
+      const resBobRevoke = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: `/api/proxy/api-keys/${createdKey.id}`,
+          method: 'DELETE',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': bobCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resBobRevoke.statusCode, 403);
+      resBobRevoke.resume();
+
+      // 9. Alice successfully revokes her own key
+      const resAliceRevoke = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: `/api/proxy/api-keys/${createdKey.id}`,
+          method: 'DELETE',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAliceRevoke.statusCode, 200);
+      let revokeBody = '';
+      resAliceRevoke.on('data', chunk => { revokeBody += chunk; });
+      await new Promise(resolve => resAliceRevoke.on('end', resolve));
+      assert.strictEqual(JSON.parse(revokeBody).status, 'REVOKED');
+
+      // 10. Subsequent requests using revoked API Key are immediately rejected with 401
+      const resRevokedCall = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/pops',
+          method: 'GET',
+          agent: false,
+          headers: { 'Connection': 'close', 'Authorization': `Bearer ${createdKey.secret_key}` }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resRevokedCall.statusCode, 401);
+      resRevokedCall.resume();
+
+    } finally {
+      await safeClose(server);
+      await safeClose(mockCP);
+    }
+  });
+
+  it('Requirement 15: Developer API Key UI elements & view-once modals are wired in frontend bundle', () => {
+    const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+    const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+
+    assert.strictEqual(indexHtmlContent.includes('api-keys-tbody'), true, 'index.html must define #api-keys-tbody');
+    assert.strictEqual(indexHtmlContent.includes('modal-new-api-key'), true, 'index.html must define #modal-new-api-key');
+    assert.strictEqual(indexHtmlContent.includes('modal-key-revealed'), true, 'index.html must define #modal-key-revealed');
+    assert.strictEqual(indexHtmlContent.includes('revealed-secret-key'), true, 'index.html must define #revealed-secret-key');
+
+    assert.strictEqual(appJsContent.includes('function openNewKeyModal()'), true, 'app.js must define openNewKeyModal()');
+    assert.strictEqual(appJsContent.includes('function loadAPIKeys()'), true, 'app.js must define loadAPIKeys()');
+    assert.strictEqual(appJsContent.includes('function submitNewAPIKey()'), true, 'app.js must define submitNewAPIKey()');
+    assert.strictEqual(appJsContent.includes('function copyRevealedSecretKey()'), true, 'app.js must define copyRevealedSecretKey()');
+    assert.strictEqual(appJsContent.includes('function revokeAPIKey('), true, 'app.js must define revokeAPIKey()');
+  });
+
+  it('Requirement 16: Custom Domain Onboarding & Live DNS Verification Proxying', async () => {
+    process.env.NODE_ENV = 'production';
+    process.env.NEXUSEDGE_OPERATOR_TOKEN = 'prod-op-token';
+    process.env.NEXUSEDGE_DASHBOARD_USERS = 'token-tenant-a:alice@client.com:TENANT_ADMIN:proj-alpha;token-tenant-b:bob@client.com:TENANT_ADMIN:proj-beta;token-viewer:charlie@client.com:VIEWER:proj-alpha';
+
+    let lastForwardedHeaders = {};
+    let lastForwardedPath = '';
+
+    // Mock Upstream Control Plane for Domain Lifecycle
+    const mockCP = http.createServer((cReq, cRes) => {
+      lastForwardedHeaders = { ...cReq.headers };
+      lastForwardedPath = cReq.url;
+
+      // POST /v1/projects/proj-alpha/domains (Onboard Domain)
+      if (cReq.method === 'POST' && cReq.url === '/v1/projects/proj-alpha/domains') {
+        let body = '';
+        cReq.on('data', chunk => { body += chunk; });
+        cReq.on('end', () => {
+          const parsed = JSON.parse(body);
+          cRes.writeHead(201, { 'Content-Type': 'application/json' });
+          cRes.end(JSON.stringify({
+            domain_id: 'dom-alpha-001',
+            hostname: parsed.hostname,
+            cname_target: 'dom-alpha-001.edge.nexusedge.net',
+            verification_token: 'nke-verify-token-alpha-001',
+            status: 'pending_verification',
+            allowed_pops: parsed.allowed_pops || ['dhaka', 'singapore']
+          }));
+        });
+        return;
+      }
+
+      // POST /v1/domains/dom-alpha-001/verify (DNS Verification)
+      if (cReq.method === 'POST' && cReq.url.startsWith('/v1/domains/dom-alpha-001/verify')) {
+        // IDOR check simulation
+        const callerProj = cReq.headers['x-authenticated-project-id'];
+        const callerRole = cReq.headers['x-authenticated-role'];
+        if (callerRole !== 'PLATFORM_OPERATOR' && callerProj !== 'proj-alpha') {
+          cRes.writeHead(403, { 'Content-Type': 'application/json' });
+          cRes.end(JSON.stringify({ error: 'Forbidden: caller not authorized for domain' }));
+          return;
+        }
+
+        const isForce = cReq.url.includes('force=true');
+        cRes.writeHead(200, { 'Content-Type': 'application/json' });
+        cRes.end(JSON.stringify({
+          status: 'verified',
+          domain_id: 'dom-alpha-001',
+          hostname: 'api.alpha.com',
+          state: 'active',
+          message: isForce ? 'domain force-verified by platform operator' : 'domain verified successfully; active on edge proxy'
+        }));
+        return;
+      }
+
+      // GET /v1/domains/dom-alpha-001
+      if (cReq.method === 'GET' && cReq.url === '/v1/domains/dom-alpha-001') {
+        cRes.writeHead(200, { 'Content-Type': 'application/json' });
+        cRes.end(JSON.stringify({
+          id: 'dom-alpha-001',
+          project_id: 'proj-alpha',
+          hostname: 'api.alpha.com',
+          status: 'active',
+          cname_target: 'dom-alpha-001.edge.nexusedge.net'
+        }));
+        return;
+      }
+
+      // DELETE /v1/domains/dom-alpha-001
+      if (cReq.method === 'DELETE' && cReq.url === '/v1/domains/dom-alpha-001') {
+        const callerProj = cReq.headers['x-authenticated-project-id'];
+        const callerRole = cReq.headers['x-authenticated-role'];
+        if (callerRole !== 'PLATFORM_OPERATOR' && callerProj !== 'proj-alpha') {
+          cRes.writeHead(403, { 'Content-Type': 'application/json' });
+          cRes.end(JSON.stringify({ error: 'Forbidden: caller not authorized for domain' }));
+          return;
+        }
+        cRes.writeHead(200, { 'Content-Type': 'application/json' });
+        cRes.end(JSON.stringify({ status: 'deleted', domain_id: 'dom-alpha-001' }));
+        return;
+      }
+
+      cRes.writeHead(404, { 'Content-Type': 'application/json' });
+      cRes.end(JSON.stringify({ error: 'Not found in mock control plane' }));
+    });
+
+    await new Promise((resolve) => mockCP.listen(0, '127.0.0.1', resolve));
+    const cpPort = mockCP.address().port;
+    process.env.CONTROL_PLANE_URL = `http://127.0.0.1:${cpPort}`;
+
+    delete require.cache[require.resolve('../server')];
+    const server = require('../server');
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    try {
+      // 1. Unauthenticated request to verify domain returns 401
+      const resUnauthVerify = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains/dom-alpha-001/verify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close' }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resUnauthVerify.statusCode, 401);
+      resUnauthVerify.resume();
+
+      // Login as VIEWER (charlie) in proj-alpha
+      const loginViewerRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-viewer' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const viewerCookie = loginViewerRes.headers['set-cookie'][0].split(';')[0];
+      loginViewerRes.resume();
+
+      // 2. VIEWER cannot verify domains (403 Forbidden)
+      const resViewerVerify = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains/dom-alpha-001/verify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': viewerCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resViewerVerify.statusCode, 403);
+      resViewerVerify.resume();
+
+      // Login as TENANT_ADMIN (alice) in proj-alpha
+      const loginAliceRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-tenant-a' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const aliceCookie = loginAliceRes.headers['set-cookie'][0].split(';')[0];
+      loginAliceRes.resume();
+
+      // 3. Alice onboards custom domain via POST /api/proxy/domains
+      const resAliceOnboard = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({
+          hostname: 'api.alpha.com',
+          origin_address: '203.0.113.195',
+          origin_port: 443,
+          origin_protocol: 'https',
+          allowed_pops: ['dhaka', 'singapore']
+        });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      assert.strictEqual(resAliceOnboard.statusCode, 201);
+      let onboardBody = '';
+      resAliceOnboard.on('data', chunk => { onboardBody += chunk; });
+      await new Promise(resolve => resAliceOnboard.on('end', resolve));
+      const onboardResult = JSON.parse(onboardBody);
+      assert.strictEqual(onboardResult.domain_id, 'dom-alpha-001');
+      assert.strictEqual(onboardResult.cname_target, 'dom-alpha-001.edge.nexusedge.net');
+      assert.strictEqual(onboardResult.status, 'pending_verification');
+      assert.strictEqual(lastForwardedPath, '/v1/projects/proj-alpha/domains');
+      assert.strictEqual(lastForwardedHeaders['x-authenticated-project-id'], 'proj-alpha');
+
+      // 4. Alice verifies DNS via POST /api/proxy/domains/:id/verify
+      const resAliceVerify = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains/dom-alpha-001/verify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAliceVerify.statusCode, 200);
+      let verifyBody = '';
+      resAliceVerify.on('data', chunk => { verifyBody += chunk; });
+      await new Promise(resolve => resAliceVerify.on('end', resolve));
+      const verifyResult = JSON.parse(verifyBody);
+      assert.strictEqual(verifyResult.status, 'verified');
+      assert.strictEqual(verifyResult.state, 'active');
+      assert.strictEqual(lastForwardedPath, '/v1/domains/dom-alpha-001/verify');
+
+      // Login as TENANT_ADMIN (bob) in proj-beta
+      const loginBobRes = await new Promise((resolve, reject) => {
+        const data = JSON.stringify({ token: 'token-tenant-b' });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/auth/login',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+        }, resolve);
+        req.on('error', reject);
+        req.write(data);
+        req.end();
+      });
+      const bobCookie = loginBobRes.headers['set-cookie'][0].split(';')[0];
+      loginBobRes.resume();
+
+      // 5. Bob (proj-beta) is rejected with 403 when trying to verify Alice's domain (proj-alpha)
+      const resBobVerify = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains/dom-alpha-001/verify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': bobCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resBobVerify.statusCode, 403);
+      resBobVerify.resume();
+
+      // 6. Alice deletes her domain via DELETE /api/proxy/domains/dom-alpha-001
+      const resAliceDelete = await new Promise((resolve, reject) => {
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port: port,
+          path: '/api/proxy/domains/dom-alpha-001',
+          method: 'DELETE',
+          agent: false,
+          headers: { 'Connection': 'close', 'Cookie': aliceCookie }
+        }, resolve);
+        req.on('error', reject);
+        req.end();
+      });
+      assert.strictEqual(resAliceDelete.statusCode, 200);
+      resAliceDelete.resume();
+
+    } finally {
+      await safeClose(server);
+      await safeClose(mockCP);
+    }
+  });
+
+  it('Requirement 17: Custom Domain Onboarding & DNS Verification UI Components', () => {
+    const appJsContent = fs.readFileSync(appJsPath, 'utf8');
+    const indexHtmlContent = fs.readFileSync(indexHtmlPath, 'utf8');
+
+    // index.html structural elements
+    assert.strictEqual(indexHtmlContent.includes('new-domain-modal'), true, 'index.html must define #new-domain-modal');
+    assert.strictEqual(indexHtmlContent.includes('modal-domain-origin'), true, 'index.html must define #modal-domain-origin');
+    assert.strictEqual(indexHtmlContent.includes('modal-domain-port'), true, 'index.html must define #modal-domain-port');
+    assert.strictEqual(indexHtmlContent.includes('modal-domain-proto'), true, 'index.html must define #modal-domain-proto');
+    assert.strictEqual(indexHtmlContent.includes('modal-domain-dns-instructions'), true, 'index.html must define #modal-domain-dns-instructions');
+    assert.strictEqual(indexHtmlContent.includes('dns-wizard-cname-host'), true, 'index.html must define #dns-wizard-cname-host');
+    assert.strictEqual(indexHtmlContent.includes('dns-wizard-cname-target'), true, 'index.html must define #dns-wizard-cname-target');
+    assert.strictEqual(indexHtmlContent.includes('dns-wizard-txt-name'), true, 'index.html must define #dns-wizard-txt-name');
+    assert.strictEqual(indexHtmlContent.includes('dns-wizard-txt-token'), true, 'index.html must define #dns-wizard-txt-token');
+    assert.strictEqual(indexHtmlContent.includes('btn-wizard-verify-now'), true, 'index.html must define #btn-wizard-verify-now');
+
+    // app.js helper and proxy functions
+    assert.strictEqual(appJsContent.includes('function loadDomains()'), true, 'app.js must define loadDomains()');
+    assert.strictEqual(appJsContent.includes('function submitNewDomain()'), true, 'app.js must define submitNewDomain()');
+    assert.strictEqual(appJsContent.includes('function openDomainDnsModal('), true, 'app.js must define openDomainDnsModal()');
+    assert.strictEqual(appJsContent.includes('function copyDnsWizardTarget()'), true, 'app.js must define copyDnsWizardTarget()');
+    assert.strictEqual(appJsContent.includes('function copyDnsWizardToken()'), true, 'app.js must define copyDnsWizardToken()');
+    assert.strictEqual(appJsContent.includes('function triggerWizardVerify()'), true, 'app.js must define triggerWizardVerify()');
+    assert.strictEqual(appJsContent.includes('function verifyDomain('), true, 'app.js must define verifyDomain()');
+    assert.strictEqual(appJsContent.includes('function deleteDomain('), true, 'app.js must define deleteDomain()');
+  });
 });
+
+
 
 
 
