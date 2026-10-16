@@ -56,9 +56,13 @@
       if (viewId === 'domains') {
         loadDomains();
       }
+      if (viewId === 'storage') {
+        loadStorageBuckets();
+      }
       if (viewId === 'servers') {
         loadPoPs();
         loadPoPTelemetry();
+        loadSubseaCables();
       }
       if (viewId === 'analytics') {
         loadAnalytics();
@@ -1930,14 +1934,232 @@ print(f"Cache Hit Ratio: {telemetry.cache_hit_ratio * 100:.1f}%")`;
     window.deleteDomain = deleteDomain;
     window.loadAnalytics = loadAnalytics;
 
+    // --- Sovereign S3 Object Storage Management ---
+    async function loadStorageBuckets() {
+      const tbody = document.getElementById('storage-buckets-tbody');
+      if (!tbody) return;
+
+      try {
+        const res = await fetch('/api/proxy/storage/buckets');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const buckets = data.buckets || [];
+
+        const totalVolEl = document.getElementById('storage-total-volume');
+        const activeBucketsEl = document.getElementById('storage-active-buckets');
+        if (activeBucketsEl) activeBucketsEl.textContent = buckets.length;
+
+        let totalBytes = 0;
+        buckets.forEach(b => { totalBytes += (b.stored_bytes || 0); });
+        if (totalVolEl) {
+          if (totalBytes > 1073741824) {
+            totalVolEl.textContent = (totalBytes / 1073741824).toFixed(2) + ' GB';
+          } else {
+            totalVolEl.textContent = (totalBytes / 1048576).toFixed(1) + ' MB';
+          }
+        }
+
+        if (buckets.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">No storage buckets provisioned. Click "+ New Bucket" to create an S3 bucket.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = buckets.map(b => {
+          let badgeClass = 'badge-emerald';
+          if (b.sovereignty_policy === 'BD_ONLY') badgeClass = 'badge-amber';
+          else if (b.sovereignty_policy === 'EU_ONLY') badgeClass = 'badge-cyan';
+
+          const storedFormatted = b.stored_bytes > 1073741824 
+            ? (b.stored_bytes / 1073741824).toFixed(2) + ' GB' 
+            : (b.stored_bytes / 1048576).toFixed(1) + ' MB';
+
+          return `
+            <tr>
+              <td class="mono"><strong>${escapeHtml(b.name)}</strong></td>
+              <td>${escapeHtml(b.primary_region)}</td>
+              <td>${escapeHtml(b.replication_topology)}</td>
+              <td><span class="badge ${badgeClass}">${escapeHtml(b.sovereignty_policy)}</span></td>
+              <td>${storedFormatted} (${b.object_count || 0} objects)</td>
+              <td><span class="badge badge-emerald">${escapeHtml(b.status || 'ACTIVE')}</span></td>
+              <td>
+                <button class="btn btn-secondary btn-sm" onclick="deleteStorageBucket('${escapeHtml(b.name)}')">Delete</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--accent-rose); padding: 20px;">Failed to load storage buckets: ${escapeHtml(err.message)}</td></tr>`;
+      }
+    }
+    window.loadStorageBuckets = loadStorageBuckets;
+
+    async function submitCreateStorageBucket() {
+      const nameInput = document.getElementById('new-bucket-name');
+      const sovInput = document.getElementById('new-bucket-sovereignty');
+      const topInput = document.getElementById('new-bucket-topology');
+      const regInput = document.getElementById('new-bucket-region');
+      const quotaInput = document.getElementById('new-bucket-quota');
+      const errBanner = document.getElementById('new-bucket-error');
+      const submitBtn = document.getElementById('btn-create-bucket-submit');
+
+      const name = nameInput ? nameInput.value.trim() : '';
+      if (!name) {
+        if (errBanner) {
+          errBanner.textContent = 'Bucket name is required';
+          errBanner.style.display = 'block';
+        }
+        return;
+      }
+
+      if (errBanner) errBanner.style.display = 'none';
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const quotaGB = quotaInput ? parseInt(quotaInput.value, 10) || 50 : 50;
+        const res = await fetch('/api/proxy/storage/buckets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: name,
+            sovereignty_policy: sovInput ? sovInput.value : 'GLOBAL_REDUNDANT',
+            replication_topology: topInput ? topInput.value : 'SINGLE_REGION_NVME',
+            primary_region: regInput ? regInput.value : 'ap-south-2',
+            max_size_bytes: quotaGB * 1024 * 1024 * 1024,
+          })
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to create bucket');
+
+        closeModal('modal-new-bucket');
+        if (nameInput) nameInput.value = '';
+        showToast(`Bucket "${data.name}" provisioned at ${data.primary_region} successfully.`);
+        loadStorageBuckets();
+      } catch (err) {
+        if (errBanner) {
+          errBanner.textContent = err.message;
+          errBanner.style.display = 'block';
+        }
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    }
+    window.submitCreateStorageBucket = submitCreateStorageBucket;
+
+    async function deleteStorageBucket(name) {
+      if (!confirm(`Are you sure you want to delete bucket "${name}"? This action cannot be undone.`)) {
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/proxy/storage/buckets/${encodeURIComponent(name)}`, {
+          method: 'DELETE'
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to delete bucket');
+
+        showToast(`Bucket "${name}" deleted.`);
+        loadStorageBuckets();
+      } catch (err) {
+        showToast(`Delete failed: ${err.message}`);
+      }
+    }
+    window.deleteStorageBucket = deleteStorageBucket;
+
+    // --- Subsea Cable Telemetry & BGP Steering ---
+    async function loadSubseaCables() {
+      const tbody = document.getElementById('subsea-cables-tbody');
+      const badge = document.getElementById('cables-active-badge');
+      if (!tbody) return;
+
+      try {
+        const res = await fetch('/api/proxy/network/cables');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const cables = data.cables || [];
+
+        let offlineCount = 0;
+        cables.forEach(c => {
+          if (c.status !== 'ONLINE') offlineCount++;
+        });
+
+        if (badge) {
+          if (offlineCount === 0) {
+            badge.className = 'badge badge-emerald';
+            badge.textContent = `${cables.length}/${cables.length} FIBER RINGS NOMINAL`;
+          } else {
+            badge.className = 'badge badge-rose';
+            badge.textContent = `${offlineCount} CABLE SEVERED (BGP REROUTED)`;
+          }
+        }
+
+        if (cables.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="9" style="text-align: center; color: var(--text-muted); padding: 20px;">No cables monitored.</td></tr>';
+          return;
+        }
+
+        tbody.innerHTML = cables.map(c => {
+          const isOnline = c.status === 'ONLINE';
+          const statusBadge = isOnline 
+            ? '<span class="badge badge-emerald">ONLINE</span>' 
+            : '<span class="badge badge-rose">SEVERED</span>';
+
+          const landingPointsStr = (c.landing_points || []).join(' &harr; ');
+          const latencyDisplay = isOnline
+            ? `<span class="text-emerald">${c.current_latency_ms.toFixed(1)} ms</span>`
+            : `<span class="text-rose font-bold">${c.current_latency_ms.toFixed(1)} ms</span>`;
+
+          const actionBtn = isOnline
+            ? `<button class="btn btn-secondary btn-sm" onclick="simulateCableAction('${c.id}', 'cut')">Simulate Fiber Break</button>`
+            : `<button class="btn btn-primary btn-sm" onclick="simulateCableAction('${c.id}', 'restore')">Restore Nominal</button>`;
+
+          return `
+            <tr>
+              <td class="mono"><strong>${escapeHtml(c.name)}</strong><br><span style="font-size: 0.72rem; color: var(--text-muted);">${escapeHtml(c.id)}</span></td>
+              <td>${landingPointsStr}</td>
+              <td class="mono">${(c.capacity_gbps / 1000).toFixed(0)} Tbps</td>
+              <td>${c.normal_latency_ms.toFixed(1)} ms</td>
+              <td>${latencyDisplay}</td>
+              <td><span class="badge badge-subtle">${c.active_bgp_paths} paths</span></td>
+              <td><span style="font-size: 0.78rem; color: var(--accent-amber);">${escapeHtml(c.alternate_route)}</span></td>
+              <td>${statusBadge}</td>
+              <td>${actionBtn}</td>
+            </tr>
+          `;
+        }).join('');
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="9" style="text-align: center; color: var(--accent-rose); padding: 20px;">Failed to load cables: ${escapeHtml(err.message)}</td></tr>`;
+      }
+    }
+    window.loadSubseaCables = loadSubseaCables;
+
+    async function simulateCableAction(cableId, action) {
+      try {
+        const res = await fetch(`/api/proxy/network/cables/${encodeURIComponent(cableId)}/${action}`, {
+          method: 'POST'
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Failed to ${action} cable`);
+
+        showToast(data.message || `Cable ${cableId} ${action} executed.`);
+        loadSubseaCables();
+        loadPoPTelemetry();
+      } catch (err) {
+        showToast(`Cable action failed: ${err.message}`);
+      }
+    }
+    window.simulateCableAction = simulateCableAction;
+
     // Initial Dashboard Bootstrap
     initSessionContext();
     checkControlPlaneHealth();
     loadDomains();
     loadPoPs();
     loadPoPTelemetry();
+    loadSubseaCables();
     loadLatencyMatrix();
     loadAnalytics();
     fetchAuditLogs();
     loadAPIKeys();
+    loadStorageBuckets();
     setInterval(checkControlPlaneHealth, 15000);

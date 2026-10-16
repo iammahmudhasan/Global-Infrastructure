@@ -1129,6 +1129,31 @@ const server = http.createServer((req, res) => {
       return proxyToControlPlane('/v1/workloads/nodes', req, res, session);
     }
 
+    // Proxy Sovereign S3 Object Storage Buckets (Authenticated session)
+    if (pathname === '/api/proxy/storage/buckets') {
+      const targetQuery = reqUrl.search || '';
+      return proxyToControlPlane(`/v1/storage/buckets${targetQuery}`, req, res, session);
+    }
+
+    if (pathname.startsWith('/api/proxy/storage/buckets/')) {
+      const subPath = pathname.slice('/api/proxy/storage/buckets/'.length);
+      const targetQuery = reqUrl.search || '';
+      return proxyToControlPlane(`/v1/storage/buckets/${subPath}${targetQuery}`, req, res, session);
+    }
+
+    // Proxy Subsea Cable Telemetry & BGP Steering (Authenticated session)
+    if (pathname === '/api/proxy/network/cables') {
+      if (req.method !== 'GET') {
+        return sendJSON(res, 405, { code: 405, error: 'Method not allowed' });
+      }
+      return proxyToControlPlane('/v1/edge/network/cables', req, res, session);
+    }
+
+    if (pathname.startsWith('/api/proxy/network/cables/')) {
+      const subPath = pathname.slice('/api/proxy/network/cables/'.length);
+      return proxyToControlPlane(`/v1/edge/network/cables/${subPath}`, req, res, session);
+    }
+
     return sendJSON(res, 404, { code: 404, error: 'Proxy route not found' });
   }
 

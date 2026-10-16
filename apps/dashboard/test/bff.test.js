@@ -2700,6 +2700,39 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
     assert.strictEqual(serverJsContent.includes('/api/proxy/workloads/schedule'), true, 'server.js must define proxy for workloads schedule');
     assert.strictEqual(serverJsContent.includes('/api/proxy/workloads/nodes'), true, 'server.js must define proxy for workloads nodes');
   });
+
+  it('Requirement 21: Sovereign S3 Object Storage & Subsea Cable BGP Steering proxy and UI', async () => {
+    const fs = require('fs');
+    const path = require('path');
+    const indexHtmlContent = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf-8');
+    const appJsContent = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf-8');
+    const serverJsContent = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf-8');
+
+    // 1. Verify index.html UI elements for Sovereign Storage
+    assert.strictEqual(indexHtmlContent.includes('id="view-storage"'), true, 'index.html must define #view-storage');
+    assert.strictEqual(indexHtmlContent.includes('id="storage-buckets-tbody"'), true, 'index.html must define #storage-buckets-tbody');
+    assert.strictEqual(indexHtmlContent.includes('id="modal-new-bucket"'), true, 'index.html must define #modal-new-bucket');
+    assert.strictEqual(indexHtmlContent.includes('id="new-bucket-name"'), true, 'index.html must define #new-bucket-name');
+    assert.strictEqual(indexHtmlContent.includes('id="new-bucket-sovereignty"'), true, 'index.html must define #new-bucket-sovereignty');
+
+    // 2. Verify index.html UI elements for Subsea Cables
+    assert.strictEqual(indexHtmlContent.includes('id="subsea-cables-table"'), true, 'index.html must define #subsea-cables-table');
+    assert.strictEqual(indexHtmlContent.includes('id="subsea-cables-tbody"'), true, 'index.html must define #subsea-cables-tbody');
+    assert.strictEqual(indexHtmlContent.includes('id="cables-active-badge"'), true, 'index.html must define #cables-active-badge');
+
+    // 3. Verify app.js client functions
+    assert.strictEqual(appJsContent.includes('async function loadStorageBuckets'), true, 'app.js must define loadStorageBuckets');
+    assert.strictEqual(appJsContent.includes('async function submitCreateStorageBucket'), true, 'app.js must define submitCreateStorageBucket');
+    assert.strictEqual(appJsContent.includes('async function deleteStorageBucket'), true, 'app.js must define deleteStorageBucket');
+    assert.strictEqual(appJsContent.includes('async function loadSubseaCables'), true, 'app.js must define loadSubseaCables');
+    assert.strictEqual(appJsContent.includes('async function simulateCableAction'), true, 'app.js must define simulateCableAction');
+    assert.strictEqual(appJsContent.includes('window.loadStorageBuckets = loadStorageBuckets;'), true, 'app.js must export window.loadStorageBuckets');
+    assert.strictEqual(appJsContent.includes('window.loadSubseaCables = loadSubseaCables;'), true, 'app.js must export window.loadSubseaCables');
+
+    // 4. Verify server.js BFF proxy routes
+    assert.strictEqual(serverJsContent.includes('/api/proxy/storage/buckets'), true, 'server.js must define proxy for storage buckets');
+    assert.strictEqual(serverJsContent.includes('/api/proxy/network/cables'), true, 'server.js must define proxy for subsea cables');
+  });
 });
 
 

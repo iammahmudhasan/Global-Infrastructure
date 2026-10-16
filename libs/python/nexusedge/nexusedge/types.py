@@ -182,3 +182,59 @@ class ComputeNodeRecord:
     rtt_from_singapore: int = 0
     kv_cache_warmth: float = 0.0
 
+
+@dataclass
+class BucketRecord:
+    name: str
+    project_id: str
+    tenant_id: str
+    sovereignty_policy: str
+    replication_topology: str
+    primary_region: str
+    stored_bytes: int
+    object_count: int
+    max_size_bytes: int
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class ObjectRecord:
+    bucket_name: str
+    key: str
+    size_bytes: int
+    content_type: str
+    etag: str
+    sha256_checksum: str
+    sovereign_jurisdiction: str
+    encryption: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class SubseaCableStatus:
+    id: str
+    name: str
+    landing_points: List[str]
+    capacity_gbps: int
+    normal_latency_ms: float
+    current_latency_ms: float
+    status: str
+    active_bgp_paths: int
+    alternate_route: str
+    last_health_check: Optional[str] = None
+
+
+@dataclass
+class CableEventResult:
+    cable_id: str
+    status: str
+    bgp_failover_triggered: bool
+    rerouted_to: str
+    new_latency_ms: float
+    message: str
+    timestamp: Optional[str] = None
+
+

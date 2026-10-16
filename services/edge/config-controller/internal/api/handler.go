@@ -23,6 +23,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/analytics"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/auth"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cable"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/cache"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/certificate"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
@@ -35,6 +36,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/scheduler"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/stek"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/storage"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
@@ -70,6 +72,8 @@ type APIHandler struct {
 	snapshotCache      map[string]poPSnapshotCacheEntry
 	policyEvaluator    *policy.Evaluator
 	universalScheduler *scheduler.UniversalScheduler
+	storageManager     *storage.Manager
+	cableManager       *cable.Manager
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -173,6 +177,8 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		snapshotCache:      make(map[string]poPSnapshotCacheEntry),
 		policyEvaluator:    policy.NewEvaluator(),
 		universalScheduler: scheduler.NewUniversalScheduler(nil),
+		storageManager:     storage.NewManager(),
+		cableManager:       cable.NewManager(),
 	}
 	h.registerRoutes()
 	return h
@@ -252,6 +258,14 @@ func (h *APIHandler) PolicyEvaluator() *policy.Evaluator {
 
 func (h *APIHandler) UniversalScheduler() *scheduler.UniversalScheduler {
 	return h.universalScheduler
+}
+
+func (h *APIHandler) StorageManager() *storage.Manager {
+	return h.storageManager
+}
+
+func (h *APIHandler) CableManager() *cable.Manager {
+	return h.cableManager
 }
 
 func (h *APIHandler) Store() store.Repository {
@@ -389,6 +403,10 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/policies/sovereignty/evaluate", h.handleSovereignPolicyEvaluate)
 	h.mux.HandleFunc("/v1/workloads/schedule", h.handleWorkloadSchedule)
 	h.mux.HandleFunc("/v1/workloads/nodes", h.handleWorkloadNodes)
+	h.mux.HandleFunc("/v1/storage/buckets", h.handleStorageBuckets)
+	h.mux.HandleFunc("/v1/storage/buckets/", h.handleStorageBucketsRoute)
+	h.mux.HandleFunc("/v1/edge/network/cables", h.handleNetworkCables)
+	h.mux.HandleFunc("/v1/edge/network/cables/", h.handleNetworkCablesRoute)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -4058,4 +4076,349 @@ func (h *APIHandler) handleWorkloadNodes(w http.ResponseWriter, r *http.Request)
 		"nodes": nodes,
 		"count": len(nodes),
 	})
+}
+
+// --- Sovereign S3 Object Store Endpoints ---
+
+// GET /v1/storage/buckets, POST /v1/storage/buckets
+func (h *APIHandler) handleStorageBuckets(w http.ResponseWriter, r *http.Request) {
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	tc, _ := auth.FromContext(r.Context())
+	tenantID := "tenant-system"
+	projectID := "proj-core"
+	if tc != nil && tc.TenantID != "" {
+		tenantID = tc.TenantID
+		projectID = tc.ProjectID
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		targetProject := r.URL.Query().Get("project_id")
+		if targetProject != "" {
+			if !h.authenticator.AuthorizeProject(r.Context(), targetProject) {
+				writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+targetProject)
+				return
+			}
+			projectID = targetProject
+		}
+		buckets := h.storageManager.ListBuckets(tenantID, projectID)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"buckets": buckets,
+			"count":   len(buckets),
+		})
+
+	case http.MethodPost:
+		var req struct {
+			Name                string                      `json:"name"`
+			ProjectID           string                      `json:"project_id"`
+			SovereigntyPolicy   storage.SovereigntyPolicy   `json:"sovereignty_policy"`
+			ReplicationTopology storage.ReplicationTopology `json:"replication_topology"`
+			PrimaryRegion       string                      `json:"primary_region"`
+			MaxSizeBytes        int64                       `json:"max_size_bytes"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.ProjectID != "" {
+			if !h.authenticator.AuthorizeProject(r.Context(), req.ProjectID) {
+				writeError(w, http.StatusForbidden, "forbidden: caller not authorized for project "+req.ProjectID)
+				return
+			}
+			projectID = req.ProjectID
+		}
+		bucket, err := h.storageManager.CreateBucket(
+			tenantID, projectID, req.Name,
+			req.SovereigntyPolicy, req.ReplicationTopology,
+			req.PrimaryRegion, req.MaxSizeBytes,
+		)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, storage.ErrBucketAlreadyExists) {
+				status = http.StatusConflict
+			} else if errors.Is(err, storage.ErrUnauthorizedTenant) {
+				status = http.StatusForbidden
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, bucket)
+
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// Routes under /v1/storage/buckets/{bucketName}...
+func (h *APIHandler) handleStorageBucketsRoute(w http.ResponseWriter, r *http.Request) {
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	tc, _ := auth.FromContext(r.Context())
+	tenantID := "tenant-system"
+	projectID := "proj-core"
+	if tc != nil && tc.TenantID != "" {
+		tenantID = tc.TenantID
+		projectID = tc.ProjectID
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/v1/storage/buckets/")
+	parts := strings.SplitN(path, "/", 3)
+	bucketName := parts[0]
+	if bucketName == "" {
+		writeError(w, http.StatusBadRequest, "bucket name required")
+		return
+	}
+
+	// 1. Bucket Operations: /v1/storage/buckets/{bucketName}
+	if len(parts) == 1 {
+		switch r.Method {
+		case http.MethodGet:
+			b, err := h.storageManager.GetBucket(tenantID, projectID, bucketName)
+			if err != nil {
+				status := http.StatusNotFound
+				if errors.Is(err, storage.ErrUnauthorizedTenant) {
+					status = http.StatusForbidden
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, b)
+
+		case http.MethodDelete:
+			err := h.storageManager.DeleteBucket(tenantID, projectID, bucketName)
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, storage.ErrBucketNotFound) {
+					status = http.StatusNotFound
+				} else if errors.Is(err, storage.ErrUnauthorizedTenant) {
+					status = http.StatusForbidden
+				} else if errors.Is(err, storage.ErrBucketNotEmpty) {
+					status = http.StatusConflict
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status":  "DELETED",
+				"message": "Bucket successfully deleted",
+				"bucket":  bucketName,
+			})
+
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
+	// 2. Object List Operations: /v1/storage/buckets/{bucketName}/objects
+	if len(parts) == 2 && parts[1] == "objects" {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		objects, err := h.storageManager.ListObjects(tenantID, projectID, bucketName)
+		if err != nil {
+			status := http.StatusNotFound
+			if errors.Is(err, storage.ErrUnauthorizedTenant) {
+				status = http.StatusForbidden
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"bucket":  bucketName,
+			"objects": objects,
+			"count":   len(objects),
+		})
+		return
+	}
+
+	// 3. Object Key Operations: /v1/storage/buckets/{bucketName}/objects/{key...}
+	if len(parts) == 3 && parts[1] == "objects" {
+		objectKey := parts[2]
+		if objectKey == "" {
+			writeError(w, http.StatusBadRequest, "object key required")
+			return
+		}
+
+		switch r.Method {
+		case http.MethodPut:
+			data, err := io.ReadAll(io.LimitReader(r.Body, 32*1024*1024))
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "failed to read object body")
+				return
+			}
+			contentType := r.Header.Get("Content-Type")
+			meta, err := h.storageManager.PutObject(tenantID, projectID, bucketName, objectKey, data, contentType)
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, storage.ErrBucketNotFound) {
+					status = http.StatusNotFound
+				} else if errors.Is(err, storage.ErrUnauthorizedTenant) {
+					status = http.StatusForbidden
+				} else if errors.Is(err, storage.ErrBucketQuotaExceeded) {
+					status = http.StatusInsufficientStorage
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			w.Header().Set("ETag", meta.ETag)
+			w.Header().Set("X-NexusEdge-SHA256", meta.SHA256Checksum)
+			w.Header().Set("X-NexusEdge-Sovereignty", meta.SovereignJurisdiction)
+			writeJSON(w, http.StatusCreated, meta)
+
+		case http.MethodGet:
+			destJurisdiction := r.URL.Query().Get("destination_jurisdiction")
+			if destJurisdiction == "" {
+				destJurisdiction = r.Header.Get("X-Destination-Jurisdiction")
+			}
+			data, meta, err := h.storageManager.GetObject(tenantID, projectID, bucketName, objectKey, destJurisdiction)
+			if err != nil {
+				status := http.StatusNotFound
+				if errors.Is(err, storage.ErrUnauthorizedTenant) {
+					status = http.StatusForbidden
+				} else if errors.Is(err, storage.ErrSovereignExportProhibited) {
+					status = http.StatusUnavailableForLegalReasons
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", meta.ContentType)
+			w.Header().Set("ETag", meta.ETag)
+			w.Header().Set("X-NexusEdge-SHA256", meta.SHA256Checksum)
+			w.Header().Set("X-NexusEdge-Sovereignty", meta.SovereignJurisdiction)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+
+		case http.MethodDelete:
+			err := h.storageManager.DeleteObject(tenantID, projectID, bucketName, objectKey)
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, storage.ErrObjectNotFound) || errors.Is(err, storage.ErrBucketNotFound) {
+					status = http.StatusNotFound
+				} else if errors.Is(err, storage.ErrUnauthorizedTenant) {
+					status = http.StatusForbidden
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{
+				"status":  "DELETED",
+				"message": "Object successfully deleted",
+				"key":     objectKey,
+			})
+
+		default:
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
+	writeError(w, http.StatusNotFound, "storage route not found")
+}
+
+// --- Subsea Cable & BGP Steering Endpoints ---
+
+// GET /v1/edge/network/cables
+func (h *APIHandler) handleNetworkCables(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	cables := h.cableManager.ListCables()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"cables": cables,
+		"count":  len(cables),
+	})
+}
+
+// Routes under /v1/edge/network/cables/{id}...
+func (h *APIHandler) handleNetworkCablesRoute(w http.ResponseWriter, r *http.Request) {
+	release, ok := h.acquireControlPlaneSlot(w, r)
+	if !ok {
+		return
+	}
+	defer release()
+
+	path := strings.TrimPrefix(r.URL.Path, "/v1/edge/network/cables/")
+	parts := strings.Split(path, "/")
+	cableID := parts[0]
+	if cableID == "" {
+		writeError(w, http.StatusBadRequest, "cable id required")
+		return
+	}
+
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		c, err := h.cableManager.GetCable(cableID)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, c)
+		return
+	}
+
+	action := parts[1]
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	switch action {
+	case "cut":
+		res, err := h.cableManager.SimulateCableCut(cableID)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, cable.ErrCableNotFound) {
+				status = http.StatusNotFound
+			} else if errors.Is(err, cable.ErrCableAlreadyCut) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		if cableID == "smw6" && h.popManager != nil {
+			_ = h.popManager.SetPoPRouteFailover("dhaka", "frankfurt")
+		}
+		writeJSON(w, http.StatusOK, res)
+
+	case "restore":
+		res, err := h.cableManager.RestoreCable(cableID)
+		if err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, cable.ErrCableNotFound) {
+				status = http.StatusNotFound
+			} else if errors.Is(err, cable.ErrCableAlreadyAlive) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		if cableID == "smw6" && h.popManager != nil {
+			_ = h.popManager.RestorePoPRoute("dhaka")
+		}
+		writeJSON(w, http.StatusOK, res)
+
+	default:
+		writeError(w, http.StatusNotFound, "action not found")
+	}
 }

@@ -152,6 +152,44 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
 
+        if self.path.startswith("/api/proxy/storage/buckets"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            if "/objects" in self.path:
+                if self.path.endswith("/objects"):
+                    self.end_headers()
+                    resp = {"bucket": "vault-model-weights", "objects": [{"bucket_name": "vault-model-weights", "key": "model.safetensors", "size_bytes": 1024, "content_type": "application/octet-stream", "etag": "\"abc\"", "sha256_checksum": "def", "sovereign_jurisdiction": "BD", "encryption": "AES256-GCM", "created_at": "2026-10-17T00:00:00Z", "updated_at": "2026-10-17T00:00:00Z"}]}
+                    self.wfile.write(json.dumps(resp).encode("utf-8"))
+                    return
+                else:
+                    self.send_header("ETag", "\"abc\"")
+                    self.send_header("X-NexusEdge-SHA256", "def")
+                    self.send_header("X-NexusEdge-Sovereignty", "BD")
+                    self.end_headers()
+                    self.wfile.write(b"mock object payload bytes")
+                    return
+            elif self.path == "/api/proxy/storage/buckets" or self.path.startswith("/api/proxy/storage/buckets?"):
+                self.end_headers()
+                resp = {"buckets": [{"name": "vault-model-weights", "project_id": "proj-core", "tenant_id": "tenant-system", "sovereignty_policy": "GLOBAL_REDUNDANT", "replication_topology": "MULTI_REGION_NVME_CACHE", "primary_region": "ap-south-2", "stored_bytes": 1024, "object_count": 1, "max_size_bytes": 53687091200, "status": "ACTIVE", "created_at": "2026-10-17T00:00:00Z", "updated_at": "2026-10-17T00:00:00Z"}]}
+                self.wfile.write(json.dumps(resp).encode("utf-8"))
+                return
+            else:
+                self.end_headers()
+                resp = {"name": "vault-model-weights", "project_id": "proj-core", "tenant_id": "tenant-system", "sovereignty_policy": "GLOBAL_REDUNDANT", "replication_topology": "MULTI_REGION_NVME_CACHE", "primary_region": "ap-south-2", "stored_bytes": 1024, "object_count": 1, "max_size_bytes": 53687091200, "status": "ACTIVE", "created_at": "2026-10-17T00:00:00Z", "updated_at": "2026-10-17T00:00:00Z"}
+                self.wfile.write(json.dumps(resp).encode("utf-8"))
+                return
+
+        if self.path.startswith("/api/proxy/network/cables"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if self.path == "/api/proxy/network/cables":
+                resp = {"cables": [{"id": "smw6", "name": "SEA-ME-WE 6", "landing_points": ["Cox's Bazar", "Singapore"], "capacity_gbps": 30000, "normal_latency_ms": 32.0, "current_latency_ms": 32.0, "status": "ONLINE", "active_bgp_paths": 4, "alternate_route": "SMW5"}]}
+            else:
+                resp = {"id": "smw6", "name": "SEA-ME-WE 6", "landing_points": ["Cox's Bazar", "Singapore"], "capacity_gbps": 30000, "normal_latency_ms": 32.0, "current_latency_ms": 32.0, "status": "ONLINE", "active_bgp_paths": 4, "alternate_route": "SMW5"}
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -286,6 +324,57 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
 
+        if self.path == "/api/proxy/storage/buckets":
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "name": payload.get("name", "test-bucket"),
+                "project_id": payload.get("project_id", "proj-core"),
+                "tenant_id": "tenant-system",
+                "sovereignty_policy": payload.get("sovereignty_policy", "GLOBAL_REDUNDANT"),
+                "replication_topology": payload.get("replication_topology", "SINGLE_REGION_NVME"),
+                "primary_region": payload.get("primary_region", "ap-south-2"),
+                "stored_bytes": 0,
+                "object_count": 0,
+                "max_size_bytes": payload.get("max_size_bytes", 53687091200),
+                "status": "ACTIVE",
+                "created_at": "2026-10-17T00:00:00Z",
+                "updated_at": "2026-10-17T00:00:00Z",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path == "/api/proxy/network/cables/smw6/cut":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "cable_id": "smw6",
+                "status": "SEVERED",
+                "bgp_failover_triggered": True,
+                "rerouted_to": "SMW5 / Terrestrial",
+                "new_latency_ms": 121.6,
+                "message": "Subsea cable severed. BGP failover triggered.",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
+        if self.path == "/api/proxy/network/cables/smw6/restore":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "cable_id": "smw6",
+                "status": "ONLINE",
+                "bgp_failover_triggered": True,
+                "rerouted_to": "Primary Subsea Fiber Direct",
+                "new_latency_ms": 32.0,
+                "message": "Subsea cable restored.",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
@@ -301,6 +390,42 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "deleted", "domain_id": "dom_001"}).encode("utf-8"))
+            return
+
+        if self.path.startswith("/api/proxy/storage/buckets"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "DELETED"}).encode("utf-8"))
+            return
+
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self) -> None:
+        auth_hdr = self.headers.get("Authorization", "")
+        if auth_hdr != "Bearer nke_live_test_key_01":
+            self.send_response(401)
+            self.end_headers()
+            return
+
+        if "/objects/" in self.path:
+            self.send_response(201)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            resp = {
+                "bucket_name": "vault-model-weights",
+                "key": "test.bin",
+                "size_bytes": 100,
+                "content_type": "application/octet-stream",
+                "etag": "\"mock-etag\"",
+                "sha256_checksum": "mock-checksum",
+                "sovereign_jurisdiction": "BD",
+                "encryption": "AES256-GCM",
+                "created_at": "2026-10-17T00:00:00Z",
+                "updated_at": "2026-10-17T00:00:00Z",
+            }
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
             return
 
         self.send_response(404)
@@ -532,9 +657,73 @@ class NexusEdgePythonSDKTests(unittest.TestCase):
             verify_ssl=False,
         )
         self.assertFalse(custom_client.verify_ssl)
-        # Execute request to confirm it succeeds with verify_ssl=False
         nodes = custom_client.scheduler.list_nodes()
         self.assertEqual(len(nodes), 1)
+
+    def test_storage_bucket_and_object_lifecycle(self) -> None:
+        """Verifies S3-compatible sovereign object storage operations."""
+        # 1. List buckets
+        buckets = self.client.storage.list_buckets()
+        self.assertGreaterEqual(len(buckets), 1)
+        self.assertEqual(buckets[0].name, "vault-model-weights")
+
+        # 2. Create bucket
+        new_bucket = self.client.storage.create_bucket(
+            name="new-checkpoints-bd",
+            sovereignty_policy="BD_ONLY",
+            replication_topology="SINGLE_REGION_NVME",
+            primary_region="ap-south-2",
+        )
+        self.assertEqual(new_bucket.name, "new-checkpoints-bd")
+
+        # 3. Get bucket
+        b = self.client.storage.get_bucket("vault-model-weights")
+        self.assertEqual(b.name, "vault-model-weights")
+
+        # 4. Put object
+        obj_meta = self.client.storage.put_object("vault-model-weights", "test.bin", b"test data")
+        self.assertEqual(obj_meta.key, "test.bin")
+        self.assertEqual(obj_meta.sovereign_jurisdiction, "BD")
+
+        # 5. List objects
+        objs = self.client.storage.list_objects("vault-model-weights")
+        self.assertEqual(len(objs), 1)
+        self.assertEqual(objs[0].key, "model.safetensors")
+
+        # 6. Get object
+        data, meta = self.client.storage.get_object("vault-model-weights", "model.safetensors", destination_jurisdiction="BD")
+        self.assertEqual(data, b"mock object payload bytes")
+        self.assertEqual(meta.etag, "\"abc\"")
+
+        # 7. Delete object and bucket
+        del_obj = self.client.storage.delete_object("vault-model-weights", "model.safetensors")
+        self.assertTrue(del_obj)
+
+        del_b = self.client.storage.delete_bucket("vault-model-weights")
+        self.assertTrue(del_b)
+
+    def test_network_subsea_cables_and_bgp_failover(self) -> None:
+        """Verifies subsea cable telemetry and dynamic BGP failover triggers."""
+        # 1. List cables
+        cables = self.client.network.list_cables()
+        self.assertGreaterEqual(len(cables), 1)
+        self.assertEqual(cables[0].id, "smw6")
+
+        # 2. Get specific cable
+        c = self.client.network.get_cable("smw6")
+        self.assertEqual(c.id, "smw6")
+        self.assertEqual(c.status, "ONLINE")
+
+        # 3. Simulate cut
+        cut = self.client.network.simulate_cable_cut("smw6")
+        self.assertEqual(cut.status, "SEVERED")
+        self.assertTrue(cut.bgp_failover_triggered)
+        self.assertGreater(cut.new_latency_ms, 32.0)
+
+        # 4. Restore cable
+        restored = self.client.network.restore_cable("smw6")
+        self.assertEqual(restored.status, "ONLINE")
+        self.assertEqual(restored.new_latency_ms, 32.0)
 
 
 if __name__ == "__main__":

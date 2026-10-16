@@ -35,6 +35,10 @@ from .types import (
     SovereignEvaluationResult,
     SchedulingDecision,
     ComputeNodeRecord,
+    BucketRecord,
+    ObjectRecord,
+    SubseaCableStatus,
+    CableEventResult,
 )
 
 
@@ -61,6 +65,8 @@ class NexusEdgeClient:
         self.telemetry = TelemetryNamespace(self)
         self.scheduler = SchedulerNamespace(self)
         self.policies = PoliciesNamespace(self)
+        self.storage = StorageNamespace(self)
+        self.network = NetworkNamespace(self)
 
     def request(
         self,
@@ -538,4 +544,326 @@ class SchedulerNamespace:
                 )
             )
         return nodes
+
+
+class StorageNamespace:
+    """Operations for S3-Compatible Sovereign Object Storage."""
+
+    def __init__(self, client: NexusEdgeClient) -> None:
+        self._client = client
+
+    def list_buckets(self, project_id: Optional[str] = None) -> List[BucketRecord]:
+        """Lists accessible storage buckets."""
+        endpoint = "/api/proxy/storage/buckets"
+        if project_id:
+            endpoint += f"?project_id={urllib.parse.quote(project_id)}"
+        data, _ = self._client.request(endpoint, method="GET")
+        raw_buckets = data.get("buckets", []) if isinstance(data, dict) else []
+        buckets: List[BucketRecord] = []
+        for b in raw_buckets:
+            buckets.append(
+                BucketRecord(
+                    name=str(b.get("name", "")),
+                    project_id=str(b.get("project_id", "")),
+                    tenant_id=str(b.get("tenant_id", "")),
+                    sovereignty_policy=str(b.get("sovereignty_policy", "")),
+                    replication_topology=str(b.get("replication_topology", "")),
+                    primary_region=str(b.get("primary_region", "")),
+                    stored_bytes=int(b.get("stored_bytes", 0)),
+                    object_count=int(b.get("object_count", 0)),
+                    max_size_bytes=int(b.get("max_size_bytes", 0)),
+                    status=str(b.get("status", "ACTIVE")),
+                    created_at=str(b.get("created_at", "")),
+                    updated_at=str(b.get("updated_at", "")),
+                )
+            )
+        return buckets
+
+    def create_bucket(
+        self,
+        name: str,
+        sovereignty_policy: str = "GLOBAL_REDUNDANT",
+        replication_topology: str = "SINGLE_REGION_NVME",
+        primary_region: str = "ap-south-2",
+        max_size_bytes: int = 53687091200,
+        project_id: Optional[str] = None,
+    ) -> BucketRecord:
+        """Provisions a new isolated bucket at the edge."""
+        if not name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        body: Dict[str, Any] = {
+            "name": name,
+            "sovereignty_policy": sovereignty_policy,
+            "replication_topology": replication_topology,
+            "primary_region": primary_region,
+            "max_size_bytes": max_size_bytes,
+        }
+        if project_id:
+            body["project_id"] = project_id
+        data, _ = self._client.request("/api/proxy/storage/buckets", method="POST", body=body)
+        return BucketRecord(
+            name=str(data.get("name", "")),
+            project_id=str(data.get("project_id", "")),
+            tenant_id=str(data.get("tenant_id", "")),
+            sovereignty_policy=str(data.get("sovereignty_policy", "")),
+            replication_topology=str(data.get("replication_topology", "")),
+            primary_region=str(data.get("primary_region", "")),
+            stored_bytes=int(data.get("stored_bytes", 0)),
+            object_count=int(data.get("object_count", 0)),
+            max_size_bytes=int(data.get("max_size_bytes", 0)),
+            status=str(data.get("status", "ACTIVE")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+    def get_bucket(self, name: str) -> BucketRecord:
+        """Retrieves metadata for an existing bucket."""
+        if not name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        data, _ = self._client.request(f"/api/proxy/storage/buckets/{urllib.parse.quote(name)}", method="GET")
+        return BucketRecord(
+            name=str(data.get("name", "")),
+            project_id=str(data.get("project_id", "")),
+            tenant_id=str(data.get("tenant_id", "")),
+            sovereignty_policy=str(data.get("sovereignty_policy", "")),
+            replication_topology=str(data.get("replication_topology", "")),
+            primary_region=str(data.get("primary_region", "")),
+            stored_bytes=int(data.get("stored_bytes", 0)),
+            object_count=int(data.get("object_count", 0)),
+            max_size_bytes=int(data.get("max_size_bytes", 0)),
+            status=str(data.get("status", "ACTIVE")),
+            created_at=str(data.get("created_at", "")),
+            updated_at=str(data.get("updated_at", "")),
+        )
+
+    def delete_bucket(self, name: str) -> bool:
+        """Deletes an empty bucket."""
+        if not name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        data, _ = self._client.request(f"/api/proxy/storage/buckets/{urllib.parse.quote(name)}", method="DELETE")
+        return data.get("status") == "DELETED"
+
+    def list_objects(self, bucket_name: str) -> List[ObjectRecord]:
+        """Lists objects stored within a bucket."""
+        if not bucket_name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        data, _ = self._client.request(f"/api/proxy/storage/buckets/{urllib.parse.quote(bucket_name)}/objects", method="GET")
+        raw_objects = data.get("objects", []) if isinstance(data, dict) else []
+        objects: List[ObjectRecord] = []
+        for obj in raw_objects:
+            objects.append(
+                ObjectRecord(
+                    bucket_name=str(obj.get("bucket_name", "")),
+                    key=str(obj.get("key", "")),
+                    size_bytes=int(obj.get("size_bytes", 0)),
+                    content_type=str(obj.get("content_type", "")),
+                    etag=str(obj.get("etag", "")),
+                    sha256_checksum=str(obj.get("sha256_checksum", "")),
+                    sovereign_jurisdiction=str(obj.get("sovereign_jurisdiction", "")),
+                    encryption=str(obj.get("encryption", "")),
+                    created_at=str(obj.get("created_at", "")),
+                    updated_at=str(obj.get("updated_at", "")),
+                )
+            )
+        return objects
+
+    def put_object(
+        self,
+        bucket_name: str,
+        key: str,
+        data: Union[bytes, str],
+        content_type: str = "application/octet-stream",
+    ) -> ObjectRecord:
+        """Stores a payload into an edge bucket."""
+        if not bucket_name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        if not key:
+            raise NexusEdgeError(400, "Object key is required", "INVALID_OBJECT_KEY")
+
+        payload_bytes = data.encode("utf-8") if isinstance(data, str) else data
+        endpoint = f"/api/proxy/storage/buckets/{urllib.parse.quote(bucket_name)}/objects/{urllib.parse.quote(key)}"
+
+        req_headers = {
+            "Content-Type": content_type,
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self._client.api_key}",
+            "X-API-Key": self._client.api_key,
+            "User-Agent": "NexusEdge-Python-SDK/0.1.0",
+        }
+        full_url = f"{self._client.base_url}{endpoint}"
+        req = urllib.request.Request(full_url, data=payload_bytes, headers=req_headers, method="PUT")
+        ssl_ctx = None if self._client.verify_ssl else ssl._create_unverified_context()
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._client.timeout_seconds, context=ssl_ctx) as resp:
+                resp_bytes = resp.read()
+                data_dict = json.loads(resp_bytes.decode("utf-8")) if resp_bytes else {}
+                return ObjectRecord(
+                    bucket_name=str(data_dict.get("bucket_name", bucket_name)),
+                    key=str(data_dict.get("key", key)),
+                    size_bytes=int(data_dict.get("size_bytes", len(payload_bytes))),
+                    content_type=str(data_dict.get("content_type", content_type)),
+                    etag=str(data_dict.get("etag", "")),
+                    sha256_checksum=str(data_dict.get("sha256_checksum", "")),
+                    sovereign_jurisdiction=str(data_dict.get("sovereign_jurisdiction", "")),
+                    encryption=str(data_dict.get("encryption", "")),
+                    created_at=str(data_dict.get("created_at", "")),
+                    updated_at=str(data_dict.get("updated_at", "")),
+                )
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            err_code = "HTTP_ERROR"
+            try:
+                err_json = json.loads(raw_err)
+                err_msg = err_json.get("error", raw_err)
+                err_code = err_json.get("code", err_code)
+            except Exception:
+                err_msg = raw_err or str(e.reason)
+            raise NexusEdgeError(e.code, str(err_msg), code=str(err_code)) from e
+
+    def get_object(
+        self,
+        bucket_name: str,
+        key: str,
+        destination_jurisdiction: Optional[str] = None,
+    ) -> Tuple[bytes, ObjectRecord]:
+        """Retrieves payload and metadata, strictly enforcing sovereignty."""
+        if not bucket_name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        if not key:
+            raise NexusEdgeError(400, "Object key is required", "INVALID_OBJECT_KEY")
+
+        endpoint = f"/api/proxy/storage/buckets/{urllib.parse.quote(bucket_name)}/objects/{urllib.parse.quote(key)}"
+        if destination_jurisdiction:
+            endpoint += f"?destination_jurisdiction={urllib.parse.quote(destination_jurisdiction)}"
+
+        full_url = f"{self._client.base_url}{endpoint}"
+        req_headers = {
+            "Accept": "*/*",
+            "Authorization": f"Bearer {self._client.api_key}",
+            "X-API-Key": self._client.api_key,
+            "User-Agent": "NexusEdge-Python-SDK/0.1.0",
+        }
+        if destination_jurisdiction:
+            req_headers["X-Destination-Jurisdiction"] = destination_jurisdiction
+
+        req = urllib.request.Request(full_url, headers=req_headers, method="GET")
+        ssl_ctx = None if self._client.verify_ssl else ssl._create_unverified_context()
+
+        try:
+            with urllib.request.urlopen(req, timeout=self._client.timeout_seconds, context=ssl_ctx) as resp:
+                data_bytes = resp.read()
+                raw_hdrs = dict(resp.headers.items())
+                norm_hdrs = {k.lower(): v for k, v in raw_hdrs.items()}
+                meta = ObjectRecord(
+                    bucket_name=bucket_name,
+                    key=key,
+                    size_bytes=len(data_bytes),
+                    content_type=norm_hdrs.get("content-type", "application/octet-stream"),
+                    etag=norm_hdrs.get("etag", ""),
+                    sha256_checksum=norm_hdrs.get("x-nexusedge-sha256", ""),
+                    sovereign_jurisdiction=norm_hdrs.get("x-nexusedge-sovereignty", ""),
+                    encryption="AES256-GCM",
+                    created_at="",
+                    updated_at="",
+                )
+                return data_bytes, meta
+        except urllib.error.HTTPError as e:
+            raw_err = e.read().decode("utf-8", errors="replace")
+            err_code = "HTTP_ERROR"
+            try:
+                err_json = json.loads(raw_err)
+                err_msg = err_json.get("error", raw_err)
+                err_code = err_json.get("code", err_code)
+            except Exception:
+                err_msg = raw_err or str(e.reason)
+            raise NexusEdgeError(e.code, str(err_msg), code=str(err_code)) from e
+
+    def delete_object(self, bucket_name: str, key: str) -> bool:
+        """Deletes an object from a bucket."""
+        if not bucket_name:
+            raise NexusEdgeError(400, "Bucket name is required", "INVALID_BUCKET_NAME")
+        if not key:
+            raise NexusEdgeError(400, "Object key is required", "INVALID_OBJECT_KEY")
+        endpoint = f"/api/proxy/storage/buckets/{urllib.parse.quote(bucket_name)}/objects/{urllib.parse.quote(key)}"
+        data, _ = self._client.request(endpoint, method="DELETE")
+        return data.get("status") == "DELETED"
+
+
+class NetworkNamespace:
+    """Operations for Subsea Fiber Telemetry and BGP Traffic Steering."""
+
+    def __init__(self, client: NexusEdgeClient) -> None:
+        self._client = client
+
+    def list_cables(self) -> List[SubseaCableStatus]:
+        """Lists international subsea cable links and live telemetry."""
+        data, _ = self._client.request("/api/proxy/network/cables", method="GET")
+        raw_cables = data.get("cables", []) if isinstance(data, dict) else []
+        cables: List[SubseaCableStatus] = []
+        for c in raw_cables:
+            cables.append(
+                SubseaCableStatus(
+                    id=str(c.get("id", "")),
+                    name=str(c.get("name", "")),
+                    landing_points=list(c.get("landing_points", [])),
+                    capacity_gbps=int(c.get("capacity_gbps", 0)),
+                    normal_latency_ms=float(c.get("normal_latency_ms", 0.0)),
+                    current_latency_ms=float(c.get("current_latency_ms", 0.0)),
+                    status=str(c.get("status", "ONLINE")),
+                    active_bgp_paths=int(c.get("active_bgp_paths", 0)),
+                    alternate_route=str(c.get("alternate_route", "")),
+                    last_health_check=c.get("last_health_check"),
+                )
+            )
+        return cables
+
+    def get_cable(self, cable_id: str) -> SubseaCableStatus:
+        """Retrieves status and telemetry for a specific submarine cable."""
+        if not cable_id:
+            raise NexusEdgeError(400, "Cable ID is required", "INVALID_CABLE_ID")
+        data, _ = self._client.request(f"/api/proxy/network/cables/{urllib.parse.quote(cable_id)}", method="GET")
+        return SubseaCableStatus(
+            id=str(data.get("id", "")),
+            name=str(data.get("name", "")),
+            landing_points=list(data.get("landing_points", [])),
+            capacity_gbps=int(data.get("capacity_gbps", 0)),
+            normal_latency_ms=float(data.get("normal_latency_ms", 0.0)),
+            current_latency_ms=float(data.get("current_latency_ms", 0.0)),
+            status=str(data.get("status", "ONLINE")),
+            active_bgp_paths=int(data.get("active_bgp_paths", 0)),
+            alternate_route=str(data.get("alternate_route", "")),
+            last_health_check=data.get("last_health_check"),
+        )
+
+    def simulate_cable_cut(self, cable_id: str) -> CableEventResult:
+        """Simulates physical fiber break, triggering autonomous BGP Anycast rerouting."""
+        if not cable_id:
+            raise NexusEdgeError(400, "Cable ID is required", "INVALID_CABLE_ID")
+        data, _ = self._client.request(f"/api/proxy/network/cables/{urllib.parse.quote(cable_id)}/cut", method="POST")
+        return CableEventResult(
+            cable_id=str(data.get("cable_id", "")),
+            status=str(data.get("status", "SEVERED")),
+            bgp_failover_triggered=bool(data.get("bgp_failover_triggered", False)),
+            rerouted_to=str(data.get("rerouted_to", "")),
+            new_latency_ms=float(data.get("new_latency_ms", 0.0)),
+            message=str(data.get("message", "")),
+            timestamp=data.get("timestamp"),
+        )
+
+    def restore_cable(self, cable_id: str) -> CableEventResult:
+        """Restores subsea link to nominal operating parameters."""
+        if not cable_id:
+            raise NexusEdgeError(400, "Cable ID is required", "INVALID_CABLE_ID")
+        data, _ = self._client.request(f"/api/proxy/network/cables/{urllib.parse.quote(cable_id)}/restore", method="POST")
+        return CableEventResult(
+            cable_id=str(data.get("cable_id", "")),
+            status=str(data.get("status", "ONLINE")),
+            bgp_failover_triggered=bool(data.get("bgp_failover_triggered", False)),
+            rerouted_to=str(data.get("rerouted_to", "")),
+            new_latency_ms=float(data.get("new_latency_ms", 0.0)),
+            message=str(data.get("message", "")),
+            timestamp=data.get("timestamp"),
+        )
+
 
