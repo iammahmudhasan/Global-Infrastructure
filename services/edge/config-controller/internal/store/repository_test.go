@@ -1798,6 +1798,22 @@ func TestPostgresRepository_ReconcileCache_CorruptCiphertextFailsClosed(t *testi
 		t.Fatalf("SaveDomain failed: %v", err)
 	}
 
+	// Seed healthy domain into cache
+	validDomID := fmt.Sprintf("dom-healthy-%d", ts)
+	validDom := &model.Domain{
+		ID:        validDomID,
+		ProjectID: "prj-test",
+		Hostname:  fmt.Sprintf("healthy-%d.example.com", ts),
+		Status:    model.DomainStatusActive,
+		Version:   1,
+	}
+	if err := repo.SaveDomain(validDom); err != nil {
+		t.Fatalf("SaveDomain healthy failed: %v", err)
+	}
+	defer func() {
+		_, _ = repo.DB().ExecContext(ctx, "DELETE FROM domains WHERE id = $1", validDomID)
+	}()
+
 	// Insert active certificate with corrupted ciphertext directly into DB
 	certID := fmt.Sprintf("cert-corrupt-%d", ts)
 	corruptedCiphertext := "enc:v1:this-is-corrupted-ciphertext-that-fails-decryption"
@@ -1820,6 +1836,12 @@ func TestPostgresRepository_ReconcileCache_CorruptCiphertextFailsClosed(t *testi
 	}
 	if !strings.Contains(err.Error(), "decrypt private key for certificate") {
 		t.Fatalf("expected decryption error message, got: %v", err)
+	}
+
+	// Working cache must still retain healthy domain
+	cachedHealthyAfter, err := repo.GetDomain(validDomID)
+	if err != nil || cachedHealthyAfter == nil {
+		t.Fatalf("expected healthy domain to remain in cache despite failed reconciliation: %v", err)
 	}
 
 	// GetCertificate must also fail-closed and return nil rather than returning ciphertext

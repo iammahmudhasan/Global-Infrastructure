@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -1439,6 +1440,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		if encKey != "" {
 			dec, decErr := security.DecryptSecret(encKey)
 			if decErr != nil {
+				log.Printf("[SECURITY ALERT] ReconcileCache rejected un-decryptable private key for certificate %s (domain %s): %v", cert.ID, cert.DomainID, decErr)
 				return nil, fmt.Errorf("reconcile cache decrypt private key for certificate %s (domain %s): %w", cert.ID, cert.DomainID, decErr)
 			}
 			cert.PrivateKeyPEM = dec
@@ -1568,7 +1570,9 @@ func (r *PostgresRepository) StartReconciler(ctx context.Context, interval time.
 				return
 			case <-ticker.C:
 				reconcileTimeoutCtx, tCancel := context.WithTimeout(reconcileCtx, 5*time.Second)
-				_, _ = r.ReconcileCache(reconcileTimeoutCtx)
+				if _, recErr := r.ReconcileCache(reconcileTimeoutCtx); recErr != nil {
+					log.Printf("[RECONCILER ERROR] Periodic cache reconciliation failed: %v", recErr)
+				}
 				tCancel()
 			}
 		}
@@ -2279,6 +2283,7 @@ func (r *PostgresRepository) GetCertificate(domainID string) *model.Certificate 
 	if encKey != "" {
 		dec, decErr := security.DecryptSecret(encKey)
 		if decErr != nil {
+			log.Printf("[SECURITY ALERT] Failed to decrypt active certificate private key for domain=%s cert_id=%s: %v", domainID, cert.ID, decErr)
 			return nil
 		}
 		cert.PrivateKeyPEM = dec
@@ -2490,6 +2495,7 @@ func (r *PostgresRepository) GetAIProvider(id string) (*model.AIProvider, error)
 	if encryptedKey != "" {
 		dec, decErr := security.DecryptSecret(encryptedKey)
 		if decErr != nil {
+			log.Printf("[SECURITY ALERT] Failed to decrypt AI provider secret for id=%s: %v", id, decErr)
 			return nil, fmt.Errorf("decrypt ai_provider %s secret: %w", id, decErr)
 		}
 		p.APIKey = dec

@@ -485,58 +485,78 @@ impl GatewayAckManager {
 
             // Monotonic generation, identity, and conflict validation on disk
             if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(existing) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
-                        // 1. Identity validation: Gateway ID and PoP ID must match existing spool
-                        if existing.gateway_id != ack.gateway_id || existing.pop_id != ack.pop_id {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!(
-                                    "Identity mismatch for ACK spool: disk holds gateway='{}', pop='{}', but submitted gateway='{}', pop='{}'",
-                                    existing.gateway_id, existing.pop_id, ack.gateway_id, ack.pop_id
-                                ),
-                            ));
-                        }
+                let content = std::fs::read_to_string(path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "Failed to read existing ACK spool file '{}' for validation: {}",
+                            path.display(),
+                            e
+                        ),
+                    )
+                })?;
 
-                        // 2. Monotonic version validation: prevent older ACKs from overwriting newer state on disk
-                        if existing.applied_version > ack.applied_version {
-                            tracing::warn!(
-                                existing_version = existing.applied_version,
-                                proposed_version = ack.applied_version,
-                                "Ignoring stale ACK submission; disk already holds newer version"
-                            );
-                            let mut guard =
-                                self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
-                            if guard
-                                .as_ref()
-                                .map(|g| g.applied_version < existing.applied_version)
-                                .unwrap_or(true)
-                            {
-                                *guard = Some(existing);
-                            }
-                            return Ok(());
-                        }
+                let existing = serde_json::from_str::<GatewaySyncAckPayload>(&content).map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Corrupted ACK spool file '{}': JSON deserialization failed ({}); refusing overwrite to prevent monotonic validation bypass",
+                            path.display(),
+                            e
+                        ),
+                    )
+                })?;
 
-                        // 3. Same version validation: detect conflicting checksums vs idempotent retries
-                        if existing.applied_version == ack.applied_version {
-                            if existing.applied_checksum != ack.applied_checksum {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidInput,
-                                    format!(
-                                        "Checksum mismatch conflict for version {}: disk holds '{}', but proposed '{}'",
-                                        ack.applied_version, existing.applied_checksum, ack.applied_checksum
-                                    ),
-                                ));
-                            }
+                // 1. Identity validation: Gateway ID and PoP ID must match existing spool
+                if existing.gateway_id != ack.gateway_id || existing.pop_id != ack.pop_id {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "Identity mismatch for ACK spool: disk holds gateway='{}', pop='{}', but submitted gateway='{}', pop='{}'",
+                            existing.gateway_id, existing.pop_id, ack.gateway_id, ack.pop_id
+                        ),
+                    ));
+                }
 
-                            // Exact match: accept as idempotent retry without re-writing disk
-                            let mut guard =
-                                self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
-                            *guard = Some(ack);
-                            self.notify.notify_one();
-                            return Ok(());
-                        }
+                // 2. Monotonic version validation: prevent older ACKs from overwriting newer state on disk
+                if existing.applied_version > ack.applied_version {
+                    tracing::warn!(
+                        existing_version = existing.applied_version,
+                        proposed_version = ack.applied_version,
+                        "Ignoring stale ACK submission; disk already holds newer version"
+                    );
+                    let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                    if guard
+                        .as_ref()
+                        .map(|g| g.applied_version < existing.applied_version)
+                        .unwrap_or(true)
+                    {
+                        *guard = Some(existing);
                     }
+                    drop(guard);
+                    // Wake worker so the newer restored ACK is promptly delivered
+                    self.notify.notify_one();
+                    return Ok(());
+                }
+
+                // 3. Same version validation: detect conflicting checksums vs idempotent retries
+                if existing.applied_version == ack.applied_version {
+                    if existing.applied_checksum != ack.applied_checksum {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "Checksum mismatch conflict for version {}: disk holds '{}', but proposed '{}'",
+                                ack.applied_version, existing.applied_checksum, ack.applied_checksum
+                            ),
+                        ));
+                    }
+
+                    // Exact match: accept as idempotent retry without re-writing disk
+                    let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                    *guard = Some(ack);
+                    drop(guard);
+                    self.notify.notify_one();
+                    return Ok(());
                 }
             }
 
@@ -674,11 +694,39 @@ impl GatewayAckManager {
                                             if spooled.applied_version == ack.applied_version
                                                 && spooled.applied_checksum == ack.applied_checksum
                                             {
-                                                let _ = std::fs::remove_file(path);
-                                                #[cfg(unix)]
-                                                if let Some(parent) = path.parent() {
-                                                    if let Ok(dir) = std::fs::File::open(parent) {
-                                                        let _ = dir.sync_all();
+                                                if let Err(e) = std::fs::remove_file(path) {
+                                                    tracing::warn!(
+                                                        path = %path.display(),
+                                                        error = %e,
+                                                        "Failed to remove acknowledged ACK spool file"
+                                                    );
+                                                } else {
+                                                    #[cfg(unix)]
+                                                    if let Some(parent) = path.parent() {
+                                                        let dir_path =
+                                                            if parent.as_os_str().is_empty() {
+                                                                std::path::Path::new(".")
+                                                            } else {
+                                                                parent
+                                                            };
+                                                        match std::fs::File::open(dir_path) {
+                                                            Ok(dir) => {
+                                                                if let Err(e) = dir.sync_all() {
+                                                                    tracing::warn!(
+                                                                        dir = %dir_path.display(),
+                                                                        error = %e,
+                                                                        "Failed to fsync parent directory after ACK spool deletion; directory metadata flush deferred to OS"
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                tracing::warn!(
+                                                                    dir = %dir_path.display(),
+                                                                    error = %e,
+                                                                    "Failed to open parent directory for fsync after ACK spool deletion"
+                                                                );
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             } else {
@@ -1587,6 +1635,116 @@ mod tests {
         assert!(mgr.submit_ack(ack.clone()).is_ok());
         // Exact same version and checksum must succeed idempotently
         assert!(mgr.submit_ack(ack).is_ok());
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_corrupted_spool_refuses_overwrite() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_corrupt_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Write corrupt JSON bytes directly to simulate partial crash write or bit rot
+        let corrupted_content =
+            "{\"gateway_id\": \"gw-01\", \"applied_version\": 100, \"applied_checksum\": ";
+        std::fs::write(&spool_path, corrupted_content).expect("write corrupt spool failed");
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        // Attempting to submit a new ACK must FAIL CLOSED and refuse to overwrite
+        let new_ack = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 90,
+            applied_checksum: "hash-v90".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+
+        let res = mgr.submit_ack(new_ack);
+        assert!(
+            res.is_err(),
+            "expected error when existing spool is corrupted"
+        );
+        let err_str = res.unwrap_err().to_string();
+        assert!(
+            err_str.contains("Corrupted ACK spool file"),
+            "unexpected error message: {}",
+            err_str
+        );
+
+        // Invariant: corrupt file must NOT have been overwritten
+        let raw_on_disk = std::fs::read_to_string(&spool_path).expect("read corrupt spool failed");
+        assert_eq!(raw_on_disk, corrupted_content);
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_stale_ack_wakes_worker() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_stale_wake_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        // 1. Initial authoritative submission of version 100
+        let ack_v100 = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 100,
+            applied_checksum: "hash-v100".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v100).is_ok());
+
+        // Clear in-memory state to simulate a worker pickup or memory reset
+        if let Ok(mut guard) = mgr.pending_ack.write() {
+            *guard = None;
+        }
+        assert!(mgr.pending_ack().is_none());
+
+        // 2. Submit a stale version 90
+        let ack_stale = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 90,
+            applied_checksum: "hash-v90".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_stale).is_ok());
+
+        // 3. Invariant: in-memory queue MUST be restored with disk's version 100
+        let restored = mgr.pending_ack().expect("expected restored ACK in memory");
+        assert_eq!(restored.applied_version, 100);
+        assert_eq!(restored.applied_checksum, "hash-v100");
 
         let _ = std::fs::remove_file(&spool_path);
     }
