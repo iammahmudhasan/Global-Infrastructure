@@ -1239,3 +1239,268 @@ func TestPostgresRepository_MultiReplicaTopologyReconciliation(t *testing.T) {
 		t.Fatalf("expected origin 10.200.1.5 in compiled pool, got %+v", compiledPool.Origins)
 	}
 }
+
+func TestStore_ConcurrentAuditChain(t *testing.T) {
+	s := store.NewStore()
+	testKey := []byte("01234567890123456789012345678901")
+	s.SetAuditHMACKey(testKey)
+
+	const goroutines = 10
+	const logsPerGoroutine = 5
+	var wg sync.WaitGroup
+
+	errCh := make(chan error, goroutines*logsPerGoroutine)
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(gID int) {
+			defer wg.Done()
+			for i := 0; i < logsPerGoroutine; i++ {
+				logID := fmt.Sprintf("aud-inmem-conc-%d-%d", gID, i)
+				now := time.Now().UTC()
+				tsStr := now.Truncate(time.Microsecond).Format(time.RFC3339Nano)
+				hash, err := security.ComputeCanonicalPayloadHash(
+					testKey, logID, tsStr, "actor-conc", "org-conc", "prj-conc",
+					"domain.create", "domain", "dom-1", "127.0.0.1",
+					map[string]interface{}{"idx": i}, security.GenesisHash,
+				)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				auditLog := &model.AuditLog{
+					ID:           logID,
+					OrgID:        "org-conc",
+					ProjectID:    "prj-conc",
+					Actor:        "actor-conc",
+					Action:       "domain.create",
+					ResourceType: "domain",
+					ResourceID:   "dom-1",
+					ClientIP:     "127.0.0.1",
+					Details:      map[string]interface{}{"idx": i},
+					PrevHash:     security.GenesisHash,
+					Hash:         hash,
+					CreatedAt:    now,
+				}
+				if err := s.SaveAuditLog(auditLog); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent save audit log error: %v", err)
+	}
+
+	logs, total, err := s.ListAuditLogs("prj-conc", 100, 0)
+	if err != nil {
+		t.Fatalf("ListAuditLogs failed: %v", err)
+	}
+	expectedTotal := goroutines * logsPerGoroutine
+	if total != expectedTotal || len(logs) != expectedTotal {
+		t.Fatalf("expected %d audit logs, got total=%d len=%d", expectedTotal, total, len(logs))
+	}
+
+	// Verify unbroken sequential continuity: logs are returned in descending chronological order
+	for i := 0; i < len(logs)-1; i++ {
+		if logs[i].PrevHash != logs[i+1].Hash {
+			t.Errorf("chain break at index %d: log.PrevHash (%s) != next.Hash (%s)", i, logs[i].PrevHash, logs[i+1].Hash)
+		}
+	}
+}
+
+func TestPostgresRepository_ConcurrentAuditChainStress(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres concurrent audit chain test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	testKey := []byte("01234567890123456789012345678901")
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test database: %v", err)
+	}
+	repo.SetAuditHMACKey(testKey)
+	defer repo.Close()
+
+	const goroutines = 10
+	const logsPerGoroutine = 5
+	var wg sync.WaitGroup
+	errCh := make(chan error, goroutines*logsPerGoroutine)
+
+	projectID := fmt.Sprintf("prj-stress-%d", time.Now().UnixNano())
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(gID int) {
+			defer wg.Done()
+			for i := 0; i < logsPerGoroutine; i++ {
+				logID := fmt.Sprintf("aud-pg-stress-%d-%d-%d", time.Now().UnixNano(), gID, i)
+				now := time.Now().UTC()
+				tsStr := now.Truncate(time.Microsecond).Format(time.RFC3339Nano)
+				// Deliberately use genesis or arbitrary prevHash to force advisory lock & atomic re-linking under contention
+				hash, err := security.ComputeCanonicalPayloadHash(
+					testKey, logID, tsStr, "stress-actor", "org-stress", projectID,
+					"route.create", "route", "rt-1", "127.0.0.1",
+					map[string]interface{}{"gid": gID, "idx": i}, security.GenesisHash,
+				)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				auditLog := &model.AuditLog{
+					ID:           logID,
+					OrgID:        "org-stress",
+					ProjectID:    projectID,
+					Actor:        "stress-actor",
+					Action:       "route.create",
+					ResourceType: "route",
+					ResourceID:   "rt-1",
+					ClientIP:     "127.0.0.1",
+					Details:      map[string]interface{}{"gid": gID, "idx": i},
+					PrevHash:     security.GenesisHash,
+					Hash:         hash,
+					CreatedAt:    now,
+				}
+				if err := repo.SaveAuditLog(auditLog); err != nil {
+					errCh <- fmt.Errorf("concurrent SaveAuditLog (g=%d, i=%d): %w", gID, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent audit log save failed: %v", err)
+	}
+
+	logs, total, err := repo.ListAuditLogs(projectID, 100, 0)
+	if err != nil {
+		t.Fatalf("ListAuditLogs failed: %v", err)
+	}
+	expectedTotal := goroutines * logsPerGoroutine
+	if total != expectedTotal || len(logs) != expectedTotal {
+		t.Fatalf("expected %d audit logs, got total=%d len=%d", expectedTotal, total, len(logs))
+	}
+
+	// Verify unbroken cryptographic chain: logs[i].PrevHash == logs[i+1].Hash
+	for i := 0; i < len(logs)-1; i++ {
+		if logs[i].PrevHash != logs[i+1].Hash {
+			t.Fatalf("cryptographic chain broken at index %d: log.PrevHash (%s) != next.Hash (%s)", i, logs[i].PrevHash, logs[i+1].Hash)
+		}
+	}
+}
+
+func TestPostgresRepository_MultiReplicaStaleCacheRouteRevocation(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres multi-replica route revocation test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo1: %v", err)
+	}
+	defer repo1.Close()
+
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo2: %v", err)
+	}
+	defer repo2.Close()
+
+	suffix := time.Now().UnixNano()
+	domainID := fmt.Sprintf("dom-revoc-%d", suffix)
+	poolID := fmt.Sprintf("pool-revoc-%d", suffix)
+	routeID := fmt.Sprintf("route-revoc-%d", suffix)
+
+	// 1. Repo 1 creates pool, domain, and route
+	pool := &model.OriginPool{
+		ID:          poolID,
+		ProjectID:   "proj-revoc",
+		Name:        "Revoc Pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		AllowedPoPs: []string{"dhaka"},
+		Origins: []model.Origin{
+			{
+				ID:          fmt.Sprintf("orig-revoc-%d", suffix),
+				PoolID:      poolID,
+				Address:     "10.0.0.1",
+				Port:        80,
+				Protocol:    model.ProtocolHTTP,
+				Healthy:     true,
+				AllowedPoPs: []string{"dhaka"},
+			},
+		},
+	}
+	if err := repo1.SaveOriginPool(pool); err != nil {
+		t.Fatalf("repo1.SaveOriginPool failed: %v", err)
+	}
+
+	dom := &model.Domain{
+		ID:             domainID,
+		ProjectID:      "proj-revoc",
+		Hostname:       fmt.Sprintf("revoc-%d.nexusedge.net", suffix),
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		AllowedPoPs:    []string{"dhaka"},
+		Version:        1,
+	}
+	if err := repo1.SaveDomain(dom); err != nil {
+		t.Fatalf("repo1.SaveDomain failed: %v", err)
+	}
+
+	rt := &model.Route{
+		ID:         routeID,
+		DomainID:   domainID,
+		PoolID:     poolID,
+		PathPrefix: "/api/test",
+		Priority:   5,
+		TimeoutMs:  3000,
+	}
+	if err := repo1.SaveRoute(rt); err != nil {
+		t.Fatalf("repo1.SaveRoute failed: %v", err)
+	}
+
+	// 2. Repo 2 fetches and populates its local cache
+	fetchedDom, err := repo2.GetDomain(domainID)
+	if err != nil || fetchedDom == nil {
+		t.Fatalf("repo2.GetDomain failed: %v", err)
+	}
+	fetchedRoutes := repo2.GetRoutes(domainID)
+	if len(fetchedRoutes) != 1 || fetchedRoutes[0].ID != routeID {
+		t.Fatalf("repo2.GetRoutes returned unexpected routes: %+v", fetchedRoutes)
+	}
+
+	// 3. Repo 1 deletes the domain from PostgreSQL
+	if err := repo1.DeleteDomain(domainID); err != nil {
+		t.Fatalf("repo1.DeleteDomain failed: %v", err)
+	}
+
+	// 4. Repo 2 (which hasn't run ReconcileCache yet) MUST immediately fail-closed:
+	// Calling GetRoutes(domainID) checks authoritative DB, detects deletion, evicts cache, returns nil!
+	routesAfterDelete := repo2.GetRoutes(domainID)
+	if len(routesAfterDelete) != 0 {
+		t.Fatalf("CRITICAL SECURITY HOLE: repo2 returned %d routes for deleted domain from stale cache!", len(routesAfterDelete))
+	}
+
+	// Calling GetDomain(domainID) on repo 2 returns ErrNotFound
+	domAfterDelete, err := repo2.GetDomain(domainID)
+	if !errors.Is(err, store.ErrNotFound) || domAfterDelete != nil {
+		t.Fatalf("expected ErrNotFound from repo2 for deleted domain, got dom=%v err=%v", domAfterDelete, err)
+	}
+}

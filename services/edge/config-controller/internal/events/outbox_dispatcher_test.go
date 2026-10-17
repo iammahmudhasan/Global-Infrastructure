@@ -330,3 +330,238 @@ func TestOutboxDispatcher_ConcurrentWorkersLeaseFencing(t *testing.T) {
 		}
 	}
 }
+
+func TestOutboxDispatcher_MalformedPayloadQuarantine(t *testing.T) {
+	s := store.NewStore()
+	b := NewBroadcaster()
+	defer b.Close()
+
+	tracker := NewGatewaySyncTracker(10 * time.Second)
+	bridge := NewBroadcasterBridgeWithTracker(b, tracker)
+
+	cfg := OutboxDispatcherConfig{
+		WorkerID:      "worker-quarantine-test",
+		BatchSize:     10,
+		PollInterval:  50 * time.Millisecond,
+		LeaseDuration: 5 * time.Second,
+	}
+
+	dispatcher, err := NewOutboxDispatcher(s, bridge, cfg)
+	if err != nil {
+		t.Fatalf("NewOutboxDispatcher failed: %v", err)
+	}
+
+	// 1. Insert an outbox event with corrupt/malformed JSON
+	corruptEventID := "evt-corrupt-01"
+	s.SaveOutboxEvent(&store.OutboxEvent{
+		EventID:       corruptEventID,
+		AggregateType: "domain",
+		AggregateID:   "dom-corrupt",
+		EventType:     "domain.config.changed",
+		Payload:       []byte("{corrupt-non-json-payload-marker"),
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
+	// Dispatch batch: must quarantine immediately
+	count, err := dispatcher.DispatchBatch(context.Background())
+	if err != nil {
+		t.Fatalf("DispatchBatch failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 event processed in batch, got %d", count)
+	}
+
+	stats := dispatcher.Stats()
+	if stats.EventsFailed != 1 {
+		t.Fatalf("expected 1 failed event, got %d", stats.EventsFailed)
+	}
+
+	// Verify the event in store is now DEAD_LETTER (quarantined) and NOT pending
+	pending, _ := s.GetPendingOutboxEvents(context.Background(), 10)
+	if len(pending) != 0 {
+		t.Fatalf("expected 0 pending events after quarantine, got %d", len(pending))
+	}
+}
+
+func TestOutboxDispatcher_SchemaValidationFailureQuarantine(t *testing.T) {
+	s := store.NewStore()
+	b := NewBroadcaster()
+	defer b.Close()
+
+	bridge := NewBroadcasterBridge(b)
+	cfg := OutboxDispatcherConfig{
+		WorkerID:      "worker-schema-test",
+		BatchSize:     10,
+		PollInterval:  50 * time.Millisecond,
+		LeaseDuration: 5 * time.Second,
+	}
+
+	dispatcher, _ := NewOutboxDispatcher(s, bridge, cfg)
+
+	// Valid JSON, but missing required domain_id field
+	s.SaveOutboxEvent(&store.OutboxEvent{
+		EventID:       "evt-bad-schema-01",
+		AggregateType: "domain",
+		AggregateID:   "dom-bad",
+		EventType:     "domain.config.changed",
+		Payload:       []byte(`{"status": "ACTIVE"}`), // missing domain_id
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
+	count, err := dispatcher.DispatchBatch(context.Background())
+	if err != nil {
+		t.Fatalf("DispatchBatch failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 event processed, got %d", count)
+	}
+
+	// Must be quarantined to DEAD_LETTER
+	pending, _ := s.GetPendingOutboxEvents(context.Background(), 10)
+	if len(pending) != 0 {
+		t.Fatalf("expected event to be quarantined to DEAD_LETTER, but found %d pending events", len(pending))
+	}
+}
+
+func TestOutboxDispatcher_DeadlineAwareShutdown(t *testing.T) {
+	s := store.NewStore()
+
+	// Handler that blocks until unblocked or context canceled
+	blockCh := make(chan struct{})
+	defer close(blockCh)
+
+	slowHandler := OutboxEventHandlerFunc(func(ctx context.Context, ev *store.OutboxEvent) error {
+		select {
+		case <-blockCh:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+
+	cfg := OutboxDispatcherConfig{
+		WorkerID:        "worker-timeout-test",
+		BatchSize:       1,
+		PollInterval:    10 * time.Millisecond,
+		LeaseDuration:   2 * time.Second,
+		ShutdownTimeout: 50 * time.Millisecond,
+	}
+
+	d, _ := NewOutboxDispatcher(s, slowHandler, cfg)
+	s.SaveOutboxEvent(&store.OutboxEvent{
+		EventID:       "evt-slow-01",
+		AggregateType: "domain",
+		AggregateID:   "dom-slow",
+		EventType:     "domain.config.changed",
+		Payload:       []byte(`{"domain_id": "dom-slow"}`),
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	// Wait briefly for worker to pick up event
+	time.Sleep(30 * time.Millisecond)
+
+	startStop := time.Now()
+	err := d.Stop()
+	elapsed := time.Since(startStop)
+
+	// Stop must return within reasonable deadline and not hang
+	if elapsed > 1*time.Second {
+		t.Fatalf("d.Stop() took %v, exceeded shutdown deadline", elapsed)
+	}
+	if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("unexpected stop error: %v", err)
+	}
+}
+
+func TestBroadcaster_DropTrackingWhenBufferSaturated(t *testing.T) {
+	b := NewBroadcasterWithBufferSize(2)
+	defer b.Close()
+
+	ch, cleanup := b.Subscribe("dhaka")
+	defer cleanup()
+
+	// Send 5 events without reading from ch (bufferSize=2)
+	for i := 0; i < 5; i++ {
+		b.Broadcast("dhaka", Event{Type: "test_event"})
+	}
+
+	if b.DeliveredCount() != 2 {
+		t.Fatalf("expected 2 delivered events, got %d", b.DeliveredCount())
+	}
+	if b.DroppedCount() != 3 {
+		t.Fatalf("expected 3 dropped events due to full buffer, got %d", b.DroppedCount())
+	}
+
+	// Read 2 events from channel
+	for i := 0; i < 2; i++ {
+		<-ch
+	}
+}
+
+func TestGatewaySyncTracker_ConvergenceLifecycle(t *testing.T) {
+	tracker := NewGatewaySyncTracker(100 * time.Millisecond)
+
+	// Advance target version
+	v1 := tracker.AdvanceTargetVersion(1, "chk-1")
+	if v1 != 2 {
+		t.Fatalf("expected target version 2, got %d", v1)
+	}
+
+	// 1. Gateway 1 ACKs version 2 -> IN_SYNC
+	rec1, err := tracker.RecordAck(GatewaySyncAcknowledgement{
+		GatewayID:       "gw-sg-01",
+		PoPID:           "singapore",
+		AppliedVersion:  2,
+		AppliedChecksum: "chk-1",
+		Status:          "IN_SYNC",
+	})
+	if err != nil {
+		t.Fatalf("RecordAck failed: %v", err)
+	}
+	if rec1.Status != SyncStatusInSync || rec1.VersionLag != 0 {
+		t.Fatalf("expected IN_SYNC and lag 0, got status=%s lag=%d", rec1.Status, rec1.VersionLag)
+	}
+
+	// 2. Gateway 2 ACKs version 1 -> LAGGING
+	rec2, err := tracker.RecordAck(GatewaySyncAcknowledgement{
+		GatewayID:       "gw-dhk-01",
+		PoPID:           "dhaka",
+		AppliedVersion:  1,
+		AppliedChecksum: "chk-0",
+		Status:          "APPLYING",
+	})
+	if err != nil {
+		t.Fatalf("RecordAck failed: %v", err)
+	}
+	if rec2.Status != SyncStatusApplying || rec2.VersionLag != 1 {
+		t.Fatalf("expected APPLYING and lag 1, got status=%s lag=%d", rec2.Status, rec2.VersionLag)
+	}
+
+	// 3. Summary check
+	summary := tracker.GetConvergenceSummary()
+	if summary["total_gateways"] != 2 {
+		t.Fatalf("expected 2 total gateways, got %v", summary["total_gateways"])
+	}
+	if summary["in_sync_gateways"] != 1 {
+		t.Fatalf("expected 1 in_sync gateway, got %v", summary["in_sync_gateways"])
+	}
+	if summary["fully_converged"] != false {
+		t.Fatalf("expected fully_converged to be false, got %v", summary["fully_converged"])
+	}
+
+	// 4. Stale detection: wait past staleThreshold (100ms)
+	time.Sleep(120 * time.Millisecond)
+	list := tracker.ListGateways()
+	for _, gw := range list {
+		if gw.Status != SyncStatusStale {
+			t.Errorf("expected gateway %s to become STALE, got status %s", gw.GatewayID, gw.Status)
+		}
+	}
+}

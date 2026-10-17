@@ -2,17 +2,48 @@ package events
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
+
+// PermanentError marks an unrecoverable poison-pill error that must be quarantined immediately.
+type PermanentError interface {
+	error
+	IsPermanent() bool
+}
+
+type permanentError struct {
+	err error
+}
+
+func (p *permanentError) Error() string     { return p.err.Error() }
+func (p *permanentError) IsPermanent() bool { return true }
+func (p *permanentError) Unwrap() error     { return p.err }
+
+// NewPermanentError wraps an error as permanent to trigger immediate quarantine.
+func NewPermanentError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentError{err: err}
+}
+
+// IsPermanent returns true if err or its cause implements PermanentError.
+func IsPermanent(err error) bool {
+	var pe PermanentError
+	return errors.As(err, &pe) && pe.IsPermanent()
+}
 
 // OutboxDispatcherConfig tunes the transactional outbox worker daemon.
 type OutboxDispatcherConfig struct {
@@ -51,9 +82,52 @@ func (f OutboxEventHandlerFunc) HandleOutboxEvent(ctx context.Context, ev *store
 	return f(ctx, ev)
 }
 
-// BroadcasterBridge adapts store.OutboxEvent into edge notifications for Broadcaster.
+func validateOutboxPayloadSchema(eventType string, payload map[string]interface{}) error {
+	if payload == nil {
+		return errors.New("payload cannot be empty")
+	}
+
+	checkNonEmptyStr := func(key string) error {
+		val, ok := payload[key]
+		if !ok || val == nil {
+			return fmt.Errorf("missing required field '%s'", key)
+		}
+		s, ok := val.(string)
+		if !ok || strings.TrimSpace(s) == "" {
+			return fmt.Errorf("field '%s' must be a non-empty string", key)
+		}
+		return nil
+	}
+
+	switch eventType {
+	case "domain.config.changed", "domain.status.changed", "domain.deleted":
+		return checkNonEmptyStr("domain_id")
+	case "pool.config.changed":
+		return checkNonEmptyStr("pool_id")
+	case "route.config.changed":
+		if err := checkNonEmptyStr("route_id"); err != nil {
+			return err
+		}
+		return checkNonEmptyStr("domain_id")
+	case "security.policy.changed":
+		return checkNonEmptyStr("domain_id")
+	case "certificate.changed":
+		if err := checkNonEmptyStr("cert_id"); err != nil {
+			return err
+		}
+		return checkNonEmptyStr("domain_id")
+	case "ai_provider.changed":
+		return checkNonEmptyStr("provider_id")
+	default:
+		return nil
+	}
+}
+
+// BroadcasterBridge adapts store.OutboxEvent into edge notifications for Broadcaster
+// and advances the global Edge Configuration Convergence Tracker (P1).
 type BroadcasterBridge struct {
 	broadcaster *Broadcaster
+	tracker     *GatewaySyncTracker
 }
 
 // NewBroadcasterBridge creates a bridge connecting outbox dispatching to real-time Edge Gateways.
@@ -61,42 +135,77 @@ func NewBroadcasterBridge(b *Broadcaster) *BroadcasterBridge {
 	return &BroadcasterBridge{broadcaster: b}
 }
 
-// HandleOutboxEvent translates an outbox event into Broadcaster notifications.
+// NewBroadcasterBridgeWithTracker creates a bridge with integrated edge convergence tracking.
+func NewBroadcasterBridgeWithTracker(b *Broadcaster, tracker *GatewaySyncTracker) *BroadcasterBridge {
+	return &BroadcasterBridge{
+		broadcaster: b,
+		tracker:     tracker,
+	}
+}
+
+// HandleOutboxEvent translates an outbox event into Broadcaster notifications,
+// strictly validating payloads and advancing the target configuration version.
 func (b *BroadcasterBridge) HandleOutboxEvent(ctx context.Context, ev *store.OutboxEvent) error {
-	if b.broadcaster == nil || ev == nil {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	if ev == nil {
 		return nil
 	}
 
+	if len(ev.Payload) == 0 {
+		return NewPermanentError(fmt.Errorf("empty payload in outbox event %s", ev.EventID))
+	}
+
 	var payload map[string]interface{}
-	if len(ev.Payload) > 0 {
-		_ = json.Unmarshal(ev.Payload, &payload)
+	if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+		return NewPermanentError(fmt.Errorf("malformed JSON in outbox payload for event %s: %w", ev.EventID, err))
+	}
+
+	if err := validateOutboxPayloadSchema(ev.EventType, payload); err != nil {
+		return NewPermanentError(fmt.Errorf("payload schema validation error for event %s (%s): %w", ev.EventID, ev.EventType, err))
+	}
+
+	sum := sha256.Sum256(ev.Payload)
+	checksum := hex.EncodeToString(sum[:8])
+
+	var targetVer int64
+	if b.tracker != nil {
+		targetVer = b.tracker.AdvanceTargetVersion(1, checksum)
 	}
 
 	var allowedPoPs []string
-	if payload != nil {
-		if rawPoPs, ok := payload["allowed_pops"].([]interface{}); ok {
-			for _, p := range rawPoPs {
-				if s, ok := p.(string); ok && s != "" {
-					allowedPoPs = append(allowedPoPs, s)
-				}
+	if rawPoPs, ok := payload["allowed_pops"].([]interface{}); ok {
+		for _, p := range rawPoPs {
+			if s, ok := p.(string); ok && s != "" {
+				allowedPoPs = append(allowedPoPs, s)
 			}
 		}
 	}
 
+	payload["target_version"] = targetVer
+	payload["checksum"] = checksum
+
 	outEvent := Event{
 		Type:      ev.EventType,
 		Timestamp: ev.CreatedAt,
+		Checksum:  checksum,
 		Payload:   payload,
 	}
 
-	if len(allowedPoPs) > 0 {
-		for _, pop := range allowedPoPs {
-			b.broadcaster.Broadcast(pop, outEvent)
-			b.broadcaster.BroadcastConfigUpdate(pop, "")
+	if b.broadcaster != nil {
+		if len(allowedPoPs) > 0 {
+			for _, pop := range allowedPoPs {
+				b.broadcaster.Broadcast(pop, outEvent)
+				b.broadcaster.BroadcastConfigUpdate(pop, checksum)
+			}
+		} else {
+			b.broadcaster.Broadcast("*", outEvent)
+			b.broadcaster.BroadcastConfigUpdate("*", checksum)
 		}
-	} else {
-		b.broadcaster.Broadcast("*", outEvent)
-		b.broadcaster.BroadcastConfigUpdate("*", "")
 	}
 
 	return nil
@@ -188,11 +297,23 @@ func (d *OutboxDispatcher) Start(ctx context.Context) {
 }
 
 // Stop initiates a graceful shutdown of the outbox worker and waits for active processing to drain.
-func (d *OutboxDispatcher) Stop() {
+// Stop initiates a graceful shutdown bounded by cfg.ShutdownTimeout (default 5s).
+func (d *OutboxDispatcher) Stop() error {
+	timeout := d.cfg.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return d.StopWithContext(ctx)
+}
+
+// StopWithContext initiates a graceful shutdown bounded by the provided context deadline.
+func (d *OutboxDispatcher) StopWithContext(ctx context.Context) error {
 	d.mu.Lock()
 	if !d.running {
 		d.mu.Unlock()
-		return
+		return nil
 	}
 	d.running = false
 	if d.cancel != nil {
@@ -200,7 +321,19 @@ func (d *OutboxDispatcher) Stop() {
 	}
 	d.mu.Unlock()
 
-	d.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		d.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		log.Printf("[WARN] OutboxDispatcher shutdown deadline exceeded (%v): active tasks drained or left for lease expiry", ctx.Err())
+		return ctx.Err()
+	}
 }
 
 // Trigger notifies the dispatcher to immediately evaluate pending events without waiting for the next ticker tick.
@@ -241,7 +374,11 @@ func (d *OutboxDispatcher) DispatchBatch(ctx context.Context) (int, error) {
 			}
 		} else {
 			d.eventsFailed.Add(1)
-			if failErr := d.store.MarkOutboxEventFailed(ctx, ev.EventID, d.cfg.WorkerID, ev.LeaseToken, handleErr.Error()); failErr != nil {
+			failReason := handleErr.Error()
+			if IsPermanent(handleErr) {
+				failReason = "QUARANTINE: " + failReason
+			}
+			if failErr := d.store.MarkOutboxEventFailed(ctx, ev.EventID, d.cfg.WorkerID, ev.LeaseToken, failReason); failErr != nil {
 				log.Printf("[ERROR] Failed to mark outbox event %s failed: %v", ev.EventID, failErr)
 			}
 		}

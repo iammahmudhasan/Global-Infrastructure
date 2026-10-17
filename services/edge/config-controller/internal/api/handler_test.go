@@ -4533,3 +4533,76 @@ func TestOutboxStatusRoute(t *testing.T) {
 		t.Fatalf("expected 405 Method Not Allowed for POST, got %d", wPost.Code)
 	}
 }
+
+func TestGatewayConvergenceRoutes(t *testing.T) {
+	h := setupTestServer()
+
+	// 1. Initial gateway sync check: current_version=0 vs target_version=1 -> needs_pull=true
+	req := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=0", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for gateway sync query, got %d", w.Code)
+	}
+	var syncRes map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&syncRes); err != nil {
+		t.Fatalf("decode sync response error: %v", err)
+	}
+	if syncRes["needs_pull"] != true {
+		t.Fatalf("expected needs_pull true for version 0, got %v", syncRes["needs_pull"])
+	}
+
+	// 2. Gateway reports applied version 1 via ACK
+	ackBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+		"status":           "IN_SYNC",
+	})
+	reqAck := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(ackBody))
+	wAck := httptest.NewRecorder()
+	h.ServeHTTP(wAck, reqAck)
+	if wAck.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for gateway ack, got %d", wAck.Code)
+	}
+	var ackRec map[string]interface{}
+	if err := json.NewDecoder(wAck.Body).Decode(&ackRec); err != nil {
+		t.Fatalf("decode ack response error: %v", err)
+	}
+	if ackRec["status"] != "IN_SYNC" || ackRec["version_lag"].(float64) != 0 {
+		t.Fatalf("expected IN_SYNC with lag 0, got %v", ackRec)
+	}
+
+	// 3. Inspect convergence status
+	reqStatus := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/status", nil)
+	wStatus := httptest.NewRecorder()
+	h.ServeHTTP(wStatus, reqStatus)
+	if wStatus.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for gateway status, got %d", wStatus.Code)
+	}
+	var statusRes map[string]interface{}
+	if err := json.NewDecoder(wStatus.Body).Decode(&statusRes); err != nil {
+		t.Fatalf("decode status response error: %v", err)
+	}
+	summary, ok := statusRes["summary"].(map[string]interface{})
+	if !ok || summary["total_gateways"].(float64) != 1 || summary["fully_converged"].(bool) != true {
+		t.Fatalf("expected 1 gateway fully converged, got summary %v", summary)
+	}
+
+	// 4. Target version advances -> gateway sync query detects lag
+	h.GatewaySyncTracker().AdvanceTargetVersion(1, "chk-target-2")
+	reqSync2 := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=1", nil)
+	wSync2 := httptest.NewRecorder()
+	h.ServeHTTP(wSync2, reqSync2)
+	if wSync2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for gateway sync query 2, got %d", wSync2.Code)
+	}
+	var syncRes2 map[string]interface{}
+	if err := json.NewDecoder(wSync2.Body).Decode(&syncRes2); err != nil {
+		t.Fatalf("decode sync response 2 error: %v", err)
+	}
+	if syncRes2["needs_pull"] != true || syncRes2["target_version"].(float64) != 2 {
+		t.Fatalf("expected needs_pull true for target_version 2, got %v", syncRes2)
+	}
+}

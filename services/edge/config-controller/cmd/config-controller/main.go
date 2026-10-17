@@ -270,7 +270,7 @@ func main() {
 	defer stopDispatcher()
 
 	if outboxStore, ok := dataStore.(store.OutboxStore); ok {
-		bridge := events.NewBroadcasterBridge(handler.Broadcaster())
+		bridge := events.NewBroadcasterBridgeWithTracker(handler.Broadcaster(), handler.GatewaySyncTracker())
 		cfg := events.DefaultOutboxDispatcherConfig()
 		if intervalEnv := os.Getenv("NEXUSEDGE_OUTBOX_POLL_INTERVAL"); intervalEnv != "" {
 			if d, err := time.ParseDuration(intervalEnv); err == nil && d > 0 {

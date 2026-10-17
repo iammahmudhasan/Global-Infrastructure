@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 )
 
 const (
@@ -117,6 +118,7 @@ type Store struct {
 	aiProviders         map[string]*model.AIProvider          // provider ID -> AIProvider
 	auditLogs           []*model.AuditLog
 	auditLogMap         map[string]*model.AuditLog // id -> AuditLog
+	auditHMACKey        []byte
 	outboxEvents        []*inMemoryOutboxEntry
 }
 
@@ -1518,6 +1520,13 @@ func (s *Store) DeleteAIProvider(id string) error {
 	return nil
 }
 
+func (s *Store) SetAuditHMACKey(key []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditHMACKey = make([]byte, len(key))
+	copy(s.auditHMACKey, key)
+}
+
 func (s *Store) SaveAuditLog(log *model.AuditLog) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1532,6 +1541,38 @@ func (s *Store) SaveAuditLog(log *model.AuditLog) error {
 			return nil
 		}
 		return fmt.Errorf("audit log conflict: ID %s exists with different hash", clone.ID)
+	}
+
+	currentHead := security.GenesisHash
+	if len(s.auditLogs) > 0 {
+		currentHead = s.auditLogs[len(s.auditLogs)-1].Hash
+	}
+
+	if len(s.auditHMACKey) > 0 {
+		if clone.PrevHash != currentHead {
+			clone.PrevHash = currentHead
+			tsStr := clone.CreatedAt.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
+			newHash, err := security.ComputeCanonicalPayloadHash(
+				s.auditHMACKey,
+				clone.ID,
+				tsStr,
+				clone.Actor,
+				clone.OrgID,
+				clone.ProjectID,
+				clone.Action,
+				clone.ResourceType,
+				clone.ResourceID,
+				clone.ClientIP,
+				clone.Details,
+				clone.PrevHash,
+			)
+			if err != nil {
+				return fmt.Errorf("recompute audit log hash: %w", err)
+			}
+			clone.Hash = newHash
+		}
+	} else if len(s.auditLogs) == 0 && clone.PrevHash == "" {
+		clone.PrevHash = security.GenesisHash
 	}
 
 	s.auditLogs = append(s.auditLogs, &clone)
@@ -1720,7 +1761,7 @@ func (s *Store) MarkOutboxEventFailed(ctx context.Context, eventID string, worke
 	for _, entry := range s.outboxEvents {
 		if entry.event.EventID == eventID {
 			if entry.event.Status == "PROCESSING" && entry.lockedBy == workerID && entry.event.LeaseToken == leaseToken && now.Before(entry.lockedUntil) {
-				if entry.event.RetryCount >= 5 {
+				if strings.HasPrefix(reason, "QUARANTINE:") || strings.HasPrefix(reason, "DEAD_LETTER:") || entry.event.RetryCount >= 5 {
 					entry.event.Status = "DEAD_LETTER"
 				} else {
 					entry.event.Status = "PENDING"

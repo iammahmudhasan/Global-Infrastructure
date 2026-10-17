@@ -2,6 +2,7 @@ package events
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,10 +31,12 @@ type Event struct {
 
 // Broadcaster manages real-time event distribution to connected Edge Gateways with per-PoP isolation.
 type Broadcaster struct {
-	mu          sync.RWMutex
-	subscribers map[string]map[chan Event]struct{}
-	bufferSize  int
-	closed      bool
+	mu              sync.RWMutex
+	subscribers     map[string]map[chan Event]struct{}
+	bufferSize      int
+	closed          bool
+	deliveredEvents atomic.Int64
+	droppedEvents   atomic.Int64
 }
 
 // NewBroadcaster creates an initialized Broadcaster.
@@ -89,24 +92,32 @@ func (b *Broadcaster) Subscribe(popID string) (<-chan Event, func()) {
 
 // Broadcast sends an event to all subscribers registered for popID and wildcard ("*") subscribers.
 // Sends are strictly non-blocking to prevent slow or stalled consumers from impacting line-rate dispatch.
-func (b *Broadcaster) Broadcast(popID string, evt Event) {
+// Returns (deliveredCount, droppedCount) across all targeted subscriber channels.
+func (b *Broadcaster) Broadcast(popID string, evt Event) (int, int) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 
 	if b.closed {
-		return
+		return 0, 0
 	}
 
 	if evt.Timestamp.IsZero() {
 		evt.Timestamp = time.Now().UTC()
 	}
 
+	delivered := 0
+	dropped := 0
+
 	deliver := func(subs map[chan Event]struct{}) {
 		for ch := range subs {
 			select {
 			case ch <- evt:
+				delivered++
+				b.deliveredEvents.Add(1)
 			default:
 				// Buffer saturated: drop to protect overall system throughput and avoid goroutine leaks
+				dropped++
+				b.droppedEvents.Add(1)
 			}
 		}
 	}
@@ -123,16 +134,28 @@ func (b *Broadcaster) Broadcast(popID string, evt Event) {
 			deliver(subs)
 		}
 	}
+
+	return delivered, dropped
 }
 
 // BroadcastConfigUpdate is a helper to broadcast a configuration invalidation event for a specific PoP.
-func (b *Broadcaster) BroadcastConfigUpdate(popID, checksum string) {
-	b.Broadcast(popID, Event{
+func (b *Broadcaster) BroadcastConfigUpdate(popID, checksum string) (int, int) {
+	return b.Broadcast(popID, Event{
 		Type:      EventConfigUpdate,
 		PoPID:     popID,
 		Checksum:  checksum,
 		Timestamp: time.Now().UTC(),
 	})
+}
+
+// DroppedCount returns the aggregate dropped event notifications across all subscribers.
+func (b *Broadcaster) DroppedCount() int64 {
+	return b.droppedEvents.Load()
+}
+
+// DeliveredCount returns the aggregate successfully delivered event notifications.
+func (b *Broadcaster) DeliveredCount() int64 {
+	return b.deliveredEvents.Load()
 }
 
 // SubscriberCount returns the total active subscriber channels for a given popID.

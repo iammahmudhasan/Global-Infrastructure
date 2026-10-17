@@ -1691,6 +1691,14 @@ func (r *PostgresRepository) SaveRoute(rt *model.Route) error {
 }
 
 func (r *PostgresRepository) GetRoutes(domainID string) []*model.Route {
+	// First ensure domain exists authoritatively in PostgreSQL (P1 Multi-Replica Stale Eviction)
+	if _, err := r.getDomainFromDB(domainID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			_ = r.cache.DeleteDomain(domainID)
+		}
+		return nil
+	}
+
 	cached := r.cache.GetRoutes(domainID)
 	if len(cached) > 0 {
 		return cached
@@ -2695,7 +2703,10 @@ func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID 
 	const maxRetries = 5
 	query := `
 		UPDATE outbox_events
-		SET status = CASE WHEN retry_count >= $1 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+		SET status = CASE 
+		        WHEN $2 LIKE 'QUARANTINE:%' OR $2 LIKE 'DEAD_LETTER:%' OR retry_count >= $1 THEN 'DEAD_LETTER' 
+		        ELSE 'PENDING' 
+		    END,
 		    error_message = $2,
 		    locked_by = '',
 		    lease_token = '',

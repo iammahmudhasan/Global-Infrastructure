@@ -76,6 +76,7 @@ type APIHandler struct {
 	cableManager       *cable.Manager
 	auditKey           []byte
 	outboxDispatcher   *events.OutboxDispatcher
+	gatewaySyncTracker *events.GatewaySyncTracker
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -193,6 +194,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		storageManager:     storage.NewManager(),
 		cableManager:       cable.NewManager(),
 		auditKey:           auditKey,
+		gatewaySyncTracker: events.NewGatewaySyncTracker(15 * time.Second),
 	}
 	h.registerRoutes()
 	return h
@@ -288,6 +290,14 @@ func (h *APIHandler) OutboxDispatcher() *events.OutboxDispatcher {
 
 func (h *APIHandler) SetOutboxDispatcher(d *events.OutboxDispatcher) {
 	h.outboxDispatcher = d
+}
+
+func (h *APIHandler) GatewaySyncTracker() *events.GatewaySyncTracker {
+	return h.gatewaySyncTracker
+}
+
+func (h *APIHandler) SetGatewaySyncTracker(t *events.GatewaySyncTracker) {
+	h.gatewaySyncTracker = t
 }
 
 func (h *APIHandler) Store() store.Repository {
@@ -430,6 +440,9 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/edge/network/cables", h.handleNetworkCables)
 	h.mux.HandleFunc("/v1/edge/network/cables/", h.handleNetworkCablesRoute)
 	h.mux.HandleFunc("/v1/system/outbox/status", h.handleOutboxStatus)
+	h.mux.HandleFunc("/v1/edge/gateways/ack", h.handleGatewayAck)
+	h.mux.HandleFunc("/v1/edge/gateways/status", h.handleGatewayStatus)
+	h.mux.HandleFunc("/v1/edge/gateways/sync", h.handleGatewaySync)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -4050,6 +4063,80 @@ func (h *APIHandler) handleOutboxStatus(w http.ResponseWriter, r *http.Request) 
 		"batches_executed":   stats.BatchesExecuted,
 		"last_dispatched_at": stats.LastDispatchedAt,
 		"last_lag_ms":        stats.LastLag.Milliseconds(),
+	})
+}
+
+func (h *APIHandler) handleGatewayAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var ack events.GatewaySyncAcknowledgement
+	if err := json.NewDecoder(r.Body).Decode(&ack); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request payload")
+		return
+	}
+	if h.gatewaySyncTracker == nil {
+		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")
+		return
+	}
+	rec, err := h.gatewaySyncTracker.RecordAck(ack)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
+}
+
+func (h *APIHandler) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.gatewaySyncTracker == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"gateways": []interface{}{},
+			"summary":  map[string]interface{}{"status": "disabled"},
+		})
+		return
+	}
+	gateways := h.gatewaySyncTracker.ListGateways()
+	summary := h.gatewaySyncTracker.GetConvergenceSummary()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"gateways": gateways,
+		"summary":  summary,
+	})
+}
+
+func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.gatewaySyncTracker == nil {
+		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")
+		return
+	}
+	gatewayID := r.URL.Query().Get("gateway_id")
+	currentVerStr := r.URL.Query().Get("current_version")
+	var currentVer int64
+	if currentVerStr != "" {
+		if v, err := strconv.ParseInt(currentVerStr, 10, 64); err == nil {
+			currentVer = v
+		}
+	}
+
+	targetVer := h.gatewaySyncTracker.TargetVersion()
+	targetChk := h.gatewaySyncTracker.TargetChecksum()
+	needsPull := currentVer < targetVer
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"gateway_id":      gatewayID,
+		"current_version": currentVer,
+		"target_version":  targetVer,
+		"target_checksum": targetChk,
+		"needs_pull":      needsPull,
+		"snapshot_url":    "/v1/edge/envoy-config",
 	})
 }
 
