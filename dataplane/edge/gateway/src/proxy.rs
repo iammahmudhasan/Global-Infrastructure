@@ -1387,6 +1387,8 @@ pub fn has_conditional_or_range_headers(headers: &hyper::HeaderMap) -> bool {
         || headers.contains_key("if-range")
         || headers.contains_key("if-none-match")
         || headers.contains_key("if-modified-since")
+        || headers.contains_key("if-match")
+        || headers.contains_key("if-unmodified-since")
 }
 
 #[cfg(test)]
@@ -1821,6 +1823,17 @@ mod tests {
         headers.remove("if-none-match");
         headers.insert(
             "if-modified-since",
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert!(has_conditional_or_range_headers(&headers));
+
+        headers.remove("if-modified-since");
+        headers.insert("if-match", "\"etag123\"".parse().unwrap());
+        assert!(has_conditional_or_range_headers(&headers));
+
+        headers.remove("if-match");
+        headers.insert(
+            "if-unmodified-since",
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
         );
         assert!(has_conditional_or_range_headers(&headers));

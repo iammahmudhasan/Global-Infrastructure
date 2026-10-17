@@ -2782,6 +2782,10 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 		var finalBytes []byte
 		var bodyHash string
+		targetVer := int64(1)
+		if h.gatewaySyncTracker != nil {
+			targetVer = h.gatewaySyncTracker.TargetVersion()
+		}
 
 		if exists && cached.contentHash == compositeKey {
 			finalBytes = cached.bodyBytes
@@ -2789,12 +2793,8 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			bodyHash = hex.EncodeToString(bodySum[:])
 		} else {
 			compiledAt := time.Now().UTC().Truncate(time.Second)
-			targetVer := int64(1)
-			if h.gatewaySyncTracker != nil {
-				targetVer = h.gatewaySyncTracker.TargetVersion()
-				if !h.gatewaySyncTracker.TargetUpdatedAt().IsZero() {
-					compiledAt = h.gatewaySyncTracker.TargetUpdatedAt().Truncate(time.Second)
-				}
+			if h.gatewaySyncTracker != nil && !h.gatewaySyncTracker.TargetUpdatedAt().IsZero() {
+				compiledAt = h.gatewaySyncTracker.TargetUpdatedAt().Truncate(time.Second)
 			}
 			syncResult := model.PoPConfigSync{
 				PoPID:           pop.ID,
@@ -2826,7 +2826,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if h.gatewaySyncTracker != nil {
-			h.gatewaySyncTracker.SetPoPTargetChecksum(popID, bodyHash)
+			h.gatewaySyncTracker.SetPoPTargetChecksum(popID, targetVer, bodyHash)
 		}
 
 		w.Header().Set("X-Snapshot-Checksum", bodyHash)
@@ -4271,8 +4271,11 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 	targetVer := h.gatewaySyncTracker.TargetVersion()
 	targetChk := h.gatewaySyncTracker.TargetChecksum()
 	if popID != "" {
-		if popChk := h.gatewaySyncTracker.GetPoPTargetChecksum(popID); popChk != "" {
+		if popVer, popChk := h.gatewaySyncTracker.GetPoPTargetChecksum(popID); popChk != "" {
 			targetChk = popChk
+			if popVer > 0 {
+				targetVer = popVer
+			}
 		}
 	}
 	needsPull := currentVer < targetVer

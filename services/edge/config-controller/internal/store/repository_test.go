@@ -1768,3 +1768,100 @@ func TestPostgresRepository_ReconcileCache_QueryFailurePreservesWorkingCache(t *
 		t.Fatalf("expected cached domain %s to remain present, err: %v", domID, err)
 	}
 }
+
+func TestStore_ApplyReconciliationSnapshot_AtomicEviction(t *testing.T) {
+	s := store.NewStore()
+
+	// 1. Seed store with 2 items of each entity type
+	dom1 := &model.Domain{ID: "dom-keep", ProjectID: "p1", Hostname: "keep.example.com", Status: model.DomainStatusActive}
+	dom2 := &model.Domain{ID: "dom-stale", ProjectID: "p1", Hostname: "stale.example.com", Status: model.DomainStatusActive}
+	_ = s.SaveDomain(dom1)
+	_ = s.SaveDomain(dom2)
+
+	pool1 := &model.OriginPool{ID: "pool-keep", ProjectID: "p1", Name: "keep-pool"}
+	pool2 := &model.OriginPool{ID: "pool-stale", ProjectID: "p1", Name: "stale-pool"}
+	_ = s.SaveOriginPool(pool1)
+	_ = s.SaveOriginPool(pool2)
+
+	orig1 := &model.Origin{ID: "orig-keep", PoolID: "pool-keep", Address: "1.1.1.1", Port: 80, Weight: 1}
+	orig2 := &model.Origin{ID: "orig-stale", PoolID: "pool-stale", Address: "2.2.2.2", Port: 80, Weight: 1}
+	_ = s.AddOrigin(orig1)
+	_ = s.AddOrigin(orig2)
+
+	cert1 := &model.Certificate{ID: "cert-keep", DomainID: "dom-keep", Domains: []string{"keep.example.com"}, Status: model.CertStatusActive}
+	cert2 := &model.Certificate{ID: "cert-stale", DomainID: "dom-stale", Domains: []string{"stale.example.com"}, Status: model.CertStatusActive}
+	_ = s.SaveCertificate(cert1)
+	_ = s.SaveCertificate(cert2)
+
+	sp1 := &model.SecurityPolicy{ID: "sp-keep", DomainID: "dom-keep"}
+	sp2 := &model.SecurityPolicy{ID: "sp-stale", DomainID: "dom-stale"}
+	_ = s.SaveSecurityPolicy(sp1)
+	_ = s.SaveSecurityPolicy(sp2)
+
+	versionBefore := s.GetVersion()
+
+	// 2. Prepare candidate reconciliation snapshot containing ONLY the keep entities
+	pool1WithOrigins := &model.OriginPool{
+		ID:        "pool-keep",
+		ProjectID: "p1",
+		Name:      "keep-pool",
+		Origins:   []model.Origin{*orig1},
+	}
+	snap := &store.ReconciliationSnapshot{
+		Domains: map[string]*model.Domain{
+			dom1.ID: dom1,
+		},
+		RoutesByDomain: map[string][]*model.Route{},
+		Pools: map[string]*model.OriginPool{
+			pool1WithOrigins.ID: pool1WithOrigins,
+		},
+		Certificates: map[string]*model.Certificate{
+			cert1.DomainID: cert1,
+		},
+		SecurityPolicies: map[string]*model.SecurityPolicy{
+			sp1.DomainID: sp1,
+		},
+	}
+
+	// 3. Atomically apply snapshot
+	if err := s.ApplyReconciliationSnapshot(snap); err != nil {
+		t.Fatalf("ApplyReconciliationSnapshot failed: %v", err)
+	}
+
+	// 4. Invariant: Stale entities MUST be completely evicted
+	if _, err := s.GetDomain("dom-stale"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for dom-stale, got %v", err)
+	}
+	if _, err := s.GetOriginPool("pool-stale"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for pool-stale, got %v", err)
+	}
+	if cert := s.GetCertificate("dom-stale"); cert != nil {
+		t.Fatalf("expected nil certificate for dom-stale, got %+v", cert)
+	}
+	if sp := s.GetSecurityPolicy("dom-stale"); sp != nil {
+		t.Fatalf("expected nil security policy for dom-stale, got %+v", sp)
+	}
+
+	// 5. Invariant: Kept entities MUST remain accessible
+	if dom, err := s.GetDomain("dom-keep"); err != nil || dom == nil {
+		t.Fatalf("expected dom-keep to be present, err: %v", err)
+	}
+	pool, err := s.GetOriginPool("pool-keep")
+	if err != nil || pool == nil {
+		t.Fatalf("expected pool-keep to be present, err: %v", err)
+	}
+	if len(pool.Origins) != 1 || pool.Origins[0].ID != "orig-keep" {
+		t.Fatalf("expected pool-keep to have orig-keep, got %+v", pool.Origins)
+	}
+	if cert := s.GetCertificate("dom-keep"); cert == nil {
+		t.Fatalf("expected cert for dom-keep to be present")
+	}
+	if sp := s.GetSecurityPolicy("dom-keep"); sp == nil {
+		t.Fatalf("expected sp for dom-keep to be present")
+	}
+
+	// Version must increment
+	if s.GetVersion() <= versionBefore {
+		t.Fatalf("expected store version to increment from %d, got %d", versionBefore, s.GetVersion())
+	}
+}

@@ -94,6 +94,8 @@ type Repository interface {
 	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
 	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
 	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)
+	SavePoPSnapshotHead(ctx context.Context, popID string, targetVersion int64, targetChecksum string) error
+	GetPoPSnapshotHead(ctx context.Context, popID string) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
 }
 
 // Ensure *Store satisfies Repository at compile time.

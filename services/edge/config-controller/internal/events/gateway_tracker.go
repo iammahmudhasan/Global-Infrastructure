@@ -40,6 +40,8 @@ type GatewayConvergenceStore interface {
 	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
 	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
 	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)
+	SavePoPSnapshotHead(ctx context.Context, popID string, targetVersion int64, targetChecksum string) error
+	GetPoPSnapshotHead(ctx context.Context, popID string) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
 }
 
 // GatewaySyncTracker coordinates configuration generation tracking, per-gateway ACKs,
@@ -50,6 +52,7 @@ type GatewaySyncTracker struct {
 	targetChecksum     string
 	targetUpdatedAt    time.Time
 	popTargetChecksums map[string]string
+	popTargetVersions  map[string]int64
 	gateways           map[string]*GatewaySyncRecord
 	staleThreshold     time.Duration
 	store              GatewayConvergenceStore
@@ -72,6 +75,7 @@ func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConve
 	}
 	t := &GatewaySyncTracker{
 		popTargetChecksums: make(map[string]string),
+		popTargetVersions:  make(map[string]int64),
 		gateways:           make(map[string]*GatewaySyncRecord),
 		staleThreshold:     staleThreshold,
 		targetUpdatedAt:    time.Now().UTC(),
@@ -193,35 +197,68 @@ func (t *GatewaySyncTracker) TargetUpdatedAt() time.Time {
 	return t.targetUpdatedAt
 }
 
-// SetPoPTargetChecksum records the authoritative compiled snapshot checksum for a specific PoP.
-func (t *GatewaySyncTracker) SetPoPTargetChecksum(popID string, checksum string) {
+// SetPoPTargetChecksum records the authoritative compiled snapshot checksum and version for a specific PoP.
+// Invariant: Durable across multi-replica control plane. If backing store exists, persists to durable storage.
+func (t *GatewaySyncTracker) SetPoPTargetChecksum(popID string, targetVersion int64, checksum string) {
 	if strings.TrimSpace(popID) == "" || strings.TrimSpace(checksum) == "" {
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.popTargetChecksums == nil {
 		t.popTargetChecksums = make(map[string]string)
+		t.popTargetVersions = make(map[string]int64)
 	}
 	t.popTargetChecksums[popID] = checksum
+	t.popTargetVersions[popID] = targetVersion
+	store := t.store
+	t.mu.Unlock()
+
+	if store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = store.SavePoPSnapshotHead(ctx, popID, targetVersion, checksum)
+	}
 }
 
-// GetPoPTargetChecksum returns the authoritative compiled snapshot checksum for a PoP,
-// falling back to the global target checksum if not specifically set for that PoP.
-func (t *GatewaySyncTracker) GetPoPTargetChecksum(popID string) string {
+// GetPoPTargetChecksum returns the authoritative compiled snapshot checksum and version for a PoP,
+// checking local cache first, falling back to durable store, and finally global target version/checksum.
+func (t *GatewaySyncTracker) GetPoPTargetChecksum(popID string) (int64, string) {
 	t.mu.RLock()
-	defer t.mu.RUnlock()
 	if t.popTargetChecksums != nil {
 		if chk, exists := t.popTargetChecksums[popID]; exists && chk != "" {
-			return chk
+			ver := t.popTargetVersions[popID]
+			t.mu.RUnlock()
+			return ver, chk
 		}
 	}
-	return t.targetChecksum
+	store := t.store
+	globalVer := t.targetVersion.Load()
+	globalChk := t.targetChecksum
+	t.mu.RUnlock()
+
+	if store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if ver, chk, _, err := store.GetPoPSnapshotHead(ctx, popID); err == nil && chk != "" {
+			t.mu.Lock()
+			if t.popTargetChecksums == nil {
+				t.popTargetChecksums = make(map[string]string)
+				t.popTargetVersions = make(map[string]int64)
+			}
+			t.popTargetChecksums[popID] = chk
+			t.popTargetVersions[popID] = ver
+			t.mu.Unlock()
+			return ver, chk
+		}
+	}
+
+	return globalVer, globalChk
 }
 
 // RecordAck records an applied version acknowledgement from an edge gateway.
 // Rejects applied checksum mismatch with ErrChecksumMismatch and sets status to CHECKSUM_MISMATCH.
 // A gateway CANNOT be marked IN_SYNC unless both version and checksum match authoritative desired state.
+// Invariant: Exact version equality (AppliedVersion == TargetVersion) is required for IN_SYNC.
 // Invariant: Fail-closed persistence. If persistent store write fails, in-memory state is NOT updated
 // and an error is returned to caller.
 func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*GatewaySyncRecord, error) {
@@ -232,14 +269,19 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 		return nil, errors.New("pop_id is required")
 	}
 
+	// Authoritative lookup for PoP-specific snapshot head (multi-replica consistent)
+	// Resolved before acquiring t.mu.Lock() to avoid recursive lock deadlock and store I/O under mutex.
+	popVer, popChk := t.GetPoPTargetChecksum(ack.PoPID)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	targetVer := t.targetVersion.Load()
 	expectedChk := t.targetChecksum
-	if t.popTargetChecksums != nil {
-		if popChk, ok := t.popTargetChecksums[ack.PoPID]; ok && popChk != "" {
-			expectedChk = popChk
+	if popChk != "" {
+		expectedChk = popChk
+		if popVer > 0 {
+			targetVer = popVer
 		}
 	}
 	now := time.Now().UTC()
@@ -258,7 +300,7 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	}
 
 	// Strict checksum validation: Gateway cannot be IN_SYNC on checksum mismatch for target version
-	if ack.AppliedVersion >= targetVer && expectedChk != "" && ack.AppliedChecksum != "" && ack.AppliedChecksum != expectedChk {
+	if ack.AppliedVersion == targetVer && expectedChk != "" && ack.AppliedChecksum != "" && ack.AppliedChecksum != expectedChk {
 		errMsg := fmt.Sprintf("applied checksum mismatch for pop %s: expected %s, got %s", ack.PoPID, expectedChk, ack.AppliedChecksum)
 		rec := &GatewaySyncRecord{
 			GatewayID:        ack.GatewayID,
@@ -288,7 +330,13 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	var status GatewaySyncStatus
 	if strings.ToUpper(ack.Status) == string(model.SyncStatusError) || ack.Error != "" {
 		status = model.SyncStatusError
-	} else if ack.AppliedVersion >= targetVer && (expectedChk == "" || ack.AppliedChecksum == expectedChk) {
+	} else if ack.AppliedVersion > targetVer {
+		// Future version rejected: cannot be IN_SYNC when applied version exceeds authoritative target version (Finding 4)
+		status = model.SyncStatusError
+		if ack.Error == "" {
+			ack.Error = fmt.Sprintf("gateway applied future version %d exceeding authoritative target %d", ack.AppliedVersion, targetVer)
+		}
+	} else if ack.AppliedVersion == targetVer && (expectedChk == "" || ack.AppliedChecksum == expectedChk) {
 		status = model.SyncStatusInSync
 	} else if strings.ToUpper(ack.Status) == string(model.SyncStatusApplying) {
 		status = model.SyncStatusApplying

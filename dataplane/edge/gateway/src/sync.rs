@@ -4,6 +4,8 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fmt;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 /// Maximum permissible payload budget for Control Plane dynamic configuration snapshots.
 /// Enforces bounded memory allocation on edge nodes to defeat snapshot memory-bomb attacks (P2 Finding).
@@ -386,6 +388,99 @@ pub fn parse_sse_block(block: &str) -> Option<SseEvent> {
     }
 }
 
+/// Manages asynchronous, reliable dispatch of Gateway synchronization ACKs with exponential backoff.
+/// Guarantees that ACKs are never silently dropped upon control plane transient 503s or network errors.
+pub struct GatewayAckManager {
+    endpoint: String,
+    auth_token: String,
+    client: HttpClient,
+    pending_ack: Arc<RwLock<Option<GatewaySyncAckPayload>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl GatewayAckManager {
+    pub fn new(endpoint: String, auth_token: String, client: HttpClient) -> Self {
+        Self {
+            endpoint,
+            auth_token,
+            client,
+            pending_ack: Arc::new(RwLock::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
+    pub fn submit_ack(&self, ack: GatewaySyncAckPayload) {
+        if let Ok(mut guard) = self.pending_ack.write() {
+            *guard = Some(ack);
+        }
+        self.notify.notify_one();
+    }
+
+    /// Returns a copy of the currently pending ACK, if any.
+    pub fn pending_ack(&self) -> Option<GatewaySyncAckPayload> {
+        self.pending_ack.read().ok().and_then(|g| g.clone())
+    }
+
+    /// Spawns a background task that reliably delivers pending ACKs with exponential backoff.
+    pub fn spawn_worker(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_millis(500);
+            const MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+            loop {
+                let current_opt = self.pending_ack.read().ok().and_then(|g| g.clone());
+                match current_opt {
+                    Some(ack) => {
+                        match send_control_plane_ack(
+                            &self.endpoint,
+                            &self.auth_token,
+                            &self.client,
+                            &ack,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    pop_id = %ack.pop_id,
+                                    gateway_id = %ack.gateway_id,
+                                    version = ack.applied_version,
+                                    checksum = %ack.applied_checksum,
+                                    "Successfully acknowledged edge gateway synchronization state to Control Plane"
+                                );
+                                if let Ok(mut guard) = self.pending_ack.write() {
+                                    if let Some(ref latest) = *guard {
+                                        if latest.applied_version == ack.applied_version
+                                            && latest.applied_checksum == ack.applied_checksum
+                                        {
+                                            *guard = None;
+                                        }
+                                    }
+                                }
+                                backoff = Duration::from_millis(500);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    pop_id = %ack.pop_id,
+                                    error = %e,
+                                    version = ack.applied_version,
+                                    backoff_ms = backoff.as_millis(),
+                                    "Control Plane ACK submission failed; retrying with backoff"
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = (backoff * 2).min(MAX_BACKOFF);
+                            }
+                        }
+                    }
+                    None => {
+                        self.notify.notified().await;
+                    }
+                }
+            }
+        })
+    }
+}
+
 /// Context parameters required for real-time SSE configuration synchronization.
 pub struct StreamSyncContext<'a> {
     pub endpoint: &'a str,
@@ -398,6 +493,7 @@ pub struct StreamSyncContext<'a> {
     pub ai_director: Option<&'a crate::ai::AiTrafficDirector>,
     pub is_ready: &'a std::sync::atomic::AtomicBool,
     pub gateway_id: Option<&'a str>,
+    pub ack_manager: Option<&'a GatewayAckManager>,
 }
 
 /// Sends an authenticated synchronization ACK to the Control Plane convergence tracker (/v1/edge/gateways/ack).
@@ -518,13 +614,17 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                     status: "IN_SYNC".to_string(),
                                     error: None,
                                 };
-                                let _ = send_control_plane_ack(
-                                    ctx.endpoint,
-                                    ctx.auth_token,
-                                    ctx.client,
-                                    &ack,
-                                )
-                                .await;
+                                if let Some(mgr) = ctx.ack_manager {
+                                    mgr.submit_ack(ack);
+                                } else {
+                                    let _ = send_control_plane_ack(
+                                        ctx.endpoint,
+                                        ctx.auth_token,
+                                        ctx.client,
+                                        &ack,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -570,15 +670,16 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                         status: "IN_SYNC".to_string(),
                                         error: None,
                                     };
-                                    if let Err(e) = send_control_plane_ack(
-                                        ctx.endpoint,
-                                        ctx.auth_token,
-                                        ctx.client,
-                                        &ack,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(error = %e, "Failed to submit convergence ACK after SSE update");
+                                    if let Some(mgr) = ctx.ack_manager {
+                                        mgr.submit_ack(ack);
+                                    } else {
+                                        let _ = send_control_plane_ack(
+                                            ctx.endpoint,
+                                            ctx.auth_token,
+                                            ctx.client,
+                                            &ack,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -597,13 +698,17 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                         status: "ERROR".to_string(),
                                         error: Some(e.to_string()),
                                     };
-                                    let _ = send_control_plane_ack(
-                                        ctx.endpoint,
-                                        ctx.auth_token,
-                                        ctx.client,
-                                        &ack,
-                                    )
-                                    .await;
+                                    if let Some(mgr) = ctx.ack_manager {
+                                        mgr.submit_ack(ack);
+                                    } else {
+                                        let _ = send_control_plane_ack(
+                                            ctx.endpoint,
+                                            ctx.auth_token,
+                                            ctx.client,
+                                            &ack,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         }
@@ -750,5 +855,49 @@ mod tests {
         let err_json = serde_json::to_string(&err_ack).expect("serialization failed");
         assert!(err_json.contains("\"status\":\"ERROR\""));
         assert!(err_json.contains("\"error\":\"checksum mismatch\""));
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_queue_and_supersede() {
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "test-token".to_string(),
+            client,
+        );
+
+        let ack1 = GatewaySyncAckPayload {
+            gateway_id: "gw-test-01".to_string(),
+            pop_id: "singapore".to_string(),
+            applied_version: 1,
+            applied_checksum: "hash-1".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        mgr.submit_ack(ack1);
+
+        {
+            let lock = mgr.pending_ack.read().unwrap();
+            assert!(lock.is_some());
+            assert_eq!(lock.as_ref().unwrap().applied_version, 1);
+        }
+
+        // Newer version 2 arrives while ACK is still pending
+        let ack2 = GatewaySyncAckPayload {
+            gateway_id: "gw-test-01".to_string(),
+            pop_id: "singapore".to_string(),
+            applied_version: 2,
+            applied_checksum: "hash-2".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        mgr.submit_ack(ack2);
+
+        {
+            let lock = mgr.pending_ack.read().unwrap();
+            assert!(lock.is_some());
+            assert_eq!(lock.as_ref().unwrap().applied_version, 2);
+            assert_eq!(lock.as_ref().unwrap().applied_checksum, "hash-2");
+        }
     }
 }

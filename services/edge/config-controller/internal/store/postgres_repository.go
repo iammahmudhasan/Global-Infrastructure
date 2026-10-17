@@ -490,6 +490,17 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`CREATE INDEX IF NOT EXISTS idx_gateway_sync_status ON gateway_sync_state(status);`,
 			},
 		},
+		{
+			version: "0010_pop_snapshot_convergence",
+			stmts: []string{
+				`CREATE TABLE IF NOT EXISTS pop_snapshot_heads (
+					pop_id VARCHAR(64) PRIMARY KEY,
+					target_version BIGINT NOT NULL,
+					target_checksum VARCHAR(64) NOT NULL,
+					updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -1446,54 +1457,38 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 
 	// =========================================================================
 	// ATOMIC APPLY PHASE: All PostgreSQL queries and deserializations succeeded!
-	// Only now is in-memory cache mutated.
+	// Swap the entire candidate state into in-memory cache under a single lock,
+	// cleanly evicting deleted domains, routes, pools, certificates, and policies.
 	// =========================================================================
+	stagedPoolsMap := make(map[string]*model.OriginPool, len(stagedPools))
+	for _, p := range stagedPools {
+		stagedPoolsMap[p.ID] = p
+	}
+	stagedCertsMap := make(map[string]*model.Certificate, len(stagedCerts))
+	for _, c := range stagedCerts {
+		stagedCertsMap[c.DomainID] = c
+	}
+	stagedPoliciesMap := make(map[string]*model.SecurityPolicy, len(stagedPolicies))
+	for _, sp := range stagedPolicies {
+		stagedPoliciesMap[sp.DomainID] = sp
+	}
+
+	snap := &ReconciliationSnapshot{
+		Domains:          activeDBMap,
+		RoutesByDomain:   stagedRoutesByDomain,
+		Pools:            stagedPoolsMap,
+		Certificates:     stagedCertsMap,
+		SecurityPolicies: stagedPoliciesMap,
+	}
+
+	if err := r.cache.ApplyReconciliationSnapshot(snap); err != nil {
+		return nil, fmt.Errorf("apply reconciliation snapshot to cache: %w", err)
+	}
+
 	stats := &CacheReconciliationStats{
 		ActiveDomains: len(activeDBMap),
+		Duration:      time.Since(start),
 	}
-
-	// A. Evict any cached domain that no longer exists in PostgreSQL
-	cachedDomains := r.cache.ListDomains()
-	for _, cd := range cachedDomains {
-		if _, exists := activeDBMap[cd.ID]; !exists {
-			_ = r.cache.DeleteDomain(cd.ID)
-			stats.EvictedDomains++
-		}
-	}
-
-	// B. Synchronize new or updated domains
-	for _, dbDom := range activeDBMap {
-		cached, err := r.cache.GetDomain(dbDom.ID)
-		if err != nil || cached == nil {
-			_ = r.cache.SaveDomain(dbDom)
-			stats.UpdatedDomains++
-		} else if dbDom.Version > cached.Version || dbDom.Status != cached.Status || dbDom.Hostname != cached.Hostname {
-			_ = r.cache.SaveDomain(dbDom)
-			stats.UpdatedDomains++
-		}
-	}
-
-	// C. Synchronize active routes for all active domains
-	for domID := range activeDBMap {
-		r.cache.SetRoutes(domID, stagedRoutesByDomain[domID])
-	}
-
-	// D. Synchronize active origin pools and origins
-	for _, p := range stagedPools {
-		_ = r.cache.SaveOriginPool(p)
-	}
-
-	// E. Synchronize active certificates
-	for _, cert := range stagedCerts {
-		_ = r.cache.SaveCertificate(cert)
-	}
-
-	// F. Synchronize active security policies
-	for _, sp := range stagedPolicies {
-		_ = r.cache.SaveSecurityPolicy(sp)
-	}
-
-	stats.Duration = time.Since(start)
 	if !latestUpdate.IsZero() {
 		stats.MaxLag = time.Since(latestUpdate)
 	}
@@ -3053,4 +3048,43 @@ func (r *PostgresRepository) ListGatewaySyncRecords(ctx context.Context) ([]*mod
 		return nil, fmt.Errorf("iterate gateway sync records: %w", err)
 	}
 	return records, nil
+}
+
+func (r *PostgresRepository) SavePoPSnapshotHead(ctx context.Context, popID string, targetVersion int64, targetChecksum string) error {
+	if strings.TrimSpace(popID) == "" {
+		return errors.New("pop_id required")
+	}
+	query := `
+		INSERT INTO pop_snapshot_heads (pop_id, target_version, target_checksum, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (pop_id) DO UPDATE
+		SET target_version = EXCLUDED.target_version,
+		    target_checksum = EXCLUDED.target_checksum,
+		    updated_at = NOW()
+	`
+	_, err := r.db.ExecContext(ctx, query, popID, targetVersion, targetChecksum)
+	if err != nil {
+		return fmt.Errorf("save pop snapshot head: %w", err)
+	}
+	_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
+	return nil
+}
+
+func (r *PostgresRepository) GetPoPSnapshotHead(ctx context.Context, popID string) (int64, string, time.Time, error) {
+	if v, c, t, err := r.cache.GetPoPSnapshotHead(ctx, popID); err == nil && v > 0 {
+		return v, c, t, nil
+	}
+	query := `SELECT target_version, target_checksum, updated_at FROM pop_snapshot_heads WHERE pop_id = $1`
+	var targetVersion int64
+	var targetChecksum string
+	var updatedAt time.Time
+	err := r.db.QueryRowContext(ctx, query, popID).Scan(&targetVersion, &targetChecksum, &updatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, "", time.Time{}, ErrNotFound
+		}
+		return 0, "", time.Time{}, fmt.Errorf("get pop snapshot head: %w", err)
+	}
+	_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
+	return targetVersion, targetChecksum, updatedAt, nil
 }

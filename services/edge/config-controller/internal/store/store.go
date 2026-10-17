@@ -100,38 +100,41 @@ func ValidateAllowedPoPs(pops []string) error {
 }
 
 type Store struct {
-	mu                  sync.RWMutex
-	version             uint64
-	popTopologyCache    map[string][]*DomainTopology
-	activeTopologyCache []*DomainTopology
-	domains             map[string]*model.Domain
-	hostIndex           map[string]string // hostname -> domain ID
-	projectQuotas       map[string]ProjectQuota
-	projectDomainCount  map[string]int
-	pools               map[string]*model.OriginPool
-	origins             map[string]*model.Origin
-	routes              map[string][]*model.Route             // domain ID -> routes
-	security            map[string]*model.SecurityPolicy      // domain ID -> policy
-	wafRules            map[string][]model.WAFRule            // domain ID -> WAF rules
-	rateLimits          map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
-	events              map[string][]model.SecurityEvent      // domain ID -> Security events
-	cache               map[string]*model.CachePolicy         // domain ID -> policy
-	cacheRules          map[string][]model.CacheRule          // domain ID -> Cache rules
-	monitors            map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
-	healthStates        map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
-	certificates        map[string]*model.Certificate         // domain ID -> certificate
-	pendingCertificates map[string]*model.Certificate         // domain ID -> pending renewal/issuance certificate
-	challenges          map[string]*model.ACMEChallenge       // token -> ACMEChallenge
-	tlsSettings         map[string]*model.TLSSettings         // domain ID -> TLSSettings
-	aiProviders         map[string]*model.AIProvider          // provider ID -> AIProvider
-	auditLogs           []*model.AuditLog
-	auditLogMap         map[string]*model.AuditLog // id -> AuditLog
-	auditHMACKey        []byte
-	outboxEvents        []*inMemoryOutboxEntry
-	edgeConvergenceVer  int64
-	edgeConvergenceChk  string
-	edgeConvergenceTime time.Time
-	gatewaySyncStates   map[string]*model.GatewaySyncRecord
+	mu                   sync.RWMutex
+	version              uint64
+	popTopologyCache     map[string][]*DomainTopology
+	activeTopologyCache  []*DomainTopology
+	domains              map[string]*model.Domain
+	hostIndex            map[string]string // hostname -> domain ID
+	projectQuotas        map[string]ProjectQuota
+	projectDomainCount   map[string]int
+	pools                map[string]*model.OriginPool
+	origins              map[string]*model.Origin
+	routes               map[string][]*model.Route             // domain ID -> routes
+	security             map[string]*model.SecurityPolicy      // domain ID -> policy
+	wafRules             map[string][]model.WAFRule            // domain ID -> WAF rules
+	rateLimits           map[string][]model.RateLimitRule      // domain ID -> Rate limit rules
+	events               map[string][]model.SecurityEvent      // domain ID -> Security events
+	cache                map[string]*model.CachePolicy         // domain ID -> policy
+	cacheRules           map[string][]model.CacheRule          // domain ID -> Cache rules
+	monitors             map[string]*model.HealthMonitor       // pool ID -> HealthMonitor
+	healthStates         map[string]*model.OriginEndpointState // origin ID -> OriginEndpointState
+	certificates         map[string]*model.Certificate         // domain ID -> certificate
+	pendingCertificates  map[string]*model.Certificate         // domain ID -> pending renewal/issuance certificate
+	challenges           map[string]*model.ACMEChallenge       // token -> ACMEChallenge
+	tlsSettings          map[string]*model.TLSSettings         // domain ID -> TLSSettings
+	aiProviders          map[string]*model.AIProvider          // provider ID -> AIProvider
+	auditLogs            []*model.AuditLog
+	auditLogMap          map[string]*model.AuditLog // id -> AuditLog
+	auditHMACKey         []byte
+	outboxEvents         []*inMemoryOutboxEntry
+	edgeConvergenceVer   int64
+	edgeConvergenceChk   string
+	edgeConvergenceTime  time.Time
+	gatewaySyncStates    map[string]*model.GatewaySyncRecord
+	popSnapshotVersions  map[string]int64
+	popSnapshotChecksums map[string]string
+	popSnapshotTimes     map[string]time.Time
 }
 
 type inMemoryOutboxEntry struct {
@@ -142,33 +145,36 @@ type inMemoryOutboxEntry struct {
 
 func NewStore() *Store {
 	return &Store{
-		popTopologyCache:    make(map[string][]*DomainTopology),
-		domains:             make(map[string]*model.Domain),
-		hostIndex:           make(map[string]string),
-		projectQuotas:       make(map[string]ProjectQuota),
-		projectDomainCount:  make(map[string]int),
-		pools:               make(map[string]*model.OriginPool),
-		origins:             make(map[string]*model.Origin),
-		routes:              make(map[string][]*model.Route),
-		security:            make(map[string]*model.SecurityPolicy),
-		wafRules:            make(map[string][]model.WAFRule),
-		rateLimits:          make(map[string][]model.RateLimitRule),
-		events:              make(map[string][]model.SecurityEvent),
-		cache:               make(map[string]*model.CachePolicy),
-		cacheRules:          make(map[string][]model.CacheRule),
-		monitors:            make(map[string]*model.HealthMonitor),
-		healthStates:        make(map[string]*model.OriginEndpointState),
-		certificates:        make(map[string]*model.Certificate),
-		pendingCertificates: make(map[string]*model.Certificate),
-		challenges:          make(map[string]*model.ACMEChallenge),
-		tlsSettings:         make(map[string]*model.TLSSettings),
-		aiProviders:         make(map[string]*model.AIProvider),
-		auditLogs:           make([]*model.AuditLog, 0),
-		auditLogMap:         make(map[string]*model.AuditLog),
-		outboxEvents:        make([]*inMemoryOutboxEntry, 0),
-		edgeConvergenceVer:  1,
-		edgeConvergenceTime: time.Now().UTC(),
-		gatewaySyncStates:   make(map[string]*model.GatewaySyncRecord),
+		popTopologyCache:     make(map[string][]*DomainTopology),
+		domains:              make(map[string]*model.Domain),
+		hostIndex:            make(map[string]string),
+		projectQuotas:        make(map[string]ProjectQuota),
+		projectDomainCount:   make(map[string]int),
+		pools:                make(map[string]*model.OriginPool),
+		origins:              make(map[string]*model.Origin),
+		routes:               make(map[string][]*model.Route),
+		security:             make(map[string]*model.SecurityPolicy),
+		wafRules:             make(map[string][]model.WAFRule),
+		rateLimits:           make(map[string][]model.RateLimitRule),
+		events:               make(map[string][]model.SecurityEvent),
+		cache:                make(map[string]*model.CachePolicy),
+		cacheRules:           make(map[string][]model.CacheRule),
+		monitors:             make(map[string]*model.HealthMonitor),
+		healthStates:         make(map[string]*model.OriginEndpointState),
+		certificates:         make(map[string]*model.Certificate),
+		pendingCertificates:  make(map[string]*model.Certificate),
+		challenges:           make(map[string]*model.ACMEChallenge),
+		tlsSettings:          make(map[string]*model.TLSSettings),
+		aiProviders:          make(map[string]*model.AIProvider),
+		auditLogs:            make([]*model.AuditLog, 0),
+		auditLogMap:          make(map[string]*model.AuditLog),
+		outboxEvents:         make([]*inMemoryOutboxEntry, 0),
+		edgeConvergenceVer:   1,
+		edgeConvergenceTime:  time.Now().UTC(),
+		gatewaySyncStates:    make(map[string]*model.GatewaySyncRecord),
+		popSnapshotVersions:  make(map[string]int64),
+		popSnapshotChecksums: make(map[string]string),
+		popSnapshotTimes:     make(map[string]time.Time),
 	}
 }
 
@@ -176,6 +182,13 @@ func (s *Store) invalidateCachesLocked() {
 	s.version++
 	s.popTopologyCache = make(map[string][]*DomainTopology)
 	s.activeTopologyCache = nil
+}
+
+// GetVersion returns the current in-memory store generation version.
+func (s *Store) GetVersion() uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.version
 }
 
 func (s *Store) SetProjectQuota(projectID string, quota ProjectQuota) error {
@@ -1902,4 +1915,159 @@ func (s *Store) ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyn
 		list = append(list, &cp)
 	}
 	return list, nil
+}
+
+func (s *Store) SavePoPSnapshotHead(ctx context.Context, popID string, targetVersion int64, targetChecksum string) error {
+	if strings.TrimSpace(popID) == "" {
+		return errors.New("pop_id required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.popSnapshotVersions == nil {
+		s.popSnapshotVersions = make(map[string]int64)
+		s.popSnapshotChecksums = make(map[string]string)
+		s.popSnapshotTimes = make(map[string]time.Time)
+	}
+	s.popSnapshotVersions[popID] = targetVersion
+	s.popSnapshotChecksums[popID] = targetChecksum
+	s.popSnapshotTimes[popID] = time.Now().UTC()
+	return nil
+}
+
+func (s *Store) GetPoPSnapshotHead(ctx context.Context, popID string) (int64, string, time.Time, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.popSnapshotVersions != nil {
+		if ver, exists := s.popSnapshotVersions[popID]; exists && ver > 0 {
+			return ver, s.popSnapshotChecksums[popID], s.popSnapshotTimes[popID], nil
+		}
+	}
+	return 0, "", time.Time{}, ErrNotFound
+}
+
+// ReconciliationSnapshot represents an authoritative candidate snapshot of edge configuration
+// assembled from durable database queries to be atomically swapped into the in-memory cache.
+type ReconciliationSnapshot struct {
+	Domains          map[string]*model.Domain
+	RoutesByDomain   map[string][]*model.Route
+	Pools            map[string]*model.OriginPool
+	Certificates     map[string]*model.Certificate
+	SecurityPolicies map[string]*model.SecurityPolicy
+}
+
+// ApplyReconciliationSnapshot atomically swaps the entire candidate configuration state into memory
+// under a single lock acquisition, cleanly evicting stale deleted resources across all domains, routes,
+// origin pools, origins, certificates, and security policies.
+func (s *Store) ApplyReconciliationSnapshot(snap *ReconciliationSnapshot) error {
+	if snap == nil {
+		return errors.New("nil reconciliation snapshot")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 1. Evict stale domains that no longer exist in authoritative DB
+	for domID, dom := range s.domains {
+		if _, exists := snap.Domains[domID]; !exists {
+			delete(s.hostIndex, dom.Hostname)
+			if dom.ProjectID != "" && s.projectDomainCount[dom.ProjectID] > 0 {
+				s.projectDomainCount[dom.ProjectID]--
+				if s.projectDomainCount[dom.ProjectID] == 0 {
+					delete(s.projectDomainCount, dom.ProjectID)
+				}
+			}
+			delete(s.domains, domID)
+		}
+	}
+
+	// 2. Synchronize active domains
+	for id, dom := range snap.Domains {
+		if dom == nil {
+			continue
+		}
+		cloned := cloneDomain(dom)
+		isNew := s.domains[id] == nil
+		s.domains[id] = cloned
+		s.hostIndex[dom.Hostname] = id
+		if isNew && dom.ProjectID != "" {
+			s.projectDomainCount[dom.ProjectID]++
+		}
+	}
+
+	// 3. Atomically replace routes: evict stale domains, set candidate routes for active domains
+	for domID := range s.routes {
+		if _, exists := snap.Domains[domID]; !exists {
+			delete(s.routes, domID)
+		}
+	}
+	for domID := range snap.Domains {
+		routes := snap.RoutesByDomain[domID]
+		clonedRoutes := make([]*model.Route, len(routes))
+		for i, rt := range routes {
+			clonedRoutes[i] = cloneRoute(rt)
+		}
+		s.routes[domID] = clonedRoutes
+	}
+
+	// 4. Atomically synchronize pools & origins: evict deleted pools and orphaned origins
+	for poolID := range s.pools {
+		if _, exists := snap.Pools[poolID]; !exists {
+			delete(s.pools, poolID)
+			delete(s.monitors, poolID)
+			for origID, orig := range s.origins {
+				if orig != nil && orig.PoolID == poolID {
+					delete(s.origins, origID)
+					delete(s.healthStates, origID)
+				}
+			}
+		}
+	}
+	for poolID, p := range snap.Pools {
+		if p == nil {
+			continue
+		}
+		s.pools[poolID] = cloneOriginPool(p)
+		for _, o := range p.Origins {
+			s.origins[o.ID] = cloneOrigin(&o)
+		}
+	}
+
+	// 5. Atomically synchronize certificates: evict deleted certificates
+	for domID := range s.certificates {
+		if _, exists := snap.Certificates[domID]; !exists {
+			delete(s.certificates, domID)
+		}
+	}
+	for domID, cert := range snap.Certificates {
+		if cert != nil {
+			s.certificates[domID] = cloneCertificate(cert)
+		}
+	}
+
+	// 6. Atomically synchronize security policies: evict deleted security policies
+	for domID := range s.security {
+		if _, exists := snap.SecurityPolicies[domID]; !exists {
+			delete(s.security, domID)
+			delete(s.wafRules, domID)
+			delete(s.rateLimits, domID)
+		}
+	}
+	for domID, sp := range snap.SecurityPolicies {
+		if sp != nil {
+			s.security[domID] = cloneSecurityPolicy(sp)
+			if sp.WAFRules != nil {
+				s.wafRules[domID] = append([]model.WAFRule(nil), sp.WAFRules...)
+			}
+			if sp.RateLimitRules != nil {
+				s.rateLimits[domID] = append([]model.RateLimitRule(nil), sp.RateLimitRules...)
+			}
+		}
+	}
+
+	// 7. Flush compiled topology caches and advance version
+	s.popTopologyCache = make(map[string][]*DomainTopology)
+	s.activeTopologyCache = nil
+	s.version++
+
+	return nil
 }

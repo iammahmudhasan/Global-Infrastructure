@@ -7,8 +7,8 @@ use nexusedge_gateway::proxy::{
 use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{self, Router};
 use nexusedge_gateway::sync::{
-    fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream,
-    send_control_plane_ack, GatewaySyncAckPayload, SnapshotFetchContext, StreamSyncContext,
+    fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream, GatewayAckManager,
+    GatewaySyncAckPayload, SnapshotFetchContext, StreamSyncContext,
 };
 use nexusedge_gateway::waf::WafEngine;
 
@@ -244,6 +244,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
+        let ack_manager = Arc::new(GatewayAckManager::new(
+            cp_cfg.endpoint.clone(),
+            cp_cfg.auth_token.clone(),
+            sync_client.clone(),
+        ));
+        Arc::clone(&ack_manager).spawn_worker();
+
         if cp_cfg.enabled {
             let sse_endpoint = cp_cfg.endpoint.clone();
             let sse_pop_id = cp_cfg.pop_id.clone();
@@ -258,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let sse_ai = sync_ai.clone();
             let sse_is_ready = Arc::clone(&sync_is_ready);
             let sse_snapshot_path = autonomous_snapshot_path.clone();
+            let sse_ack_manager = Arc::clone(&ack_manager);
 
             tokio::spawn(async move {
                 let mut backoff_secs = 1u64;
@@ -271,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         endpoint: &sse_endpoint,
                         pop_id: &sse_pop_id,
                         gateway_id: Some(&sse_node_id),
+                        ack_manager: Some(&sse_ack_manager),
                         auth_token: &sse_auth_token,
                         snapshot_path: Some(&sse_snapshot_path),
                         client: &sse_client,
@@ -297,6 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let watchdog_checksum = Arc::clone(&last_checksum);
         let watchdog_snapshot_path = autonomous_snapshot_path.clone();
         let watchdog_node_id = config.server.node_id.clone();
+        let watchdog_ack_manager = Arc::clone(&ack_manager);
 
         tokio::spawn(async move {
             let interval_secs = cp_cfg.poll_interval_secs.max(15);
@@ -348,17 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     status: "IN_SYNC".to_string(),
                                     error: None,
                                 };
-                                let client_for_ack = sync_client.clone();
-                                let ep = cp_cfg.endpoint.clone();
-                                let tok = cp_cfg.auth_token.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        send_control_plane_ack(&ep, &tok, &client_for_ack, &ack)
-                                            .await
-                                    {
-                                        tracing::warn!(error = %e, "Failed to submit watchdog convergence ACK to Control Plane");
-                                    }
-                                });
+                                watchdog_ack_manager.submit_ack(ack);
                             } else {
                                 tracing::debug!(
                                     pop_id = %cp_cfg.pop_id,
