@@ -19,6 +19,7 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/auth"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/events"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
@@ -4459,5 +4460,76 @@ func TestPoP_MultiRegionRoutingAndHealthAPI(t *testing.T) {
 	}
 	if updatedSt.LastError != "BDIX route server maintenance" {
 		t.Fatalf("expected recorded error, got %s", updatedSt.LastError)
+	}
+}
+
+func TestOutboxStatusRoute(t *testing.T) {
+	h := setupTestServer()
+
+	// 1. When dispatcher is not configured
+	req := httptest.NewRequest(http.MethodGet, "/v1/system/outbox/status", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for disabled outbox status, got %d", w.Code)
+	}
+	var resDisabled map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resDisabled); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resDisabled["status"] != "disabled" || resDisabled["enabled"] != false {
+		t.Fatalf("expected disabled status, got %v", resDisabled)
+	}
+
+	// 2. When dispatcher is running
+	st, ok := h.Store().(store.OutboxStore)
+	if !ok {
+		t.Fatalf("store does not implement OutboxStore")
+	}
+	cfg := events.OutboxDispatcherConfig{
+		WorkerID:        "test-worker-status",
+		BatchSize:       10,
+		PollInterval:    50 * time.Millisecond,
+		LeaseDuration:   5 * time.Second,
+		ShutdownTimeout: 1 * time.Second,
+	}
+	bridge := events.NewBroadcasterBridge(h.Broadcaster())
+	disp, err := events.NewOutboxDispatcher(st, bridge, cfg)
+	if err != nil {
+		t.Fatalf("failed to create outbox dispatcher: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	disp.Start(ctx)
+	defer disp.Stop()
+
+	h.SetOutboxDispatcher(disp)
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/system/outbox/status", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for running outbox status, got %d", w.Code)
+	}
+	var resRunning map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&resRunning); err != nil {
+		t.Fatalf("failed to decode running response: %v", err)
+	}
+	if resRunning["status"] != "running" || resRunning["enabled"] != true {
+		t.Fatalf("expected running status, got %v", resRunning)
+	}
+	if resRunning["worker_id"] != "test-worker-status" {
+		t.Fatalf("expected worker_id test-worker-status, got %v", resRunning["worker_id"])
+	}
+	if resRunning["is_running"] != true {
+		t.Fatalf("expected is_running true, got %v", resRunning["is_running"])
+	}
+
+	// Method Not Allowed check
+	reqPost := httptest.NewRequest(http.MethodPost, "/v1/system/outbox/status", nil)
+	wPost := httptest.NewRecorder()
+	h.ServeHTTP(wPost, reqPost)
+	if wPost.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed for POST, got %d", wPost.Code)
 	}
 }

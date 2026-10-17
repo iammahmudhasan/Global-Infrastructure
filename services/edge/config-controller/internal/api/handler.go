@@ -75,6 +75,7 @@ type APIHandler struct {
 	storageManager     *storage.Manager
 	cableManager       *cable.Manager
 	auditKey           []byte
+	outboxDispatcher   *events.OutboxDispatcher
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -281,6 +282,14 @@ func (h *APIHandler) CableManager() *cable.Manager {
 	return h.cableManager
 }
 
+func (h *APIHandler) OutboxDispatcher() *events.OutboxDispatcher {
+	return h.outboxDispatcher
+}
+
+func (h *APIHandler) SetOutboxDispatcher(d *events.OutboxDispatcher) {
+	h.outboxDispatcher = d
+}
+
 func (h *APIHandler) Store() store.Repository {
 	return h.store
 }
@@ -420,6 +429,7 @@ func (h *APIHandler) registerRoutes() {
 	h.mux.HandleFunc("/v1/storage/buckets/", h.handleStorageBucketsRoute)
 	h.mux.HandleFunc("/v1/edge/network/cables", h.handleNetworkCables)
 	h.mux.HandleFunc("/v1/edge/network/cables/", h.handleNetworkCablesRoute)
+	h.mux.HandleFunc("/v1/system/outbox/status", h.handleOutboxStatus)
 }
 
 func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -4013,6 +4023,33 @@ func (h *APIHandler) handleAlertsStatusRoute(w http.ResponseWriter, r *http.Requ
 		"target_origins": []string{
 			"aeitron.com (185.232.14.188:443)",
 		},
+	})
+}
+
+func (h *APIHandler) handleOutboxStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.outboxDispatcher == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"enabled": false,
+			"status":  "disabled",
+		})
+		return
+	}
+	stats := h.outboxDispatcher.Stats()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled":            true,
+		"status":             "running",
+		"worker_id":          h.outboxDispatcher.WorkerID(),
+		"is_running":         h.outboxDispatcher.IsRunning(),
+		"events_claimed":     stats.EventsClaimed,
+		"events_processed":   stats.EventsProcessed,
+		"events_failed":      stats.EventsFailed,
+		"batches_executed":   stats.BatchesExecuted,
+		"last_dispatched_at": stats.LastDispatchedAt,
+		"last_lag_ms":        stats.LastLag.Milliseconds(),
 	})
 }
 

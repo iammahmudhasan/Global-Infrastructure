@@ -283,6 +283,7 @@ func main() {
 			log.Fatalf("[FATAL] Failed to initialize Outbox Dispatcher: %v", err)
 		}
 		outboxDispatcher.Start(dispatcherCtx)
+		handler.SetOutboxDispatcher(outboxDispatcher)
 		log.Printf("[INFO] Initialized and started automated Transactional Outbox Dispatcher (worker=%s, interval=%v)", cfg.WorkerID, cfg.PollInterval)
 	}
 

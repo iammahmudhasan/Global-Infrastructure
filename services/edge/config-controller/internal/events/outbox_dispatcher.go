@@ -279,6 +279,13 @@ func (d *OutboxDispatcher) WorkerID() string {
 	return d.cfg.WorkerID
 }
 
+// IsRunning reports whether the background dispatcher loop is running.
+func (d *OutboxDispatcher) IsRunning() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.running
+}
+
 func (d *OutboxDispatcher) run(ctx context.Context) {
 	defer d.wg.Done()
 

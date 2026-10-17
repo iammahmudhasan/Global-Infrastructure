@@ -534,6 +534,27 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 	}
 
 	s.pools[p.ID] = cloneOriginPool(p)
+
+	eventID := fmt.Sprintf("evt-pool-%d-%s", time.Now().UnixNano(), p.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"pool_id":      p.ID,
+		"project_id":   p.ProjectID,
+		"name":         p.Name,
+		"lb_algorithm": string(p.LBAlgorithm),
+		"allowed_pops": p.AllowedPoPs,
+		"origin_count": len(p.Origins),
+		"updated_at":   time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "pool",
+		AggregateID:   p.ID,
+		EventType:     "pool.config.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -689,6 +710,27 @@ func (s *Store) SaveRoute(r *model.Route) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.routes[r.DomainID] = append(s.routes[r.DomainID], cloneRoute(r))
+
+	eventID := fmt.Sprintf("evt-route-%d-%s", time.Now().UnixNano(), r.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"route_id":    r.ID,
+		"domain_id":   r.DomainID,
+		"pool_id":     r.PoolID,
+		"path_prefix": r.PathPrefix,
+		"priority":    r.Priority,
+		"timeout_ms":  r.TimeoutMs,
+		"updated_at":  time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "route",
+		AggregateID:   r.ID,
+		EventType:     "route.config.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -715,6 +757,25 @@ func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) error {
 	if sp.RateLimitRules != nil {
 		s.rateLimits[sp.DomainID] = append([]model.RateLimitRule(nil), sp.RateLimitRules...)
 	}
+
+	eventID := fmt.Sprintf("evt-sec-%d-%s", time.Now().UnixNano(), sp.DomainID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id":     sp.DomainID,
+		"waf_enabled":   sp.WAFEnabled,
+		"waf_mode":      string(sp.WAFMode),
+		"rate_limit_en": sp.RateLimitEnabled,
+		"updated_at":    time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "security_policy",
+		AggregateID:   sp.DomainID,
+		EventType:     "security.policy.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -990,6 +1051,24 @@ func (s *Store) SaveCertificate(cert *model.Certificate) error {
 	} else {
 		s.certificates[cert.DomainID] = cloneCertificate(cert)
 		delete(s.pendingCertificates, cert.DomainID)
+
+		eventID := fmt.Sprintf("evt-cert-%d-%s", time.Now().UnixNano(), cert.ID)
+		payloadJSON, _ := json.Marshal(map[string]interface{}{
+			"cert_id":    cert.ID,
+			"domain_id":  cert.DomainID,
+			"status":     string(cert.Status),
+			"expires_at": cert.ExpiresAt.Format(time.RFC3339),
+			"updated_at": time.Now().UTC().Format(time.RFC3339),
+		})
+		s.saveOutboxEventLocked(&OutboxEvent{
+			EventID:       eventID,
+			AggregateType: "certificate",
+			AggregateID:   cert.ID,
+			EventType:     "certificate.changed",
+			Payload:       payloadJSON,
+			Status:        "PENDING",
+			CreatedAt:     time.Now().UTC(),
+		})
 	}
 	s.invalidateCachesLocked()
 	return nil
@@ -1355,6 +1434,26 @@ func (s *Store) SaveAIProvider(p *model.AIProvider) error {
 
 	clone := *p
 	s.aiProviders[p.ID] = &clone
+
+	eventID := fmt.Sprintf("evt-aiprov-%d-%s", time.Now().UnixNano(), p.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"provider_id":   p.ID,
+		"project_id":    p.ProjectID,
+		"name":          p.Name,
+		"provider_type": string(p.ProviderType),
+		"enabled":       p.Enabled,
+		"updated_at":    time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "ai_provider",
+		AggregateID:   p.ID,
+		EventType:     "ai_provider.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	return nil
 }
 

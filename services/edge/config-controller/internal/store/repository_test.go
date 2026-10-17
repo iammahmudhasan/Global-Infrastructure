@@ -1003,3 +1003,239 @@ func TestPostgresRepository_OutboxDispatcherIntegration(t *testing.T) {
 		t.Fatalf("invalid dispatcher stats: %+v", stats)
 	}
 }
+
+func TestStore_MultiResourceOutboxEvents(t *testing.T) {
+	s := store.NewStore()
+	ctx := context.Background()
+
+	// 1. Save Domain
+	dom := &model.Domain{
+		ID:        "dom-all-outbox",
+		ProjectID: "proj-all",
+		Hostname:  "all.example.com",
+		Status:    model.DomainStatusActive,
+		Version:   1,
+	}
+	if err := s.SaveDomain(dom); err != nil {
+		t.Fatalf("SaveDomain failed: %v", err)
+	}
+
+	// 2. Save Origin Pool
+	pool := &model.OriginPool{
+		ID:          "pool-all-outbox",
+		ProjectID:   "proj-all",
+		Name:        "all-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		Origins: []model.Origin{
+			{
+				ID:       "orig-01",
+				PoolID:   "pool-all-outbox",
+				Address:  "192.0.2.1",
+				Port:     80,
+				Protocol: model.ProtocolHTTP,
+				Healthy:  true,
+			},
+		},
+	}
+	if err := s.SaveOriginPool(pool); err != nil {
+		t.Fatalf("SaveOriginPool failed: %v", err)
+	}
+
+	// 3. Save Route
+	rt := &model.Route{
+		ID:         "route-all-outbox",
+		DomainID:   dom.ID,
+		PoolID:     pool.ID,
+		PathPrefix: "/api",
+		Priority:   1,
+		TimeoutMs:  5000,
+	}
+	if err := s.SaveRoute(rt); err != nil {
+		t.Fatalf("SaveRoute failed: %v", err)
+	}
+
+	// 4. Save Security Policy
+	sec := &model.SecurityPolicy{
+		ID:               "sec-all-outbox",
+		DomainID:         dom.ID,
+		WAFEnabled:       true,
+		WAFMode:          "BLOCK",
+		RateLimitEnabled: true,
+	}
+	if err := s.SaveSecurityPolicy(sec); err != nil {
+		t.Fatalf("SaveSecurityPolicy failed: %v", err)
+	}
+
+	// 5. Save Certificate
+	cert := &model.Certificate{
+		ID:        "cert-all-outbox",
+		DomainID:  dom.ID,
+		Status:    model.CertStatusActive,
+		ExpiresAt: time.Now().Add(90 * 24 * time.Hour),
+	}
+	if err := s.SaveCertificate(cert); err != nil {
+		t.Fatalf("SaveCertificate failed: %v", err)
+	}
+
+	// 6. Save AI Provider
+	provider := &model.AIProvider{
+		ID:           "aiprov-all-outbox",
+		ProjectID:    "proj-all",
+		Name:         "OpenAI Production",
+		ProviderType: string(model.AIProviderTypeOpenAI),
+		Endpoint:     "https://api.openai.com/v1",
+		APIKey:       "sk-test-mock-key",
+	}
+	if err := s.SaveAIProvider(provider); err != nil {
+		t.Fatalf("SaveAIProvider failed: %v", err)
+	}
+
+	eventsList, err := s.GetPendingOutboxEvents(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingOutboxEvents failed: %v", err)
+	}
+
+	eventMap := make(map[string]bool)
+	for _, ev := range eventsList {
+		eventMap[ev.EventType] = true
+	}
+
+	requiredEvents := []string{
+		"domain.config.changed",
+		"pool.config.changed",
+		"route.config.changed",
+		"security.policy.changed",
+		"certificate.changed",
+		"ai_provider.changed",
+	}
+
+	for _, expected := range requiredEvents {
+		if !eventMap[expected] {
+			t.Errorf("expected outbox event type %s was not found in pending outbox events", expected)
+		}
+	}
+}
+
+func TestPostgresRepository_MultiReplicaTopologyReconciliation(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres multi-replica reconciliation test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo1 to test database: %v", err)
+	}
+	defer repo1.Close()
+
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo2 to test database: %v", err)
+	}
+	defer repo2.Close()
+
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+	domainID := fmt.Sprintf("dom-multi-%d", suffix)
+	poolID := fmt.Sprintf("pool-multi-%d", suffix)
+	routeID := fmt.Sprintf("route-multi-%d", suffix)
+	hostname := fmt.Sprintf("multi-%d.nexusedge.net", suffix)
+
+	// 1. Repo 1 creates Origin Pool with Origin
+	pool := &model.OriginPool{
+		ID:          poolID,
+		ProjectID:   "proj-multi-rep",
+		Name:        "Multi-Replica Origin Pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		AllowedPoPs: []string{"dhaka", "singapore"},
+		Origins: []model.Origin{
+			{
+				ID:          fmt.Sprintf("orig-multi-%d", suffix),
+				PoolID:      poolID,
+				Address:     "10.200.1.5",
+				Port:        8080,
+				Protocol:    model.ProtocolHTTP,
+				Weight:      100,
+				Healthy:     true,
+				AllowedPoPs: []string{"dhaka", "singapore"},
+			},
+		},
+	}
+	if err := repo1.SaveOriginPool(pool); err != nil {
+		t.Fatalf("repo1.SaveOriginPool failed: %v", err)
+	}
+
+	// 2. Repo 1 creates Domain
+	dom := &model.Domain{
+		ID:             domainID,
+		ProjectID:      "proj-multi-rep",
+		Hostname:       hostname,
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+		AllowedPoPs:    []string{"dhaka", "singapore"},
+		Version:        1,
+	}
+	if err := repo1.SaveDomain(dom); err != nil {
+		t.Fatalf("repo1.SaveDomain failed: %v", err)
+	}
+
+	// 3. Repo 1 creates Route
+	rt := &model.Route{
+		ID:         routeID,
+		DomainID:   domainID,
+		PoolID:     poolID,
+		PathPrefix: "/api/v1",
+		Priority:   10,
+		TimeoutMs:  4000,
+	}
+	if err := repo1.SaveRoute(rt); err != nil {
+		t.Fatalf("repo1.SaveRoute failed: %v", err)
+	}
+
+	// 4. Authoritative fallback on Repo 2: GetOriginPool should fetch from DB even before ReconcileCache
+	fetchedPool, err := repo2.GetOriginPool(poolID)
+	if err != nil || fetchedPool == nil {
+		t.Fatalf("repo2.GetOriginPool fallback failed: %v", err)
+	}
+	if len(fetchedPool.Origins) != 1 || fetchedPool.Origins[0].Address != "10.200.1.5" {
+		t.Fatalf("repo2.GetOriginPool returned unexpected origins: %+v", fetchedPool.Origins)
+	}
+
+	// 5. Authoritative fallback on Repo 2: GetRoutes should fetch from DB even before ReconcileCache
+	fetchedRoutes := repo2.GetRoutes(domainID)
+	if len(fetchedRoutes) != 1 || fetchedRoutes[0].ID != routeID {
+		t.Fatalf("repo2.GetRoutes fallback failed: %+v", fetchedRoutes)
+	}
+
+	// 6. Full Cache Reconciliation on Repo 2: pulls domains, routes, origin pools, security policies, certs
+	if _, err := repo2.ReconcileCache(ctx); err != nil {
+		t.Fatalf("repo2.ReconcileCache failed: %v", err)
+	}
+
+	// 7. Verify compiled Envoy topologies on Repo 2 now compile the full graph
+	topos := repo2.GetActiveTopologies()
+	var foundTopology *store.DomainTopology
+	for _, dt := range topos {
+		if dt.Domain.ID == domainID {
+			foundTopology = dt
+			break
+		}
+	}
+	if foundTopology == nil {
+		t.Fatalf("domain %s not found in repo2 compiled active topologies", domainID)
+	}
+	if len(foundTopology.Routes) != 1 || foundTopology.Routes[0].ID != routeID {
+		t.Fatalf("expected compiled route %s in topology, got %+v", routeID, foundTopology.Routes)
+	}
+	compiledPool, exists := foundTopology.Pools[poolID]
+	if !exists || compiledPool == nil {
+		t.Fatalf("expected compiled pool %s in topology, got %+v", poolID, foundTopology.Pools)
+	}
+	if len(compiledPool.Origins) != 1 || compiledPool.Origins[0].Address != "10.200.1.5" {
+		t.Fatalf("expected origin 10.200.1.5 in compiled pool, got %+v", compiledPool.Origins)
+	}
+}

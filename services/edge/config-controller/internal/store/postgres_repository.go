@@ -1276,6 +1276,93 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		}
 	}
 
+	// 3. Synchronize active routes for all active domains
+	routeRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
+	if err == nil {
+		defer routeRows.Close()
+		for routeRows.Next() {
+			var rt model.Route
+			if err := routeRows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err == nil {
+				_ = r.cache.SaveRoute(&rt)
+			}
+		}
+	}
+
+	// 4. Synchronize active origin pools and origins
+	poolRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools")
+	if err == nil {
+		defer poolRows.Close()
+		for poolRows.Next() {
+			var p model.OriginPool
+			var pops pq.StringArray
+			if err := poolRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.LBAlgorithm, &pops); err == nil {
+				p.AllowedPoPs = []string(pops)
+				origRows, errOrig := r.db.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
+				if errOrig == nil {
+					for origRows.Next() {
+						var o model.Origin
+						var opops pq.StringArray
+						if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err == nil {
+							o.AllowedPoPs = []string(opops)
+							p.Origins = append(p.Origins, o)
+						}
+					}
+					origRows.Close()
+				}
+				_ = r.cache.SaveOriginPool(&p)
+			}
+		}
+	}
+
+	// 5. Synchronize active certificates
+	certRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE status = 'ACTIVE'")
+	if err == nil {
+		defer certRows.Close()
+		for certRows.Next() {
+			var cert model.Certificate
+			var domains pq.StringArray
+			var encKey string
+			var issuedAt, expiresAt sql.NullTime
+			if err := certRows.Scan(&cert.ID, &cert.DomainID, &cert.Status, &cert.Issuer, &cert.SerialNumber, &cert.CertPEM, &encKey, &cert.FingerprintSHA256, &cert.KeyType, &domains, &cert.AutoRenew, &issuedAt, &expiresAt); err == nil {
+				cert.Domains = []string(domains)
+				if issuedAt.Valid {
+					cert.IssuedAt = issuedAt.Time
+				}
+				if expiresAt.Valid {
+					cert.ExpiresAt = expiresAt.Time
+				}
+				if encKey != "" {
+					dec, decErr := security.DecryptSecret(encKey)
+					if decErr == nil {
+						cert.PrivateKeyPEM = dec
+					} else {
+						cert.PrivateKeyPEM = encKey
+					}
+				}
+				_ = r.cache.SaveCertificate(&cert)
+			}
+		}
+	}
+
+	// 6. Synchronize active security policies
+	spRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies")
+	if err == nil {
+		defer spRows.Close()
+		for spRows.Next() {
+			var sp model.SecurityPolicy
+			var wafJSON, rlJSON []byte
+			if err := spRows.Scan(&sp.ID, &sp.DomainID, &sp.WAFEnabled, &sp.WAFMode, &sp.RateLimitEnabled, &sp.RateLimitRPM, &wafJSON, &rlJSON); err == nil {
+				if len(wafJSON) > 0 {
+					_ = json.Unmarshal(wafJSON, &sp.WAFRules)
+				}
+				if len(rlJSON) > 0 {
+					_ = json.Unmarshal(rlJSON, &sp.RateLimitRules)
+				}
+				_ = r.cache.SaveSecurityPolicy(&sp)
+			}
+		}
+	}
+
 	stats.Duration = time.Since(start)
 	if !latestUpdate.IsZero() {
 		stats.MaxLag = time.Since(latestUpdate)
@@ -1377,6 +1464,22 @@ func (r *PostgresRepository) SaveOriginPool(p *model.OriginPool) error {
 		}
 	}
 
+	eventID := fmt.Sprintf("evt-pool-%d-%s", time.Now().UnixNano(), p.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"pool_id":      p.ID,
+		"project_id":   p.ProjectID,
+		"name":         p.Name,
+		"lb_algorithm": string(p.LBAlgorithm),
+		"allowed_pops": p.AllowedPoPs,
+		"origin_count": len(p.Origins),
+		"updated_at":   time.Now().UTC().Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'pool', $2, 'pool.config.changed', $3, 'PENDING')`,
+		eventID, p.ID, payloadJSON,
+	)
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit origin pool tx: %w", err)
 	}
@@ -1415,7 +1518,58 @@ func (r *PostgresRepository) AddOrigin(o *model.Origin) error {
 }
 
 func (r *PostgresRepository) GetOriginPool(poolID string) (*model.OriginPool, error) {
-	return r.cache.GetOriginPool(poolID)
+	if p, err := r.cache.GetOriginPool(poolID); err == nil && p != nil {
+		return p, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var p model.OriginPool
+	var pops pq.StringArray
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools WHERE id = $1",
+		poolID,
+	).Scan(&p.ID, &p.ProjectID, &p.Name, &p.LBAlgorithm, &pops)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query origin pool %s: %w", poolID, err)
+	}
+	p.AllowedPoPs = []string(pops)
+
+	origRows, err := r.db.QueryContext(ctx,
+		"SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1",
+		poolID,
+	)
+	if err == nil {
+		defer origRows.Close()
+		for origRows.Next() {
+			var o model.Origin
+			var opops pq.StringArray
+			if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err == nil {
+				o.AllowedPoPs = []string(opops)
+				p.Origins = append(p.Origins, o)
+			}
+		}
+	}
+
+	var hm model.HealthMonitor
+	var codes pq.Int64Array
+	if err := r.db.QueryRowContext(ctx,
+		"SELECT id, pool_id, protocol, path, port, interval_seconds, timeout_seconds, healthy_threshold, unhealthy_threshold, expected_status_codes FROM health_monitors WHERE pool_id = $1",
+		poolID,
+	).Scan(&hm.ID, &hm.PoolID, &hm.Protocol, &hm.Path, &hm.Port, &hm.IntervalSeconds, &hm.TimeoutSeconds, &hm.HealthyThreshold, &hm.UnhealthyThreshold, &codes); err == nil {
+		for _, c := range codes {
+			hm.ExpectedStatusCodes = append(hm.ExpectedStatusCodes, int(c))
+		}
+		p.HealthMonitor = &hm
+		_ = r.cache.SaveHealthMonitor(&hm)
+	}
+
+	_ = r.cache.SaveOriginPool(&p)
+	return &p, nil
 }
 
 // -------------------------------------------------------------------------
@@ -1492,7 +1646,13 @@ func (r *PostgresRepository) SaveRoute(rt *model.Route) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	_, err := r.db.ExecContext(ctx,
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin route tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO routes (id, domain_id, pool_id, path_prefix, priority, timeout_ms)
 		 VALUES ($1, $2, $3, $4, $5, $6)
 		 ON CONFLICT (id) DO UPDATE SET
@@ -1507,11 +1667,56 @@ func (r *PostgresRepository) SaveRoute(rt *model.Route) error {
 		return fmt.Errorf("persist route: %w", err)
 	}
 
+	eventID := fmt.Sprintf("evt-route-%d-%s", time.Now().UnixNano(), rt.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"route_id":    rt.ID,
+		"domain_id":   rt.DomainID,
+		"pool_id":     rt.PoolID,
+		"path_prefix": rt.PathPrefix,
+		"priority":    rt.Priority,
+		"timeout_ms":  rt.TimeoutMs,
+		"updated_at":  time.Now().UTC().Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'route', $2, 'route.config.changed', $3, 'PENDING')`,
+		eventID, rt.ID, payloadJSON,
+	)
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit route tx: %w", err)
+	}
+
 	return r.cache.SaveRoute(rt)
 }
 
 func (r *PostgresRepository) GetRoutes(domainID string) []*model.Route {
-	return r.cache.GetRoutes(domainID)
+	cached := r.cache.GetRoutes(domainID)
+	if len(cached) > 0 {
+		return cached
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes WHERE domain_id = $1 ORDER BY priority DESC",
+		domainID,
+	)
+	if err != nil {
+		return cached
+	}
+	defer rows.Close()
+
+	var dbRoutes []*model.Route
+	for rows.Next() {
+		var rt model.Route
+		if err := rows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err == nil {
+			dbRoutes = append(dbRoutes, &rt)
+			_ = r.cache.SaveRoute(&rt)
+		}
+	}
+	return dbRoutes
 }
 
 // -------------------------------------------------------------------------
@@ -1522,6 +1727,12 @@ func (r *PostgresRepository) SaveSecurityPolicy(sp *model.SecurityPolicy) error 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin security policy tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	wafJSON, err := json.Marshal(sp.WAFRules)
 	if err != nil {
 		return fmt.Errorf("marshal waf rules: %w", err)
@@ -1531,7 +1742,7 @@ func (r *PostgresRepository) SaveSecurityPolicy(sp *model.SecurityPolicy) error 
 		return fmt.Errorf("marshal rate limit rules: %w", err)
 	}
 
-	_, err = r.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO security_policies (id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 ON CONFLICT (domain_id) DO UPDATE SET
@@ -1547,11 +1758,55 @@ func (r *PostgresRepository) SaveSecurityPolicy(sp *model.SecurityPolicy) error 
 		return fmt.Errorf("persist security policy: %w", err)
 	}
 
+	eventID := fmt.Sprintf("evt-sec-%d-%s", time.Now().UnixNano(), sp.DomainID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"security_policy_id": sp.ID,
+		"domain_id":          sp.DomainID,
+		"waf_enabled":        sp.WAFEnabled,
+		"waf_mode":           sp.WAFMode,
+		"rate_limit_enabled": sp.RateLimitEnabled,
+		"rate_limit_rpm":     sp.RateLimitRPM,
+		"updated_at":         time.Now().UTC().Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'security_policy', $2, 'security.policy.changed', $3, 'PENDING')`,
+		eventID, sp.DomainID, payloadJSON,
+	)
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit security policy tx: %w", err)
+	}
+
 	return r.cache.SaveSecurityPolicy(sp)
 }
 
 func (r *PostgresRepository) GetSecurityPolicy(domainID string) *model.SecurityPolicy {
-	return r.cache.GetSecurityPolicy(domainID)
+	if sp := r.cache.GetSecurityPolicy(domainID); sp != nil {
+		return sp
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var sp model.SecurityPolicy
+	var wafJSON, rlJSON []byte
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies WHERE domain_id = $1",
+		domainID,
+	).Scan(&sp.ID, &sp.DomainID, &sp.WAFEnabled, &sp.WAFMode, &sp.RateLimitEnabled, &sp.RateLimitRPM, &wafJSON, &rlJSON)
+	if err != nil {
+		return nil
+	}
+
+	if len(wafJSON) > 0 {
+		_ = json.Unmarshal(wafJSON, &sp.WAFRules)
+	}
+	if len(rlJSON) > 0 {
+		_ = json.Unmarshal(rlJSON, &sp.RateLimitRules)
+	}
+	_ = r.cache.SaveSecurityPolicy(&sp)
+	return &sp
 }
 
 func (r *PostgresRepository) AddWAFRule(domainID string, rule model.WAFRule) error {
@@ -1783,6 +2038,20 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 		return fmt.Errorf("upsert certificate: %w", err)
 	}
 
+	eventID := fmt.Sprintf("evt-cert-%d-%s", time.Now().UnixNano(), cert.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"certificate_id": cert.ID,
+		"domain_id":      cert.DomainID,
+		"status":         string(cert.Status),
+		"domains":        cert.Domains,
+		"updated_at":     time.Now().UTC().Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'certificate', $2, 'certificate.changed', $3, 'PENDING')`,
+		eventID, cert.DomainID, payloadJSON,
+	)
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit cert tx: %w", err)
 	}
@@ -1791,7 +2060,48 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 }
 
 func (r *PostgresRepository) GetCertificate(domainID string) *model.Certificate {
-	return r.cache.GetCertificate(domainID)
+	if cert := r.cache.GetCertificate(domainID); cert != nil {
+		return cert
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var cert model.Certificate
+	var domains pq.StringArray
+	var encKey string
+	var issuedAt, expiresAt sql.NullTime
+
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE domain_id = $1 AND status = 'ACTIVE' ORDER BY expires_at DESC LIMIT 1",
+		domainID,
+	).Scan(
+		&cert.ID, &cert.DomainID, &cert.Status, &cert.Issuer, &cert.SerialNumber,
+		&cert.CertPEM, &encKey, &cert.FingerprintSHA256, &cert.KeyType,
+		&domains, &cert.AutoRenew, &issuedAt, &expiresAt,
+	)
+	if err != nil {
+		return nil
+	}
+
+	cert.Domains = []string(domains)
+	if issuedAt.Valid {
+		cert.IssuedAt = issuedAt.Time
+	}
+	if expiresAt.Valid {
+		cert.ExpiresAt = expiresAt.Time
+	}
+
+	if encKey != "" {
+		dec, decErr := security.DecryptSecret(encKey)
+		if decErr == nil {
+			cert.PrivateKeyPEM = dec
+		} else {
+			cert.PrivateKeyPEM = encKey
+		}
+	}
+	_ = r.cache.SaveCertificate(&cert)
+	return &cert
 }
 
 func (r *PostgresRepository) GetPendingCertificate(domainID string) *model.Certificate {
@@ -1857,7 +2167,25 @@ func (r *PostgresRepository) SaveTLSSettings(domainID string, settings *model.TL
 }
 
 func (r *PostgresRepository) GetTLSSettings(domainID string) *model.TLSSettings {
-	return r.cache.GetTLSSettings(domainID)
+	if settings := r.cache.GetTLSSettings(domainID); settings != nil {
+		return settings
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var st model.TLSSettings
+	err := r.db.QueryRowContext(ctx,
+		"SELECT enforce_https, min_tls_version, hsts, hsts_max_age FROM tls_settings WHERE domain_id = $1",
+		domainID,
+	).Scan(
+		&st.EnforceHTTPS, &st.MinTLSVersion, &st.HSTS, &st.HSTSMaxAge,
+	)
+	if err != nil {
+		return nil
+	}
+	_ = r.cache.SaveTLSSettings(domainID, &st)
+	return &st
 }
 
 // -------------------------------------------------------------------------
@@ -1884,6 +2212,12 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin ai provider tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
 	now := time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = now
@@ -1899,7 +2233,7 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 		encryptedKey = enc
 	}
 
-	_, err := r.db.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO ai_providers (
 			id, project_id, name, endpoint, provider_type, api_key,
 			cost_per_m_tokens, priority, sovereignty_jurisdiction,
@@ -1923,11 +2257,63 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 		return fmt.Errorf("persist ai_provider: %w", err)
 	}
 
+	eventID := fmt.Sprintf("evt-ai-%d-%s", time.Now().UnixNano(), p.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"provider_id":   p.ID,
+		"project_id":    p.ProjectID,
+		"name":          p.Name,
+		"provider_type": string(p.ProviderType),
+		"enabled":       p.Enabled,
+		"updated_at":    now.Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'ai_provider', $2, 'ai_provider.changed', $3, 'PENDING')`,
+		eventID, p.ID, payloadJSON,
+	)
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit ai provider tx: %w", err)
+	}
+
 	return r.cache.SaveAIProvider(p)
 }
 
 func (r *PostgresRepository) GetAIProvider(id string) (*model.AIProvider, error) {
-	return r.cache.GetAIProvider(id)
+	if p, err := r.cache.GetAIProvider(id); err == nil && p != nil {
+		return p, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var p model.AIProvider
+	var encryptedKey string
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, project_id, name, endpoint, provider_type, api_key, cost_per_m_tokens, priority, sovereignty_jurisdiction, failover_cooldown_secs, enabled, created_at, updated_at FROM ai_providers WHERE id = $1",
+		id,
+	).Scan(
+		&p.ID, &p.ProjectID, &p.Name, &p.Endpoint, &p.ProviderType, &encryptedKey,
+		&p.CostPerMTokens, &p.Priority, &p.SovereigntyJurisdiction,
+		&p.FailoverCooldownSecs, &p.Enabled, &p.CreatedAt, &p.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query ai_provider %s: %w", id, err)
+	}
+
+	if encryptedKey != "" {
+		dec, decErr := security.DecryptSecret(encryptedKey)
+		if decErr == nil {
+			p.APIKey = dec
+		} else {
+			p.APIKey = encryptedKey
+		}
+	}
+	_ = r.cache.SaveAIProvider(&p)
+	return &p, nil
 }
 
 func (r *PostgresRepository) ListAIProvidersByProject(projectID string) []*model.AIProvider {
