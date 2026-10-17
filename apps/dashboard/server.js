@@ -180,7 +180,11 @@ function validateAPIKey(token) {
       }
 
       record.lastUsedAt = new Date().toISOString();
-      saveVaultDurable();
+      const lastPersist = record._lastPersistTime || 0;
+      if (now - lastPersist > 60000) {
+        record._lastPersistTime = now;
+        saveVaultDurable();
+      }
       return {
         id: record.id,
         user: `apikey:${record.name}`,

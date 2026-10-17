@@ -119,3 +119,41 @@ func TestInvalidIPInputs(t *testing.T) {
 		t.Errorf("expected ErrInvalidDestinationIP, got %v", err)
 	}
 }
+
+func TestNonBDIXAPNICPrefixNotDomestic(t *testing.T) {
+	engine := NewBDIXSteeringEngine()
+
+	// Australian APNIC IP in 103.28.248.0/24 (NOT Bangladesh)
+	// Must NOT be classified as domestic BDIX simply due to 103.x.x.x
+	decision, err := engine.ResolveSteering("103.14.24.1", "103.28.248.1", 13335)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if decision.RouteClass == RouteClassBDIXPeering {
+		t.Errorf("non-BD APNIC address 103.28.248.1 must not be classified as RouteClassBDIXPeering")
+	}
+	if decision.PinnedDomestic {
+		t.Errorf("expected PinnedDomestic to be false for non-BD APNIC destination")
+	}
+	if decision.RouteClass != RouteClassSubseaTransit {
+		t.Errorf("expected RouteClassSubseaTransit for international APNIC destination, got %s", decision.RouteClass)
+	}
+}
+
+func TestSteeringDecisionSimulationProvenance(t *testing.T) {
+	engine := NewBDIXSteeringEngine()
+
+	decision, err := engine.ResolveSteering("103.14.24.1", "103.20.30.40", 202456)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if decision.Mode != "SIMULATION" {
+		t.Errorf("expected Mode == 'SIMULATION', got %s", decision.Mode)
+	}
+	if decision.Measured != false {
+		t.Errorf("expected Measured == false for simulation model")
+	}
+	if decision.SimulationNotice == "" {
+		t.Errorf("expected non-empty SimulationNotice on decision")
+	}
+}

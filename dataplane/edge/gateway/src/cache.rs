@@ -383,6 +383,21 @@ impl EdgeCache {
             }
         }
 
+        // RFC 9111 Section 3.5: Shared caches MUST NOT store responses to requests with Authorization
+        // header field unless a directive is present in the response that explicitly permits it
+        // (such as public or s-maxage).
+        if let Some(req_h) = req_headers {
+            if req_h.contains_key("authorization")
+                && !(resp_cc.public || resp_cc.s_maxage.is_some())
+            {
+                return;
+            }
+        }
+
+        // Never store Set-Cookie in shared edge cache to prevent session leakage across tenants (RFC 6265)
+        let mut headers = headers;
+        headers.remove("set-cookie");
+
         // RFC 9111 Section 4.1: Reject Vary: * responses across all Vary header lines
         for vary_val in headers.get_all("vary").iter() {
             if let Ok(v_str) = vary_val.to_str() {
@@ -415,7 +430,11 @@ impl EdgeCache {
                 }
             }
         }
+
         // RFC 9111 Section 4.2: Enforce freshness calculation
+        // Security Invariant: Even if custom_ttl is provided by customer rule, RFC 9111 uncacheable mandates
+        // (no-store, private, no-cache, Vary: *, and un-authenticated Authorization) ALWAYS take precedence
+        // and are strictly rejected. Custom TTL only overrides origin freshness duration on otherwise cacheable responses.
         let ttl = match custom_ttl {
             Some(t) => t,
             None => match compute_rfc9111_freshness(&headers, self.default_ttl, chrono::Utc::now())
@@ -1171,5 +1190,156 @@ mod tests {
             None,
         );
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_rfc9111_custom_ttl_cannot_override_no_store() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("cache-control", HeaderValue::from_static("no-store"));
+
+        cache.put(
+            "http://example.com/no-store".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"sensitive"),
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Custom TTL must NEVER override RFC 9111 no-store mandate"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_custom_ttl_cannot_override_private() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("cache-control", HeaderValue::from_static("private"));
+
+        cache.put(
+            "http://example.com/private".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"user-profile"),
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Custom TTL must NEVER override RFC 9111 private directive in shared cache"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_custom_ttl_cannot_override_vary_star() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("vary", HeaderValue::from_static("*"));
+
+        cache.put(
+            "http://example.com/vary-star".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"dynamic"),
+            Some(Duration::from_secs(600)),
+            None,
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Custom TTL must NEVER override RFC 9111 Vary: * rejection"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_authorization_rejected_without_public_or_s_maxage() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token-xyz"),
+        );
+
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("cache-control", HeaderValue::from_static("max-age=300"));
+
+        cache.put(
+            "http://example.com/auth-resource".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"authenticated-content"),
+            Some(Duration::from_secs(300)),
+            Some(&req_headers),
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Shared cache MUST NOT store response to request with Authorization unless public or s-maxage is present"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_authorization_allowed_with_public() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer secret-token-xyz"),
+        );
+
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=300"),
+        );
+
+        cache.put(
+            "http://example.com/public-auth-resource".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"publicly-shared-content"),
+            None,
+            Some(&req_headers),
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "Shared cache is permitted to store response to Authorization request if marked public"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_set_cookie_stripped_from_cached_response() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=300"),
+        );
+        resp_headers.insert(
+            "set-cookie",
+            HeaderValue::from_static("session_id=attacker_or_user_secret; Path=/; HttpOnly"),
+        );
+
+        cache.put(
+            "http://example.com/set-cookie-page".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"page-content"),
+            None,
+            None,
+        );
+
+        let cached = cache.get("http://example.com/set-cookie-page", None);
+        assert!(cached.is_some(), "Page should be cached");
+        let cached_resp = cached.unwrap();
+        assert!(
+            !cached_resp.headers.contains_key("set-cookie"),
+            "Set-Cookie MUST be stripped from shared cache response to prevent credential leakage"
+        );
     }
 }

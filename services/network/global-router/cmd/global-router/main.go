@@ -716,11 +716,15 @@ func (s *Server) routes() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"mode":                     "SIMULATION",
+			"measured":                 false,
+			"source":                   "static_fixture_topology",
 			"smw6_severed":             severed,
 			"active_transits":          []string{"BDIX Dhaka Metro Fabric (167 peers)", "SMW4 Cox's Bazar", "SMW6 (30 Tbps Landing Cox's Bazar)"},
 			"bdix_peering_rtt":         "3.2ms",
 			"smw6_subsea_rtt":          "32.0ms",
 			"terrestrial_failover_rtt": "121.6ms",
+			"disclaimer":               "Metrics reflect calibrated simulation testbed values, not live optical tap telemetry.",
 		})
 	})
 

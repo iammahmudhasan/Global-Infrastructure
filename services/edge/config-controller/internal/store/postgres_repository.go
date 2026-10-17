@@ -143,6 +143,13 @@ func (r *PostgresRepository) Close() error {
 }
 
 func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
+	// Serialize schema migrations across concurrent replicas using PostgreSQL session advisory lock
+	const migrationAdvisoryLockID = 74291048201
+	_, _ = r.db.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID)
+	defer func() {
+		_, _ = r.db.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
+	}()
+
 	// 0. Ensure schema_migrations table exists for versioned tracking
 	_, err := r.db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -884,15 +891,70 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 		return fmt.Errorf("commit domain tx: %w", err)
 	}
 
-	return r.cache.SaveDomain(d)
+	// Cache is a disposable line-rate projection. If cache write fails, do NOT fail the call
+	// because PostgreSQL committed atomically as the system of record.
+	_ = r.cache.SaveDomain(d)
+	return nil
 }
 
 func (r *PostgresRepository) GetDomain(id string) (*model.Domain, error) {
-	return r.cache.GetDomain(id)
+	d, err := r.cache.GetDomain(id)
+	if err == nil && d != nil {
+		return d, nil
+	}
+	// Fallback to authoritative PostgreSQL system-of-record if cache projection has not yet refreshed
+	return r.getDomainFromDB(id)
 }
 
 func (r *PostgresRepository) GetDomainByHost(hostname string) (*model.Domain, error) {
-	return r.cache.GetDomainByHost(hostname)
+	d, err := r.cache.GetDomainByHost(hostname)
+	if err == nil && d != nil {
+		return d, nil
+	}
+	// Fallback to authoritative PostgreSQL system-of-record if cache projection has not yet refreshed
+	return r.getDomainByHostFromDB(hostname)
+}
+
+func (r *PostgresRepository) getDomainFromDB(id string) (*model.Domain, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var d model.Domain
+	var pops pq.StringArray
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE id = $1",
+		id,
+	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query domain %s: %w", id, err)
+	}
+	d.AllowedPoPs = []string(pops)
+	_ = r.cache.SaveDomain(&d)
+	return &d, nil
+}
+
+func (r *PostgresRepository) getDomainByHostFromDB(hostname string) (*model.Domain, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var d model.Domain
+	var pops pq.StringArray
+	err := r.db.QueryRowContext(ctx,
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE hostname = $1",
+		hostname,
+	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("query domain by host %s: %w", hostname, err)
+	}
+	d.AllowedPoPs = []string(pops)
+	_ = r.cache.SaveDomain(&d)
+	return &d, nil
 }
 
 func (r *PostgresRepository) ListDomainsByProject(projectID string) []*model.Domain {
