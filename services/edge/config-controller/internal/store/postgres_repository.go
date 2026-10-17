@@ -1438,11 +1438,10 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		}
 		if encKey != "" {
 			dec, decErr := security.DecryptSecret(encKey)
-			if decErr == nil {
-				cert.PrivateKeyPEM = dec
-			} else {
-				cert.PrivateKeyPEM = encKey
+			if decErr != nil {
+				return nil, fmt.Errorf("reconcile cache decrypt private key for certificate %s (domain %s): %w", cert.ID, cert.DomainID, decErr)
 			}
+			cert.PrivateKeyPEM = dec
 		}
 		stagedCerts = append(stagedCerts, &cert)
 	}
@@ -2279,11 +2278,10 @@ func (r *PostgresRepository) GetCertificate(domainID string) *model.Certificate 
 
 	if encKey != "" {
 		dec, decErr := security.DecryptSecret(encKey)
-		if decErr == nil {
-			cert.PrivateKeyPEM = dec
-		} else {
-			cert.PrivateKeyPEM = encKey
+		if decErr != nil {
+			return nil
 		}
+		cert.PrivateKeyPEM = dec
 	}
 	_ = r.cache.SaveCertificate(&cert)
 	return &cert
@@ -2491,11 +2489,10 @@ func (r *PostgresRepository) GetAIProvider(id string) (*model.AIProvider, error)
 
 	if encryptedKey != "" {
 		dec, decErr := security.DecryptSecret(encryptedKey)
-		if decErr == nil {
-			p.APIKey = dec
-		} else {
-			p.APIKey = encryptedKey
+		if decErr != nil {
+			return nil, fmt.Errorf("decrypt ai_provider %s secret: %w", id, decErr)
 		}
+		p.APIKey = dec
 	}
 	_ = r.cache.SaveAIProvider(&p)
 	return &p, nil

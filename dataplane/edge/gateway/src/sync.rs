@@ -356,9 +356,13 @@ pub fn persist_snapshot_to_disk(path: &str, payload: &str) -> Result<(), std::io
 
         #[cfg(unix)]
         if let Some(parent) = p.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            let dir_path = if parent.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                parent
+            };
+            let dir = std::fs::File::open(dir_path)?;
+            dir.sync_all()?;
         }
         Ok(())
     })();
@@ -468,6 +472,7 @@ impl GatewayAckManager {
     /// Invariant: Atomically persists ACK payload to durable disk spool before updating memory.
     /// Fail-Closed: If persisting to disk spool fails, the ACK is rejected and not staged in memory.
     /// Thread-Safe: Serialized under spool_lock with globally unique temporary file naming.
+    /// Conflict-Aware: Rejects identity mismatches and same-version checksum conflicts.
     pub fn submit_ack(&self, ack: GatewaySyncAckPayload) -> Result<(), std::io::Error> {
         let _spool_guard = self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -478,11 +483,22 @@ impl GatewayAckManager {
                 }
             }
 
-            // Monotonic generation check on disk:
-            // Prevent older ACKs from overwriting newer state on disk.
+            // Monotonic generation, identity, and conflict validation on disk
             if path.exists() {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     if let Ok(existing) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                        // 1. Identity validation: Gateway ID and PoP ID must match existing spool
+                        if existing.gateway_id != ack.gateway_id || existing.pop_id != ack.pop_id {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "Identity mismatch for ACK spool: disk holds gateway='{}', pop='{}', but submitted gateway='{}', pop='{}'",
+                                    existing.gateway_id, existing.pop_id, ack.gateway_id, ack.pop_id
+                                ),
+                            ));
+                        }
+
+                        // 2. Monotonic version validation: prevent older ACKs from overwriting newer state on disk
                         if existing.applied_version > ack.applied_version {
                             tracing::warn!(
                                 existing_version = existing.applied_version,
@@ -498,6 +514,26 @@ impl GatewayAckManager {
                             {
                                 *guard = Some(existing);
                             }
+                            return Ok(());
+                        }
+
+                        // 3. Same version validation: detect conflicting checksums vs idempotent retries
+                        if existing.applied_version == ack.applied_version {
+                            if existing.applied_checksum != ack.applied_checksum {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    format!(
+                                        "Checksum mismatch conflict for version {}: disk holds '{}', but proposed '{}'",
+                                        ack.applied_version, existing.applied_checksum, ack.applied_checksum
+                                    ),
+                                ));
+                            }
+
+                            // Exact match: accept as idempotent retry without re-writing disk
+                            let mut guard =
+                                self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                            *guard = Some(ack);
+                            self.notify.notify_one();
                             return Ok(());
                         }
                     }
@@ -531,9 +567,13 @@ impl GatewayAckManager {
 
                 #[cfg(unix)]
                 if let Some(parent) = path.parent() {
-                    if let Ok(dir) = std::fs::File::open(parent) {
-                        let _ = dir.sync_all();
-                    }
+                    let dir_path = if parent.as_os_str().is_empty() {
+                        std::path::Path::new(".")
+                    } else {
+                        parent
+                    };
+                    let dir = std::fs::File::open(dir_path)?;
+                    dir.sync_all()?;
                 }
                 Ok(())
             })();
@@ -1409,6 +1449,144 @@ mod tests {
         let parsed: GatewaySyncAckPayload = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed.applied_version, 50);
         assert_eq!(mgr.pending_ack().unwrap().applied_version, 50);
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_same_version_checksum_conflict_rejected() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_conflict_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        let ack_v50_a = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 50,
+            applied_checksum: "hash-v50-A".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v50_a).is_ok());
+
+        // Conflicting checksum on same version 50
+        let ack_v50_b = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 50,
+            applied_checksum: "hash-v50-B".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        let res = mgr.submit_ack(ack_v50_b);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Checksum mismatch conflict"));
+
+        // Invariant: On-disk spool MUST retain original hash-v50-A
+        let raw = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        let parsed: GatewaySyncAckPayload = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.applied_checksum, "hash-v50-A");
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_identity_mismatch_rejected() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_identity_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        let ack_initial = GatewaySyncAckPayload {
+            gateway_id: "gw-dhaka-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 1,
+            applied_checksum: "hash-v1".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_initial).is_ok());
+
+        // Attempt submission from a different PoP/Gateway ID into the same spool
+        let ack_spoofed = GatewaySyncAckPayload {
+            gateway_id: "gw-dhaka-02".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 2,
+            applied_checksum: "hash-v2".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        let res = mgr.submit_ack(ack_spoofed);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("Identity mismatch for ACK spool"));
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_same_version_idempotent_retry() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_idempotent_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        let ack = GatewaySyncAckPayload {
+            gateway_id: "gw-dhaka-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 10,
+            applied_checksum: "hash-v10".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack.clone()).is_ok());
+        // Exact same version and checksum must succeed idempotently
+        assert!(mgr.submit_ack(ack).is_ok());
 
         let _ = std::fs::remove_file(&spool_path);
     }

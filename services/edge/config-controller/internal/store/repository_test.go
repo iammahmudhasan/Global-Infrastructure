@@ -1769,6 +1769,66 @@ func TestPostgresRepository_ReconcileCache_QueryFailurePreservesWorkingCache(t *
 	}
 }
 
+func TestPostgresRepository_ReconcileCache_CorruptCiphertextFailsClosed(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres ReconcileCache corrupt ciphertext test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo: %v", err)
+	}
+	defer repo.Close()
+
+	ts := time.Now().UnixNano()
+	domID := fmt.Sprintf("dom-corrupt-cert-%d", ts)
+	dom := &model.Domain{
+		ID:        domID,
+		ProjectID: "prj-test",
+		Hostname:  fmt.Sprintf("corrupt-%d.example.com", ts),
+		Status:    model.DomainStatusActive,
+		Version:   1,
+	}
+	if err := repo.SaveDomain(dom); err != nil {
+		t.Fatalf("SaveDomain failed: %v", err)
+	}
+
+	// Insert active certificate with corrupted ciphertext directly into DB
+	certID := fmt.Sprintf("cert-corrupt-%d", ts)
+	corruptedCiphertext := "enc:v1:this-is-corrupted-ciphertext-that-fails-decryption"
+	_, err = repo.DB().ExecContext(ctx, `
+		INSERT INTO certificates (id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, expires_at)
+		VALUES ($1, $2, 'ACTIVE', 'Let''s Encrypt', '123456', '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----', $3, 'fingerprint123', 'RSA', ARRAY[$4], false, NOW() + INTERVAL '30 days')
+	`, certID, domID, corruptedCiphertext, dom.Hostname)
+	if err != nil {
+		t.Fatalf("failed to insert corrupt cert: %v", err)
+	}
+	defer func() {
+		_, _ = repo.DB().ExecContext(ctx, "DELETE FROM certificates WHERE id = $1", certID)
+		_, _ = repo.DB().ExecContext(ctx, "DELETE FROM domains WHERE id = $1", domID)
+	}()
+
+	// ReconcileCache must fail-closed with error
+	stats, err := repo.ReconcileCache(ctx)
+	if err == nil {
+		t.Fatalf("expected ReconcileCache to fail due to corrupt ciphertext, but succeeded with stats: %+v", stats)
+	}
+	if !strings.Contains(err.Error(), "decrypt private key for certificate") {
+		t.Fatalf("expected decryption error message, got: %v", err)
+	}
+
+	// GetCertificate must also fail-closed and return nil rather than returning ciphertext
+	badCert := repo.GetCertificate(domID)
+	if badCert != nil {
+		t.Fatalf("expected GetCertificate to return nil for corrupt ciphertext, got %+v", badCert)
+	}
+}
+
 func TestStore_ApplyReconciliationSnapshot_AtomicEviction(t *testing.T) {
 	s := store.NewStore()
 
