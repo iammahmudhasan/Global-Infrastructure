@@ -1511,13 +1511,34 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		SecurityPolicies: stagedPoliciesMap,
 	}
 
+	// Calculate evicted and updated domains by comparing current cache with authoritative DB snapshot
+	cachedDomains := r.cache.ListDomains()
+	var evictedDomains int
+	for _, cd := range cachedDomains {
+		if _, exists := activeDBMap[cd.ID]; !exists {
+			evictedDomains++
+		}
+	}
+
+	var updatedDomains int
+	for _, dbDom := range activeDBMap {
+		cached, err := r.cache.GetDomain(dbDom.ID)
+		if err != nil || cached == nil {
+			updatedDomains++
+		} else if dbDom.Version > cached.Version || dbDom.Status != cached.Status || dbDom.Hostname != cached.Hostname {
+			updatedDomains++
+		}
+	}
+
 	if err := r.cache.ApplyReconciliationSnapshot(snap); err != nil {
 		return nil, fmt.Errorf("apply reconciliation snapshot to cache: %w", err)
 	}
 
 	stats := &CacheReconciliationStats{
-		ActiveDomains: len(activeDBMap),
-		Duration:      time.Since(start),
+		ActiveDomains:  len(activeDBMap),
+		EvictedDomains: evictedDomains,
+		UpdatedDomains: updatedDomains,
+		Duration:       time.Since(start),
 	}
 	if !latestUpdate.IsZero() {
 		stats.MaxLag = time.Since(latestUpdate)
