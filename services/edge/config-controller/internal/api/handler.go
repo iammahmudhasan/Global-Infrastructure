@@ -483,6 +483,11 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	resp := map[string]interface{}{
+		"status":  "healthy",
+		"service": "nexusedge-config-controller",
+		"version": "1.0.0",
+	}
 	if pgRepo, ok := h.store.(*store.PostgresRepository); ok {
 		if fails := pgRepo.ConsecutiveReconcileFailures(); fails >= 3 {
 			lastErrStr := ""
@@ -498,12 +503,16 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		resp["consecutive_reconcile_failures"] = pgRepo.ConsecutiveReconcileFailures()
+		if lastSuccess := pgRepo.LastReconcileSuccess(); !lastSuccess.IsZero() {
+			resp["last_reconcile_success"] = lastSuccess.Format(time.RFC3339)
+		}
+		if dur := pgRepo.LastReconcileDuration(); dur > 0 {
+			resp["last_reconcile_duration_ms"] = dur.Milliseconds()
+		}
+		resp["reconcile_alert_failures"] = pgRepo.ReconcileAlertFailures()
 	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"status":  "healthy",
-		"service": "nexusedge-config-controller",
-		"version": "1.0.0",
-	})
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // /v1/projects/{project_id}/domains, /v1/projects/{project_id}/ai/providers, and /v1/projects/{project_id}/audit-logs

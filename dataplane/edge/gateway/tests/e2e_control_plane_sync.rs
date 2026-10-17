@@ -1020,12 +1020,15 @@ async fn test_e2e_corrupt_spool_readiness_gate_and_operator_recovery() {
     // 1. Write corrupted JSON payload to disk
     std::fs::write(&spool_path, "{ broken json...").expect("write corrupt spool failed");
 
-    let ack_mgr = Arc::new(GatewayAckManager::new(
-        "http://127.0.0.1:9999".to_string(),
-        "dummy-token".to_string(),
-        HttpClient::new(),
-        Some(spool_path.clone()),
-    ));
+    let ack_mgr = Arc::new(
+        GatewayAckManager::new(
+            "http://127.0.0.1:9999".to_string(),
+            "dummy-token".to_string(),
+            HttpClient::new(),
+            Some(spool_path.clone()),
+        )
+        .with_expected_identity(Some("gw-e2e-repair".to_string()), Some("dhaka".to_string())),
+    );
     assert!(ack_mgr.has_corrupt_spool());
 
     let config = GatewayConfig::default();
@@ -1100,11 +1103,33 @@ async fn test_e2e_corrupt_spool_readiness_gate_and_operator_recovery() {
     .expect("write repaired spool failed");
 
     // 5. Operator triggers POST /v1/system/spool/recover
+    std::env::set_var("NEXUSEDGE_SYSTEM_AUTH_TOKEN", "sys-token-e2e-recovery");
+
+    // 5a. Unauthenticated request must fail with 401 Unauthorized even on loopback
+    let unauth_resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/system/spool/recover",
+            addr.port()
+        ))
+        .send()
+        .await
+        .expect("Spool recover request must succeed");
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth_resp
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer realm=\"nexusedge-system\"")
+    );
+
+    // 5b. Authenticated operator request succeeds
     let recover_resp = client
         .post(format!(
             "http://127.0.0.1:{}/v1/system/spool/recover",
             addr.port()
         ))
+        .header("Authorization", "Bearer sys-token-e2e-recovery")
         .send()
         .await
         .expect("Spool recover request must succeed");
@@ -1135,6 +1160,7 @@ async fn test_e2e_corrupt_spool_readiness_gate_and_operator_recovery() {
     let metrics_again_text = metrics_again.text().await.unwrap();
     assert!(metrics_again_text.contains("nexusedge_gateway_ack_spool_corrupted 0"));
 
+    std::env::remove_var("NEXUSEDGE_SYSTEM_AUTH_TOKEN");
     let _ = shutdown_tx.send(());
     let _ = std::fs::remove_file(&spool_path);
 }
@@ -1163,4 +1189,229 @@ async fn test_e2e_strict_dns_fails_closed_on_unpinned_host() {
     assert!(res.is_err(), "Unpinned host must fail closed");
     let err = res.err().unwrap();
     assert!(err.to_string().contains("Strict DNS"));
+}
+
+#[tokio::test]
+async fn test_e2e_spool_recover_endpoint_security_authorization_and_validation() {
+    let spool_path = std::env::temp_dir().join(format!(
+        "nexusedge_test_spool_security_{}.json",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // Initially write a corrupt file
+    std::fs::write(&spool_path, "corrupt initial spool").expect("write initial spool");
+
+    let ack_mgr = Arc::new(
+        GatewayAckManager::new(
+            "http://127.0.0.1:9999".to_string(),
+            "cp-token".to_string(),
+            HttpClient::new(),
+            Some(spool_path.clone()),
+        )
+        .with_expected_identity(
+            Some("node-auth-test".to_string()),
+            Some("dhaka".to_string()),
+        ),
+    );
+    assert!(ack_mgr.has_corrupt_spool());
+
+    let config = GatewayConfig::default();
+    let state = Arc::new(ProxyState {
+        rate_limiter: RateLimiter::new(
+            config.rate_limit.enabled,
+            config.rate_limit.requests_per_second,
+            config.rate_limit.burst_capacity,
+        ),
+        waf: WafEngine::new(&config.waf),
+        cache: EdgeCache::new(
+            config.cache.enabled,
+            config.cache.default_ttl_seconds,
+            config.cache.max_entries,
+            config.cache.max_bytes,
+        ),
+        router: Router::new(vec![], 5000),
+        http_client: HttpClient::new(),
+        client_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        inflight_buffer_semaphore: Arc::new(tokio::sync::Semaphore::new(100)),
+        aggregate_buffered_bytes: Arc::new(AtomicUsize::new(0)),
+        aggregate_buffered_request_bytes: Arc::new(AtomicUsize::new(0)),
+        is_ready: Arc::new(AtomicBool::new(true)),
+        trusted_proxies: config.parsed_trusted_proxies(),
+        config,
+        ai_director: None,
+        metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
+        ack_manager: Some(Arc::clone(&ack_mgr)),
+    });
+
+    let (addr, shutdown_tx) = spawn_mock_gateway(state).await;
+    let client = HttpClient::new();
+    let base_url = format!("http://127.0.0.1:{}/v1/system/spool/recover", addr.port());
+
+    // 1. Method verification: GET is rejected with 405 Method Not Allowed
+    let get_resp = client.get(&base_url).send().await.unwrap();
+    assert_eq!(get_resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+
+    // 2. Unset NEXUSEDGE_SYSTEM_AUTH_TOKEN: Fail-Closed with 503 Service Unavailable
+    std::env::remove_var("NEXUSEDGE_SYSTEM_AUTH_TOKEN");
+    let no_env_resp = client.post(&base_url).send().await.unwrap();
+    assert_eq!(
+        no_env_resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let no_env_body: serde_json::Value = no_env_resp.json().await.unwrap();
+    assert!(no_env_body["message"]
+        .as_str()
+        .unwrap()
+        .contains("disabled: NEXUSEDGE_SYSTEM_AUTH_TOKEN is not configured"));
+
+    // 3. Set dedicated NEXUSEDGE_SYSTEM_AUTH_TOKEN
+    std::env::set_var("NEXUSEDGE_SYSTEM_AUTH_TOKEN", "super-secret-system-key");
+
+    // 4. Missing Authorization header: 401 Unauthorized with WWW-Authenticate header
+    let unauth_resp = client.post(&base_url).send().await.unwrap();
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth_resp
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer realm=\"nexusedge-system\"")
+    );
+
+    // 5. Wrong token: 401 Unauthorized
+    let wrong_token_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer invalid-token-attack")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_token_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 6. Semantic Validation - Mismatched gateway_id: 400 Bad Request
+    let bad_gw_payload = GatewaySyncAckPayload {
+        gateway_id: "other-node".to_string(),
+        pop_id: "dhaka".to_string(),
+        applied_version: 10,
+        applied_checksum: "hash-valid-10".to_string(),
+        status: "IN_SYNC".to_string(),
+        error: None,
+    };
+    let bad_gw_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer super-secret-system-key")
+        .json(&bad_gw_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_gw_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let bad_gw_body: serde_json::Value = bad_gw_resp.json().await.unwrap();
+    assert!(bad_gw_body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Identity mismatch: payload.gateway_id 'other-node'"));
+
+    // 7. Semantic Validation - Mismatched pop_id: 400 Bad Request
+    let bad_pop_payload = GatewaySyncAckPayload {
+        gateway_id: "node-auth-test".to_string(),
+        pop_id: "singapore".to_string(),
+        applied_version: 10,
+        applied_checksum: "hash-valid-10".to_string(),
+        status: "IN_SYNC".to_string(),
+        error: None,
+    };
+    let bad_pop_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer super-secret-system-key")
+        .json(&bad_pop_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_pop_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let bad_pop_body: serde_json::Value = bad_pop_resp.json().await.unwrap();
+    assert!(bad_pop_body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Identity mismatch: payload.pop_id 'singapore'"));
+
+    // 8. Semantic Validation - Version <= 0: 400 Bad Request
+    let bad_ver_payload = GatewaySyncAckPayload {
+        gateway_id: "node-auth-test".to_string(),
+        pop_id: "dhaka".to_string(),
+        applied_version: 0,
+        applied_checksum: "hash-valid-10".to_string(),
+        status: "IN_SYNC".to_string(),
+        error: None,
+    };
+    let bad_ver_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer super-secret-system-key")
+        .json(&bad_ver_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_ver_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let bad_ver_body: serde_json::Value = bad_ver_resp.json().await.unwrap();
+    assert!(bad_ver_body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid applied_version: 0 must be greater than 0"));
+
+    // 9. Semantic Validation - Invalid status: 400 Bad Request
+    let bad_status_payload = GatewaySyncAckPayload {
+        gateway_id: "node-auth-test".to_string(),
+        pop_id: "dhaka".to_string(),
+        applied_version: 10,
+        applied_checksum: "hash-valid-10".to_string(),
+        status: "MALICIOUS_STATUS".to_string(),
+        error: None,
+    };
+    let bad_status_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer super-secret-system-key")
+        .json(&bad_status_payload)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad_status_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let bad_status_body: serde_json::Value = bad_status_resp.json().await.unwrap();
+    assert!(bad_status_body["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid status 'MALICIOUS_STATUS': must be IN_SYNC or DEGRADED"));
+
+    // Invariant: Spool corruption flag MUST remain true on validation failure
+    assert!(ack_mgr.has_corrupt_spool());
+
+    // 10. Valid Authorized Force Recovery: 200 OK
+    let valid_force = GatewaySyncAckPayload {
+        gateway_id: "node-auth-test".to_string(),
+        pop_id: "dhaka".to_string(),
+        applied_version: 10,
+        applied_checksum: "hash-valid-10".to_string(),
+        status: "IN_SYNC".to_string(),
+        error: None,
+    };
+    let valid_resp = client
+        .post(&base_url)
+        .header("Authorization", "Bearer super-secret-system-key")
+        .json(&valid_force)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(valid_resp.status(), reqwest::StatusCode::OK);
+    let valid_body: serde_json::Value = valid_resp.json().await.unwrap();
+    assert_eq!(valid_body["status"], "recovered");
+    assert_eq!(valid_body["action"], "force_overwrite");
+    assert_eq!(valid_body["applied_version"], 10);
+    assert_eq!(valid_body["spool_corrupted"], false);
+
+    // Invariant: Spool corruption flag is now cleared
+    assert!(!ack_mgr.has_corrupt_spool());
+
+    std::env::remove_var("NEXUSEDGE_SYSTEM_AUTH_TOKEN");
+    let _ = shutdown_tx.send(());
+    let _ = std::fs::remove_file(&spool_path);
 }

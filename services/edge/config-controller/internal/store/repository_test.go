@@ -2163,4 +2163,77 @@ func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *
 	if lastSuccess := repo.LastReconcileSuccess(); lastSuccess.Before(testStart) {
 		t.Fatalf("expected last reconcile success timestamp (%v) to be after testStart (%v)", lastSuccess, testStart)
 	}
+
+	// Invariant: Alerter MUST have received RECONCILER_RECOVERED event
+	time.Sleep(100 * time.Millisecond) // allow goroutine dispatch
+	events = mockAlert.getEvents()
+	var recoveryAlertFound bool
+	for _, ev := range events {
+		if ev.Type == alert.EventTypeReconcilerRecovered {
+			recoveryAlertFound = true
+			if ev.Severity != alert.SeverityInfo {
+				t.Fatalf("expected INFO severity on recovery, got %v", ev.Severity)
+			}
+			if ev.Details["previous_failures"] != "3" {
+				t.Fatalf("expected previous_failures=3, got %v", ev.Details["previous_failures"])
+			}
+			break
+		}
+	}
+	if !recoveryAlertFound {
+		t.Fatalf("expected RECONCILER_RECOVERED alert event after recovery from threshold, got %v", events)
+	}
+}
+
+type failingMockAlerter struct {
+	mu       sync.Mutex
+	attempts int
+}
+
+func (f *failingMockAlerter) SendAlert(ctx context.Context, event alert.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempts++
+	return errors.New("simulated network outage to alert provider")
+}
+
+func (f *failingMockAlerter) IsConfigured() bool {
+	return true
+}
+
+func TestPostgresRepository_ReconcileAlertRetryAndFailureTracking(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("skipping Postgres ReconcileAlertRetry test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository: %v", err)
+	}
+	defer repo.Close()
+
+	failingAlert := &failingMockAlerter{}
+	repo.SetAlerter(failingAlert)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 1; i <= 3; i++ {
+		_, _ = repo.ReconcileCache(canceledCtx)
+	}
+
+	// Retry loop does 3 attempts with 100ms and 200ms backoff
+	time.Sleep(600 * time.Millisecond)
+
+	failingAlert.mu.Lock()
+	attempts := failingAlert.attempts
+	failingAlert.mu.Unlock()
+
+	if attempts != 3 {
+		t.Fatalf("expected exactly 3 retry attempts before giving up, got %d", attempts)
+	}
+	if alertFails := repo.ReconcileAlertFailures(); alertFails != 1 {
+		t.Fatalf("expected ReconcileAlertFailures() == 1, got %d", alertFails)
+	}
 }

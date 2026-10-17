@@ -431,6 +431,8 @@ pub struct GatewayAckManager {
     notify: Arc<tokio::sync::Notify>,
     spool_lock: Arc<std::sync::Mutex<()>>,
     pub corrupt_spool_detected: Arc<std::sync::atomic::AtomicBool>,
+    expected_gateway_id: Option<String>,
+    expected_pop_id: Option<String>,
 }
 
 impl GatewayAckManager {
@@ -486,7 +488,20 @@ impl GatewayAckManager {
             notify: Arc::new(tokio::sync::Notify::new()),
             spool_lock: Arc::new(std::sync::Mutex::new(())),
             corrupt_spool_detected: corrupt_flag,
+            expected_gateway_id: None,
+            expected_pop_id: None,
         }
+    }
+
+    /// Configures the expected gateway and PoP identity invariants for validating operator-provided recovery ACKs.
+    pub fn with_expected_identity(
+        mut self,
+        gateway_id: Option<String>,
+        pop_id: Option<String>,
+    ) -> Self {
+        self.expected_gateway_id = gateway_id;
+        self.expected_pop_id = pop_id;
+        self
     }
 
     /// Returns true if an unreadable or corrupted ACK spool was encountered on disk during startup or worker reload.
@@ -509,6 +524,63 @@ impl GatewayAckManager {
                 let content = std::fs::read_to_string(path)?;
                 let recovered = serde_json::from_str::<GatewaySyncAckPayload>(&content)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                // Semantic validation on recovered payload
+                if let Some(ref expected_gw) = self.expected_gateway_id {
+                    if recovered.gateway_id != *expected_gw {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Spool identity mismatch: recovered.gateway_id '{}' does not match expected '{}'",
+                                recovered.gateway_id, expected_gw
+                            ),
+                        ));
+                    }
+                }
+                if let Some(ref expected_pop) = self.expected_pop_id {
+                    if recovered.pop_id != *expected_pop {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "Spool identity mismatch: recovered.pop_id '{}' does not match expected '{}'",
+                                recovered.pop_id, expected_pop
+                            ),
+                        ));
+                    }
+                }
+                if recovered.applied_version <= 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid applied_version in spool: {} must be greater than 0",
+                            recovered.applied_version
+                        ),
+                    ));
+                }
+                let cs = recovered.applied_checksum.trim();
+                if cs.len() < 8
+                    || cs.len() > 128
+                    || !cs
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid applied_checksum in spool: '{}'",
+                            recovered.applied_checksum
+                        ),
+                    ));
+                }
+                if recovered.status != "IN_SYNC" && recovered.status != "DEGRADED" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Invalid status in spool: '{}' must be IN_SYNC or DEGRADED",
+                            recovered.status
+                        ),
+                    ));
+                }
 
                 self.corrupt_spool_detected
                     .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -538,10 +610,68 @@ impl GatewayAckManager {
 
     /// Allows an operator to manually overwrite/repair a corrupted spool with a validated payload.
     /// Atomically persists the payload, clears the corrupt flag, updates memory, and wakes the worker.
+    /// Fails closed with InvalidInput if payload fails semantic verification.
     pub fn force_recover_spool(
         &self,
         payload: GatewaySyncAckPayload,
     ) -> Result<(), std::io::Error> {
+        // Semantic validation: Reject invalid state before taking spool_lock or mutating disk/memory
+        if let Some(ref expected_gw) = self.expected_gateway_id {
+            if payload.gateway_id != *expected_gw {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Identity mismatch: payload.gateway_id '{}' does not match expected '{}'",
+                        payload.gateway_id, expected_gw
+                    ),
+                ));
+            }
+        }
+        if let Some(ref expected_pop) = self.expected_pop_id {
+            if payload.pop_id != *expected_pop {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "Identity mismatch: payload.pop_id '{}' does not match expected '{}'",
+                        payload.pop_id, expected_pop
+                    ),
+                ));
+            }
+        }
+        if payload.applied_version <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid applied_version: {} must be greater than 0",
+                    payload.applied_version
+                ),
+            ));
+        }
+        let cs = payload.applied_checksum.trim();
+        if cs.len() < 8
+            || cs.len() > 128
+            || !cs
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == ':')
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid applied_checksum format: '{}' (must be 8-128 ascii chars: alphanumeric, hyphen, underscore, colon)",
+                    payload.applied_checksum
+                ),
+            ));
+        }
+        if payload.status != "IN_SYNC" && payload.status != "DEGRADED" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "Invalid status '{}': must be IN_SYNC or DEGRADED",
+                    payload.status
+                ),
+            ));
+        }
+
         let _spool_guard = self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
 
         if let Some(ref path) = self.spool_path {

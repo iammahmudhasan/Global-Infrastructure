@@ -37,6 +37,39 @@ fn plain_response(
         .unwrap()
 }
 
+fn json_response_with_headers(
+    status: StatusCode,
+    body: serde_json::Value,
+    headers: &[(&'static str, &'static str)],
+) -> Response<GatewayResponseBody> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Server", "NexusEdge/0.1.0");
+    for (k, v) in headers {
+        builder = builder.header(*k, *v);
+    }
+    builder
+        .body(GatewayResponseBody::from_string(body.to_string()))
+        .unwrap()
+}
+
+/// Constant-time token equality comparison using SHA-256 digests and XOR accumulation.
+/// Prevents byte-comparison and length timing side-channel leaks.
+pub fn constant_time_token_match(provided: &str, expected: &str) -> bool {
+    if provided.is_empty() || expected.is_empty() {
+        return false;
+    }
+    use sha2::{Digest, Sha256};
+    let h1 = Sha256::digest(provided.as_bytes());
+    let h2 = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (b1, b2) in h1.iter().zip(h2.iter()) {
+        diff |= b1 ^ b2;
+    }
+    diff == 0
+}
+
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -560,11 +593,35 @@ pub async fn handle_request(
             return Ok(json_response(StatusCode::METHOD_NOT_ALLOWED, body));
         }
 
+        // 1. Network Boundary Verification (Defense-in-Depth):
+        // Spool recovery is strictly an administrative management operation.
+        // Direct or proxied requests outside loopback or explicitly trusted proxy CIDRs fail closed immediately.
         let is_internal = client_ip.is_loopback()
             || state
                 .trusted_proxies
                 .iter()
                 .any(|cidr| cidr.contains(client_ip));
+        if !is_internal {
+            let body = serde_json::json!({
+                "error": "Forbidden",
+                "message": "Spool recovery restricted to internal management network",
+            });
+            return Ok(json_response(StatusCode::FORBIDDEN, body));
+        }
+
+        // 2. Administrative Token Configuration (Fail-Closed Gate):
+        // Must use dedicated NEXUSEDGE_SYSTEM_AUTH_TOKEN. No fallback to general CP tokens.
+        let expected_token = std::env::var("NEXUSEDGE_SYSTEM_AUTH_TOKEN").unwrap_or_default();
+        if expected_token.trim().is_empty() {
+            let body = serde_json::json!({
+                "error": "Service Unavailable",
+                "message": "Administrative recovery endpoint is disabled: NEXUSEDGE_SYSTEM_AUTH_TOKEN is not configured",
+            });
+            return Ok(json_response(StatusCode::SERVICE_UNAVAILABLE, body));
+        }
+
+        // 3. Mandatory Cryptographic Authorization (Even on Loopback / Trusted Proxies):
+        // Network proximity alone NEVER grants administrative execution rights.
         let auth_header = req
             .headers()
             .get("Authorization")
@@ -572,17 +629,16 @@ pub async fn handle_request(
             .unwrap_or("")
             .trim();
         let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
-        let expected_token = std::env::var("NEXUSEDGE_SYSTEM_AUTH_TOKEN")
-            .unwrap_or_else(|_| std::env::var("NEXUSEDGE_CP_AUTH_TOKEN").unwrap_or_default());
-
-        let is_authenticated = !expected_token.is_empty() && token == expected_token;
-
-        if !is_internal && !is_authenticated {
+        if token.is_empty() || !constant_time_token_match(token, expected_token.trim()) {
             let body = serde_json::json!({
-                "error": "Forbidden",
-                "message": "Spool recovery restricted to internal network or authorized operator",
+                "error": "Unauthorized",
+                "message": "Missing or invalid administrative bearer token",
             });
-            return Ok(json_response(StatusCode::FORBIDDEN, body));
+            return Ok(json_response_with_headers(
+                StatusCode::UNAUTHORIZED,
+                body,
+                &[("WWW-Authenticate", "Bearer realm=\"nexusedge-system\"")],
+            ));
         }
 
         let Some(ref ack_mgr) = state.ack_manager else {
@@ -608,6 +664,14 @@ pub async fn handle_request(
             match serde_json::from_slice::<crate::sync::GatewaySyncAckPayload>(&body_buf) {
                 Ok(force_payload) => match ack_mgr.force_recover_spool(force_payload.clone()) {
                     Ok(()) => {
+                        // Audit log: Actor IP, timestamp, action, version (strictly NO secrets or tokens)
+                        tracing::info!(
+                            actor_ip = %client_ip,
+                            action = "force_overwrite",
+                            applied_version = force_payload.applied_version,
+                            spool_corrupted = ack_mgr.has_corrupt_spool(),
+                            "Administrative spool recovery executed successfully"
+                        );
                         let body = serde_json::json!({
                             "status": "recovered",
                             "action": "force_overwrite",
@@ -615,6 +679,13 @@ pub async fn handle_request(
                             "spool_corrupted": ack_mgr.has_corrupt_spool(),
                         });
                         return Ok(json_response(StatusCode::OK, body));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        let body = serde_json::json!({
+                            "error": "Bad Request",
+                            "message": format!("Semantic validation failed: {}", e),
+                        });
+                        return Ok(json_response(StatusCode::BAD_REQUEST, body));
                     }
                     Err(e) => {
                         let body = serde_json::json!({
@@ -635,6 +706,14 @@ pub async fn handle_request(
         } else {
             match ack_mgr.recheck_and_recover_spool() {
                 Ok(recovered_opt) => {
+                    // Audit log: Actor IP, timestamp, action, version (strictly NO secrets or tokens)
+                    tracing::info!(
+                        actor_ip = %client_ip,
+                        action = "recheck_disk",
+                        recovered_version = ?recovered_opt.as_ref().map(|p| p.applied_version),
+                        spool_corrupted = ack_mgr.has_corrupt_spool(),
+                        "Administrative spool recovery executed successfully"
+                    );
                     let body = serde_json::json!({
                         "status": "recovered",
                         "action": "recheck_disk",
@@ -646,7 +725,7 @@ pub async fn handle_request(
                 Err(e) => {
                     let body = serde_json::json!({
                         "error": "Conflict",
-                        "message": format!("Spool file is still unreadable or corrupted: {}", e),
+                        "message": format!("Spool file is still unreadable, corrupted, or semantically invalid: {}", e),
                         "spool_corrupted": true,
                     });
                     return Ok(json_response(StatusCode::CONFLICT, body));

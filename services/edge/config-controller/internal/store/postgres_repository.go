@@ -94,6 +94,7 @@ type PostgresRepository struct {
 	lastReconcileSuccess      time.Time
 	lastReconcileDuration     time.Duration
 	alerter                   alert.Alerter
+	reconcileAlertFailures    int64
 }
 
 var _ Repository = (*PostgresRepository)(nil)
@@ -110,6 +111,33 @@ func (r *PostgresRepository) SetAlerter(a alert.Alerter) {
 	r.alerter = a
 }
 
+func (r *PostgresRepository) dispatchAlertWithRetry(alerter alert.Alerter, event alert.Event) {
+	if alerter == nil || !alerter.IsConfigured() {
+		return
+	}
+	go func() {
+		const maxAttempts = 3
+		var lastErr error
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := alerter.SendAlert(ctx, event)
+			cancel()
+			if err == nil {
+				return
+			}
+			lastErr = err
+			if attempt < maxAttempts {
+				time.Sleep(time.Duration(attempt*100) * time.Millisecond)
+			}
+		}
+		r.reconcileMu.Lock()
+		r.reconcileAlertFailures++
+		r.reconcileMu.Unlock()
+		log.Printf("[ALERT DELIVERY ERROR] event=reconciler_alert_delivery_failed type=%s attempts=%d error=%q",
+			event.Type, maxAttempts, lastErr.Error())
+	}()
+}
+
 func (r *PostgresRepository) recordReconcileFailure(err error, dur time.Duration) {
 	r.reconcileMu.Lock()
 	r.consecutiveReconcileFails++
@@ -124,24 +152,27 @@ func (r *PostgresRepository) recordReconcileFailure(err error, dur time.Duration
 		log.Printf("[CRITICAL RECONCILER THRESHOLD EXCEEDED] event=reconcile_failure_threshold_exceeded consecutive_failures=%d threshold=%d error=%q",
 			count, alertThreshold, err.Error())
 		if alerter != nil && alerter.IsConfigured() {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = alerter.SendAlert(ctx, alert.Event{
-					Type:      alert.EventTypeReconcilerThresholdExceeded,
-					Severity:  alert.SeverityCritical,
-					Title:     fmt.Sprintf("Cache Reconciler Threshold Exceeded (%d failures)", count),
-					Message:   fmt.Sprintf("Edge config-controller cache reconciliation has failed %d consecutive times. Last error: %s", count, err.Error()),
-					Timestamp: time.Now().UTC(),
-					Details: map[string]string{
-						"consecutive_failures": strconv.FormatInt(count, 10),
-						"threshold":            strconv.Itoa(alertThreshold),
-						"last_error":           err.Error(),
-					},
-				})
-			}()
+			r.dispatchAlertWithRetry(alerter, alert.Event{
+				Type:      alert.EventTypeReconcilerThresholdExceeded,
+				Severity:  alert.SeverityCritical,
+				Title:     fmt.Sprintf("Cache Reconciler Threshold Exceeded (%d failures)", count),
+				Message:   fmt.Sprintf("Edge config-controller cache reconciliation has failed %d consecutive times. Last error: %s", count, err.Error()),
+				Timestamp: time.Now().UTC(),
+				Details: map[string]string{
+					"consecutive_failures": strconv.FormatInt(count, 10),
+					"threshold":            strconv.Itoa(alertThreshold),
+					"last_error":           err.Error(),
+				},
+			})
 		}
 	}
+}
+
+// ReconcileAlertFailures returns the count of failed alert delivery attempts.
+func (r *PostgresRepository) ReconcileAlertFailures() int64 {
+	r.reconcileMu.RLock()
+	defer r.reconcileMu.RUnlock()
+	return r.reconcileAlertFailures
 }
 
 // ConsecutiveReconcileFailures returns the current count of consecutive failed cache reconciliations.
@@ -1386,11 +1417,27 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (stats *CacheRe
 			r.recordReconcileFailure(err, dur)
 		} else {
 			r.reconcileMu.Lock()
+			previousFails := r.consecutiveReconcileFails
 			r.consecutiveReconcileFails = 0
 			r.lastReconcileError = nil
 			r.lastReconcileSuccess = time.Now().UTC()
 			r.lastReconcileDuration = dur
+			alerter := r.alerter
 			r.reconcileMu.Unlock()
+
+			if previousFails >= 3 && alerter != nil && alerter.IsConfigured() {
+				r.dispatchAlertWithRetry(alerter, alert.Event{
+					Type:      alert.EventTypeReconcilerRecovered,
+					Severity:  alert.SeverityInfo,
+					Title:     "Cache Reconciler Recovered",
+					Message:   fmt.Sprintf("Edge config-controller cache reconciliation recovered after %d consecutive failures", previousFails),
+					Timestamp: time.Now().UTC(),
+					Details: map[string]string{
+						"previous_failures": strconv.FormatInt(previousFails, 10),
+						"duration_ms":       strconv.FormatInt(dur.Milliseconds(), 10),
+					},
+				})
+			}
 		}
 	}()
 

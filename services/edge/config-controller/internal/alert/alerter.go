@@ -33,6 +33,7 @@ const (
 	EventTypePoPRecovered                = "POP_RECOVERED"
 	EventTypePoPFailover                 = "POP_FAILOVER"
 	EventTypeReconcilerThresholdExceeded = "RECONCILER_THRESHOLD_EXCEEDED"
+	EventTypeReconcilerRecovered         = "RECONCILER_RECOVERED"
 )
 
 // Event represents a structured infrastructure health or performance alert.

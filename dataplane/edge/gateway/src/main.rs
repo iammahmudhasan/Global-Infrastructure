@@ -217,12 +217,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     std::path::PathBuf::from(format!("{}.ack.json", autonomous_snapshot_path))
                 });
 
-            let mgr = Arc::new(GatewayAckManager::new(
-                cp_cfg.endpoint.clone(),
-                cp_cfg.auth_token.clone(),
-                sync_client.clone(),
-                Some(ack_spool_path),
-            ));
+            let mgr = Arc::new(
+                GatewayAckManager::new(
+                    cp_cfg.endpoint.clone(),
+                    cp_cfg.auth_token.clone(),
+                    sync_client.clone(),
+                    Some(ack_spool_path),
+                )
+                .with_expected_identity(
+                    Some(config.server.node_id.clone()),
+                    Some(cp_cfg.pop_id.clone()),
+                ),
+            );
             Arc::clone(&mgr).spawn_worker();
             (Some(mgr), Some(sync_client))
         } else {
