@@ -112,8 +112,12 @@ func validateOutboxPayloadSchema(eventType string, payload map[string]interface{
 	case "security.policy.changed":
 		return checkNonEmptyStr("domain_id")
 	case "certificate.changed":
-		if err := checkNonEmptyStr("cert_id"); err != nil {
-			return err
+		certID, hasCertID := payload["cert_id"].(string)
+		if !hasCertID || strings.TrimSpace(certID) == "" {
+			certID, hasCertID = payload["certificate_id"].(string)
+		}
+		if !hasCertID || strings.TrimSpace(certID) == "" {
+			return errors.New("outbox payload schema error: cert_id or certificate_id is required")
 		}
 		return checkNonEmptyStr("domain_id")
 	case "ai_provider.changed":

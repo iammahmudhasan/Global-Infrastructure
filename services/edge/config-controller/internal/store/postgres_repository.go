@@ -1277,15 +1277,19 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	}
 
 	// 3. Synchronize active routes for all active domains
+	routesByDomain := make(map[string][]*model.Route)
 	routeRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
 	if err == nil {
 		defer routeRows.Close()
 		for routeRows.Next() {
 			var rt model.Route
 			if err := routeRows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err == nil {
-				_ = r.cache.SaveRoute(&rt)
+				routesByDomain[rt.DomainID] = append(routesByDomain[rt.DomainID], &rt)
 			}
 		}
+	}
+	for domID := range activeDBMap {
+		r.cache.SetRoutes(domID, routesByDomain[domID])
 	}
 
 	// 4. Synchronize active origin pools and origins
@@ -1721,9 +1725,9 @@ func (r *PostgresRepository) GetRoutes(domainID string) []*model.Route {
 		var rt model.Route
 		if err := rows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err == nil {
 			dbRoutes = append(dbRoutes, &rt)
-			_ = r.cache.SaveRoute(&rt)
 		}
 	}
+	r.cache.SetRoutes(domainID, dbRoutes)
 	return dbRoutes
 }
 
@@ -2049,6 +2053,7 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 	eventID := fmt.Sprintf("evt-cert-%d-%s", time.Now().UnixNano(), cert.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"certificate_id": cert.ID,
+		"cert_id":        cert.ID,
 		"domain_id":      cert.DomainID,
 		"status":         string(cert.Status),
 		"domains":        cert.Domains,

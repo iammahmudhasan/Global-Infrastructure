@@ -536,6 +536,9 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 	}
 
 	s.pools[p.ID] = cloneOriginPool(p)
+	for _, o := range p.Origins {
+		s.origins[o.ID] = cloneOrigin(&o)
+	}
 
 	eventID := fmt.Sprintf("evt-pool-%d-%s", time.Now().UnixNano(), p.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
@@ -566,6 +569,9 @@ func (s *Store) SaveOriginPoolBypass(p *model.OriginPool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pools[p.ID] = cloneOriginPool(p)
+	for _, o := range p.Origins {
+		s.origins[o.ID] = cloneOrigin(&o)
+	}
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -711,7 +717,32 @@ func (s *Store) UpdateOriginHealthy(originID string, healthy bool) error {
 func (s *Store) SaveRoute(r *model.Route) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.routes[r.DomainID] = append(s.routes[r.DomainID], cloneRoute(r))
+
+	// Clean from any old domain if route moved
+	for domID, rList := range s.routes {
+		if domID != r.DomainID {
+			for i, existing := range rList {
+				if existing != nil && existing.ID == r.ID {
+					s.routes[domID] = append(rList[:i], rList[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+
+	// Update existing route in-place if present, otherwise append
+	existingList := s.routes[r.DomainID]
+	updated := false
+	for i, existing := range existingList {
+		if existing != nil && existing.ID == r.ID {
+			existingList[i] = cloneRoute(r)
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		s.routes[r.DomainID] = append(existingList, cloneRoute(r))
+	}
 
 	eventID := fmt.Sprintf("evt-route-%d-%s", time.Now().UnixNano(), r.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
@@ -735,6 +766,19 @@ func (s *Store) SaveRoute(r *model.Route) error {
 
 	s.invalidateCachesLocked()
 	return nil
+}
+
+// SetRoutes atomically replaces the in-memory route slice for a specific domain.
+func (s *Store) SetRoutes(domainID string, routes []*model.Route) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	clonedList := make([]*model.Route, len(routes))
+	for i, r := range routes {
+		clonedList[i] = cloneRoute(r)
+	}
+	s.routes[domainID] = clonedList
+	s.invalidateCachesLocked()
 }
 
 func (s *Store) GetRoutes(domainID string) []*model.Route {
