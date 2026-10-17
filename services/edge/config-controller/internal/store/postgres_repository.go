@@ -366,6 +366,25 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`ALTER TABLE cache_policies ADD COLUMN IF NOT EXISTS strip_cookies BOOLEAN NOT NULL DEFAULT FALSE;`,
 			},
 		},
+		{
+			version: "0005_outbox_events_and_desired_state",
+			stmts: []string{
+				`CREATE TABLE IF NOT EXISTS outbox_events (
+					event_id VARCHAR(64) PRIMARY KEY,
+					aggregate_type VARCHAR(64) NOT NULL,
+					aggregate_id VARCHAR(64) NOT NULL,
+					event_type VARCHAR(64) NOT NULL,
+					payload JSONB NOT NULL,
+					status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+					retry_count INT NOT NULL DEFAULT 0,
+					created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					processed_at TIMESTAMPTZ
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_outbox_events_status ON outbox_events(status, created_at);`,
+				`CREATE INDEX IF NOT EXISTS idx_outbox_events_aggregate ON outbox_events(aggregate_type, aggregate_id);`,
+				`ALTER TABLE domains ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -824,20 +843,41 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 	}
 
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO domains (id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		`INSERT INTO domains (id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
 		 ON CONFLICT (id) DO UPDATE SET
 		   hostname = EXCLUDED.hostname,
 		   status = EXCLUDED.status,
 		   onboarding_type = EXCLUDED.onboarding_type,
 		   cname_target = EXCLUDED.cname_target,
 		   allowed_pops = EXCLUDED.allowed_pops,
-		   updated_at = EXCLUDED.updated_at`,
+		   updated_at = EXCLUDED.updated_at,
+		   version = domains.version + 1`,
 		d.ID, d.ProjectID, d.Hostname, string(d.Status), d.OnboardingType, d.CNAMETarget,
 		pqStringArray(d.AllowedPoPs), createdAt, now,
 	)
 	if err != nil {
 		return fmt.Errorf("upsert domain: %w", err)
+	}
+
+	eventID := fmt.Sprintf("evt-%d-%s", time.Now().UnixNano(), d.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id":       d.ID,
+		"project_id":      d.ProjectID,
+		"hostname":        d.Hostname,
+		"status":          string(d.Status),
+		"onboarding_type": d.OnboardingType,
+		"cname_target":    d.CNAMETarget,
+		"allowed_pops":    d.AllowedPoPs,
+		"updated_at":      now.Format(time.RFC3339),
+	})
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'domain', $2, 'domain.config.changed', $3, 'PENDING')`,
+		eventID, d.ID, payloadJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("record outbox event: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -864,15 +904,39 @@ func (r *PostgresRepository) ListDomains() []*model.Domain {
 }
 
 func (r *PostgresRepository) UpdateDomainStatus(id string, status model.DomainStatus) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := r.db.ExecContext(ctx,
-		"UPDATE domains SET status = $1, updated_at = NOW() WHERE id = $2",
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx,
+		"UPDATE domains SET status = $1, version = version + 1, updated_at = NOW() WHERE id = $2",
 		string(status), id,
 	)
 	if err != nil {
 		return fmt.Errorf("update domain status: %w", err)
+	}
+
+	eventID := fmt.Sprintf("evt-status-%d-%s", time.Now().UnixNano(), id)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id": id,
+		"status":    string(status),
+	})
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'domain', $2, 'domain.status.changed', $3, 'PENDING')`,
+		eventID, id, payloadJSON,
+	)
+	if err != nil {
+		return fmt.Errorf("record outbox event: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit status tx: %w", err)
 	}
 
 	return r.cache.UpdateDomainStatus(id, status)
@@ -887,6 +951,17 @@ func (r *PostgresRepository) DeleteDomain(domainID string) error {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	eventID := fmt.Sprintf("evt-del-%d-%s", time.Now().UnixNano(), domainID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id":  domainID,
+		"deleted_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	_, _ = tx.ExecContext(ctx,
+		`INSERT INTO outbox_events (event_id, aggregate_type, aggregate_id, event_type, payload, status)
+		 VALUES ($1, 'domain', $2, 'domain.deleted', $3, 'PENDING')`,
+		eventID, domainID, payloadJSON,
+	)
 
 	_, err = tx.ExecContext(ctx, "DELETE FROM domains WHERE id = $1", domainID)
 	if err != nil {
@@ -1603,4 +1678,67 @@ func (r *PostgresRepository) GetAuditLog(id string) (*model.AuditLog, error) {
 
 func (r *PostgresRepository) GetLastAuditHash() string {
 	return r.cache.GetLastAuditHash()
+}
+
+// -------------------------------------------------------------------------
+// Transactional Outbox Events (Desired-State Configuration Synchronization)
+// -------------------------------------------------------------------------
+
+// OutboxEvent represents an atomic desired-state event generated within the same
+// database transaction as domain/config mutations for reliable asynchronous reconciliation.
+type OutboxEvent struct {
+	EventID       string     `json:"event_id"`
+	AggregateType string     `json:"aggregate_type"`
+	AggregateID   string     `json:"aggregate_id"`
+	EventType     string     `json:"event_type"`
+	Payload       []byte     `json:"payload"`
+	Status        string     `json:"status"`
+	RetryCount    int        `json:"retry_count"`
+	CreatedAt     time.Time  `json:"created_at"`
+	ProcessedAt   *time.Time `json:"processed_at,omitempty"`
+}
+
+// GetPendingOutboxEvents retrieves unapplied outbox events ordered by creation timestamp.
+func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, created_at, processed_at
+		 FROM outbox_events
+		 WHERE status = 'PENDING'
+		 ORDER BY created_at ASC
+		 LIMIT $1`,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query pending outbox events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*OutboxEvent
+	for rows.Next() {
+		var ev OutboxEvent
+		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
+			return nil, fmt.Errorf("scan outbox event: %w", err)
+		}
+		events = append(events, &ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate outbox events: %w", err)
+	}
+	return events, nil
+}
+
+// MarkOutboxEventProcessed marks an outbox event as PROCESSED.
+func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, eventID string) error {
+	now := time.Now().UTC()
+	_, err := r.db.ExecContext(ctx,
+		"UPDATE outbox_events SET status = 'PROCESSED', processed_at = $1 WHERE event_id = $2",
+		now, eventID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark outbox event processed: %w", err)
+	}
+	return nil
 }

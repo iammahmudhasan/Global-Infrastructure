@@ -151,6 +151,131 @@ where
     directives
 }
 
+/// Parses an HTTP date string according to RFC 9110 Section 5.6.7 formats:
+/// 1. IMF-fixdate (e.g., "Sun, 06 Nov 1994 08:49:37 GMT")
+/// 2. RFC 850 format (e.g., "Sunday, 06-Nov-94 08:49:37 GMT")
+/// 3. ANSI C's asctime() format (e.g., "Sun Nov  6 08:49:37 1994")
+pub fn parse_http_date(date_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = date_str.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // 1. Preferred IMF-fixdate (RFC 2822 format)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+
+    // 2. Direct format match for "Sun, 06 Nov 1994 08:49:37 GMT"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+
+    // 3. Obsolete RFC 850 format "Sunday, 06-Nov-94 08:49:37 GMT"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%A, %d-%b-%y %H:%M:%S GMT") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+
+    // 4. Obsolete ANSI C asctime() format "Sun Nov  6 08:49:37 1994"
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%a %b %e %H:%M:%S %Y") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
+    }
+
+    None
+}
+
+/// Evaluates RFC 9111 Section 4.2 Freshness and Age calculation.
+/// Returns Some(remaining_freshness_duration) if the response is fresh and cacheable,
+/// or None if the response is stale, uncacheable, or expired past origin deadline.
+pub fn compute_rfc9111_freshness(
+    resp_headers: &HeaderMap,
+    default_ttl: Duration,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
+    let resp_cc_lines = resp_headers
+        .get_all("cache-control")
+        .iter()
+        .filter_map(|v| v.to_str().ok());
+    let resp_cc = parse_cache_control(resp_cc_lines);
+
+    // RFC 9111 Section 5.2.2.4 / 5.2.2.5 / 5.2.2.7:
+    // Reject responses marked no-store, private, or no-cache
+    if resp_cc.no_store || resp_cc.private || resp_cc.no_cache {
+        return None;
+    }
+
+    // Parse Date header (RFC 9110 Section 6.6.1)
+    let date_val = resp_headers
+        .get("date")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_http_date)
+        .unwrap_or(now);
+
+    // 1. Freshness Lifetime (RFC 9111 Section 4.2.1)
+    let freshness_lifetime: Duration = if let Some(s_max) = resp_cc.s_maxage {
+        Duration::from_secs(s_max)
+    } else if let Some(max_age) = resp_cc.max_age {
+        Duration::from_secs(max_age)
+    } else if let Some(expires_raw) = resp_headers.get("expires").and_then(|v| v.to_str().ok()) {
+        // Handle explicit "0" or invalid as already expired per RFC 9111 Section 5.3
+        if expires_raw.trim() == "0" {
+            return None;
+        }
+        match parse_http_date(expires_raw) {
+            Some(expires_dt) => {
+                if expires_dt <= date_val || expires_dt <= now {
+                    // Stale / past expiration deadline
+                    return None;
+                }
+                match (expires_dt - date_val).to_std() {
+                    Ok(dur) => dur,
+                    Err(_) => return None,
+                }
+            }
+            None => {
+                // Invalid date in Expires treated as past (RFC 9111 Section 5.3)
+                return None;
+            }
+        }
+    } else {
+        default_ttl
+    };
+
+    // 2. Current Age (RFC 9111 Section 4.2.3)
+    let age_header_secs = resp_headers
+        .get("age")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let apparent_age = if now > date_val {
+        (now - date_val).to_std().unwrap_or(Duration::ZERO)
+    } else {
+        Duration::ZERO
+    };
+
+    let corrected_initial_age = apparent_age.max(Duration::from_secs(age_header_secs));
+    let current_age = corrected_initial_age;
+
+    // Remaining freshness = freshness_lifetime - current_age
+    if current_age >= freshness_lifetime {
+        // Age already consumed entire freshness lifetime
+        return None;
+    }
+
+    let remaining = freshness_lifetime - current_age;
+    Some(remaining)
+}
+
 /// Bounded earliest-expiry eviction cache with RFC 9111 Vary header and byte limit support.
 #[derive(Clone)]
 pub struct EdgeCache {
@@ -290,9 +415,20 @@ impl EdgeCache {
                 }
             }
         }
-        // P2 Finding 2: Enforce hard ceiling on cache TTL and prevent Instant::now() + ttl panic on arithmetic overflow
+        // RFC 9111 Section 4.2: Enforce freshness calculation
+        let ttl = match custom_ttl {
+            Some(t) => t,
+            None => match compute_rfc9111_freshness(&headers, self.default_ttl, chrono::Utc::now())
+            {
+                Some(fresh) => fresh,
+                None => return, // Uncacheable or already expired per RFC 9111
+            },
+        };
         const MAX_CACHE_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
-        let ttl = custom_ttl.unwrap_or(self.default_ttl).min(MAX_CACHE_TTL);
+        let ttl = ttl.min(MAX_CACHE_TTL);
+        if ttl == Duration::ZERO {
+            return;
+        }
         let expires_at = match Instant::now().checked_add(ttl) {
             Some(at) => at,
             None => return, // Defensively drop unrepresentable Instant expiries
@@ -854,5 +990,186 @@ mod tests {
             bypass.is_none(),
             "Request Cache-Control: no-cache must bypass cache"
         );
+    }
+
+    #[test]
+    fn test_rfc9111_expires_in_past_rejected() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "date",
+            HeaderValue::from_static("Sat, 17 Oct 2026 06:00:00 GMT"),
+        );
+        resp_headers.insert(
+            "expires",
+            HeaderValue::from_static("Sat, 17 Oct 2026 05:00:00 GMT"),
+        );
+
+        let now = chrono::DateTime::parse_from_rfc2822("Sat, 17 Oct 2026 06:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert!(
+            freshness.is_none(),
+            "Response with Expires in the past must be uncacheable / stale"
+        );
+
+        cache.put(
+            "http://example.com/stale-expires".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"stale-content"),
+            None,
+            None,
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Stale expired response must never enter cache"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_expires_in_future_freshness() {
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "date",
+            HeaderValue::from_static("Sat, 17 Oct 2026 06:00:00 GMT"),
+        );
+        resp_headers.insert(
+            "expires",
+            HeaderValue::from_static("Sat, 17 Oct 2026 08:00:00 GMT"),
+        );
+
+        let now = chrono::DateTime::parse_from_rfc2822("Sat, 17 Oct 2026 06:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert_eq!(
+            freshness,
+            Some(Duration::from_secs(7200)),
+            "Freshness lifetime should exactly match (Expires - Date)"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_age_header_deduction() {
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+        resp_headers.insert("age", HeaderValue::from_static("3500"));
+
+        let now = chrono::Utc::now();
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert_eq!(
+            freshness,
+            Some(Duration::from_secs(100)),
+            "Remaining freshness must deduct Age header (3600 - 3500 = 100)"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_age_exceeds_max_age_rejected() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+        resp_headers.insert("age", HeaderValue::from_static("3700"));
+
+        let now = chrono::Utc::now();
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert!(
+            freshness.is_none(),
+            "Response whose Age >= max-age is already stale"
+        );
+
+        cache.put(
+            "http://example.com/stale-age".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"stale-content"),
+            None,
+            None,
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "Response with Age >= max-age must not be stored"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_max_age_precedence_over_expires() {
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "date",
+            HeaderValue::from_static("Sat, 17 Oct 2026 06:00:00 GMT"),
+        );
+        resp_headers.insert(
+            "expires",
+            HeaderValue::from_static("Sun, 17 Oct 2027 06:00:00 GMT"),
+        );
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, max-age=60"),
+        );
+
+        let now = chrono::DateTime::parse_from_rfc2822("Sat, 17 Oct 2026 06:00:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert_eq!(
+            freshness,
+            Some(Duration::from_secs(60)),
+            "RFC 9111 Section 4.2.1 mandates max-age overrides Expires"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_s_maxage_precedence_over_max_age() {
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert(
+            "cache-control",
+            HeaderValue::from_static("public, s-maxage=120, max-age=60"),
+        );
+
+        let now = chrono::Utc::now();
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert_eq!(
+            freshness,
+            Some(Duration::from_secs(120)),
+            "RFC 9111 Section 4.2.1 mandates s-maxage overrides max-age in shared caches"
+        );
+    }
+
+    #[test]
+    fn test_rfc9111_expires_zero_treated_as_past() {
+        let cache = EdgeCache::new(true, 3600, 10, 1024 * 1024);
+        let mut resp_headers = HeaderMap::new();
+        resp_headers.insert("expires", HeaderValue::from_static("0"));
+
+        let now = chrono::Utc::now();
+        let freshness = compute_rfc9111_freshness(&resp_headers, Duration::from_secs(3600), now);
+        assert!(
+            freshness.is_none(),
+            "Expires: 0 must be treated as time in the past per RFC 9111 Section 5.3"
+        );
+
+        cache.put(
+            "http://example.com/expires-zero".to_string(),
+            StatusCode::OK,
+            resp_headers,
+            Bytes::from_static(b"never-cache"),
+            None,
+            None,
+        );
+        assert_eq!(cache.len(), 0);
     }
 }

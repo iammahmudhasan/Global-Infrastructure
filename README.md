@@ -57,7 +57,7 @@ NexusEdge is an infrastructure-native, high-performance global network designed 
 | **Failover Routing** | DNS TTL-based rerouting (30s–300s delay) | Health check ping intervals (10s–30s) | Sub-millisecond EWMA ($\alpha = 0.2$) real-time steering |
 | **WAF Evaluation** | Interpreted ruleset engines | Centralized inspection middleboxes | In-process zero-allocation deterministic regex |
 | **State Propagation** | Eventual consistency (minutes globally) | Regional propagation delays | Raft / NATS JetStream declarative state replication |
-| **Data Sovereignty** | General geographic regions | Single country availability zones | Cryptographic NDMA 2026 & GDPR hard boundaries |
+| **Data Sovereignty** | General geographic regions | Single country availability zones | Policy-driven NDMA 2026 & GDPR data residency boundaries |
 
 ---
 
@@ -128,8 +128,8 @@ graph TD
 
 > [!NOTE]
 > **Data Plane Integration & Security Boundary Notices:**  
-> - **Proxy Integration:** The codebase currently features a **Go Control Plane & Envoy Configuration Compiler prototype** (`services/edge/config-controller`) alongside an **independent high-performance Rust L7 Edge Proxy prototype** (`dataplane/edge/gateway`). In this prototype milestone, the Rust gateway operates with a local configuration fixture (`gateway.yaml`), while the Go control plane compiles declarative Envoy v3 LDS/CDS/SDS JSON configurations (`/v1/edge/envoy-config`). Live dynamic integration via an Envoy xDS server and synchronized Rust config ingestion is scheduled for the V1 release.
-> - **Origin DNS Rebinding:** In the V0 prototype, customer origin domain names use Envoy `STRICT_DNS` directly. While onboarding validates resolved public IPs, full runtime DNS rebinding mitigation (via an Egress Proxy with link-local/private IP rejection or IP-pinned EDS) is `NOT_IMPLEMENTED` in V0 and scheduled for V1.
+> - **Authoritative Serving Data Plane:** The high-performance Rust L7 Edge Proxy (`dataplane/edge/gateway`) serves as the line-rate customer traffic data plane, synchronizing active routing, WAF rules, and cache policies via real-time Server-Sent Events (`/v1/edge/pops/{pop_id}/events`) and snapshot polling (`/v1/edge/pops/{pop_id}/config`) with deterministic fallback to local verified snapshots (`data/pop_snapshot.json` / `gateway.yaml`). The Go Control Plane (`services/edge/config-controller`) compiles both live JSON snapshots for Rust edge nodes and declarative Envoy v3 LDS/CDS/SDS JSON manifests (`/v1/edge/envoy-config`) for Envoy sidecar deployments.
+> - **Origin SSRF & Runtime DNS Rebinding Mitigation:** Customer origin domain names are resolved at the control plane, strictly validated against private, loopback, multicast, link-local, and cloud-metadata IP ranges, and pinned as static destination socket endpoints (`buildCluster`). At the edge gateway, client connections fail closed if resolved IPs are forbidden, and automatic HTTP redirects are strictly disabled to prevent SSRF traversal.
 
 ---
 
@@ -244,7 +244,7 @@ Every subsystem in the repository is strictly tracked against our 6-stage lifecy
 ### The Strategic Bangladesh Advantage
 1. **BDIX Fabric:** Direct low-latency peering with 167 members and over 2.27 Tbps cumulative port capacity, yielding $<5\text{ms}$ domestic RTT across Bangladesh.
 2. **SMW6 Submarine Cable:** 30,000 Gbps planned capacity terminating at Cox's Bazar, connecting directly to Singapore, Mumbai, and Europe.
-3. **Data Sovereignty Mandate:** Complete architectural compliance with the **National Data Management Act (NDMA) 2026**, guaranteeing localized, cryptographically verifiable data residency for Critical Information Infrastructure (CII).
+3. **Data Sovereignty Architecture:** Designed to support compliance objectives for the **National Data Management Act (NDMA) 2026** and **EU GDPR**, providing policy-driven, cryptographically verifiable data residency boundaries for Critical Information Infrastructure (CII).
 
 ---
 

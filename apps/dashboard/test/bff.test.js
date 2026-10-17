@@ -2733,6 +2733,76 @@ describe('Dashboard Security & BFF Acceptance Tests', () => {
     assert.strictEqual(serverJsContent.includes('/api/proxy/storage/buckets'), true, 'server.js must define proxy for storage buckets');
     assert.strictEqual(serverJsContent.includes('/api/proxy/network/cables'), true, 'server.js must define proxy for subsea cables');
   });
+
+  it('Requirement 22: Cryptographic API Key Lifecycle & Durable Vault Restart Recovery', async () => {
+    const os = require('os');
+    const tempVaultDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexusedge-vault-test-'));
+    const tempVaultFile = path.join(tempVaultDir, 'test_vault.json');
+    process.env.NEXUSEDGE_VAULT_PATH = tempVaultFile;
+
+    try {
+      delete require.cache[require.resolve('../server.js')];
+      const server = require('../server.js');
+
+      // 1. Generate active key with 30-day lifetime
+      const { record: activeRecord, secretKey: activeSecret } = server.generateAPIKey(
+        'proj-crypto-01',
+        'Production Edge Worker',
+        'DEVELOPER',
+        ['inference'],
+        30
+      );
+      assert.strictEqual(activeRecord.status, 'ACTIVE');
+      assert.strictEqual(activeRecord.revokedAt, null);
+      assert.strictEqual(typeof activeRecord.expiresAt, 'string');
+      const validSession = server.validateAPIKey(activeSecret);
+      assert.notStrictEqual(validSession, null);
+      assert.strictEqual(validSession.projectId, 'proj-crypto-01');
+
+      // 2. Generate key with expired timestamp
+      const { record: expiredRecord, secretKey: expiredSecret } = server.generateAPIKey(
+        'proj-crypto-01',
+        'Stale Worker',
+        'DEVELOPER',
+        ['inference'],
+        1
+      );
+      // Simulate expired timestamp in the past
+      expiredRecord.expiresAt = new Date(Date.now() - 3600000).toISOString();
+      server.apiKeys.set(expiredRecord.id, expiredRecord);
+      server.saveVaultDurable();
+
+      const expiredSession = server.validateAPIKey(expiredSecret);
+      assert.strictEqual(expiredSession, null, 'Expired API key must be rejected with null session');
+      assert.strictEqual(expiredRecord.status, 'EXPIRED', 'Status must transition to EXPIRED');
+
+      // 3. Test revocation
+      activeRecord.status = 'REVOKED';
+      activeRecord.revokedAt = new Date().toISOString();
+      server.saveVaultDurable();
+      const revokedSession = server.validateAPIKey(activeSecret);
+      assert.strictEqual(revokedSession, null, 'Revoked API key must be rejected');
+
+      // 4. Test Durable Vault Restart Recovery
+      assert.strictEqual(fs.existsSync(tempVaultFile), true, 'Vault file must be written to disk');
+      
+      // Simulate process restart: clear in-memory maps and call loadVaultDurable()
+      server.apiKeys.clear();
+      assert.strictEqual(server.apiKeys.size, 0);
+      server.loadVaultDurable();
+
+      assert.strictEqual(server.apiKeys.has(activeRecord.id), true, 'Active key must be restored after restart');
+      assert.strictEqual(server.apiKeys.has(expiredRecord.id), true, 'Expired key must be restored after restart');
+      const recoveredActive = server.apiKeys.get(activeRecord.id);
+      assert.strictEqual(recoveredActive.status, 'REVOKED');
+      assert.strictEqual(recoveredActive.projectId, 'proj-crypto-01');
+    } finally {
+      delete process.env.NEXUSEDGE_VAULT_PATH;
+      try {
+        fs.rmSync(tempVaultDir, { recursive: true, force: true });
+      } catch (_) {}
+    }
+  });
 });
 
 

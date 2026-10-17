@@ -55,22 +55,87 @@ const DOMAIN_MUTATION_ROLES = new Set(['PLATFORM_OPERATOR', 'TENANT_ADMIN']);
 // Maximum bounded size for login rate limit cache
 const MAX_RATE_LIMIT_ENTRIES = 10000;
 
-// In-Memory Active Session Store
+function getVaultFilePath() {
+  if (process.env.NEXUSEDGE_VAULT_PATH) {
+    return process.env.NEXUSEDGE_VAULT_PATH;
+  }
+  const isRunningInTest = process.argv.some(arg => arg.includes('test')) || process.env.NODE_ENV === 'test';
+  if (isRunningInTest) {
+    return null;
+  }
+  return path.join(__dirname, 'data', 'dashboard_vault.json');
+}
+
+// Active Session Store: sessionId -> { id, user, role, projectId, expiresAt }
 const sessions = new Map();
 
-// In-Memory Cryptographic API Key Vault: id -> { id, projectId, name, prefix, hashedSecret, role, scopes, createdAt, lastUsedAt, status }
+// Cryptographic API Key Vault: id -> { id, projectId, name, prefix, hashedSecret, role, scopes, createdAt, expiresAt, revokedAt, lastUsedAt, status }
 const apiKeys = new Map();
+
+function saveVaultDurable() {
+  const vaultPath = getVaultFilePath();
+  if (!vaultPath) return;
+  const tmpPath = `${vaultPath}.tmp.${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    const dir = path.dirname(vaultPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const data = {
+      apiKeys: Array.from(apiKeys.entries()),
+      sessions: Array.from(sessions.entries()).filter(([_, s]) => s && s.expiresAt > Date.now())
+    };
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
+    try {
+      fs.renameSync(tmpPath, vaultPath);
+    } catch (_renameErr) {
+      fs.copyFileSync(tmpPath, vaultPath);
+      try { fs.unlinkSync(tmpPath); } catch (_) {}
+    }
+  } catch (err) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    console.error('[WARN] Failed to persist dashboard vault to durable storage:', err.message);
+  }
+}
+
+function loadVaultDurable() {
+  const vaultPath = getVaultFilePath();
+  if (!vaultPath || !fs.existsSync(vaultPath)) return;
+  try {
+    const raw = fs.readFileSync(vaultPath, 'utf8');
+    const data = JSON.parse(raw);
+    if (data.apiKeys && Array.isArray(data.apiKeys)) {
+      for (const [id, record] of data.apiKeys) {
+        apiKeys.set(id, record);
+      }
+    }
+    if (data.sessions && Array.isArray(data.sessions)) {
+      const now = Date.now();
+      for (const [id, session] of data.sessions) {
+        if (session && session.expiresAt > now) {
+          sessions.set(id, session);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[WARN] Failed to load dashboard vault from durable storage:', err.message);
+  }
+}
+
+loadVaultDurable();
 
 function hashSecret(secret) {
   return crypto.createHash('sha256').update(secret).digest('hex');
 }
 
-function generateAPIKey(projectId, name, role = 'DEVELOPER', scopes = ['inference', 'domains:read']) {
+function generateAPIKey(projectId, name, role = 'DEVELOPER', scopes = ['inference', 'domains:read'], expiresInDays = 365) {
   const randomHex = crypto.randomBytes(32).toString('hex');
   const secretKey = `nke_live_${randomHex}`;
   const prefix = `nke_live_${randomHex.substring(0, 8)}...`;
   const hashedSecret = hashSecret(secretKey);
   const id = `key-${crypto.randomBytes(6).toString('hex')}`;
+  const days = (typeof expiresInDays === 'number' && expiresInDays > 0) ? expiresInDays : 365;
+  const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
 
   const record = {
     id,
@@ -81,11 +146,14 @@ function generateAPIKey(projectId, name, role = 'DEVELOPER', scopes = ['inferenc
     role: ALLOWED_ROLES.has(role) ? role : 'DEVELOPER',
     scopes: Array.isArray(scopes) ? scopes : ['inference', 'domains:read'],
     createdAt: new Date().toISOString(),
+    expiresAt,
+    revokedAt: null,
     lastUsedAt: null,
     status: 'ACTIVE'
   };
 
   apiKeys.set(id, record);
+  saveVaultDurable();
   return { record, secretKey };
 }
 
@@ -93,10 +161,26 @@ function validateAPIKey(token) {
   if (!token || typeof token !== 'string') return null;
   if (!token.startsWith('nke_live_') && !token.startsWith('nke_test_')) return null;
 
+  const now = Date.now();
   const tokenHash = hashSecret(token);
   for (const record of apiKeys.values()) {
-    if (record.status === 'ACTIVE' && safeCompare(record.hashedSecret, tokenHash)) {
+    if (safeCompare(record.hashedSecret, tokenHash)) {
+      // Check revocation status
+      if (record.status === 'REVOKED' || record.revokedAt != null) {
+        return null;
+      }
+      // Check expiration timestamp
+      if (record.expiresAt && now >= new Date(record.expiresAt).getTime()) {
+        record.status = 'EXPIRED';
+        saveVaultDurable();
+        return null;
+      }
+      if (record.status !== 'ACTIVE') {
+        return null;
+      }
+
       record.lastUsedAt = new Date().toISOString();
+      saveVaultDurable();
       return {
         id: record.id,
         user: `apikey:${record.name}`,
@@ -104,7 +188,7 @@ function validateAPIKey(token) {
         projectId: record.projectId,
         scopes: record.scopes,
         isAPIKey: true,
-        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000
+        expiresAt: record.expiresAt ? new Date(record.expiresAt).getTime() : now + 365 * 24 * 60 * 60 * 1000
       };
     }
   }
@@ -458,6 +542,7 @@ function authenticateSession(req) {
       return session;
     }
     sessions.delete(sessionId);
+    saveVaultDurable();
   }
 
   return null;
@@ -747,6 +832,7 @@ const server = http.createServer((req, res) => {
           expiresAt: Date.now() + 8 * 60 * 60 * 1000
         };
         sessions.set(sid, session);
+        saveVaultDurable();
 
         const cookieFlags = ['HttpOnly', 'Path=/', 'SameSite=Strict'];
         if (isConnectionSecure(req)) {
@@ -773,7 +859,10 @@ const server = http.createServer((req, res) => {
   if (pathname === '/api/auth/logout' && req.method === 'POST') {
     const cookies = parseCookies(req);
     const sid = cookies['nexusedge_session'];
-    if (sid) sessions.delete(sid);
+    if (sid) {
+      sessions.delete(sid);
+      saveVaultDurable();
+    }
     const cookieFlags = ['HttpOnly', 'Path=/', 'Max-Age=0'];
     if (isConnectionSecure(req)) {
       cookieFlags.push('Secure');
@@ -852,6 +941,8 @@ const server = http.createServer((req, res) => {
             role: key.role,
             scopes: key.scopes,
             created_at: key.createdAt,
+            expires_at: key.expiresAt || null,
+            revoked_at: key.revokedAt || null,
             last_used_at: key.lastUsedAt,
             status: key.status
           });
@@ -889,7 +980,11 @@ const server = http.createServer((req, res) => {
           ? payload.scopes.filter(s => typeof s === 'string').map(s => s.trim())
           : ['inference', 'domains:read'];
 
-        const { record, secretKey } = generateAPIKey(session.projectId, name, requestedRole, scopes);
+        const expiresInDays = (payload && typeof payload.expires_in_days === 'number' && payload.expires_in_days > 0)
+          ? payload.expires_in_days
+          : 365;
+
+        const { record, secretKey } = generateAPIKey(session.projectId, name, requestedRole, scopes, expiresInDays);
         return sendJSON(res, 201, {
           id: record.id,
           project_id: record.projectId,
@@ -899,6 +994,7 @@ const server = http.createServer((req, res) => {
           role: record.role,
           scopes: record.scopes,
           created_at: record.createdAt,
+          expires_at: record.expiresAt,
           warning: 'This secret key will never be displayed again. Please store it securely.'
         });
       });
@@ -924,12 +1020,15 @@ const server = http.createServer((req, res) => {
         return sendJSON(res, 403, { code: 403, error: 'Forbidden: Cannot revoke API key of another project' });
       }
 
+      const nowIso = new Date().toISOString();
       keyRecord.status = 'REVOKED';
+      keyRecord.revokedAt = nowIso;
+      saveVaultDurable();
       return sendJSON(res, 200, {
         success: true,
         id: keyRecord.id,
         status: 'REVOKED',
-        revoked_at: new Date().toISOString()
+        revoked_at: nowIso
       });
     }
 
@@ -1198,5 +1297,9 @@ server.telemetryBuffer = telemetryBuffer;
 server.recordTelemetry = recordTelemetry;
 server.getTelemetrySummary = getTelemetrySummary;
 server.checkAndConsumeAPIKeyRateLimit = checkAndConsumeAPIKeyRateLimit;
+server.saveVaultDurable = saveVaultDurable;
+server.loadVaultDurable = loadVaultDurable;
+server.generateAPIKey = generateAPIKey;
+server.validateAPIKey = validateAPIKey;
 
 module.exports = server;

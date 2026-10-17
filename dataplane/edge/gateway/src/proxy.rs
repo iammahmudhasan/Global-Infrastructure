@@ -1113,16 +1113,23 @@ pub async fn handle_request(
         }
     }
 
-    let custom_ttl = resp_cc
-        .s_maxage
-        .or(resp_cc.max_age)
-        .map(Duration::from_secs)
-        .or_else(|| {
-            domain_cache_policy
-                .as_ref()
-                .map(|c| Duration::from_secs(c.default_ttl_seconds))
-        })
-        .map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
+    let default_policy_ttl = domain_cache_policy
+        .as_ref()
+        .map(|c| Duration::from_secs(c.default_ttl_seconds))
+        .unwrap_or(Duration::from_secs(3600));
+
+    let computed_freshness = crate::cache::compute_rfc9111_freshness(
+        &headers_to_cache,
+        default_policy_ttl,
+        chrono::Utc::now(),
+    );
+
+    if computed_freshness.is_none() {
+        // Stale, expired past Expires deadline, Age >= freshness lifetime, or prohibited directives
+        can_cache_candidate = false;
+    }
+
+    let custom_ttl = computed_freshness.map(|ttl| ttl.min(MAX_CUSTOM_CACHE_TTL));
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BodyError>>(32);
     let state_clone = Arc::clone(&state);

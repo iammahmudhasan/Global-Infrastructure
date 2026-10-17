@@ -31,20 +31,21 @@ All components and capabilities transition strictly through the following six ve
 
 | Domain / Subsystem | Current State | Evidence & Test Suite | Target Milestone | Notes |
 |---|---|---|---|---|
-| **Data Plane: Rust Gateway** | `LOCALLY_VERIFIED` | `cargo check --tests`, `cargo clippy -D warnings` | V0 / V1 | Hyper/Tokio HTTP reverse proxy with local WAF, cache, and destination-pinned client connection. |
+| **Data Plane: Rust Gateway** | `LOCALLY_VERIFIED` | `cargo check --tests`, `cargo clippy -D warnings` | V0 / V1 | Authoritative line-rate serving data plane with local WAF, RFC 9111 edge cache, destination IP pinning, and live SSE/snapshot config synchronization. |
 | **Data Plane: DNS Generation Pinning** | `LOCALLY_VERIFIED` | `router.rs` generational tests | V0 / V1 | Generational route snapshot with SocketAddr identity and destination-pinned connection verified. |
-| **Data Plane: Envoy xDS Engine** | `SIMULATED` | `compiler_test.go` | V1.5 / V2 | Compiles Envoy v3 LDS/CDS/SDS JSON; live xDS control stream planned. |
+| **Data Plane: Envoy xDS Engine** | `SIMULATED` | `compiler_test.go` | V1.5 / V2 | Compiles Envoy v3 LDS/CDS/SDS JSON; live xDS control stream planned for sidecar deployments. |
 | **Data Plane: eBPF XDP Filter** | `SIMULATED` | `infra/network/` | V3 | Architecture planned; line-rate XDP C programs in development. |
 | **Control Plane: Domain Service** | `LOCALLY_VERIFIED` | `onboarding_test.go`, `TestOnboardAndVerifyDomain` | V0 / V1 | RFC 1123 hostname validation & CNAME target assignment verified. |
 | **Control Plane: CRS-Aligned WAF Prototype**| `LOCALLY_VERIFIED` | `waf_test.go`, `TestWAF_OWASP_Attacks` | V0 / V1 | OWASP-inspired regex attack patterns (SQLi, XSS, RCE, Path Traversal); Coraza/CRS engine planned. |
-| **Control Plane: RFC 9111 Cache** | `LOCALLY_VERIFIED` | `cache_test.go`, `TestCacheEngineLookupStorePurge` | V0 / V1 | In-memory key normalization & Cache-Control parser passes locally. |
+| **Edge & Control Plane: RFC 9111 Cache** | `LOCALLY_VERIFIED` | `cache.rs` tests, `cache_test.go`, `TestCacheEngineLookupStorePurge` | V0 / V1 | Edge cache enforces `s-maxage` > `max-age` > (`Expires` - `Date`), deducts `Age`, and rejects stale responses; Control Plane enforces policy rules. |
 | **Control Plane: EWMA Health Router**| `LOCALLY_VERIFIED` | `router_test.go`, `TestSmartRouter_LowestLatencyAndFailover` | V0 / V1 | In-memory EWMA smoothing & autonomous failover passes locally. |
 | **Control Plane: TLS Local Rotation** | `LOCALLY_VERIFIED` | `manager_test.go`, `test_single_pop_gateway.sh` | V0 | Single fixture certificate rotation tested locally (`server.crt` / `server.key` atomic update with serial verification). |
 | **Control Plane: Production ACME (RFC 8555)** | `INCOMPLETE` | `manager_test.go` (`TestCertificateManager_ProductionGuard`) | V1 | Real Let's Encrypt / external WebPKI integration not yet implemented; guarded in production via `ErrProductionACMENotConfigured`. |
 | **Control Plane: Per-Domain TLS** | `INCOMPLETE` | - | V1 | Per-domain certificate isolation and multi-tenant Envoy filter chains scheduled for V1. |
 | **Control Plane: gRPC SDS Secret Distribution** | `INCOMPLETE` | `compiler_test.go` | V1 | Dynamic gRPC SDS streaming daemon planned for V1; current single-PoP deployment uses file-based secret rotation. |
 | **Control Plane: Traffic Analytics** | `LOCALLY_VERIFIED` | `engine_test.go`, `TestReservoirSampler_Percentiles` | V0 / V1 | Estimated p50/p95/p99 from bounded Algorithm R reservoir sampling with isolated monthly billing. |
-| **Persistence Layer: Durable Control Plane** | `INCOMPLETE (Contract Defined)` | `repository.go`, `store_test.go` | V1 | `store.Repository` interface defined; PostgreSQL repository, migrations, and restart recovery test in progress for V1. |
+| **Persistence Layer: Durable Control Plane** | `LOCALLY_VERIFIED` | `postgres_repository.go`, `repository_test.go` (`TestPostgresRepository_RestartRecovery`) | V0 / V1 | PostgreSQL storage implementation with versioned migrations (0001-0005), restart recovery, and atomic transactional outbox events for desired-state synchronization. |
+| **Dashboard BFF: API Key & Session Vault** | `LOCALLY_VERIFIED` | `apps/dashboard/test/bff.test.js` (`Requirement 22`) | V0 / V1 | Durable vault persistence with atomic writes, fixed expiration timestamps, instant revocation, and process restart recovery. |
 | **Network: Multi-PoP Topology** | `SIMULATED` | `manager_test.go` with RFC 5737/6996 test prefixes | V0 / V1 | In-memory 4-metro topology model (Dhaka, SG, Frankfurt, Virginia). |
 | **Network: BGP Route Health Injection** | `SIMULATED` | `TestPoPManager_BGPRouteLifecycle` | V3 | In-memory state machine. Hardware BGP speaker planned for V3. |
 | **Network: Global Anycast Fabric** | `SIMULATED` | - | V3 | Simulated via RFC 5737 (198.51.100.0/24) & RFC 3849 (2001:db8::/48). |
