@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/events"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
@@ -22,6 +24,8 @@ func TestRepository_InterfaceContract(t *testing.T) {
 	}
 
 	var _ store.Repository = (*store.PostgresRepository)(nil)
+	var _ store.OutboxStore = (*store.Store)(nil)
+	var _ store.OutboxStore = (*store.PostgresRepository)(nil)
 }
 
 func TestPostgresRepository_RestartRecovery(t *testing.T) {
@@ -868,5 +872,134 @@ func TestPostgresRepository_MultiReplicaCacheConsistencyAndRouteRevocation(t *te
 	}
 	if _, err := repo2.Cache().GetDomain(ghostID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ghost domain to be pruned from replica 2 cache by ListDomainsByProject, but still exists")
+	}
+}
+
+func TestStore_OutboxStoreParityAndDispatcher(t *testing.T) {
+	s := store.NewStore()
+	var processed []string
+	var mu sync.Mutex
+
+	handler := events.OutboxEventHandlerFunc(func(ctx context.Context, ev *store.OutboxEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		processed = append(processed, ev.EventType)
+		return nil
+	})
+
+	dispatcher, err := events.NewOutboxDispatcher(s, handler, events.OutboxDispatcherConfig{
+		WorkerID:      "in-memory-worker",
+		BatchSize:     10,
+		PollInterval:  50 * time.Millisecond,
+		LeaseDuration: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to create dispatcher: %v", err)
+	}
+
+	// 1. Create domain on Store -> generates domain.config.changed outbox event
+	dom := &model.Domain{
+		ID:        "dom-parity-01",
+		ProjectID: "proj-parity",
+		Hostname:  "parity.example.com",
+		Status:    model.DomainStatusActive,
+		Version:   1,
+	}
+	if err := s.SaveDomain(dom); err != nil {
+		t.Fatalf("SaveDomain failed: %v", err)
+	}
+
+	// 2. Update status -> generates domain.status.changed outbox event
+	if err := s.UpdateDomainStatus(dom.ID, model.DomainStatusSuspended); err != nil {
+		t.Fatalf("UpdateDomainStatus failed: %v", err)
+	}
+
+	// 3. Delete domain -> generates domain.deleted outbox event
+	if err := s.DeleteDomain(dom.ID); err != nil {
+		t.Fatalf("DeleteDomain failed: %v", err)
+	}
+
+	// 4. Dispatch batch
+	count, err := dispatcher.DispatchBatch(context.Background())
+	if err != nil {
+		t.Fatalf("DispatchBatch failed: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("expected 3 outbox events dispatched, got %d", count)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(processed) != 3 {
+		t.Fatalf("expected 3 events processed by handler, got %d", len(processed))
+	}
+	expectedTypes := []string{"domain.config.changed", "domain.status.changed", "domain.deleted"}
+	for i, exp := range expectedTypes {
+		if processed[i] != exp {
+			t.Errorf("event %d: expected type %s, got %s", i, exp, processed[i])
+		}
+	}
+}
+
+func TestPostgresRepository_OutboxDispatcherIntegration(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres integration test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test PostgreSQL database: %v", err)
+	}
+	defer repo.Close()
+
+	var processed []string
+	var mu sync.Mutex
+
+	handler := events.OutboxEventHandlerFunc(func(ctx context.Context, ev *store.OutboxEvent) error {
+		mu.Lock()
+		defer mu.Unlock()
+		processed = append(processed, ev.EventType)
+		return nil
+	})
+
+	dispatcher, err := events.NewOutboxDispatcher(repo, handler, events.OutboxDispatcherConfig{
+		WorkerID:      fmt.Sprintf("pg-worker-%d", time.Now().UnixNano()),
+		BatchSize:     10,
+		PollInterval:  50 * time.Millisecond,
+		LeaseDuration: 10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to initialize OutboxDispatcher for PostgresRepository: %v", err)
+	}
+
+	domID := fmt.Sprintf("dom-outbox-pg-%d", time.Now().UnixNano())
+	dom := &model.Domain{
+		ID:             domID,
+		ProjectID:      "proj-pg-outbox",
+		Hostname:       fmt.Sprintf("outbox-%d.nexusedge.net", time.Now().UnixNano()),
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+	}
+
+	if err := repo.SaveDomain(dom); err != nil {
+		t.Fatalf("SaveDomain failed: %v", err)
+	}
+
+	count, err := dispatcher.DispatchBatch(context.Background())
+	if err != nil {
+		t.Fatalf("DispatchBatch against PostgreSQL failed: %v", err)
+	}
+	if count < 1 {
+		t.Fatalf("expected at least 1 event dispatched, got %d", count)
+	}
+
+	stats := dispatcher.Stats()
+	if stats.EventsClaimed < 1 || stats.EventsProcessed < 1 {
+		t.Fatalf("invalid dispatcher stats: %+v", stats)
 	}
 }

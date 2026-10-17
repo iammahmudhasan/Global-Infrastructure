@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/api"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/compiler"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/events"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/onboarding"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
@@ -262,7 +264,29 @@ func main() {
 		}
 	}()
 
-	// 7. Run Server in Background
+	// 7. Automated Transactional Outbox Dispatcher (Lease-fenced asynchronous edge sync)
+	var outboxDispatcher *events.OutboxDispatcher
+	dispatcherCtx, stopDispatcher := context.WithCancel(context.Background())
+	defer stopDispatcher()
+
+	if outboxStore, ok := dataStore.(store.OutboxStore); ok {
+		bridge := events.NewBroadcasterBridge(handler.Broadcaster())
+		cfg := events.DefaultOutboxDispatcherConfig()
+		if intervalEnv := os.Getenv("NEXUSEDGE_OUTBOX_POLL_INTERVAL"); intervalEnv != "" {
+			if d, err := time.ParseDuration(intervalEnv); err == nil && d > 0 {
+				cfg.PollInterval = d
+			}
+		}
+		var err error
+		outboxDispatcher, err = events.NewOutboxDispatcher(outboxStore, bridge, cfg)
+		if err != nil {
+			log.Fatalf("[FATAL] Failed to initialize Outbox Dispatcher: %v", err)
+		}
+		outboxDispatcher.Start(dispatcherCtx)
+		log.Printf("[INFO] Initialized and started automated Transactional Outbox Dispatcher (worker=%s, interval=%v)", cfg.WorkerID, cfg.PollInterval)
+	}
+
+	// 8. Run Server in Background
 	stopChan := make(chan os.Signal, 1)
 	signal.Notify(stopChan, os.Interrupt, syscall.SIGTERM)
 
@@ -274,9 +298,14 @@ func main() {
 		}
 	}()
 
-	// 8. Graceful Shutdown
+	// 9. Graceful Shutdown
 	<-stopChan
 	log.Printf("[INFO] Shutting down NexusEdge Config Controller gracefully...")
+
+	if outboxDispatcher != nil {
+		outboxDispatcher.Stop()
+	}
+	stopDispatcher()
 
 	if handler.PoPProber() != nil {
 		handler.PoPProber().Stop()
@@ -288,6 +317,10 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("[ERROR] Server forced to shutdown: %v", err)
+	}
+
+	if closer, ok := dataStore.(io.Closer); ok {
+		_ = closer.Close()
 	}
 
 	log.Printf("[INFO] NexusEdge Config Controller stopped cleanly.")

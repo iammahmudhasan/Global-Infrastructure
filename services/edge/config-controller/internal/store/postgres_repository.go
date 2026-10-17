@@ -2204,20 +2204,7 @@ func (r *PostgresRepository) GetLastAuditHash() string {
 // Transactional Outbox Events (Desired-State Configuration Synchronization)
 // -------------------------------------------------------------------------
 
-// OutboxEvent represents an atomic desired-state event generated within the same
-// database transaction as domain/config mutations for reliable asynchronous reconciliation.
-type OutboxEvent struct {
-	EventID       string     `json:"event_id"`
-	AggregateType string     `json:"aggregate_type"`
-	AggregateID   string     `json:"aggregate_id"`
-	EventType     string     `json:"event_type"`
-	Payload       []byte     `json:"payload"`
-	Status        string     `json:"status"`
-	RetryCount    int        `json:"retry_count"`
-	LeaseToken    string     `json:"lease_token,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
-	ProcessedAt   *time.Time `json:"processed_at,omitempty"`
-}
+var _ OutboxStore = (*PostgresRepository)(nil)
 
 // GetPendingOutboxEvents retrieves unapplied outbox events ordered by creation timestamp.
 func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
@@ -2309,8 +2296,6 @@ func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID str
 	}
 	return events, nil
 }
-
-var ErrOutboxLeaseLost = errors.New("outbox event lease lost or claimed by another worker")
 
 // MarkOutboxEventFailed marks an outbox event as FAILED or DEAD_LETTER after repeated retry exhaustion,
 // fenced by worker lease ownership AND lease token to prevent stale workers from overwriting active events.

@@ -1,6 +1,10 @@
 package store
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -113,6 +117,13 @@ type Store struct {
 	aiProviders         map[string]*model.AIProvider          // provider ID -> AIProvider
 	auditLogs           []*model.AuditLog
 	auditLogMap         map[string]*model.AuditLog // id -> AuditLog
+	outboxEvents        []*inMemoryOutboxEntry
+}
+
+type inMemoryOutboxEntry struct {
+	event       OutboxEvent
+	lockedBy    string
+	lockedUntil time.Time
 }
 
 func NewStore() *Store {
@@ -140,6 +151,7 @@ func NewStore() *Store {
 		aiProviders:         make(map[string]*model.AIProvider),
 		auditLogs:           make([]*model.AuditLog, 0),
 		auditLogMap:         make(map[string]*model.AuditLog),
+		outboxEvents:        make([]*inMemoryOutboxEntry, 0),
 	}
 }
 
@@ -196,6 +208,27 @@ func (s *Store) SaveDomain(d *model.Domain) error {
 	if isNew && d.ProjectID != "" {
 		s.projectDomainCount[d.ProjectID]++
 	}
+
+	eventID := fmt.Sprintf("evt-cfg-%d-%s", time.Now().UnixNano(), d.ID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id":    d.ID,
+		"project_id":   d.ProjectID,
+		"hostname":     d.Hostname,
+		"status":       string(d.Status),
+		"allowed_pops": d.AllowedPoPs,
+		"version":      d.Version,
+		"updated_at":   time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "domain",
+		AggregateID:   d.ID,
+		EventType:     "domain.config.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -376,6 +409,22 @@ func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 		return ErrNotFound
 	}
 	d.Status = status
+
+	eventID := fmt.Sprintf("evt-status-%d-%s", time.Now().UnixNano(), id)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id": id,
+		"status":    string(status),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "domain",
+		AggregateID:   id,
+		EventType:     "domain.status.changed",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
+
 	s.invalidateCachesLocked()
 	return nil
 }
@@ -420,6 +469,21 @@ func (s *Store) deleteDomainLocked(domainID string) error {
 	delete(s.certificates, domainID)
 	delete(s.pendingCertificates, domainID)
 	delete(s.tlsSettings, domainID)
+
+	eventID := fmt.Sprintf("evt-del-%d-%s", time.Now().UnixNano(), domainID)
+	payloadJSON, _ := json.Marshal(map[string]interface{}{
+		"domain_id":  domainID,
+		"deleted_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	s.saveOutboxEventLocked(&OutboxEvent{
+		EventID:       eventID,
+		AggregateType: "domain",
+		AggregateID:   domainID,
+		EventType:     "domain.deleted",
+		Payload:       payloadJSON,
+		Status:        "PENDING",
+		CreatedAt:     time.Now().UTC(),
+	})
 
 	s.invalidateCachesLocked()
 	return nil
@@ -1427,4 +1491,148 @@ func (s *Store) GetLastAuditHash() string {
 		return "0000000000000000000000000000000000000000000000000000000000000000"
 	}
 	return s.auditLogs[len(s.auditLogs)-1].Hash
+}
+
+// -------------------------------------------------------------------------
+// Transactional Outbox Events (In-Memory Implementation)
+// -------------------------------------------------------------------------
+
+var _ OutboxStore = (*Store)(nil)
+
+func (s *Store) saveOutboxEventLocked(ev *OutboxEvent) {
+	if ev == nil {
+		return
+	}
+	s.outboxEvents = append(s.outboxEvents, &inMemoryOutboxEntry{
+		event: *ev,
+	})
+}
+
+// SaveOutboxEvent manually records an outbox event into the in-memory store.
+func (s *Store) SaveOutboxEvent(ev *OutboxEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.saveOutboxEventLocked(ev)
+}
+
+// GetPendingOutboxEvents retrieves unapplied outbox events ordered by creation timestamp.
+func (s *Store) GetPendingOutboxEvents(ctx context.Context, limit int) ([]*OutboxEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 100
+	}
+	var res []*OutboxEvent
+	for _, entry := range s.outboxEvents {
+		if entry.event.Status == "PENDING" {
+			evClone := entry.event
+			res = append(res, &evClone)
+			if len(res) >= limit {
+				break
+			}
+		}
+	}
+	return res, nil
+}
+
+// ClaimOutboxEvents claims up to limit unapplied outbox events with worker lease fencing.
+func (s *Store) ClaimOutboxEvents(ctx context.Context, workerID string, limit int, leaseDuration time.Duration) ([]*OutboxEvent, error) {
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("workerID is required to claim outbox events")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	var claimed []*OutboxEvent
+	for _, entry := range s.outboxEvents {
+		isAvailable := entry.event.Status == "PENDING" || (entry.event.Status == "PROCESSING" && now.After(entry.lockedUntil))
+		if isAvailable {
+			tokenBytes := make([]byte, 16)
+			_, _ = rand.Read(tokenBytes)
+			leaseToken := fmt.Sprintf("lease-%d-%s", now.UnixNano(), hex.EncodeToString(tokenBytes))
+
+			entry.event.Status = "PROCESSING"
+			entry.lockedBy = workerID
+			entry.event.LeaseToken = leaseToken
+			entry.lockedUntil = now.Add(leaseDuration)
+			entry.event.RetryCount++
+
+			evClone := entry.event
+			claimed = append(claimed, &evClone)
+			if len(claimed) >= limit {
+				break
+			}
+		}
+	}
+	return claimed, nil
+}
+
+// MarkOutboxEventProcessed marks an outbox event as PROCESSED under lease fencing.
+func (s *Store) MarkOutboxEventProcessed(ctx context.Context, eventID string, workerID string, leaseToken string) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("workerID is required for outbox lease fencing")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errors.New("leaseToken is required for outbox lease fencing")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	for _, entry := range s.outboxEvents {
+		if entry.event.EventID == eventID {
+			if entry.event.Status == "PROCESSING" && entry.lockedBy == workerID && entry.event.LeaseToken == leaseToken && now.Before(entry.lockedUntil) {
+				entry.event.Status = "PROCESSED"
+				entry.event.ProcessedAt = &now
+				entry.lockedBy = ""
+				entry.event.LeaseToken = ""
+				entry.lockedUntil = time.Time{}
+				return nil
+			}
+			return ErrOutboxLeaseLost
+		}
+	}
+	return ErrOutboxNotFound
+}
+
+// MarkOutboxEventFailed marks an outbox event as PENDING or DEAD_LETTER after repeated retry exhaustion.
+func (s *Store) MarkOutboxEventFailed(ctx context.Context, eventID string, workerID string, leaseToken string, reason string) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("workerID is required for outbox lease fencing")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errors.New("leaseToken is required for outbox lease fencing")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UTC()
+	for _, entry := range s.outboxEvents {
+		if entry.event.EventID == eventID {
+			if entry.event.Status == "PROCESSING" && entry.lockedBy == workerID && entry.event.LeaseToken == leaseToken && now.Before(entry.lockedUntil) {
+				if entry.event.RetryCount >= 5 {
+					entry.event.Status = "DEAD_LETTER"
+				} else {
+					entry.event.Status = "PENDING"
+				}
+				entry.lockedBy = ""
+				entry.event.LeaseToken = ""
+				entry.lockedUntil = time.Time{}
+				return nil
+			}
+			return ErrOutboxLeaseLost
+		}
+	}
+	return ErrOutboxNotFound
 }
