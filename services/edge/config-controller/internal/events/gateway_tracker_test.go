@@ -268,3 +268,46 @@ func TestGatewaySyncTracker_DurableStoreRestart(t *testing.T) {
 		t.Fatalf("expected ver 15, chk hash-fra-v15 after restart, got %d, %s", ver, chk)
 	}
 }
+
+func TestGatewaySyncTracker_SavePoPSnapshotHead_VersionRegressionRejection(t *testing.T) {
+	st := store.NewStore()
+	ctx := context.Background()
+
+	// Initial authoritative version 10
+	if err := st.SavePoPSnapshotHead(ctx, "pop-dhaka-01", 10, "hash-v10"); err != nil {
+		t.Fatalf("initial SavePoPSnapshotHead failed: %v", err)
+	}
+
+	// Attempt stale older version 9 write: MUST return error
+	err := st.SavePoPSnapshotHead(ctx, "pop-dhaka-01", 9, "hash-v9")
+	if err == nil {
+		t.Fatalf("expected error when saving stale snapshot version 9, but got nil")
+	}
+
+	// Authoritative version must remain 10
+	ver, chk, _, err := st.GetPoPSnapshotHead(ctx, "pop-dhaka-01")
+	if err != nil || ver != 10 || chk != "hash-v10" {
+		t.Fatalf("expected authoritative state to remain ver 10, chk hash-v10, got ver %d, chk %s, err %v", ver, chk, err)
+	}
+}
+
+func TestGatewaySyncTracker_SavePoPSnapshotHead_ChecksumDivergenceConflict(t *testing.T) {
+	st := store.NewStore()
+	ctx := context.Background()
+
+	// Initial version 10 with hashA
+	if err := st.SavePoPSnapshotHead(ctx, "pop-sin-01", 10, "hash-original"); err != nil {
+		t.Fatalf("initial SavePoPSnapshotHead failed: %v", err)
+	}
+
+	// Same version 10 with divergent hashB: MUST return conflict error
+	err := st.SavePoPSnapshotHead(ctx, "pop-sin-01", 10, "hash-divergent")
+	if err == nil {
+		t.Fatalf("expected checksum mismatch conflict error for same version with divergent hash, got nil")
+	}
+
+	// Same version 10 with matching hashA: MUST succeed idempotently
+	if err := st.SavePoPSnapshotHead(ctx, "pop-sin-01", 10, "hash-original"); err != nil {
+		t.Fatalf("expected idempotent re-save with identical version and checksum to succeed, got %v", err)
+	}
+}

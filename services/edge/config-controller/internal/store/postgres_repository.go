@@ -3080,15 +3080,31 @@ func (r *PostgresRepository) SavePoPSnapshotHead(ctx context.Context, popID stri
 		SET target_version = EXCLUDED.target_version,
 		    target_checksum = EXCLUDED.target_checksum,
 		    updated_at = NOW()
-		WHERE pop_snapshot_heads.target_version <= EXCLUDED.target_version
+		WHERE pop_snapshot_heads.target_version < EXCLUDED.target_version
+		   OR (pop_snapshot_heads.target_version = EXCLUDED.target_version AND pop_snapshot_heads.target_checksum = EXCLUDED.target_checksum)
 	`
 	res, err := r.db.ExecContext(ctx, query, popID, targetVersion, targetChecksum)
 	if err != nil {
 		return fmt.Errorf("save pop snapshot head: %w", err)
 	}
-	if rows, _ := res.RowsAffected(); rows > 0 {
-		_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check rows affected for pop snapshot head: %w", err)
 	}
+	if rows == 0 {
+		existingVer, existingChk, _, err := r.GetPoPSnapshotHead(ctx, popID)
+		if err != nil {
+			return fmt.Errorf("stale or conflicting snapshot version %d rejected by database: %w", targetVersion, err)
+		}
+		if existingVer > targetVersion {
+			return fmt.Errorf("stale snapshot version %d rejected: current authoritative version is %d", targetVersion, existingVer)
+		}
+		if existingVer == targetVersion && existingChk != targetChecksum {
+			return fmt.Errorf("checksum mismatch conflict for version %d: existing checksum %s diverges from proposed %s", targetVersion, existingChk, targetChecksum)
+		}
+		return nil
+	}
+	_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
 	return nil
 }
 

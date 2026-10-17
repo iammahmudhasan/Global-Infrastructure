@@ -5001,3 +5001,61 @@ func TestGatewaySync_IdentityBinding(t *testing.T) {
 		t.Fatalf("expected 200 OK for legitimate EdgeNode sync, got %d", wLegit.Code)
 	}
 }
+
+func TestPoPConfigSnapshot_VersionHeaderAndBodyConsistency(t *testing.T) {
+	h := setupTestServer()
+
+	// Initial fetch
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/config", nil)
+	w1 := httptest.NewRecorder()
+	h.ServeHTTP(w1, req1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", w1.Code)
+	}
+
+	verHeader1 := w1.Header().Get("X-Snapshot-Version")
+	chkHeader1 := w1.Header().Get("X-Snapshot-Checksum")
+	etag1 := w1.Header().Get("ETag")
+
+	var syncBody1 model.PoPConfigSync
+	if err := json.Unmarshal(w1.Body.Bytes(), &syncBody1); err != nil {
+		t.Fatalf("unmarshal snapshot body failed: %v", err)
+	}
+
+	// Verify header matches body config version
+	expectedPrefix1 := fmt.Sprintf("v%s-", verHeader1)
+	if !strings.HasPrefix(syncBody1.ConfigVersion, expectedPrefix1) {
+		t.Fatalf("expected ConfigVersion to start with %s, got %s", expectedPrefix1, syncBody1.ConfigVersion)
+	}
+	if etag1 != fmt.Sprintf(`"%s"`, chkHeader1) {
+		t.Fatalf("expected ETag to match X-Snapshot-Checksum, got etag=%s, chk=%s", etag1, chkHeader1)
+	}
+
+	// Simulate global target version increase on another PoP / global state
+	if tracker := h.GatewaySyncTracker(); tracker != nil {
+		_, _, _ = tracker.AdvanceTargetVersion(context.Background(), "hash-new-global-state")
+	}
+
+	// Second fetch for dhaka (cache hit because dhaka's routes/envoy config did not change)
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/edge/pops/dhaka/config", nil)
+	w2 := httptest.NewRecorder()
+	h.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on cache hit, got %d", w2.Code)
+	}
+
+	verHeader2 := w2.Header().Get("X-Snapshot-Version")
+	var syncBody2 model.PoPConfigSync
+	if err := json.Unmarshal(w2.Body.Bytes(), &syncBody2); err != nil {
+		t.Fatalf("unmarshal cached snapshot body failed: %v", err)
+	}
+
+	// Invariant: Response header X-Snapshot-Version MUST strictly match the returned body's ConfigVersion
+	expectedPrefix2 := fmt.Sprintf("v%s-", verHeader2)
+	if !strings.HasPrefix(syncBody2.ConfigVersion, expectedPrefix2) {
+		t.Fatalf("cache hit version divergence: header X-Snapshot-Version is %s but body has %s", verHeader2, syncBody2.ConfigVersion)
+	}
+	if verHeader2 != verHeader1 {
+		t.Fatalf("cached snapshot header version mutated unexpectedly: was %s, now %s", verHeader1, verHeader2)
+	}
+}

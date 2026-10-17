@@ -41,8 +41,10 @@ import (
 )
 
 type poPSnapshotCacheEntry struct {
-	contentHash string
-	bodyBytes   []byte
+	contentHash     string
+	bodyBytes       []byte
+	snapshotVersion int64
+	checksum        string
 }
 
 type APIHandler struct {
@@ -2782,6 +2784,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 		var finalBytes []byte
 		var bodyHash string
+		var snapshotVer int64
 		targetVer := int64(1)
 		if h.gatewaySyncTracker != nil {
 			targetVer = h.gatewaySyncTracker.TargetVersion()
@@ -2789,16 +2792,17 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 		if exists && cached.contentHash == compositeKey {
 			finalBytes = cached.bodyBytes
-			bodySum := sha256.Sum256(finalBytes)
-			bodyHash = hex.EncodeToString(bodySum[:])
+			bodyHash = cached.checksum
+			snapshotVer = cached.snapshotVersion
 		} else {
+			snapshotVer = targetVer
 			compiledAt := time.Now().UTC().Truncate(time.Second)
 			if h.gatewaySyncTracker != nil && !h.gatewaySyncTracker.TargetUpdatedAt().IsZero() {
 				compiledAt = h.gatewaySyncTracker.TargetUpdatedAt().Truncate(time.Second)
 			}
 			syncResult := model.PoPConfigSync{
 				PoPID:           pop.ID,
-				ConfigVersion:   fmt.Sprintf("v%d-%s", targetVer, checksum[:8]),
+				ConfigVersion:   fmt.Sprintf("v%d-%s", snapshotVer, checksum[:8]),
 				ChecksumSHA256:  checksum,
 				CanonicalSHA256: canonicalHash,
 				CompiledAt:      compiledAt,
@@ -2817,7 +2821,7 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			bodyHash = hex.EncodeToString(bodySum[:])
 			finalBytes = respBytes
 			if h.gatewaySyncTracker != nil {
-				if err := h.gatewaySyncTracker.SetPoPTargetChecksum(popID, targetVer, bodyHash); err != nil {
+				if err := h.gatewaySyncTracker.SetPoPTargetChecksum(popID, snapshotVer, bodyHash); err != nil {
 					writeError(w, http.StatusInternalServerError, "failed to persist authoritative pop snapshot head: "+err.Error())
 					return
 				}
@@ -2825,18 +2829,16 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 
 			h.snapshotCacheMu.Lock()
 			h.snapshotCache[popID] = poPSnapshotCacheEntry{
-				contentHash: compositeKey,
-				bodyBytes:   respBytes,
+				contentHash:     compositeKey,
+				bodyBytes:       respBytes,
+				snapshotVersion: snapshotVer,
+				checksum:        bodyHash,
 			}
 			h.snapshotCacheMu.Unlock()
 		}
 
 		w.Header().Set("X-Snapshot-Checksum", bodyHash)
-		if h.gatewaySyncTracker != nil {
-			w.Header().Set("X-Snapshot-Version", strconv.FormatInt(h.gatewaySyncTracker.TargetVersion(), 10))
-		} else {
-			w.Header().Set("X-Snapshot-Version", "1")
-		}
+		w.Header().Set("X-Snapshot-Version", strconv.FormatInt(snapshotVer, 10))
 		w.Header().Set("ETag", fmt.Sprintf(`"%s"`, bodyHash))
 
 		// RFC 7232: Conditional Request handling (304 Not Modified)

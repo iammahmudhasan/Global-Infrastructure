@@ -439,25 +439,42 @@ impl GatewayAckManager {
 
     /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
     /// Invariant: Atomically persists ACK payload to durable disk spool before updating memory.
-    pub fn submit_ack(&self, ack: GatewaySyncAckPayload) {
+    /// Fail-Closed: If persisting to disk spool fails, the ACK is rejected and not staged in memory.
+    pub fn submit_ack(&self, ack: GatewaySyncAckPayload) -> Result<(), std::io::Error> {
         if let Some(ref path) = self.spool_path {
-            if let Ok(serialized) = serde_json::to_string_pretty(&ack) {
-                let tmp_path = format!("{}.tmp.{}", path.display(), std::process::id());
-                if let Ok(mut file) = std::fs::File::create(&tmp_path) {
-                    use std::io::Write;
-                    if file.write_all(serialized.as_bytes()).is_ok() && file.sync_all().is_ok() {
-                        let _ = std::fs::rename(&tmp_path, path);
-                    } else {
-                        let _ = std::fs::remove_file(&tmp_path);
-                    }
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            let serialized = serde_json::to_string_pretty(&ack)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            let tmp_path = format!("{}.tmp.{}", path.display(), std::process::id());
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(serialized.as_bytes())?;
+                file.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, path)?;
+
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
                 }
             }
         }
 
         if let Ok(mut guard) = self.pending_ack.write() {
             *guard = Some(ack);
+        } else {
+            return Err(std::io::Error::other(
+                "Failed to acquire pending_ack write lock",
+            ));
         }
         self.notify.notify_one();
+        Ok(())
     }
 
     /// Returns a copy of the currently pending ACK, if any.
@@ -492,7 +509,26 @@ impl GatewayAckManager {
                                     "Successfully acknowledged edge gateway synchronization state to Control Plane"
                                 );
                                 if let Some(ref path) = self.spool_path {
-                                    let _ = std::fs::remove_file(path);
+                                    // Invariant: Version-matched deletion.
+                                    // Only delete the on-disk spool if its contents match the ACK that was just delivered.
+                                    // If a newer ACK was written to disk while this request was in flight, retain it.
+                                    if let Ok(content) = std::fs::read_to_string(path) {
+                                        if let Ok(spooled) =
+                                            serde_json::from_str::<GatewaySyncAckPayload>(&content)
+                                        {
+                                            if spooled.applied_version == ack.applied_version
+                                                && spooled.applied_checksum == ack.applied_checksum
+                                            {
+                                                let _ = std::fs::remove_file(path);
+                                            } else {
+                                                tracing::debug!(
+                                                    spooled_version = spooled.applied_version,
+                                                    delivered_version = ack.applied_version,
+                                                    "Retaining newer durable ACK on disk; not deleting superseded spool"
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                                 if let Ok(mut guard) = self.pending_ack.write() {
                                     if let Some(ref latest) = *guard {
@@ -667,7 +703,13 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                     error: None,
                                 };
                                 if let Some(mgr) = ctx.ack_manager {
-                                    mgr.submit_ack(ack);
+                                    if let Err(e) = mgr.submit_ack(ack) {
+                                        tracing::error!(
+                                            pop_id = %ctx.pop_id,
+                                            error = %e,
+                                            "Failed to durably spool initial gateway ACK to disk"
+                                        );
+                                    }
                                 } else {
                                     let _ = send_control_plane_ack(
                                         ctx.endpoint,
@@ -723,7 +765,13 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                         error: None,
                                     };
                                     if let Some(mgr) = ctx.ack_manager {
-                                        mgr.submit_ack(ack);
+                                        if let Err(e) = mgr.submit_ack(ack) {
+                                            tracing::error!(
+                                                pop_id = %ctx.pop_id,
+                                                error = %e,
+                                                "Failed to durably spool gateway sync ACK to disk"
+                                            );
+                                        }
                                     } else {
                                         let _ = send_control_plane_ack(
                                             ctx.endpoint,
@@ -751,7 +799,13 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                         error: Some(e.to_string()),
                                     };
                                     if let Some(mgr) = ctx.ack_manager {
-                                        mgr.submit_ack(ack);
+                                        if let Err(e) = mgr.submit_ack(ack) {
+                                            tracing::error!(
+                                                pop_id = %ctx.pop_id,
+                                                error = %e,
+                                                "Failed to durably spool error gateway ACK to disk"
+                                            );
+                                        }
                                     } else {
                                         let _ = send_control_plane_ack(
                                             ctx.endpoint,
@@ -927,7 +981,7 @@ mod tests {
             status: "IN_SYNC".to_string(),
             error: None,
         };
-        mgr.submit_ack(ack1);
+        assert!(mgr.submit_ack(ack1).is_ok());
 
         {
             let lock = mgr.pending_ack.read().unwrap();
@@ -944,7 +998,7 @@ mod tests {
             status: "IN_SYNC".to_string(),
             error: None,
         };
-        mgr.submit_ack(ack2);
+        assert!(mgr.submit_ack(ack2).is_ok());
 
         {
             let lock = mgr.pending_ack.read().unwrap();
@@ -984,7 +1038,7 @@ mod tests {
             status: "IN_SYNC".to_string(),
             error: None,
         };
-        mgr1.submit_ack(payload.clone());
+        assert!(mgr1.submit_ack(payload.clone()).is_ok());
 
         // Verify spool file physically exists on disk and matches payload
         assert!(spool_path.exists());
@@ -1011,5 +1065,127 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_newer_spool_not_deleted_by_older_ack_completion() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_race_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        let ack_v10 = GatewaySyncAckPayload {
+            gateway_id: "gw-sin-01".to_string(),
+            pop_id: "singapore".to_string(),
+            applied_version: 10,
+            applied_checksum: "hash-v10".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v10.clone()).is_ok());
+
+        // In-flight: newer version 11 arrives before v10 request completes
+        let ack_v11 = GatewaySyncAckPayload {
+            gateway_id: "gw-sin-01".to_string(),
+            pop_id: "singapore".to_string(),
+            applied_version: 11,
+            applied_checksum: "hash-v11".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v11.clone()).is_ok());
+
+        // Verify on-disk spool now contains version 11
+        let raw = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        assert!(raw.contains("\"applied_version\": 11"));
+
+        // Simulate worker completion for v10: executes version-matched deletion for ack_v10
+        if let Some(ref path) = mgr.spool_path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(spooled) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                    if spooled.applied_version == ack_v10.applied_version
+                        && spooled.applied_checksum == ack_v10.applied_checksum
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        // Invariant: spool file MUST NOT be deleted because it holds newer version 11
+        assert!(spool_path.exists());
+        let raw_after = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        assert!(raw_after.contains("\"applied_version\": 11"));
+
+        // In-memory queue must still hold version 11
+        if let Ok(mut guard) = mgr.pending_ack.write() {
+            if let Some(ref latest) = *guard {
+                if latest.applied_version == ack_v10.applied_version
+                    && latest.applied_checksum == ack_v10.applied_checksum
+                {
+                    *guard = None;
+                }
+            }
+        }
+        assert_eq!(mgr.pending_ack().unwrap().applied_version, 11);
+
+        // Now simulate worker completion for v11: executes version-matched deletion for ack_v11
+        if let Some(ref path) = mgr.spool_path {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                if let Ok(spooled) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                    if spooled.applied_version == ack_v11.applied_version
+                        && spooled.applied_checksum == ack_v11.applied_checksum
+                    {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
+
+        // Invariant: now that matching v11 was acknowledged, spool file is cleanly removed
+        assert!(!spool_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_submit_ack_fails_closed_on_bad_path() {
+        // Point to an invalid file path that cannot be created
+        let invalid_path =
+            std::path::PathBuf::from("/nonexistent_forbidden_dir_12345/sub/ack.json");
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(invalid_path),
+        );
+
+        let ack = GatewaySyncAckPayload {
+            gateway_id: "gw-err-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 99,
+            applied_checksum: "hash-v99".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+
+        // Invariant: When spool write fails, submit_ack MUST return error
+        let res = mgr.submit_ack(ack);
+        assert!(res.is_err());
+
+        // Invariant: In-memory pending_ack MUST NOT be updated (fails closed)
+        assert!(mgr.pending_ack().is_none());
     }
 }

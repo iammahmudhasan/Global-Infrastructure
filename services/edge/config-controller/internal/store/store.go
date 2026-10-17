@@ -1928,8 +1928,13 @@ func (s *Store) SavePoPSnapshotHead(ctx context.Context, popID string, targetVer
 		s.popSnapshotChecksums = make(map[string]string)
 		s.popSnapshotTimes = make(map[string]time.Time)
 	}
-	if existingVer, exists := s.popSnapshotVersions[popID]; exists && existingVer > targetVersion {
-		return nil
+	if existingVer, exists := s.popSnapshotVersions[popID]; exists {
+		if existingVer > targetVersion {
+			return fmt.Errorf("stale snapshot version %d rejected: current authoritative version is %d", targetVersion, existingVer)
+		}
+		if existingVer == targetVersion && s.popSnapshotChecksums[popID] != targetChecksum {
+			return fmt.Errorf("checksum mismatch conflict for version %d: existing checksum %s diverges from proposed %s", targetVersion, s.popSnapshotChecksums[popID], targetChecksum)
+		}
 	}
 	s.popSnapshotVersions[popID] = targetVersion
 	s.popSnapshotChecksums[popID] = targetChecksum

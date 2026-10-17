@@ -366,7 +366,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     status: "IN_SYNC".to_string(),
                                     error: None,
                                 };
-                                watchdog_ack_manager.submit_ack(ack);
+                                if let Err(e) = watchdog_ack_manager.submit_ack(ack) {
+                                    tracing::error!(
+                                        error = %e,
+                                        "Failed to durably spool watchdog gateway ACK to disk"
+                                    );
+                                }
                             } else {
                                 tracing::debug!(
                                     pop_id = %cp_cfg.pop_id,
