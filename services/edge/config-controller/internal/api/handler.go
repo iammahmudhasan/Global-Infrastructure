@@ -2788,12 +2788,20 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			bodySum := sha256.Sum256(finalBytes)
 			bodyHash = hex.EncodeToString(bodySum[:])
 		} else {
+			compiledAt := time.Now().UTC().Truncate(time.Second)
+			targetVer := int64(1)
+			if h.gatewaySyncTracker != nil {
+				targetVer = h.gatewaySyncTracker.TargetVersion()
+				if !h.gatewaySyncTracker.TargetUpdatedAt().IsZero() {
+					compiledAt = h.gatewaySyncTracker.TargetUpdatedAt().Truncate(time.Second)
+				}
+			}
 			syncResult := model.PoPConfigSync{
 				PoPID:           pop.ID,
-				ConfigVersion:   "v1.0.0-" + checksum[:8],
+				ConfigVersion:   fmt.Sprintf("v%d-%s", targetVer, checksum[:8]),
 				ChecksumSHA256:  checksum,
 				CanonicalSHA256: canonicalHash,
-				CompiledAt:      time.Now().UTC().Truncate(time.Second),
+				CompiledAt:      compiledAt,
 				TopologiesCount: len(topologies),
 				EnvoyConfig:     envoyCfg,
 				Routes:          gatewayRoutes,
@@ -2817,7 +2825,16 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			h.snapshotCacheMu.Unlock()
 		}
 
+		if h.gatewaySyncTracker != nil {
+			h.gatewaySyncTracker.SetPoPTargetChecksum(popID, bodyHash)
+		}
+
 		w.Header().Set("X-Snapshot-Checksum", bodyHash)
+		if h.gatewaySyncTracker != nil {
+			w.Header().Set("X-Snapshot-Version", strconv.FormatInt(h.gatewaySyncTracker.TargetVersion(), 10))
+		} else {
+			w.Header().Set("X-Snapshot-Version", "1")
+		}
 		w.Header().Set("ETag", fmt.Sprintf(`"%s"`, bodyHash))
 
 		// RFC 7232: Conditional Request handling (304 Not Modified)
@@ -4137,6 +4154,10 @@ func (h *APIHandler) handleGatewayAck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		if strings.Contains(err.Error(), "failed to persist") {
+			writeError(w, http.StatusServiceUnavailable, "persistence failure: "+err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -4159,6 +4180,44 @@ func (h *APIHandler) handleGatewayStatus(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
+
+	tc, ok := auth.FromContext(r.Context())
+	if ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
+		// Strict EdgeNode Isolation: Edge nodes can only inspect their own gateway and authorized PoP
+		if strings.TrimSpace(tc.NodeID) == "" {
+			writeError(w, http.StatusForbidden, "edge node credential requires non-empty NodeID")
+			return
+		}
+		rec, exists := h.gatewaySyncTracker.GetGateway(tc.NodeID)
+		if !exists {
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"gateways": []*events.GatewaySyncRecord{},
+				"summary": map[string]interface{}{
+					"status":  "unregistered",
+					"node_id": tc.NodeID,
+				},
+			})
+			return
+		}
+		if !h.authenticator.AuthorizePoP(r.Context(), rec.PoPID) {
+			writeError(w, http.StatusForbidden, "edge node is not authorized for recorded pop "+rec.PoPID)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"gateways": []*events.GatewaySyncRecord{rec},
+			"summary": map[string]interface{}{
+				"status":           string(rec.Status),
+				"node_id":          rec.GatewayID,
+				"pop_id":           rec.PoPID,
+				"applied_version":  rec.AppliedVersion,
+				"applied_checksum": rec.AppliedChecksum,
+				"target_version":   rec.TargetVersion,
+				"last_ack_at":      rec.LastAckAt,
+			},
+		})
+		return
+	}
+
 	gateways := h.gatewaySyncTracker.ListGateways()
 	summary := h.gatewaySyncTracker.GetConvergenceSummary()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
@@ -4180,7 +4239,27 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")
 		return
 	}
+
 	gatewayID := r.URL.Query().Get("gateway_id")
+	popID := r.URL.Query().Get("pop_id")
+
+	tc, ok := auth.FromContext(r.Context())
+	if ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
+		if strings.TrimSpace(tc.NodeID) == "" {
+			writeError(w, http.StatusForbidden, "edge node credential requires non-empty NodeID")
+			return
+		}
+		if gatewayID != "" && gatewayID != tc.NodeID {
+			writeError(w, http.StatusForbidden, "edge node credential cannot sync for another gateway")
+			return
+		}
+		gatewayID = tc.NodeID
+		if popID != "" && !h.authenticator.AuthorizePoP(r.Context(), popID) {
+			writeError(w, http.StatusForbidden, "edge node is not authorized for specified pop_id")
+			return
+		}
+	}
+
 	currentVerStr := r.URL.Query().Get("current_version")
 	var currentVer int64
 	if currentVerStr != "" {
@@ -4191,10 +4270,15 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 
 	targetVer := h.gatewaySyncTracker.TargetVersion()
 	targetChk := h.gatewaySyncTracker.TargetChecksum()
+	if popID != "" {
+		if popChk := h.gatewaySyncTracker.GetPoPTargetChecksum(popID); popChk != "" {
+			targetChk = popChk
+		}
+	}
 	needsPull := currentVer < targetVer
 
 	snapshotURL := "/v1/edge/envoy-config"
-	if popID := r.URL.Query().Get("pop_id"); popID != "" {
+	if popID != "" {
 		snapshotURL = fmt.Sprintf("/v1/edge/pops/%s/config", popID)
 	}
 

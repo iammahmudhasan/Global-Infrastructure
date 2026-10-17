@@ -45,14 +45,15 @@ type GatewayConvergenceStore interface {
 // GatewaySyncTracker coordinates configuration generation tracking, per-gateway ACKs,
 // lag monitoring, and detects stale edge nodes (P1 Edge Convergence Engine).
 type GatewaySyncTracker struct {
-	mu              sync.RWMutex
-	targetVersion   atomic.Int64
-	targetChecksum  string
-	targetUpdatedAt time.Time
-	gateways        map[string]*GatewaySyncRecord
-	staleThreshold  time.Duration
-	store           GatewayConvergenceStore
-	startupErr      error
+	mu                 sync.RWMutex
+	targetVersion      atomic.Int64
+	targetChecksum     string
+	targetUpdatedAt    time.Time
+	popTargetChecksums map[string]string
+	gateways           map[string]*GatewaySyncRecord
+	staleThreshold     time.Duration
+	store              GatewayConvergenceStore
+	startupErr         error
 }
 
 // NewGatewaySyncTracker creates an in-memory GatewaySyncTracker.
@@ -70,10 +71,11 @@ func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConve
 		staleThreshold = 15 * time.Second
 	}
 	t := &GatewaySyncTracker{
-		gateways:        make(map[string]*GatewaySyncRecord),
-		staleThreshold:  staleThreshold,
-		targetUpdatedAt: time.Now().UTC(),
-		store:           s,
+		popTargetChecksums: make(map[string]string),
+		gateways:           make(map[string]*GatewaySyncRecord),
+		staleThreshold:     staleThreshold,
+		targetUpdatedAt:    time.Now().UTC(),
+		store:              s,
 	}
 	t.targetVersion.Store(1)
 
@@ -184,9 +186,44 @@ func (t *GatewaySyncTracker) TargetChecksum() string {
 	return t.targetChecksum
 }
 
+// TargetUpdatedAt returns the timestamp when target configuration was last updated.
+func (t *GatewaySyncTracker) TargetUpdatedAt() time.Time {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.targetUpdatedAt
+}
+
+// SetPoPTargetChecksum records the authoritative compiled snapshot checksum for a specific PoP.
+func (t *GatewaySyncTracker) SetPoPTargetChecksum(popID string, checksum string) {
+	if strings.TrimSpace(popID) == "" || strings.TrimSpace(checksum) == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.popTargetChecksums == nil {
+		t.popTargetChecksums = make(map[string]string)
+	}
+	t.popTargetChecksums[popID] = checksum
+}
+
+// GetPoPTargetChecksum returns the authoritative compiled snapshot checksum for a PoP,
+// falling back to the global target checksum if not specifically set for that PoP.
+func (t *GatewaySyncTracker) GetPoPTargetChecksum(popID string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.popTargetChecksums != nil {
+		if chk, exists := t.popTargetChecksums[popID]; exists && chk != "" {
+			return chk
+		}
+	}
+	return t.targetChecksum
+}
+
 // RecordAck records an applied version acknowledgement from an edge gateway.
 // Rejects applied checksum mismatch with ErrChecksumMismatch and sets status to CHECKSUM_MISMATCH.
 // A gateway CANNOT be marked IN_SYNC unless both version and checksum match authoritative desired state.
+// Invariant: Fail-closed persistence. If persistent store write fails, in-memory state is NOT updated
+// and an error is returned to caller.
 func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*GatewaySyncRecord, error) {
 	if strings.TrimSpace(ack.GatewayID) == "" {
 		return nil, errors.New("gateway_id is required")
@@ -199,7 +236,12 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	defer t.mu.Unlock()
 
 	targetVer := t.targetVersion.Load()
-	targetChk := t.targetChecksum
+	expectedChk := t.targetChecksum
+	if t.popTargetChecksums != nil {
+		if popChk, ok := t.popTargetChecksums[ack.PoPID]; ok && popChk != "" {
+			expectedChk = popChk
+		}
+	}
 	now := time.Now().UTC()
 
 	lag := targetVer - ack.AppliedVersion
@@ -216,27 +258,29 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	}
 
 	// Strict checksum validation: Gateway cannot be IN_SYNC on checksum mismatch for target version
-	if ack.AppliedVersion >= targetVer && targetChk != "" && ack.AppliedChecksum != "" && ack.AppliedChecksum != targetChk {
-		errMsg := fmt.Sprintf("applied checksum mismatch: expected %s, got %s", targetChk, ack.AppliedChecksum)
+	if ack.AppliedVersion >= targetVer && expectedChk != "" && ack.AppliedChecksum != "" && ack.AppliedChecksum != expectedChk {
+		errMsg := fmt.Sprintf("applied checksum mismatch for pop %s: expected %s, got %s", ack.PoPID, expectedChk, ack.AppliedChecksum)
 		rec := &GatewaySyncRecord{
 			GatewayID:        ack.GatewayID,
 			PoPID:            ack.PoPID,
 			AppliedVersion:   ack.AppliedVersion,
 			AppliedChecksum:  ack.AppliedChecksum,
 			TargetVersion:    targetVer,
-			TargetChecksum:   targetChk,
+			TargetChecksum:   expectedChk,
 			VersionLag:       lag,
 			Status:           model.SyncStatusChecksumMismatch,
 			LastError:        errMsg,
 			LastAckAt:        now,
 			ConvergenceLagMs: convLagMs,
 		}
-		t.gateways[ack.GatewayID] = rec
 		if t.store != nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_ = t.store.SaveGatewaySyncRecord(ctx, rec)
+			if err := t.store.SaveGatewaySyncRecord(ctx, rec); err != nil {
+				return nil, fmt.Errorf("failed to persist gateway sync record: %w", err)
+			}
 		}
+		t.gateways[ack.GatewayID] = rec
 		recCopy := *rec
 		return &recCopy, model.ErrChecksumMismatch
 	}
@@ -244,7 +288,7 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	var status GatewaySyncStatus
 	if strings.ToUpper(ack.Status) == string(model.SyncStatusError) || ack.Error != "" {
 		status = model.SyncStatusError
-	} else if ack.AppliedVersion >= targetVer && (targetChk == "" || ack.AppliedChecksum == targetChk) {
+	} else if ack.AppliedVersion >= targetVer && (expectedChk == "" || ack.AppliedChecksum == expectedChk) {
 		status = model.SyncStatusInSync
 	} else if strings.ToUpper(ack.Status) == string(model.SyncStatusApplying) {
 		status = model.SyncStatusApplying
@@ -258,7 +302,7 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 		AppliedVersion:   ack.AppliedVersion,
 		AppliedChecksum:  ack.AppliedChecksum,
 		TargetVersion:    targetVer,
-		TargetChecksum:   targetChk,
+		TargetChecksum:   expectedChk,
 		VersionLag:       lag,
 		Status:           status,
 		LastError:        ack.Error,
@@ -266,12 +310,14 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 		ConvergenceLagMs: convLagMs,
 	}
 
-	t.gateways[ack.GatewayID] = rec
 	if t.store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		_ = t.store.SaveGatewaySyncRecord(ctx, rec)
+		if err := t.store.SaveGatewaySyncRecord(ctx, rec); err != nil {
+			return nil, fmt.Errorf("failed to persist gateway sync record: %w", err)
+		}
 	}
+	t.gateways[ack.GatewayID] = rec
 	recCopy := *rec
 	return &recCopy, nil
 }

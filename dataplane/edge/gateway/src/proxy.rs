@@ -821,6 +821,7 @@ pub async fn handle_request(
 
     let has_cookie = req_headers.contains_key("cookie");
     let has_auth = req_headers.contains_key("authorization");
+    let has_conditional_or_range = has_conditional_or_range_headers(&req_headers);
     let bypass_cache = domain_cache_policy
         .as_ref()
         .map(|c| !c.enabled || c.bypass_paths.iter().any(|bp| path.starts_with(bp)))
@@ -829,6 +830,7 @@ pub async fn handle_request(
     if method == Method::GET
         && !has_cookie
         && !has_auth
+        && !has_conditional_or_range
         && !bypass_cache
         && !req_cc.no_cache
         && !req_cc.no_store
@@ -1097,6 +1099,7 @@ pub async fn handle_request(
         && status == StatusCode::OK
         && !has_cookie
         && !has_auth
+        && !has_conditional_or_range
         && !bypass_cache
         && !req_cc.no_store
         && !req_cc.no_cache
@@ -1376,6 +1379,14 @@ pub fn normalize_accept_encoding(value: &str) -> String {
 pub fn parse_max_age(cc: &str) -> Option<u64> {
     let directives = parse_cache_control([cc]);
     directives.s_maxage.or(directives.max_age)
+}
+
+/// Detects RFC 9110 / RFC 9111 conditional and range request headers that mandate edge cache bypass.
+pub fn has_conditional_or_range_headers(headers: &hyper::HeaderMap) -> bool {
+    headers.contains_key("range")
+        || headers.contains_key("if-range")
+        || headers.contains_key("if-none-match")
+        || headers.contains_key("if-modified-since")
 }
 
 #[cfg(test)]
@@ -1789,5 +1800,29 @@ mod tests {
             resp.headers().get("X-NexusEdge-Failed-Upstream").unwrap(),
             "https://primary.aeitron.com"
         );
+    }
+
+    #[test]
+    fn test_cache_bypass_conditional_and_range_headers() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(!has_conditional_or_range_headers(&headers));
+
+        headers.insert("range", "bytes=0-1023".parse().unwrap());
+        assert!(has_conditional_or_range_headers(&headers));
+
+        headers.remove("range");
+        headers.insert("if-range", "\"etag123\"".parse().unwrap());
+        assert!(has_conditional_or_range_headers(&headers));
+
+        headers.remove("if-range");
+        headers.insert("if-none-match", "\"etag123\"".parse().unwrap());
+        assert!(has_conditional_or_range_headers(&headers));
+
+        headers.remove("if-none-match");
+        headers.insert(
+            "if-modified-since",
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert!(has_conditional_or_range_headers(&headers));
     }
 }

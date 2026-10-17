@@ -1690,3 +1690,81 @@ func TestPostgresRepository_EdgeConvergencePersistence(t *testing.T) {
 		t.Fatalf("repo2.ListGatewaySyncRecords did not contain %s", gwID)
 	}
 }
+
+func TestPostgresRepository_ReconcileCache_QueryFailurePreservesWorkingCache(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres ReconcileCache query failure test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo: %v", err)
+	}
+	defer repo.Close()
+
+	// 1. Populate a test domain and route
+	ts := time.Now().UnixNano()
+	domID := fmt.Sprintf("dom-rec-fail-%d", ts)
+	dom := &model.Domain{
+		ID:        domID,
+		ProjectID: "prj-test",
+		Hostname:  fmt.Sprintf("rec-fail-%d.example.com", ts),
+		Status:    model.DomainStatusActive,
+		Version:   1,
+	}
+	if err := repo.SaveDomain(dom); err != nil {
+		t.Fatalf("SaveDomain failed: %v", err)
+	}
+
+	rtID := fmt.Sprintf("rt-rec-fail-%d", ts)
+	rt := &model.Route{
+		ID:         rtID,
+		DomainID:   domID,
+		PoolID:     "pool-default",
+		PathPrefix: "/api",
+		Priority:   10,
+		TimeoutMs:  5000,
+	}
+	if err := repo.SaveRoute(rt); err != nil {
+		t.Fatalf("SaveRoute failed: %v", err)
+	}
+
+	// 2. Perform a successful reconciliation pass to ensure cache is populated
+	if _, err := repo.ReconcileCache(ctx); err != nil {
+		t.Fatalf("initial ReconcileCache failed: %v", err)
+	}
+
+	// Verify working cache has route
+	cachedRoutesBefore := repo.GetRoutes(domID)
+	if len(cachedRoutesBefore) == 0 {
+		t.Fatalf("expected cached route before failure test, got 0")
+	}
+
+	// 3. Trigger reconciliation failure with canceled context (simulating query failure)
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel() // canceled immediately before query execution
+
+	stats, err := repo.ReconcileCache(canceledCtx)
+	if err == nil {
+		t.Fatalf("expected ReconcileCache to return error on query failure, got stats: %+v", stats)
+	}
+
+	// 4. Invariant Verification: Working cache must NOT have been wiped or mutated
+	cachedRoutesAfter := repo.GetRoutes(domID)
+	if len(cachedRoutesAfter) == 0 {
+		t.Fatalf("CRITICAL BUG: ReconcileCache wiped working routes on query failure!")
+	}
+	if cachedRoutesAfter[0].ID != rtID {
+		t.Fatalf("expected cached route %s, got %s", rtID, cachedRoutesAfter[0].ID)
+	}
+
+	cachedDom, err := repo.GetDomain(domID)
+	if err != nil || cachedDom == nil {
+		t.Fatalf("expected cached domain %s to remain present, err: %v", domID, err)
+	}
+}

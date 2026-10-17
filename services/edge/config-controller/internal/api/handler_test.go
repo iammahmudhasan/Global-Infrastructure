@@ -4775,13 +4775,17 @@ func TestGatewayConvergence_EndToEndSnapshotPull(t *testing.T) {
 	if wSnap.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK for snapshot fetch, got %d", wSnap.Code)
 	}
+	snapChk := wSnap.Header().Get("X-Snapshot-Checksum")
+	if snapChk == "" {
+		t.Fatalf("expected X-Snapshot-Checksum header in snapshot response")
+	}
 
 	// Step 3: Gateway applies configuration and submits verified ACK
 	ackBody, _ := json.Marshal(map[string]interface{}{
 		"gateway_id":       "gw-dhk-01",
 		"pop_id":           "dhaka",
 		"applied_version":  targetVer,
-		"applied_checksum": "sha256-auth-v3",
+		"applied_checksum": snapChk,
 		"status":           "IN_SYNC",
 	})
 	reqAck := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(ackBody))
@@ -4804,7 +4808,8 @@ func TestGatewayConvergence_EndToEndSnapshotPull(t *testing.T) {
 
 type mockHandlerFailingStore struct {
 	store.Repository
-	failHead bool
+	failHead    bool
+	failSaveAck bool
 }
 
 func (m *mockHandlerFailingStore) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time.Time, error) {
@@ -4812,6 +4817,13 @@ func (m *mockHandlerFailingStore) GetEdgeConvergenceHead(ctx context.Context) (i
 		return 0, "", time.Time{}, errors.New("simulated database read failure at startup")
 	}
 	return m.Repository.GetEdgeConvergenceHead(ctx)
+}
+
+func (m *mockHandlerFailingStore) SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error {
+	if m.failSaveAck {
+		return errors.New("simulated database disk write failure on ack")
+	}
+	return m.Repository.SaveGatewaySyncRecord(ctx, rec)
 }
 
 func TestGatewayConvergence_HealthzUnreadyOnStartupFailure(t *testing.T) {
@@ -4839,5 +4851,153 @@ func TestGatewayConvergence_HealthzUnreadyOnStartupFailure(t *testing.T) {
 	}
 	if res["status"] != "unready" {
 		t.Fatalf("expected status 'unready', got %v", res["status"])
+	}
+}
+
+func TestGatewayConvergence_AckPersistenceFailureFailClosed(t *testing.T) {
+	memStore := store.NewStore()
+	failingStore := &mockHandlerFailingStore{
+		Repository:  memStore,
+		failSaveAck: true,
+	}
+
+	svc := onboarding.NewDomainService(memStore)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	h := api.NewAPIHandler(failingStore, svc, comp)
+
+	targetVer, targetChk, err := h.GatewaySyncTracker().AdvanceTargetVersion(context.Background(), "sha256-target-ack")
+	if err != nil {
+		t.Fatalf("AdvanceTargetVersion failed: %v", err)
+	}
+
+	ackBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-persist-fail",
+		"pop_id":           "dhaka",
+		"applied_version":  targetVer,
+		"applied_checksum": targetChk,
+		"status":           "IN_SYNC",
+	})
+
+	reqAck := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(ackBody))
+	wAck := httptest.NewRecorder()
+	h.ServeHTTP(wAck, reqAck)
+
+	if wAck.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 Service Unavailable on durable persistence failure, got %d (body=%s)", wAck.Code, wAck.Body.String())
+	}
+
+	// Invariant Verification: In-memory state must NOT have been updated to IN_SYNC
+	rec, exists := h.GatewaySyncTracker().GetGateway("gw-persist-fail")
+	if exists && rec.Status == model.SyncStatusInSync {
+		t.Fatalf("CRITICAL BUG: Gateway was marked IN_SYNC in memory despite durable persistence failure!")
+	}
+}
+
+func TestGatewayStatus_EdgeNodeScopedIsolation(t *testing.T) {
+	memStore := store.NewStore()
+	svc := onboarding.NewDomainService(memStore)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	h := api.NewAPIHandler(memStore, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterNodeWithPoP("key-gw-a", "tenant-edge", "proj-core", "gw-node-a", "dhaka")
+	authInst.RegisterTenantWithRole("key-operator", "tenant-op", "proj-core", auth.RolePlatformOperator, "*")
+	h.SetAuthenticator(authInst)
+
+	ctx := context.Background()
+	ver, chk, _ := h.GatewaySyncTracker().AdvanceTargetVersion(ctx, "sha256-test-iso")
+
+	// Pre-populate two gateways
+	_, _ = h.GatewaySyncTracker().RecordAck(events.GatewaySyncAcknowledgement{
+		GatewayID:       "gw-node-a",
+		PoPID:           "dhaka",
+		AppliedVersion:  ver,
+		AppliedChecksum: chk,
+		Status:          "IN_SYNC",
+	})
+	_, _ = h.GatewaySyncTracker().RecordAck(events.GatewaySyncAcknowledgement{
+		GatewayID:       "gw-node-b",
+		PoPID:           "singapore",
+		AppliedVersion:  ver,
+		AppliedChecksum: chk,
+		Status:          "IN_SYNC",
+	})
+
+	// 1. EdgeNode for gw-node-a queries status
+	reqA := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/status", nil)
+	reqA.Header.Set("Authorization", "Bearer key-gw-a")
+	wA := httptest.NewRecorder()
+	h.ServeHTTP(wA, reqA)
+
+	if wA.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for edge node status, got %d", wA.Code)
+	}
+	var resA struct {
+		Gateways []*events.GatewaySyncRecord `json:"gateways"`
+		Summary  map[string]interface{}      `json:"summary"`
+	}
+	if err := json.NewDecoder(wA.Body).Decode(&resA); err != nil {
+		t.Fatalf("decode status response failed: %v", err)
+	}
+
+	if len(resA.Gateways) != 1 {
+		t.Fatalf("CRITICAL BUG: Edge node received %d gateways instead of 1 (must be scoped to its own gateway)", len(resA.Gateways))
+	}
+	if resA.Gateways[0].GatewayID != "gw-node-a" {
+		t.Fatalf("expected gateway_id gw-node-a, got %s", resA.Gateways[0].GatewayID)
+	}
+
+	// 2. Platform operator queries status -> receives full fleet
+	reqOp := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/status", nil)
+	reqOp.Header.Set("Authorization", "Bearer key-operator")
+	wOp := httptest.NewRecorder()
+	h.ServeHTTP(wOp, reqOp)
+
+	var resOp struct {
+		Gateways []*events.GatewaySyncRecord `json:"gateways"`
+		Summary  map[string]interface{}      `json:"summary"`
+	}
+	_ = json.NewDecoder(wOp.Body).Decode(&resOp)
+	if len(resOp.Gateways) < 2 {
+		t.Fatalf("expected platform operator to see full fleet (>=2), got %d", len(resOp.Gateways))
+	}
+}
+
+func TestGatewaySync_IdentityBinding(t *testing.T) {
+	memStore := store.NewStore()
+	svc := onboarding.NewDomainService(memStore)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	h := api.NewAPIHandler(memStore, svc, comp)
+
+	authInst := auth.NewAuthenticator()
+	authInst.RegisterNodeWithPoP("key-gw-a", "tenant-edge", "proj-core", "gw-node-a", "dhaka")
+	authInst.RegisterTenantWithRole("key-operator", "tenant-op", "proj-core", auth.RolePlatformOperator, "*")
+	h.SetAuthenticator(authInst)
+
+	// 1. EdgeNode attempting to sync for a different gateway -> 403 Forbidden
+	reqSpoof := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-node-b&pop_id=dhaka", nil)
+	reqSpoof.Header.Set("Authorization", "Bearer key-gw-a")
+	wSpoof := httptest.NewRecorder()
+	h.ServeHTTP(wSpoof, reqSpoof)
+	if wSpoof.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when EdgeNode queries sync for another gateway, got %d", wSpoof.Code)
+	}
+
+	// 2. EdgeNode attempting to sync for an unauthorized PoP -> 403 Forbidden
+	reqPopSpoof := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-node-a&pop_id=singapore", nil)
+	reqPopSpoof.Header.Set("Authorization", "Bearer key-gw-a")
+	wPopSpoof := httptest.NewRecorder()
+	h.ServeHTTP(wPopSpoof, reqPopSpoof)
+	if wPopSpoof.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when EdgeNode queries sync for unauthorized PoP, got %d", wPopSpoof.Code)
+	}
+
+	// 3. Legitimate sync request for its own gateway and authorized PoP -> 200 OK
+	reqLegit := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-node-a&pop_id=dhaka", nil)
+	reqLegit.Header.Set("Authorization", "Bearer key-gw-a")
+	wLegit := httptest.NewRecorder()
+	h.ServeHTTP(wLegit, reqLegit)
+	if wLegit.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for legitimate EdgeNode sync, got %d", wLegit.Code)
 	}
 }

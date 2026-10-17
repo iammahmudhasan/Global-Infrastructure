@@ -1,6 +1,7 @@
 use crate::dns::PinnedDnsResolver;
 use crate::router::{self, Router};
 use reqwest::Client as HttpClient;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fmt;
 
@@ -13,7 +14,20 @@ pub struct SyncStats {
     pub routes_applied: usize,
     pub ai_providers_applied: usize,
     pub checksum: String,
+    pub version: i64,
     pub modified: bool,
+}
+
+/// Declarative synchronization ACK payload dispatched to Control Plane convergence tracker.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewaySyncAckPayload {
+    pub gateway_id: String,
+    pub pop_id: String,
+    pub applied_version: i64,
+    pub applied_checksum: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -208,6 +222,7 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
             routes_applied: 0,
             ai_providers_applied: 0,
             checksum: ctx.if_none_match.unwrap_or("").to_string(),
+            version: 0,
             modified: false,
         });
     }
@@ -215,6 +230,13 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
     if !resp.status().is_success() {
         return Err(SyncError::BadStatus(resp.status().as_u16()));
     }
+
+    let version = resp
+        .headers()
+        .get("x-snapshot-version")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1);
 
     let header_checksum = resp
         .headers()
@@ -302,6 +324,7 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
         routes_applied: routes_count,
         ai_providers_applied,
         checksum: computed_hash,
+        version,
         modified: true,
     })
 }
@@ -374,6 +397,33 @@ pub struct StreamSyncContext<'a> {
     pub dns_resolver: &'a PinnedDnsResolver,
     pub ai_director: Option<&'a crate::ai::AiTrafficDirector>,
     pub is_ready: &'a std::sync::atomic::AtomicBool,
+    pub gateway_id: Option<&'a str>,
+}
+
+/// Sends an authenticated synchronization ACK to the Control Plane convergence tracker (/v1/edge/gateways/ack).
+pub async fn send_control_plane_ack(
+    endpoint: &str,
+    auth_token: &str,
+    client: &HttpClient,
+    ack: &GatewaySyncAckPayload,
+) -> Result<(), SyncError> {
+    validate_control_plane_endpoint(endpoint, auth_token).map_err(SyncError::InvalidEndpoint)?;
+
+    let url = format!("{}/v1/edge/gateways/ack", endpoint.trim_end_matches('/'));
+    let mut req = client.post(&url).json(ack);
+    if !auth_token.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", auth_token));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| SyncError::NetworkError(e.to_string()))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(SyncError::BadStatus(resp.status().as_u16()))
+    }
 }
 
 /// Long-lived real-time streaming subscriber connecting to the Control Plane SSE endpoint.
@@ -456,8 +506,26 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                 routes = stats.routes_applied,
                                 ai_providers = stats.ai_providers_applied,
                                 checksum = %stats.checksum,
+                                version = stats.version,
                                 "Applied initial Control Plane snapshot via SSE handshake"
                             );
+                            if let Some(gw_id) = ctx.gateway_id {
+                                let ack = GatewaySyncAckPayload {
+                                    gateway_id: gw_id.to_string(),
+                                    pop_id: ctx.pop_id.to_string(),
+                                    applied_version: stats.version,
+                                    applied_checksum: stats.checksum,
+                                    status: "IN_SYNC".to_string(),
+                                    error: None,
+                                };
+                                let _ = send_control_plane_ack(
+                                    ctx.endpoint,
+                                    ctx.auth_token,
+                                    ctx.client,
+                                    &ack,
+                                )
+                                .await;
+                            }
                         }
                     }
                     "config_update" => {
@@ -490,8 +558,29 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                     routes = stats.routes_applied,
                                     ai_providers = stats.ai_providers_applied,
                                     checksum = %stats.checksum,
+                                    version = stats.version,
                                     "Atomically synchronized edge routes from real-time push event"
                                 );
+                                if let Some(gw_id) = ctx.gateway_id {
+                                    let ack = GatewaySyncAckPayload {
+                                        gateway_id: gw_id.to_string(),
+                                        pop_id: ctx.pop_id.to_string(),
+                                        applied_version: stats.version,
+                                        applied_checksum: stats.checksum,
+                                        status: "IN_SYNC".to_string(),
+                                        error: None,
+                                    };
+                                    if let Err(e) = send_control_plane_ack(
+                                        ctx.endpoint,
+                                        ctx.auth_token,
+                                        ctx.client,
+                                        &ack,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(error = %e, "Failed to submit convergence ACK after SSE update");
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -499,6 +588,23 @@ pub async fn listen_and_apply_event_stream(ctx: &StreamSyncContext<'_>) -> Resul
                                     error = %e,
                                     "Failed to apply snapshot following real-time config_update event"
                                 );
+                                if let Some(gw_id) = ctx.gateway_id {
+                                    let ack = GatewaySyncAckPayload {
+                                        gateway_id: gw_id.to_string(),
+                                        pop_id: ctx.pop_id.to_string(),
+                                        applied_version: 0,
+                                        applied_checksum: String::new(),
+                                        status: "ERROR".to_string(),
+                                        error: Some(e.to_string()),
+                                    };
+                                    let _ = send_control_plane_ack(
+                                        ctx.endpoint,
+                                        ctx.auth_token,
+                                        ctx.client,
+                                        &ack,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -607,5 +713,42 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[test]
+    fn test_gateway_sync_ack_payload_serialization() {
+        let ack = GatewaySyncAckPayload {
+            gateway_id: "edge-node-dhaka-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 7,
+            applied_checksum: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+                .to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+
+        let json_str = serde_json::to_string(&ack).expect("serialization failed");
+        assert!(json_str.contains("\"gateway_id\":\"edge-node-dhaka-01\""));
+        assert!(json_str.contains("\"pop_id\":\"dhaka\""));
+        assert!(json_str.contains("\"applied_version\":7"));
+        assert!(json_str.contains(
+            "\"applied_checksum\":\"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\""
+        ));
+        assert!(json_str.contains("\"status\":\"IN_SYNC\""));
+        assert!(!json_str.contains("\"error\""));
+
+        // Error status serialization
+        let err_ack = GatewaySyncAckPayload {
+            gateway_id: "edge-node-dhaka-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 7,
+            applied_checksum: "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+                .to_string(),
+            status: "ERROR".to_string(),
+            error: Some("checksum mismatch".to_string()),
+        };
+        let err_json = serde_json::to_string(&err_ack).expect("serialization failed");
+        assert!(err_json.contains("\"status\":\"ERROR\""));
+        assert!(err_json.contains("\"error\":\"checksum mismatch\""));
     }
 }

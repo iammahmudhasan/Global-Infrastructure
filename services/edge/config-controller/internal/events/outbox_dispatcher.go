@@ -173,7 +173,8 @@ func (b *BroadcasterBridge) HandleOutboxEvent(ctx context.Context, ev *store.Out
 		return NewPermanentError(fmt.Errorf("payload schema validation error for event %s (%s): %w", ev.EventID, ev.EventType, err))
 	}
 
-	sum := sha256.Sum256(ev.Payload)
+	canonicalPayload := fmt.Sprintf("%s:%s:%s:%s", ev.EventType, ev.AggregateType, ev.AggregateID, string(ev.Payload))
+	sum := sha256.Sum256([]byte(canonicalPayload))
 	checksum := hex.EncodeToString(sum[:])
 
 	var targetVer int64

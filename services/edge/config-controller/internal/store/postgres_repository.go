@@ -1317,11 +1317,142 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		return nil, fmt.Errorf("reconcile cache iterate domains: %w", err)
 	}
 
+	// 2. Stage Routes for active domains
+	stagedRoutesByDomain := make(map[string][]*model.Route)
+	routeRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache query routes: %w", err)
+	}
+	defer routeRows.Close()
+
+	for routeRows.Next() {
+		var rt model.Route
+		if err := routeRows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err != nil {
+			return nil, fmt.Errorf("reconcile cache scan route: %w", err)
+		}
+		stagedRoutesByDomain[rt.DomainID] = append(stagedRoutesByDomain[rt.DomainID], &rt)
+	}
+	if err := routeRows.Err(); err != nil {
+		return nil, fmt.Errorf("reconcile cache iterate routes: %w", err)
+	}
+
+	// 3. Stage Origin Pools and Origins
+	poolRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools")
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache query origin pools: %w", err)
+	}
+	defer poolRows.Close()
+
+	var stagedPools []*model.OriginPool
+	for poolRows.Next() {
+		var p model.OriginPool
+		var pops pq.StringArray
+		if err := poolRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.LBAlgorithm, &pops); err != nil {
+			return nil, fmt.Errorf("reconcile cache scan origin pool: %w", err)
+		}
+		p.AllowedPoPs = []string(pops)
+
+		origRows, errOrig := r.db.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
+		if errOrig != nil {
+			return nil, fmt.Errorf("reconcile cache query origins for pool %s: %w", p.ID, errOrig)
+		}
+		for origRows.Next() {
+			var o model.Origin
+			var opops pq.StringArray
+			if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err != nil {
+				origRows.Close()
+				return nil, fmt.Errorf("reconcile cache scan origin for pool %s: %w", p.ID, err)
+			}
+			o.AllowedPoPs = []string(opops)
+			p.Origins = append(p.Origins, o)
+		}
+		if err := origRows.Err(); err != nil {
+			origRows.Close()
+			return nil, fmt.Errorf("reconcile cache iterate origins for pool %s: %w", p.ID, err)
+		}
+		origRows.Close()
+		stagedPools = append(stagedPools, &p)
+	}
+	if err := poolRows.Err(); err != nil {
+		return nil, fmt.Errorf("reconcile cache iterate origin pools: %w", err)
+	}
+
+	// 4. Stage Active Certificates
+	certRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE status = 'ACTIVE'")
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache query certificates: %w", err)
+	}
+	defer certRows.Close()
+
+	var stagedCerts []*model.Certificate
+	for certRows.Next() {
+		var cert model.Certificate
+		var domains pq.StringArray
+		var encKey string
+		var issuedAt, expiresAt sql.NullTime
+		if err := certRows.Scan(&cert.ID, &cert.DomainID, &cert.Status, &cert.Issuer, &cert.SerialNumber, &cert.CertPEM, &encKey, &cert.FingerprintSHA256, &cert.KeyType, &domains, &cert.AutoRenew, &issuedAt, &expiresAt); err != nil {
+			return nil, fmt.Errorf("reconcile cache scan certificate: %w", err)
+		}
+		cert.Domains = []string(domains)
+		if issuedAt.Valid {
+			cert.IssuedAt = issuedAt.Time
+		}
+		if expiresAt.Valid {
+			cert.ExpiresAt = expiresAt.Time
+		}
+		if encKey != "" {
+			dec, decErr := security.DecryptSecret(encKey)
+			if decErr == nil {
+				cert.PrivateKeyPEM = dec
+			} else {
+				cert.PrivateKeyPEM = encKey
+			}
+		}
+		stagedCerts = append(stagedCerts, &cert)
+	}
+	if err := certRows.Err(); err != nil {
+		return nil, fmt.Errorf("reconcile cache iterate certificates: %w", err)
+	}
+
+	// 5. Stage Active Security Policies
+	spRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies")
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache query security policies: %w", err)
+	}
+	defer spRows.Close()
+
+	var stagedPolicies []*model.SecurityPolicy
+	for spRows.Next() {
+		var sp model.SecurityPolicy
+		var wafJSON, rlJSON []byte
+		if err := spRows.Scan(&sp.ID, &sp.DomainID, &sp.WAFEnabled, &sp.WAFMode, &sp.RateLimitEnabled, &sp.RateLimitRPM, &wafJSON, &rlJSON); err != nil {
+			return nil, fmt.Errorf("reconcile cache scan security policy: %w", err)
+		}
+		if len(wafJSON) > 0 {
+			if err := json.Unmarshal(wafJSON, &sp.WAFRules); err != nil {
+				return nil, fmt.Errorf("reconcile cache unmarshal waf rules for domain %s: %w", sp.DomainID, err)
+			}
+		}
+		if len(rlJSON) > 0 {
+			if err := json.Unmarshal(rlJSON, &sp.RateLimitRules); err != nil {
+				return nil, fmt.Errorf("reconcile cache unmarshal rate limit rules for domain %s: %w", sp.DomainID, err)
+			}
+		}
+		stagedPolicies = append(stagedPolicies, &sp)
+	}
+	if err := spRows.Err(); err != nil {
+		return nil, fmt.Errorf("reconcile cache iterate security policies: %w", err)
+	}
+
+	// =========================================================================
+	// ATOMIC APPLY PHASE: All PostgreSQL queries and deserializations succeeded!
+	// Only now is in-memory cache mutated.
+	// =========================================================================
 	stats := &CacheReconciliationStats{
 		ActiveDomains: len(activeDBMap),
 	}
 
-	// 1. Evict any cached domain that no longer exists in PostgreSQL
+	// A. Evict any cached domain that no longer exists in PostgreSQL
 	cachedDomains := r.cache.ListDomains()
 	for _, cd := range cachedDomains {
 		if _, exists := activeDBMap[cd.ID]; !exists {
@@ -1330,109 +1461,36 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		}
 	}
 
-	// 2. Synchronize new or updated domains
+	// B. Synchronize new or updated domains
 	for _, dbDom := range activeDBMap {
 		cached, err := r.cache.GetDomain(dbDom.ID)
 		if err != nil || cached == nil {
-			// Newly created domain on another replica
 			_ = r.cache.SaveDomain(dbDom)
 			stats.UpdatedDomains++
 		} else if dbDom.Version > cached.Version || dbDom.Status != cached.Status || dbDom.Hostname != cached.Hostname {
-			// Updated domain on another replica
 			_ = r.cache.SaveDomain(dbDom)
 			stats.UpdatedDomains++
 		}
 	}
 
-	// 3. Synchronize active routes for all active domains
-	routesByDomain := make(map[string][]*model.Route)
-	routeRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
-	if err == nil {
-		defer routeRows.Close()
-		for routeRows.Next() {
-			var rt model.Route
-			if err := routeRows.Scan(&rt.ID, &rt.DomainID, &rt.PoolID, &rt.PathPrefix, &rt.Priority, &rt.TimeoutMs); err == nil {
-				routesByDomain[rt.DomainID] = append(routesByDomain[rt.DomainID], &rt)
-			}
-		}
-	}
+	// C. Synchronize active routes for all active domains
 	for domID := range activeDBMap {
-		r.cache.SetRoutes(domID, routesByDomain[domID])
+		r.cache.SetRoutes(domID, stagedRoutesByDomain[domID])
 	}
 
-	// 4. Synchronize active origin pools and origins
-	poolRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools")
-	if err == nil {
-		defer poolRows.Close()
-		for poolRows.Next() {
-			var p model.OriginPool
-			var pops pq.StringArray
-			if err := poolRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.LBAlgorithm, &pops); err == nil {
-				p.AllowedPoPs = []string(pops)
-				origRows, errOrig := r.db.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
-				if errOrig == nil {
-					for origRows.Next() {
-						var o model.Origin
-						var opops pq.StringArray
-						if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err == nil {
-							o.AllowedPoPs = []string(opops)
-							p.Origins = append(p.Origins, o)
-						}
-					}
-					origRows.Close()
-				}
-				_ = r.cache.SaveOriginPool(&p)
-			}
-		}
+	// D. Synchronize active origin pools and origins
+	for _, p := range stagedPools {
+		_ = r.cache.SaveOriginPool(p)
 	}
 
-	// 5. Synchronize active certificates
-	certRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE status = 'ACTIVE'")
-	if err == nil {
-		defer certRows.Close()
-		for certRows.Next() {
-			var cert model.Certificate
-			var domains pq.StringArray
-			var encKey string
-			var issuedAt, expiresAt sql.NullTime
-			if err := certRows.Scan(&cert.ID, &cert.DomainID, &cert.Status, &cert.Issuer, &cert.SerialNumber, &cert.CertPEM, &encKey, &cert.FingerprintSHA256, &cert.KeyType, &domains, &cert.AutoRenew, &issuedAt, &expiresAt); err == nil {
-				cert.Domains = []string(domains)
-				if issuedAt.Valid {
-					cert.IssuedAt = issuedAt.Time
-				}
-				if expiresAt.Valid {
-					cert.ExpiresAt = expiresAt.Time
-				}
-				if encKey != "" {
-					dec, decErr := security.DecryptSecret(encKey)
-					if decErr == nil {
-						cert.PrivateKeyPEM = dec
-					} else {
-						cert.PrivateKeyPEM = encKey
-					}
-				}
-				_ = r.cache.SaveCertificate(&cert)
-			}
-		}
+	// E. Synchronize active certificates
+	for _, cert := range stagedCerts {
+		_ = r.cache.SaveCertificate(cert)
 	}
 
-	// 6. Synchronize active security policies
-	spRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies")
-	if err == nil {
-		defer spRows.Close()
-		for spRows.Next() {
-			var sp model.SecurityPolicy
-			var wafJSON, rlJSON []byte
-			if err := spRows.Scan(&sp.ID, &sp.DomainID, &sp.WAFEnabled, &sp.WAFMode, &sp.RateLimitEnabled, &sp.RateLimitRPM, &wafJSON, &rlJSON); err == nil {
-				if len(wafJSON) > 0 {
-					_ = json.Unmarshal(wafJSON, &sp.WAFRules)
-				}
-				if len(rlJSON) > 0 {
-					_ = json.Unmarshal(rlJSON, &sp.RateLimitRules)
-				}
-				_ = r.cache.SaveSecurityPolicy(&sp)
-			}
-		}
+	// F. Synchronize active security policies
+	for _, sp := range stagedPolicies {
+		_ = r.cache.SaveSecurityPolicy(sp)
 	}
 
 	stats.Duration = time.Since(start)

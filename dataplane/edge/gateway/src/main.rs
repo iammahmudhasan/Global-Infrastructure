@@ -8,7 +8,7 @@ use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{self, Router};
 use nexusedge_gateway::sync::{
     fetch_and_apply_control_plane_snapshot_full, listen_and_apply_event_stream,
-    SnapshotFetchContext, StreamSyncContext,
+    send_control_plane_ack, GatewaySyncAckPayload, SnapshotFetchContext, StreamSyncContext,
 };
 use nexusedge_gateway::waf::WafEngine;
 
@@ -247,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if cp_cfg.enabled {
             let sse_endpoint = cp_cfg.endpoint.clone();
             let sse_pop_id = cp_cfg.pop_id.clone();
+            let sse_node_id = config.server.node_id.clone();
             let sse_auth_token = cp_cfg.auth_token.clone();
             let sse_client = HttpClient::builder()
                 .connect_timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
@@ -269,6 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     let ctx = StreamSyncContext {
                         endpoint: &sse_endpoint,
                         pop_id: &sse_pop_id,
+                        gateway_id: Some(&sse_node_id),
                         auth_token: &sse_auth_token,
                         snapshot_path: Some(&sse_snapshot_path),
                         client: &sse_client,
@@ -294,6 +296,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let last_checksum: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
         let watchdog_checksum = Arc::clone(&last_checksum);
         let watchdog_snapshot_path = autonomous_snapshot_path.clone();
+        let watchdog_node_id = config.server.node_id.clone();
 
         tokio::spawn(async move {
             let interval_secs = cp_cfg.poll_interval_secs.max(15);
@@ -334,8 +337,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     routes = stats.routes_applied,
                                     ai_providers = stats.ai_providers_applied,
                                     checksum = %stats.checksum,
+                                    version = stats.version,
                                     "Atomically refreshed PoP routes and AI compute providers from Control Plane"
                                 );
+                                let ack = GatewaySyncAckPayload {
+                                    gateway_id: watchdog_node_id.clone(),
+                                    pop_id: cp_cfg.pop_id.clone(),
+                                    applied_version: stats.version,
+                                    applied_checksum: stats.checksum.clone(),
+                                    status: "IN_SYNC".to_string(),
+                                    error: None,
+                                };
+                                let client_for_ack = sync_client.clone();
+                                let ep = cp_cfg.endpoint.clone();
+                                let tok = cp_cfg.auth_token.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        send_control_plane_ack(&ep, &tok, &client_for_ack, &ack)
+                                            .await
+                                    {
+                                        tracing::warn!(error = %e, "Failed to submit watchdog convergence ACK to Control Plane");
+                                    }
+                                });
                             } else {
                                 tracing::debug!(
                                     pop_id = %cp_cfg.pop_id,
