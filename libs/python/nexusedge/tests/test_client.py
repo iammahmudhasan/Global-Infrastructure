@@ -409,6 +409,10 @@ class MockServerHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 0:
+            self.rfile.read(content_length)
+
         if "/objects/" in self.path:
             self.send_response(201)
             self.send_header("Content-Type", "application/json")

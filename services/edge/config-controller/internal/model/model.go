@@ -34,6 +34,7 @@ type Domain struct {
 	CNAMETarget       string       `json:"cname_target"`    // e.g. "cname-d101.edge.nexusedge.net"
 	VerificationToken string       `json:"verification_token,omitempty"`
 	AllowedPoPs       []string     `json:"allowed_pops,omitempty"` // empty means global / all PoPs
+	Version           int          `json:"version,omitempty"`
 	CreatedAt         time.Time    `json:"created_at"`
 	UpdatedAt         time.Time    `json:"updated_at"`
 }

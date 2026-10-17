@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -78,9 +79,11 @@ func ValidateProductionDatabaseURL(databaseURL string) error {
 // of the Repository interface. It combines transactional relational writes with a
 // synchronized write-through in-memory cache to guarantee sub-millisecond line-rate read performance.
 type PostgresRepository struct {
-	db           *sql.DB
-	cache        *Store
-	auditHMACKey []byte
+	db               *sql.DB
+	cache            *Store
+	auditHMACKey     []byte
+	reconcilerCancel context.CancelFunc
+	reconcilerWg     sync.WaitGroup
 }
 
 var _ Repository = (*PostgresRepository)(nil)
@@ -124,7 +127,8 @@ func NewPostgresRepository(databaseURL string) (*PostgresRepository, error) {
 	return NewPostgresRepositoryFromDB(db)
 }
 
-// NewPostgresRepositoryFromDB initializes migrations and cache from an existing *sql.DB handle.
+// NewPostgresRepositoryFromDB initializes migrations, warms up the local cache,
+// and starts the periodic background cache reconciliation loop.
 func NewPostgresRepositoryFromDB(db *sql.DB) (*PostgresRepository, error) {
 	repo := &PostgresRepository{
 		db:    db,
@@ -142,17 +146,27 @@ func NewPostgresRepositoryFromDB(db *sql.DB) (*PostgresRepository, error) {
 		return nil, fmt.Errorf("warm up cache from postgres: %w", err)
 	}
 
+	repo.StartReconciler(context.Background(), 1*time.Second)
 	return repo, nil
 }
 
-// Close closes the underlying database pool.
+// Close closes the underlying database pool and terminates any active background reconciler.
 func (r *PostgresRepository) Close() error {
+	if r.reconcilerCancel != nil {
+		r.reconcilerCancel()
+		r.reconcilerWg.Wait()
+	}
 	return r.db.Close()
 }
 
 // DB returns the underlying *sql.DB instance (primarily for tests and health verification).
 func (r *PostgresRepository) DB() *sql.DB {
 	return r.db
+}
+
+// Cache returns the internal in-memory *Store projection (primarily for tests and state inspection).
+func (r *PostgresRepository) Cache() *Store {
+	return r.cache
 }
 
 func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
@@ -505,7 +519,7 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	}
 
 	// 2. Domains
-	domRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains")
+	domRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains")
 	if err != nil {
 		return fmt.Errorf("query domains: %w", err)
 	}
@@ -513,7 +527,7 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	for domRows.Next() {
 		var d model.Domain
 		var pops pq.StringArray
-		if err := domRows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := domRows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version); err != nil {
 			return fmt.Errorf("scan domain: %w", err)
 		}
 		d.AllowedPoPs = []string(pops)
@@ -898,7 +912,8 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 		createdAt = now
 	}
 
-	_, err = tx.ExecContext(ctx,
+	var newVersion int
+	err = tx.QueryRowContext(ctx,
 		`INSERT INTO domains (id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
 		 ON CONFLICT (id) DO UPDATE SET
@@ -908,13 +923,15 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 		   cname_target = EXCLUDED.cname_target,
 		   allowed_pops = EXCLUDED.allowed_pops,
 		   updated_at = EXCLUDED.updated_at,
-		   version = domains.version + 1`,
+		   version = domains.version + 1
+		 RETURNING version`,
 		d.ID, d.ProjectID, d.Hostname, string(d.Status), d.OnboardingType, d.CNAMETarget,
 		pqStringArray(d.AllowedPoPs), createdAt, now,
-	)
+	).Scan(&newVersion)
 	if err != nil {
 		return fmt.Errorf("upsert domain: %w", err)
 	}
+	d.Version = newVersion
 
 	eventID := fmt.Sprintf("evt-%d-%s", time.Now().UnixNano(), d.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
@@ -925,6 +942,7 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 		"onboarding_type": d.OnboardingType,
 		"cname_target":    d.CNAMETarget,
 		"allowed_pops":    d.AllowedPoPs,
+		"version":         d.Version,
 		"updated_at":      now.Format(time.RFC3339),
 	})
 	_, err = tx.ExecContext(ctx,
@@ -947,21 +965,27 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 }
 
 func (r *PostgresRepository) GetDomain(id string) (*model.Domain, error) {
-	d, err := r.cache.GetDomain(id)
-	if err == nil && d != nil {
-		return d, nil
+	d, err := r.getDomainFromDB(id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			_ = r.cache.DeleteDomain(id)
+		}
+		return nil, err
 	}
-	// Fallback to authoritative PostgreSQL system-of-record if cache projection has not yet refreshed
-	return r.getDomainFromDB(id)
+	return d, nil
 }
 
 func (r *PostgresRepository) GetDomainByHost(hostname string) (*model.Domain, error) {
-	d, err := r.cache.GetDomainByHost(hostname)
-	if err == nil && d != nil {
-		return d, nil
+	d, err := r.getDomainByHostFromDB(hostname)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			if cached, _ := r.cache.GetDomainByHost(hostname); cached != nil {
+				_ = r.cache.DeleteDomain(cached.ID)
+			}
+		}
+		return nil, err
 	}
-	// Fallback to authoritative PostgreSQL system-of-record if cache projection has not yet refreshed
-	return r.getDomainByHostFromDB(hostname)
+	return d, nil
 }
 
 func (r *PostgresRepository) getDomainFromDB(id string) (*model.Domain, error) {
@@ -971,9 +995,9 @@ func (r *PostgresRepository) getDomainFromDB(id string) (*model.Domain, error) {
 	var d model.Domain
 	var pops pq.StringArray
 	err := r.db.QueryRowContext(ctx,
-		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE id = $1",
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains WHERE id = $1",
 		id,
-	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt)
+	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
@@ -992,9 +1016,9 @@ func (r *PostgresRepository) getDomainByHostFromDB(hostname string) (*model.Doma
 	var d model.Domain
 	var pops pq.StringArray
 	err := r.db.QueryRowContext(ctx,
-		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE hostname = $1",
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains WHERE hostname = $1",
 		hostname,
-	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt)
+	).Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, ErrNotFound
@@ -1011,7 +1035,7 @@ func (r *PostgresRepository) ListDomainsByProject(projectID string) []*model.Dom
 	defer cancel()
 
 	rows, err := r.db.QueryContext(ctx,
-		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE project_id = $1 ORDER BY created_at ASC",
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains WHERE project_id = $1 ORDER BY created_at ASC",
 		projectID,
 	)
 	if err != nil {
@@ -1019,20 +1043,30 @@ func (r *PostgresRepository) ListDomainsByProject(projectID string) []*model.Dom
 	}
 	defer rows.Close()
 
+	activeIDs := make(map[string]bool)
 	domains := make([]*model.Domain, 0)
 	for rows.Next() {
 		var d model.Domain
 		var pops pq.StringArray
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version); err != nil {
 			return r.cache.ListDomainsByProject(projectID)
 		}
 		d.AllowedPoPs = []string(pops)
 		domains = append(domains, &d)
+		activeIDs[d.ID] = true
 		_ = r.cache.SaveDomain(&d)
 	}
 	if err := rows.Err(); err != nil {
 		return r.cache.ListDomainsByProject(projectID)
 	}
+
+	// Prune cached domains for this project that are no longer active in database
+	for _, cd := range r.cache.ListDomainsByProject(projectID) {
+		if !activeIDs[cd.ID] {
+			_ = r.cache.DeleteDomain(cd.ID)
+		}
+	}
+
 	return domains
 }
 
@@ -1041,27 +1075,37 @@ func (r *PostgresRepository) ListDomains() []*model.Domain {
 	defer cancel()
 
 	rows, err := r.db.QueryContext(ctx,
-		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains ORDER BY created_at ASC",
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains ORDER BY created_at ASC",
 	)
 	if err != nil {
 		return r.cache.ListDomains()
 	}
 	defer rows.Close()
 
+	activeIDs := make(map[string]bool)
 	domains := make([]*model.Domain, 0)
 	for rows.Next() {
 		var d model.Domain
 		var pops pq.StringArray
-		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version); err != nil {
 			return r.cache.ListDomains()
 		}
 		d.AllowedPoPs = []string(pops)
 		domains = append(domains, &d)
+		activeIDs[d.ID] = true
 		_ = r.cache.SaveDomain(&d)
 	}
 	if err := rows.Err(); err != nil {
 		return r.cache.ListDomains()
 	}
+
+	// Prune all cached domains that are no longer active in database
+	for _, cd := range r.cache.ListDomains() {
+		if !activeIDs[cd.ID] {
+			_ = r.cache.DeleteDomain(cd.ID)
+		}
+	}
+
 	return domains
 }
 
@@ -1075,10 +1119,11 @@ func (r *PostgresRepository) UpdateDomainStatus(id string, status model.DomainSt
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	_, err = tx.ExecContext(ctx,
-		"UPDATE domains SET status = $1, version = version + 1, updated_at = NOW() WHERE id = $2",
+	var newVersion int
+	err = tx.QueryRowContext(ctx,
+		"UPDATE domains SET status = $1, version = version + 1, updated_at = NOW() WHERE id = $2 RETURNING version",
 		string(status), id,
-	)
+	).Scan(&newVersion)
 	if err != nil {
 		return fmt.Errorf("update domain status: %w", err)
 	}
@@ -1161,6 +1206,113 @@ func (r *PostgresRepository) SweepExpiredPendingDomains(maxAge time.Duration) in
 	}
 
 	return r.cache.SweepExpiredPendingDomains(maxAge)
+}
+
+// CacheReconciliationStats captures metrics and observability telemetry from a cache synchronization pass.
+type CacheReconciliationStats struct {
+	ActiveDomains  int           `json:"active_domains"`
+	EvictedDomains int           `json:"evicted_domains"`
+	UpdatedDomains int           `json:"updated_domains"`
+	Duration       time.Duration `json:"duration"`
+	MaxLag         time.Duration `json:"max_lag"`
+}
+
+// ReconcileCache reconciles the local in-memory cache projection against authoritative
+// PostgreSQL system-of-record state, evicting any stale domains deleted by other replicas
+// and synchronizing version-advanced configurations.
+func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconciliationStats, error) {
+	start := time.Now()
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache query domains: %w", err)
+	}
+	defer rows.Close()
+
+	activeDBMap := make(map[string]*model.Domain)
+	var latestUpdate time.Time
+
+	for rows.Next() {
+		var d model.Domain
+		var pops pq.StringArray
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt, &d.Version); err != nil {
+			return nil, fmt.Errorf("reconcile cache scan domain: %w", err)
+		}
+		d.AllowedPoPs = []string(pops)
+		activeDBMap[d.ID] = &d
+		if d.UpdatedAt.After(latestUpdate) {
+			latestUpdate = d.UpdatedAt
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reconcile cache iterate domains: %w", err)
+	}
+
+	stats := &CacheReconciliationStats{
+		ActiveDomains: len(activeDBMap),
+	}
+
+	// 1. Evict any cached domain that no longer exists in PostgreSQL
+	cachedDomains := r.cache.ListDomains()
+	for _, cd := range cachedDomains {
+		if _, exists := activeDBMap[cd.ID]; !exists {
+			_ = r.cache.DeleteDomain(cd.ID)
+			stats.EvictedDomains++
+		}
+	}
+
+	// 2. Synchronize new or updated domains
+	for _, dbDom := range activeDBMap {
+		cached, err := r.cache.GetDomain(dbDom.ID)
+		if err != nil || cached == nil {
+			// Newly created domain on another replica
+			_ = r.cache.SaveDomain(dbDom)
+			stats.UpdatedDomains++
+		} else if dbDom.Version > cached.Version || dbDom.Status != cached.Status || dbDom.Hostname != cached.Hostname {
+			// Updated domain on another replica
+			_ = r.cache.SaveDomain(dbDom)
+			stats.UpdatedDomains++
+		}
+	}
+
+	stats.Duration = time.Since(start)
+	if !latestUpdate.IsZero() {
+		stats.MaxLag = time.Since(latestUpdate)
+	}
+
+	return stats, nil
+}
+
+// StartReconciler launches a background synchronization loop that periodically reconciles
+// local cache projections against authoritative PostgreSQL state at the specified interval.
+// Returns a stop cancellation function.
+func (r *PostgresRepository) StartReconciler(ctx context.Context, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = 1 * time.Second
+	}
+	reconcileCtx, cancel := context.WithCancel(ctx)
+	r.reconcilerCancel = cancel
+
+	r.reconcilerWg.Add(1)
+	go func() {
+		defer r.reconcilerWg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-reconcileCtx.Done():
+				return
+			case <-ticker.C:
+				reconcileTimeoutCtx, tCancel := context.WithTimeout(reconcileCtx, 5*time.Second)
+				_, _ = r.ReconcileCache(reconcileTimeoutCtx)
+				tCancel()
+			}
+		}
+	}()
+
+	return cancel
 }
 
 // -------------------------------------------------------------------------

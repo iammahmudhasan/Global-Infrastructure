@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -658,5 +659,214 @@ func TestPostgresRepository_AuditPersistenceAndFencing(t *testing.T) {
 	}
 	if _, err := closedRepo.GetAuditLog(testID); err == nil {
 		t.Fatalf("expected GetAuditLog to return error on database outage, got nil")
+	}
+}
+
+func TestPostgresRepository_MultiReplicaCacheConsistencyAndRouteRevocation(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping multi-replica cache consistency test: NEXUSEDGE_TEST_DATABASE_URL is not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// 1. Initialize two separate repository instances simulating two distinct control-plane replicas
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize replica 1: %v", err)
+	}
+	defer repo1.Close()
+
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize replica 2: %v", err)
+	}
+	defer repo2.Close()
+
+	projectID := fmt.Sprintf("prj-multi-rep-%d", time.Now().UnixNano())
+	domainID := fmt.Sprintf("dom-multi-%d", time.Now().UnixNano())
+	hostname := fmt.Sprintf("sync-%d.nexusedge.net", time.Now().UnixNano())
+	poolID := fmt.Sprintf("pool-multi-%d", time.Now().UnixNano())
+	originID := fmt.Sprintf("orig-multi-%d", time.Now().UnixNano())
+	routeID := fmt.Sprintf("route-multi-%d", time.Now().UnixNano())
+
+	// 2. Replica 1 onboards a domain, origin pool, origin, and route
+	dom := &model.Domain{
+		ID:             domainID,
+		ProjectID:      projectID,
+		Hostname:       hostname,
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+		AllowedPoPs:    []string{"dhaka", "singapore"},
+	}
+	if err := repo1.SaveDomain(dom); err != nil {
+		t.Fatalf("replica 1 failed to save domain: %v", err)
+	}
+
+	pool := &model.OriginPool{
+		ID:          poolID,
+		ProjectID:   projectID,
+		Name:        "primary-pool",
+		LBAlgorithm: model.LBAlgorithmRoundRobin,
+		AllowedPoPs: []string{"dhaka", "singapore"},
+	}
+	if err := repo1.SaveOriginPool(pool); err != nil {
+		t.Fatalf("replica 1 failed to save origin pool: %v", err)
+	}
+
+	origin := &model.Origin{
+		ID:          originID,
+		PoolID:      poolID,
+		Address:     "10.0.0.1",
+		Port:        8080,
+		Protocol:    model.ProtocolHTTP,
+		Weight:      100,
+		Healthy:     true,
+		AllowedPoPs: []string{"dhaka", "singapore"},
+	}
+	if err := repo1.AddOrigin(origin); err != nil {
+		t.Fatalf("replica 1 failed to add origin: %v", err)
+	}
+
+	route := &model.Route{
+		ID:         routeID,
+		DomainID:   domainID,
+		PoolID:     poolID,
+		PathPrefix: "/api",
+		Priority:   10,
+		TimeoutMs:  5000,
+	}
+	if err := repo1.SaveRoute(route); err != nil {
+		t.Fatalf("replica 1 failed to save route: %v", err)
+	}
+
+	// 3. Replica 2 synchronizes and confirms active domain, versioning, and compiled route topology
+	stats, err := repo2.ReconcileCache(ctx)
+	if err != nil {
+		t.Fatalf("replica 2 failed to reconcile cache: %v", err)
+	}
+	if stats.ActiveDomains == 0 {
+		t.Fatalf("expected at least 1 active domain in reconciliation stats, got 0")
+	}
+
+	d2, err := repo2.GetDomain(domainID)
+	if err != nil {
+		t.Fatalf("replica 2 failed to get domain after sync: %v", err)
+	}
+	if d2.Hostname != hostname || d2.Version < 1 {
+		t.Fatalf("expected hostname %s and version >= 1, got hostname=%s version=%d", hostname, d2.Hostname, d2.Version)
+	}
+
+	// Also sync pool/origin/route into replica 2's cache to verify topology compilation
+	_ = repo2.Cache().SaveOriginPool(pool)
+	_ = repo2.Cache().AddOrigin(origin)
+	_ = repo2.Cache().SaveRoute(route)
+
+	toposBefore := repo2.GetActiveTopologies()
+	var foundTopoBefore bool
+	for _, tp := range toposBefore {
+		if tp.Domain != nil && tp.Domain.ID == domainID {
+			foundTopoBefore = true
+			if len(tp.Routes) == 0 {
+				t.Fatalf("expected routes in compiled topology on replica 2, got 0")
+			}
+		}
+	}
+	if !foundTopoBefore {
+		t.Fatalf("expected replica 2 to compile active topology for newly synced domain %s", domainID)
+	}
+
+	// 4. Replica 1 deletes the domain from PostgreSQL and its local cache
+	if err := repo1.DeleteDomain(domainID); err != nil {
+		t.Fatalf("replica 1 failed to delete domain: %v", err)
+	}
+
+	// 5. Point lookup eviction test on Replica 2:
+	// Prior to full background reconciliation, calling GetDomain directly on Replica 2
+	// must query PostgreSQL, detect ErrNotFound, evict the stale domain from Replica 2's local cache,
+	// and return ErrNotFound (no stale cache serving).
+	if _, err := repo2.GetDomain(domainID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected GetDomain on replica 2 to return ErrNotFound after DB deletion, got %v", err)
+	}
+	if _, err := repo2.Cache().GetDomain(domainID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected domain to be evicted from replica 2 cache, but still present")
+	}
+
+	// 6. Route Revocation Verification:
+	// The compiled topology on Replica 2 must NO LONGER include the deleted domain or any routes to it.
+	toposAfter := repo2.GetActiveTopologies()
+	for _, tp := range toposAfter {
+		if tp.Domain != nil && tp.Domain.ID == domainID {
+			t.Fatalf("SECURITY VIOLATION: deleted domain %s is still present in compiled active topologies on replica 2", domainID)
+		}
+	}
+
+	// 7. Full reconciliation pass on Replica 2:
+	// Create another domain, sync to replica 2, delete on replica 1, then run ReconcileCache.
+	domainID2 := fmt.Sprintf("dom-multi2-%d", time.Now().UnixNano())
+	hostname2 := fmt.Sprintf("sync2-%d.nexusedge.net", time.Now().UnixNano())
+	dom2 := &model.Domain{
+		ID:             domainID2,
+		ProjectID:      projectID,
+		Hostname:       hostname2,
+		Status:         model.DomainStatusActive,
+		OnboardingType: "CNAME",
+		CNAMETarget:    "edge.nexusedge.net",
+	}
+	if err := repo1.SaveDomain(dom2); err != nil {
+		t.Fatalf("replica 1 failed to save domain 2: %v", err)
+	}
+	if _, err := repo2.ReconcileCache(ctx); err != nil {
+		t.Fatalf("replica 2 failed to reconcile domain 2: %v", err)
+	}
+	if _, err := repo2.Cache().GetDomain(domainID2); err != nil {
+		t.Fatalf("expected domain 2 in replica 2 cache, got %v", err)
+	}
+
+	// Delete domain 2 on replica 1
+	if err := repo1.DeleteDomain(domainID2); err != nil {
+		t.Fatalf("replica 1 failed to delete domain 2: %v", err)
+	}
+
+	// ReconcileCache on replica 2 must detect missing domain and evict it
+	recStats, err := repo2.ReconcileCache(ctx)
+	if err != nil {
+		t.Fatalf("replica 2 failed to reconcile cache after deletion: %v", err)
+	}
+	if recStats.EvictedDomains == 0 {
+		t.Fatalf("expected at least 1 evicted domain during reconciliation, got 0")
+	}
+	if _, err := repo2.Cache().GetDomain(domainID2); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected domain 2 to be evicted from replica 2 cache after ReconcileCache")
+	}
+
+	// 8. ListDomainsByProject cache pruning test:
+	// Insert an unpersisted ghost domain directly into replica 2's cache.
+	ghostID := fmt.Sprintf("dom-ghost-%d", time.Now().UnixNano())
+	ghostDom := &model.Domain{
+		ID:        ghostID,
+		ProjectID: projectID,
+		Hostname:  fmt.Sprintf("ghost-%d.example.com", time.Now().UnixNano()),
+		Status:    model.DomainStatusActive,
+	}
+	_ = repo2.Cache().SaveDomain(ghostDom)
+	if _, err := repo2.Cache().GetDomain(ghostID); err != nil {
+		t.Fatalf("failed to insert ghost domain into cache: %v", err)
+	}
+
+	// Calling ListDomainsByProject must query DB and prune the ghost domain from cache
+	list := repo2.ListDomainsByProject(projectID)
+	for _, ld := range list {
+		if ld.ID == ghostID {
+			t.Fatalf("expected ghost domain to be omitted from ListDomainsByProject result")
+		}
+	}
+	if _, err := repo2.Cache().GetDomain(ghostID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ghost domain to be pruned from replica 2 cache by ListDomainsByProject, but still exists")
 	}
 }
