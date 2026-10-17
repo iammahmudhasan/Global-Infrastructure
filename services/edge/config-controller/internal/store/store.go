@@ -128,6 +128,10 @@ type Store struct {
 	auditLogMap         map[string]*model.AuditLog // id -> AuditLog
 	auditHMACKey        []byte
 	outboxEvents        []*inMemoryOutboxEntry
+	edgeConvergenceVer  int64
+	edgeConvergenceChk  string
+	edgeConvergenceTime time.Time
+	gatewaySyncStates   map[string]*model.GatewaySyncRecord
 }
 
 type inMemoryOutboxEntry struct {
@@ -162,6 +166,9 @@ func NewStore() *Store {
 		auditLogs:           make([]*model.AuditLog, 0),
 		auditLogMap:         make(map[string]*model.AuditLog),
 		outboxEvents:        make([]*inMemoryOutboxEntry, 0),
+		edgeConvergenceVer:  1,
+		edgeConvergenceTime: time.Now().UTC(),
+		gatewaySyncStates:   make(map[string]*model.GatewaySyncRecord),
 	}
 }
 
@@ -1827,4 +1834,52 @@ func (s *Store) MarkOutboxEventFailed(ctx context.Context, eventID string, worke
 		}
 	}
 	return ErrOutboxNotFound
+}
+
+func (s *Store) SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.edgeConvergenceVer = targetVersion
+	s.edgeConvergenceChk = targetChecksum
+	s.edgeConvergenceTime = time.Now().UTC()
+	return nil
+}
+
+func (s *Store) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time.Time, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.edgeConvergenceVer, s.edgeConvergenceChk, s.edgeConvergenceTime, nil
+}
+
+func (s *Store) SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error {
+	if rec == nil || rec.GatewayID == "" {
+		return errors.New("gateway_id required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := *rec
+	s.gatewaySyncStates[rec.GatewayID] = &cp
+	return nil
+}
+
+func (s *Store) GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rec, exists := s.gatewaySyncStates[gatewayID]
+	if !exists {
+		return nil, ErrNotFound
+	}
+	cp := *rec
+	return &cp, nil
+}
+
+func (s *Store) ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := make([]*model.GatewaySyncRecord, 0, len(s.gatewaySyncStates))
+	for _, rec := range s.gatewaySyncStates {
+		cp := *rec
+		list = append(list, &cp)
+	}
+	return list, nil
 }

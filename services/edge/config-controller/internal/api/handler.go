@@ -194,7 +194,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		storageManager:     storage.NewManager(),
 		cableManager:       cable.NewManager(),
 		auditKey:           auditKey,
-		gatewaySyncTracker: events.NewGatewaySyncTracker(15 * time.Second),
+		gatewaySyncTracker: events.NewGatewaySyncTrackerWithStore(15*time.Second, s),
 	}
 	h.registerRoutes()
 	return h
@@ -4071,16 +4071,34 @@ func (h *APIHandler) handleGatewayAck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "unauthorized: requires RolePlatformOperator or RoleEdgeNode")
+		return
+	}
 	var ack events.GatewaySyncAcknowledgement
 	if err := json.NewDecoder(r.Body).Decode(&ack); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request payload")
 		return
+	}
+	if tc, ok := auth.FromContext(r.Context()); ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
+		if tc.NodeID != "" && tc.NodeID != ack.GatewayID {
+			writeError(w, http.StatusForbidden, "edge node credential cannot acknowledge for another gateway")
+			return
+		}
+		if ack.PoPID != "" && !h.authenticator.AuthorizePoP(r.Context(), ack.PoPID) {
+			writeError(w, http.StatusForbidden, "edge node is not authorized for specified pop_id")
+			return
+		}
 	}
 	if h.gatewaySyncTracker == nil {
 		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")
 		return
 	}
 	rec, err := h.gatewaySyncTracker.RecordAck(ack)
+	if errors.Is(err, model.ErrChecksumMismatch) {
+		writeJSON(w, http.StatusConflict, rec)
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -4091,6 +4109,10 @@ func (h *APIHandler) handleGatewayAck(w http.ResponseWriter, r *http.Request) {
 func (h *APIHandler) handleGatewayStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "unauthorized: requires RolePlatformOperator or RoleEdgeNode")
 		return
 	}
 	if h.gatewaySyncTracker == nil {
@@ -4113,6 +4135,10 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if !h.authenticator.AuthorizeRole(r.Context(), auth.RolePlatformOperator, auth.RoleEdgeNode) {
+		writeError(w, http.StatusForbidden, "unauthorized: requires RolePlatformOperator or RoleEdgeNode")
+		return
+	}
 	if h.gatewaySyncTracker == nil {
 		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")
 		return
@@ -4130,13 +4156,18 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 	targetChk := h.gatewaySyncTracker.TargetChecksum()
 	needsPull := currentVer < targetVer
 
+	snapshotURL := "/v1/edge/envoy-config"
+	if popID := r.URL.Query().Get("pop_id"); popID != "" {
+		snapshotURL = fmt.Sprintf("/v1/edge/pops/%s/config", popID)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"gateway_id":      gatewayID,
 		"current_version": currentVer,
 		"target_version":  targetVer,
 		"target_checksum": targetChk,
 		"needs_pull":      needsPull,
-		"snapshot_url":    "/v1/edge/envoy-config",
+		"snapshot_url":    snapshotURL,
 	})
 }
 

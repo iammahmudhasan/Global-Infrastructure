@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 type DomainStatus string
 
@@ -668,3 +671,43 @@ type PoPProbeResult struct {
 	Error      string    `json:"error,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 }
+
+// GatewaySyncStatus defines the convergence health of an individual Edge Gateway.
+type GatewaySyncStatus string
+
+const (
+	SyncStatusInSync           GatewaySyncStatus = "IN_SYNC"
+	SyncStatusLagging          GatewaySyncStatus = "LAGGING"
+	SyncStatusApplying         GatewaySyncStatus = "APPLYING"
+	SyncStatusError            GatewaySyncStatus = "ERROR"
+	SyncStatusStale            GatewaySyncStatus = "STALE"
+	SyncStatusChecksumMismatch GatewaySyncStatus = "CHECKSUM_MISMATCH"
+)
+
+// GatewaySyncRecord represents the convergence state reported by an Edge Gateway.
+type GatewaySyncRecord struct {
+	GatewayID        string            `json:"gateway_id"`
+	PoPID            string            `json:"pop_id"`
+	AppliedVersion   int64             `json:"applied_version"`
+	AppliedChecksum  string            `json:"applied_checksum"`
+	TargetVersion    int64             `json:"target_version"`
+	TargetChecksum   string            `json:"target_checksum"`
+	VersionLag       int64             `json:"version_lag"`
+	Status           GatewaySyncStatus `json:"status"`
+	LastError        string            `json:"last_error,omitempty"`
+	LastAckAt        time.Time         `json:"last_ack_at"`
+	ConvergenceLagMs int64             `json:"convergence_lag_ms"`
+}
+
+// GatewaySyncAcknowledgement is received from Edge Gateways upon applying configuration.
+type GatewaySyncAcknowledgement struct {
+	GatewayID       string `json:"gateway_id"`
+	PoPID           string `json:"pop_id"`
+	AppliedVersion  int64  `json:"applied_version"`
+	AppliedChecksum string `json:"applied_checksum"`
+	Status          string `json:"status"`
+	Error           string `json:"error,omitempty"`
+}
+
+// ErrChecksumMismatch is returned when an edge gateway acknowledges with a checksum differing from desired target.
+var ErrChecksumMismatch = errors.New("applied configuration checksum does not match target checksum")

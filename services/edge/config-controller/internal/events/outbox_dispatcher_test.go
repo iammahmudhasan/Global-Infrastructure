@@ -565,3 +565,122 @@ func TestGatewaySyncTracker_ConvergenceLifecycle(t *testing.T) {
 		}
 	}
 }
+
+func TestGatewaySyncTracker_WrongChecksumRejection(t *testing.T) {
+	st := store.NewStore()
+	tracker := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+
+	tracker.AdvanceTargetVersion(4, "chk-authoritative-5")
+	if tracker.TargetVersion() != 5 {
+		t.Fatalf("expected target version 5, got %d", tracker.TargetVersion())
+	}
+
+	// Gateway reports applied version 5, but wrong checksum "bad-chk"
+	rec, err := tracker.RecordAck(GatewaySyncAcknowledgement{
+		GatewayID:       "gw-fra-01",
+		PoPID:           "frankfurt",
+		AppliedVersion:  5,
+		AppliedChecksum: "bad-chk",
+		Status:          "IN_SYNC",
+	})
+	if !errors.Is(err, model.ErrChecksumMismatch) {
+		t.Fatalf("expected ErrChecksumMismatch, got: %v", err)
+	}
+	if rec.Status != model.SyncStatusChecksumMismatch {
+		t.Fatalf("expected status CHECKSUM_MISMATCH, got: %s", rec.Status)
+	}
+	if rec.LastError == "" {
+		t.Fatalf("expected non-empty LastError detailing checksum mismatch")
+	}
+
+	// Verify gateway is not listed as IN_SYNC in summary
+	summary := tracker.GetConvergenceSummary()
+	if summary["in_sync_gateways"] != 0 {
+		t.Fatalf("expected 0 in_sync_gateways, got %v", summary["in_sync_gateways"])
+	}
+	if summary["fully_converged"] != false {
+		t.Fatalf("expected fully_converged false")
+	}
+}
+
+func TestGatewaySyncTracker_DuplicateEventIdempotency(t *testing.T) {
+	st := store.NewStore()
+	tracker := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+
+	// First event advances target to version 2
+	v1 := tracker.AdvanceTargetVersion(1, "chk-config-v2")
+	if v1 != 2 {
+		t.Fatalf("expected version 2, got %d", v1)
+	}
+
+	// Duplicate event arrives with identical checksum -> version must NOT advance
+	v2 := tracker.AdvanceTargetVersion(1, "chk-config-v2")
+	if v2 != 2 {
+		t.Fatalf("expected version to remain 2 on duplicate checksum, got %d", v2)
+	}
+
+	// Third event with distinct checksum advances target to version 3
+	v3 := tracker.AdvanceTargetVersion(1, "chk-config-v3")
+	if v3 != 3 {
+		t.Fatalf("expected version to advance to 3 on new checksum, got %d", v3)
+	}
+}
+
+func TestGatewaySyncTracker_RestartRecovery(t *testing.T) {
+	st := store.NewStore()
+	tracker1 := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+
+	tracker1.AdvanceTargetVersion(9, "chk-state-10")
+	rec, err := tracker1.RecordAck(GatewaySyncAcknowledgement{
+		GatewayID:       "gw-dhk-01",
+		PoPID:           "dhaka",
+		AppliedVersion:  10,
+		AppliedChecksum: "chk-state-10",
+		Status:          "IN_SYNC",
+	})
+	if err != nil {
+		t.Fatalf("initial RecordAck failed: %v", err)
+	}
+	if rec.Status != SyncStatusInSync {
+		t.Fatalf("expected IN_SYNC, got %s", rec.Status)
+	}
+
+	// Simulate control plane restart by creating a new tracker against the same store
+	tracker2 := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	if tracker2.TargetVersion() != 10 {
+		t.Fatalf("expected recovered target version 10, got %d", tracker2.TargetVersion())
+	}
+	if tracker2.TargetChecksum() != "chk-state-10" {
+		t.Fatalf("expected recovered target checksum 'chk-state-10', got %s", tracker2.TargetChecksum())
+	}
+
+	gw, ok := tracker2.GetGateway("gw-dhk-01")
+	if !ok {
+		t.Fatalf("expected gateway 'gw-dhk-01' to be recovered from persistent store")
+	}
+	if gw.Status != SyncStatusInSync || gw.AppliedVersion != 10 {
+		t.Fatalf("expected recovered gateway status IN_SYNC and version 10, got status=%s ver=%d", gw.Status, gw.AppliedVersion)
+	}
+}
+
+func TestOutboxSchema_AllowlistRejection(t *testing.T) {
+	// 1. Known event types should pass schema validation
+	validPayload := map[string]interface{}{"domain_id": "dom-test-01"}
+	if err := validateOutboxPayloadSchema("domain.config.changed", validPayload); err != nil {
+		t.Fatalf("expected domain.config.changed to pass, got: %v", err)
+	}
+
+	// 2. Unknown event type should be strictly rejected by allowlist
+	unknownErr := validateOutboxPayloadSchema("malicious.unregistered.event", validPayload)
+	if unknownErr == nil {
+		t.Fatalf("expected unknown event type to be rejected by strict allowlist")
+	}
+
+	// 3. NewOutboxDispatcher rejects nil handler
+	st := store.NewStore()
+	cfg := DefaultOutboxDispatcherConfig()
+	_, err := NewOutboxDispatcher(st, nil, cfg)
+	if err == nil {
+		t.Fatalf("expected NewOutboxDispatcher to reject nil handler")
+	}
+}

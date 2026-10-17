@@ -1504,3 +1504,140 @@ func TestPostgresRepository_MultiReplicaStaleCacheRouteRevocation(t *testing.T) 
 		t.Fatalf("expected ErrNotFound from repo2 for deleted domain, got dom=%v err=%v", domAfterDelete, err)
 	}
 }
+
+func TestStore_EdgeConvergencePersistence(t *testing.T) {
+	s := store.NewStore()
+	ctx := context.Background()
+
+	// 1. Initial head is version 1
+	v0, chk0, _, err := s.GetEdgeConvergenceHead(ctx)
+	if err != nil || v0 != 1 || chk0 != "" {
+		t.Fatalf("unexpected initial head: ver=%d chk=%s err=%v", v0, chk0, err)
+	}
+
+	// 2. Save new convergence head
+	if err := s.SaveEdgeConvergenceHead(ctx, 42, "sha256-edge-head-42"); err != nil {
+		t.Fatalf("SaveEdgeConvergenceHead failed: %v", err)
+	}
+	v1, chk1, _, err := s.GetEdgeConvergenceHead(ctx)
+	if err != nil || v1 != 42 || chk1 != "sha256-edge-head-42" {
+		t.Fatalf("GetEdgeConvergenceHead returned unexpected head: ver=%d chk=%s err=%v", v1, chk1, err)
+	}
+
+	// 3. Save gateway sync states
+	rec1 := &model.GatewaySyncRecord{
+		GatewayID:        "gw-test-01",
+		PoPID:            "dhaka",
+		AppliedVersion:   42,
+		AppliedChecksum:  "sha256-edge-head-42",
+		TargetVersion:    42,
+		TargetChecksum:   "sha256-edge-head-42",
+		Status:           model.SyncStatusInSync,
+		LastAckAt:        time.Now().UTC(),
+		ConvergenceLagMs: 15,
+	}
+	rec2 := &model.GatewaySyncRecord{
+		GatewayID:        "gw-test-02",
+		PoPID:            "singapore",
+		AppliedVersion:   40,
+		AppliedChecksum:  "sha256-edge-head-40",
+		TargetVersion:    42,
+		TargetChecksum:   "sha256-edge-head-42",
+		VersionLag:       2,
+		Status:           model.SyncStatusLagging,
+		LastAckAt:        time.Now().UTC(),
+		ConvergenceLagMs: 120,
+	}
+	if err := s.SaveGatewaySyncRecord(ctx, rec1); err != nil {
+		t.Fatalf("SaveGatewaySyncRecord rec1 failed: %v", err)
+	}
+	if err := s.SaveGatewaySyncRecord(ctx, rec2); err != nil {
+		t.Fatalf("SaveGatewaySyncRecord rec2 failed: %v", err)
+	}
+
+	// 4. Fetch specific gateway
+	g1, err := s.GetGatewaySyncRecord(ctx, "gw-test-01")
+	if err != nil || g1.Status != model.SyncStatusInSync || g1.AppliedVersion != 42 {
+		t.Fatalf("GetGatewaySyncRecord gw-test-01 unexpected: %+v err=%v", g1, err)
+	}
+
+	// 5. List all gateways
+	list, err := s.ListGatewaySyncRecords(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListGatewaySyncRecords returned %d records, expected 2 (err=%v)", len(list), err)
+	}
+}
+
+func TestPostgresRepository_EdgeConvergencePersistence(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("DATABASE_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping Postgres Edge Convergence Persistence test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	ctx := context.Background()
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo1: %v", err)
+	}
+	defer repo1.Close()
+
+	targetVer := time.Now().Unix()
+	targetChk := fmt.Sprintf("sha256-pg-conv-%d", targetVer)
+
+	// 1. Save authoritative target head in PostgreSQL
+	if err := repo1.SaveEdgeConvergenceHead(ctx, targetVer, targetChk); err != nil {
+		t.Fatalf("repo1.SaveEdgeConvergenceHead failed: %v", err)
+	}
+
+	// 2. Save gateway sync record
+	gwID := fmt.Sprintf("gw-pg-%d", targetVer)
+	rec := &model.GatewaySyncRecord{
+		GatewayID:        gwID,
+		PoPID:            "dhaka",
+		AppliedVersion:   targetVer,
+		AppliedChecksum:  targetChk,
+		TargetVersion:    targetVer,
+		TargetChecksum:   targetChk,
+		Status:           model.SyncStatusInSync,
+		LastAckAt:        time.Now().UTC(),
+		ConvergenceLagMs: 22,
+	}
+	if err := repo1.SaveGatewaySyncRecord(ctx, rec); err != nil {
+		t.Fatalf("repo1.SaveGatewaySyncRecord failed: %v", err)
+	}
+
+	// 3. Connect new repository instance to simulate control plane restart & multi-replica read
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to connect repo2: %v", err)
+	}
+	defer repo2.Close()
+
+	recVer, recChk, _, err := repo2.GetEdgeConvergenceHead(ctx)
+	if err != nil || recVer != targetVer || recChk != targetChk {
+		t.Fatalf("repo2 recovered unexpected convergence head: ver=%d (expected %d) chk=%s (expected %s) err=%v", recVer, targetVer, recChk, targetChk, err)
+	}
+
+	fetchedGw, err := repo2.GetGatewaySyncRecord(ctx, gwID)
+	if err != nil || fetchedGw.Status != model.SyncStatusInSync || fetchedGw.AppliedVersion != targetVer {
+		t.Fatalf("repo2 recovered unexpected gateway sync record: %+v err=%v", fetchedGw, err)
+	}
+
+	list, err := repo2.ListGatewaySyncRecords(ctx)
+	if err != nil || len(list) == 0 {
+		t.Fatalf("repo2.ListGatewaySyncRecords returned empty or error: %v", err)
+	}
+	found := false
+	for _, g := range list {
+		if g.GatewayID == gwID && g.Status == model.SyncStatusInSync {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("repo2.ListGatewaySyncRecords did not contain %s", gwID)
+	}
+}

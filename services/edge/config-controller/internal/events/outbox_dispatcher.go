@@ -123,7 +123,7 @@ func validateOutboxPayloadSchema(eventType string, payload map[string]interface{
 	case "ai_provider.changed":
 		return checkNonEmptyStr("provider_id")
 	default:
-		return nil
+		return fmt.Errorf("unknown or unsupported outbox event type: %q (strict allowlist rejection)", eventType)
 	}
 }
 
@@ -254,9 +254,7 @@ func NewOutboxDispatcher(outboxStore store.OutboxStore, handler OutboxEventHandl
 		return nil, errors.New("outboxStore cannot be nil")
 	}
 	if handler == nil {
-		handler = OutboxEventHandlerFunc(func(ctx context.Context, ev *store.OutboxEvent) error {
-			return nil
-		})
+		return nil, errors.New("outbox event handler cannot be nil")
 	}
 	defaults := DefaultOutboxDispatcherConfig()
 	if cfg.WorkerID == "" {
@@ -362,6 +360,11 @@ func (d *OutboxDispatcher) DispatchBatch(ctx context.Context) (int, error) {
 
 	now := time.Now().UTC()
 	for _, ev := range events {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
 		d.eventsClaimed.Add(1)
 
 		handleErr := d.handler.HandleOutboxEvent(ctx, ev)

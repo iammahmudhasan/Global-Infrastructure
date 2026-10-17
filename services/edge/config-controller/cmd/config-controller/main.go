@@ -303,8 +303,19 @@ func main() {
 	<-stopChan
 	log.Printf("[INFO] Shutting down NexusEdge Config Controller gracefully...")
 
+	// Step 1: Stop ingress traffic and drain in-flight client HTTP requests first
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ERROR] Server forced to shutdown: %v", err)
+	}
+
+	// Step 2: Stop background workers and probers
 	if outboxDispatcher != nil {
-		outboxDispatcher.Stop()
+		if err := outboxDispatcher.StopWithContext(shutdownCtx); err != nil {
+			log.Printf("[WARN] Outbox dispatcher stopped with notice: %v", err)
+		}
 	}
 	stopDispatcher()
 
@@ -313,15 +324,11 @@ func main() {
 	}
 	stopProber()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("[ERROR] Server forced to shutdown: %v", err)
-	}
-
+	// Step 3: Close persistent data store last
 	if closer, ok := dataStore.(io.Closer); ok {
-		_ = closer.Close()
+		if err := closer.Close(); err != nil {
+			log.Printf("[WARN] Error closing data store: %v", err)
+		}
 	}
 
 	log.Printf("[INFO] NexusEdge Config Controller stopped cleanly.")

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
@@ -85,6 +86,13 @@ type Repository interface {
 	ListAuditLogs(projectID string, limit int, offset int) ([]*model.AuditLog, int, error)
 	GetAuditLog(id string) (*model.AuditLog, error)
 	GetLastAuditHash() string
+
+	// Edge Configuration Convergence
+	SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error
+	GetEdgeConvergenceHead(ctx context.Context) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
+	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
+	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
+	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)
 }
 
 // Ensure *Store satisfies Repository at compile time.

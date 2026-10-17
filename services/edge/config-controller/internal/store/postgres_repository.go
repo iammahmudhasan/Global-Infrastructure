@@ -462,6 +462,34 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`ALTER TABLE outbox_events ALTER COLUMN aggregate_id TYPE VARCHAR(128);`,
 			},
 		},
+		{
+			version: "0009_edge_convergence_engine",
+			stmts: []string{
+				`CREATE TABLE IF NOT EXISTS edge_convergence_head (
+					id INT PRIMARY KEY DEFAULT 1,
+					target_version BIGINT NOT NULL DEFAULT 1,
+					target_checksum VARCHAR(64) NOT NULL DEFAULT '',
+					updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);`,
+				`INSERT INTO edge_convergence_head (id, target_version, target_checksum, updated_at)
+				 VALUES (1, 1, '', NOW())
+				 ON CONFLICT (id) DO NOTHING;`,
+				`CREATE TABLE IF NOT EXISTS gateway_sync_state (
+					gateway_id VARCHAR(128) PRIMARY KEY,
+					pop_id VARCHAR(64) NOT NULL,
+					applied_version BIGINT NOT NULL,
+					applied_checksum VARCHAR(64) NOT NULL,
+					target_version BIGINT NOT NULL,
+					target_checksum VARCHAR(64) NOT NULL,
+					status VARCHAR(32) NOT NULL,
+					last_error TEXT NOT NULL DEFAULT '',
+					last_ack_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+					convergence_lag_ms BIGINT NOT NULL DEFAULT 0
+				);`,
+				`CREATE INDEX IF NOT EXISTS idx_gateway_sync_pop ON gateway_sync_state(pop_id);`,
+				`CREATE INDEX IF NOT EXISTS idx_gateway_sync_status ON gateway_sync_state(status);`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
@@ -850,6 +878,39 @@ func (r *PostgresRepository) warmupCache(ctx context.Context) error {
 	}
 	if err := auditRows.Err(); err != nil {
 		return fmt.Errorf("iterate audit_logs: %w", err)
+	}
+
+	// 13. Edge Convergence Head
+	var targetVersion int64
+	var targetChecksum string
+	var headUpdatedAt time.Time
+	err = r.db.QueryRowContext(ctx, "SELECT target_version, target_checksum, updated_at FROM edge_convergence_head WHERE id = 1").Scan(&targetVersion, &targetChecksum, &headUpdatedAt)
+	if err == nil {
+		_ = r.cache.SaveEdgeConvergenceHead(ctx, targetVersion, targetChecksum)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("query edge_convergence_head: %w", err)
+	}
+
+	// 14. Gateway Sync State
+	gwRows, err := r.db.QueryContext(ctx, "SELECT gateway_id, pop_id, applied_version, applied_checksum, target_version, target_checksum, status, last_error, last_ack_at, convergence_lag_ms FROM gateway_sync_state")
+	if err != nil {
+		return fmt.Errorf("query gateway_sync_state: %w", err)
+	}
+	defer gwRows.Close()
+	for gwRows.Next() {
+		var rec model.GatewaySyncRecord
+		var statusStr string
+		if err := gwRows.Scan(&rec.GatewayID, &rec.PoPID, &rec.AppliedVersion, &rec.AppliedChecksum, &rec.TargetVersion, &rec.TargetChecksum, &statusStr, &rec.LastError, &rec.LastAckAt, &rec.ConvergenceLagMs); err != nil {
+			return fmt.Errorf("scan gateway_sync_state: %w", err)
+		}
+		rec.Status = model.GatewaySyncStatus(statusStr)
+		if rec.TargetVersion > rec.AppliedVersion {
+			rec.VersionLag = rec.TargetVersion - rec.AppliedVersion
+		}
+		_ = r.cache.SaveGatewaySyncRecord(ctx, &rec)
+	}
+	if err := gwRows.Err(); err != nil {
+		return fmt.Errorf("iterate gateway_sync_state: %w", err)
 	}
 
 	return nil
@@ -2776,4 +2837,139 @@ func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, event
 		return ErrOutboxLeaseLost
 	}
 	return nil
+}
+
+// -------------------------------------------------------------------------
+// Edge Configuration Convergence
+// -------------------------------------------------------------------------
+
+func (r *PostgresRepository) SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error {
+	query := `
+		INSERT INTO edge_convergence_head (id, target_version, target_checksum, updated_at)
+		VALUES (1, $1, $2, NOW())
+		ON CONFLICT (id) DO UPDATE
+		SET target_version = EXCLUDED.target_version,
+		    target_checksum = EXCLUDED.target_checksum,
+		    updated_at = EXCLUDED.updated_at
+	`
+	if _, err := r.db.ExecContext(ctx, query, targetVersion, targetChecksum); err != nil {
+		return fmt.Errorf("save edge convergence head: %w", err)
+	}
+	return r.cache.SaveEdgeConvergenceHead(ctx, targetVersion, targetChecksum)
+}
+
+func (r *PostgresRepository) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time.Time, error) {
+	ver, chk, t, err := r.cache.GetEdgeConvergenceHead(ctx)
+	if err == nil && ver > 0 {
+		return ver, chk, t, nil
+	}
+	var dbVer int64
+	var dbChk string
+	var dbTime time.Time
+	err = r.db.QueryRowContext(ctx, "SELECT target_version, target_checksum, updated_at FROM edge_convergence_head WHERE id = 1").Scan(&dbVer, &dbChk, &dbTime)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 1, "", time.Now().UTC(), nil
+		}
+		return 0, "", time.Time{}, fmt.Errorf("get edge convergence head: %w", err)
+	}
+	_ = r.cache.SaveEdgeConvergenceHead(ctx, dbVer, dbChk)
+	return dbVer, dbChk, dbTime, nil
+}
+
+func (r *PostgresRepository) SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error {
+	if rec == nil || rec.GatewayID == "" {
+		return errors.New("gateway_id required")
+	}
+	query := `
+		INSERT INTO gateway_sync_state (
+			gateway_id, pop_id, applied_version, applied_checksum, target_version, target_checksum, status, last_error, last_ack_at, convergence_lag_ms
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (gateway_id) DO UPDATE
+		SET pop_id = EXCLUDED.pop_id,
+		    applied_version = EXCLUDED.applied_version,
+		    applied_checksum = EXCLUDED.applied_checksum,
+		    target_version = EXCLUDED.target_version,
+		    target_checksum = EXCLUDED.target_checksum,
+		    status = EXCLUDED.status,
+		    last_error = EXCLUDED.last_error,
+		    last_ack_at = EXCLUDED.last_ack_at,
+		    convergence_lag_ms = EXCLUDED.convergence_lag_ms
+	`
+	lastAck := rec.LastAckAt
+	if lastAck.IsZero() {
+		lastAck = time.Now().UTC()
+	}
+	_, err := r.db.ExecContext(ctx, query,
+		rec.GatewayID,
+		rec.PoPID,
+		rec.AppliedVersion,
+		rec.AppliedChecksum,
+		rec.TargetVersion,
+		rec.TargetChecksum,
+		string(rec.Status),
+		rec.LastError,
+		lastAck,
+		rec.ConvergenceLagMs,
+	)
+	if err != nil {
+		return fmt.Errorf("save gateway sync record: %w", err)
+	}
+	return r.cache.SaveGatewaySyncRecord(ctx, rec)
+}
+
+func (r *PostgresRepository) GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error) {
+	if rec, err := r.cache.GetGatewaySyncRecord(ctx, gatewayID); err == nil {
+		return rec, nil
+	}
+	query := `SELECT gateway_id, pop_id, applied_version, applied_checksum, target_version, target_checksum, status, last_error, last_ack_at, convergence_lag_ms FROM gateway_sync_state WHERE gateway_id = $1`
+	var rec model.GatewaySyncRecord
+	var statusStr string
+	err := r.db.QueryRowContext(ctx, query, gatewayID).Scan(
+		&rec.GatewayID, &rec.PoPID, &rec.AppliedVersion, &rec.AppliedChecksum, &rec.TargetVersion, &rec.TargetChecksum, &statusStr, &rec.LastError, &rec.LastAckAt, &rec.ConvergenceLagMs,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("get gateway sync record: %w", err)
+	}
+	rec.Status = model.GatewaySyncStatus(statusStr)
+	if rec.TargetVersion > rec.AppliedVersion {
+		rec.VersionLag = rec.TargetVersion - rec.AppliedVersion
+	}
+	_ = r.cache.SaveGatewaySyncRecord(ctx, &rec)
+	return &rec, nil
+}
+
+func (r *PostgresRepository) ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error) {
+	list, err := r.cache.ListGatewaySyncRecords(ctx)
+	if err == nil && len(list) > 0 {
+		return list, nil
+	}
+	query := `SELECT gateway_id, pop_id, applied_version, applied_checksum, target_version, target_checksum, status, last_error, last_ack_at, convergence_lag_ms FROM gateway_sync_state ORDER BY gateway_id ASC`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list gateway sync records: %w", err)
+	}
+	defer rows.Close()
+
+	var records []*model.GatewaySyncRecord
+	for rows.Next() {
+		var rec model.GatewaySyncRecord
+		var statusStr string
+		if err := rows.Scan(&rec.GatewayID, &rec.PoPID, &rec.AppliedVersion, &rec.AppliedChecksum, &rec.TargetVersion, &rec.TargetChecksum, &statusStr, &rec.LastError, &rec.LastAckAt, &rec.ConvergenceLagMs); err != nil {
+			return nil, fmt.Errorf("scan gateway sync record: %w", err)
+		}
+		rec.Status = model.GatewaySyncStatus(statusStr)
+		if rec.TargetVersion > rec.AppliedVersion {
+			rec.VersionLag = rec.TargetVersion - rec.AppliedVersion
+		}
+		_ = r.cache.SaveGatewaySyncRecord(ctx, &rec)
+		records = append(records, &rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate gateway sync records: %w", err)
+	}
+	return records, nil
 }

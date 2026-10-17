@@ -4606,3 +4606,162 @@ func TestGatewayConvergenceRoutes(t *testing.T) {
 		t.Fatalf("expected needs_pull true for target_version 2, got %v", syncRes2)
 	}
 }
+
+func TestGatewayConvergence_ChecksumMismatchHTTP409(t *testing.T) {
+	h := setupTestServer()
+	h.GatewaySyncTracker().AdvanceTargetVersion(1, "chk-authoritative-v2")
+
+	// Gateway reports applied version 2 with incorrect checksum -> HTTP 409 Conflict
+	ackBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  2,
+		"applied_checksum": "bad-checksum-tampered",
+		"status":           "IN_SYNC",
+	})
+	reqAck := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(ackBody))
+	wAck := httptest.NewRecorder()
+	h.ServeHTTP(wAck, reqAck)
+
+	if wAck.Code != http.StatusConflict {
+		t.Fatalf("expected HTTP 409 Conflict on checksum mismatch, got %d (body=%s)", wAck.Code, wAck.Body.String())
+	}
+
+	var rec map[string]interface{}
+	if err := json.NewDecoder(wAck.Body).Decode(&rec); err != nil {
+		t.Fatalf("decode 409 response error: %v", err)
+	}
+	if rec["status"] != "CHECKSUM_MISMATCH" {
+		t.Fatalf("expected status CHECKSUM_MISMATCH, got %v", rec["status"])
+	}
+}
+
+func TestGatewayConvergence_IdentityAuthorization(t *testing.T) {
+	os.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	defer os.Setenv("NEXUSEDGE_DEV_MODE", "true")
+
+	h := setupTestServer()
+	authInst := h.Authenticator()
+
+	// Register edge node credential restricted to node gw-dhk-01 and PoP dhaka
+	authInst.RegisterNodeWithPoP("key-gw-dhk", "tenant-edge", "proj-core", "gw-dhk-01", "dhaka")
+
+	// 1. Unauthorized tenant user attempting to call /v1/edge/gateways/ack -> 403 Forbidden
+	authInst.RegisterTenantWithRole("key-tenant-readonly", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
+	unauthBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+	})
+	reqUnauth := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(unauthBody))
+	reqUnauth.Header.Set("Authorization", "Bearer key-tenant-readonly")
+	wUnauth := httptest.NewRecorder()
+	h.ServeHTTP(wUnauth, reqUnauth)
+	if wUnauth.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-operator/non-node tenant, got %d", wUnauth.Code)
+	}
+
+	// 2. Node gw-dhk-01 attempting to ACK for a different gateway gw-sin-01 -> 403 Forbidden
+	spoofBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-sin-01",
+		"pop_id":           "dhaka",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+	})
+	reqSpoof := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(spoofBody))
+	reqSpoof.Header.Set("Authorization", "Bearer key-gw-dhk")
+	wSpoof := httptest.NewRecorder()
+	h.ServeHTTP(wSpoof, reqSpoof)
+	if wSpoof.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when edge node acknowledges for another gateway, got %d", wSpoof.Code)
+	}
+
+	// 3. Node gw-dhk-01 attempting to ACK for a different PoP singapore -> 403 Forbidden
+	popSpoofBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "singapore",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+	})
+	reqPopSpoof := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(popSpoofBody))
+	reqPopSpoof.Header.Set("Authorization", "Bearer key-gw-dhk")
+	wPopSpoof := httptest.NewRecorder()
+	h.ServeHTTP(wPopSpoof, reqPopSpoof)
+	if wPopSpoof.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when edge node acknowledges for unauthorized PoP, got %d", wPopSpoof.Code)
+	}
+
+	// 4. Legitimate node ACK for own gateway and authorized PoP -> 200 OK
+	legitBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  1,
+		"applied_checksum": "",
+		"status":           "IN_SYNC",
+	})
+	reqLegit := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(legitBody))
+	reqLegit.Header.Set("Authorization", "Bearer key-gw-dhk")
+	wLegit := httptest.NewRecorder()
+	h.ServeHTTP(wLegit, reqLegit)
+	if wLegit.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for legitimate node ACK, got %d (body=%s)", wLegit.Code, wLegit.Body.String())
+	}
+}
+
+func TestGatewayConvergence_EndToEndSnapshotPull(t *testing.T) {
+	h := setupTestServer()
+
+	// Advance target version with authoritative checksum
+	targetVer := h.GatewaySyncTracker().AdvanceTargetVersion(2, "sha256-auth-v3")
+
+	// Step 1: Edge gateway checks convergence status
+	reqSync := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=1&pop_id=dhaka", nil)
+	wSync := httptest.NewRecorder()
+	h.ServeHTTP(wSync, reqSync)
+	if wSync.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for gateway sync query, got %d", wSync.Code)
+	}
+	var syncRes map[string]interface{}
+	_ = json.NewDecoder(wSync.Body).Decode(&syncRes)
+	if syncRes["needs_pull"] != true {
+		t.Fatalf("expected needs_pull=true, got %v", syncRes["needs_pull"])
+	}
+	snapshotURL, _ := syncRes["snapshot_url"].(string)
+	if snapshotURL != "/v1/edge/pops/dhaka/config" {
+		t.Fatalf("expected snapshot_url to be /v1/edge/pops/dhaka/config, got %s", snapshotURL)
+	}
+
+	// Step 2: Gateway fetches configuration snapshot
+	reqSnap := httptest.NewRequest(http.MethodGet, snapshotURL, nil)
+	wSnap := httptest.NewRecorder()
+	h.ServeHTTP(wSnap, reqSnap)
+	if wSnap.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for snapshot fetch, got %d", wSnap.Code)
+	}
+
+	// Step 3: Gateway applies configuration and submits verified ACK
+	ackBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  targetVer,
+		"applied_checksum": "sha256-auth-v3",
+		"status":           "IN_SYNC",
+	})
+	reqAck := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(ackBody))
+	wAck := httptest.NewRecorder()
+	h.ServeHTTP(wAck, reqAck)
+	if wAck.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for verified ACK, got %d (body=%s)", wAck.Code, wAck.Body.String())
+	}
+
+	// Step 4: Verify gateway is now IN_SYNC and needs_pull is false
+	reqSyncAfter := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=%d&pop_id=dhaka", targetVer), nil)
+	wSyncAfter := httptest.NewRecorder()
+	h.ServeHTTP(wSyncAfter, reqSyncAfter)
+	var syncResAfter map[string]interface{}
+	_ = json.NewDecoder(wSyncAfter.Body).Decode(&syncResAfter)
+	if syncResAfter["needs_pull"] != false {
+		t.Fatalf("expected needs_pull=false after convergence, got %v", syncResAfter["needs_pull"])
+	}
+}

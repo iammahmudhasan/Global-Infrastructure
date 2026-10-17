@@ -1,47 +1,42 @@
 package events
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 )
 
 // GatewaySyncStatus defines the convergence health of an individual Edge Gateway.
-type GatewaySyncStatus string
+type GatewaySyncStatus = model.GatewaySyncStatus
 
 const (
-	SyncStatusInSync   GatewaySyncStatus = "IN_SYNC"
-	SyncStatusLagging  GatewaySyncStatus = "LAGGING"
-	SyncStatusApplying GatewaySyncStatus = "APPLYING"
-	SyncStatusError    GatewaySyncStatus = "ERROR"
-	SyncStatusStale    GatewaySyncStatus = "STALE"
+	SyncStatusInSync           = model.SyncStatusInSync
+	SyncStatusLagging          = model.SyncStatusLagging
+	SyncStatusApplying         = model.SyncStatusApplying
+	SyncStatusError            = model.SyncStatusError
+	SyncStatusStale            = model.SyncStatusStale
+	SyncStatusChecksumMismatch = model.SyncStatusChecksumMismatch
 )
 
 // GatewaySyncRecord represents the convergence state reported by an Edge Gateway.
-type GatewaySyncRecord struct {
-	GatewayID        string            `json:"gateway_id"`
-	PoPID            string            `json:"pop_id"`
-	AppliedVersion   int64             `json:"applied_version"`
-	AppliedChecksum  string            `json:"applied_checksum"`
-	TargetVersion    int64             `json:"target_version"`
-	TargetChecksum   string            `json:"target_checksum"`
-	VersionLag       int64             `json:"version_lag"`
-	Status           GatewaySyncStatus `json:"status"`
-	LastError        string            `json:"last_error,omitempty"`
-	LastAckAt        time.Time         `json:"last_ack_at"`
-	ConvergenceLagMs int64             `json:"convergence_lag_ms"`
-}
+type GatewaySyncRecord = model.GatewaySyncRecord
 
 // GatewaySyncAcknowledgement is received from Edge Gateways upon applying configuration.
-type GatewaySyncAcknowledgement struct {
-	GatewayID       string `json:"gateway_id"`
-	PoPID           string `json:"pop_id"`
-	AppliedVersion  int64  `json:"applied_version"`
-	AppliedChecksum string `json:"applied_checksum"`
-	Status          string `json:"status"`
-	Error           string `json:"error,omitempty"`
+type GatewaySyncAcknowledgement = model.GatewaySyncAcknowledgement
+
+// GatewayConvergenceStore defines the durable persistence interface required by the convergence tracker.
+type GatewayConvergenceStore interface {
+	SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error
+	GetEdgeConvergenceHead(ctx context.Context) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
+	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
+	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
+	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)
 }
 
 // GatewaySyncTracker coordinates configuration generation tracking, per-gateway ACKs,
@@ -53,10 +48,18 @@ type GatewaySyncTracker struct {
 	targetUpdatedAt time.Time
 	gateways        map[string]*GatewaySyncRecord
 	staleThreshold  time.Duration
+	store           GatewayConvergenceStore
 }
 
-// NewGatewaySyncTracker creates an initialized GatewaySyncTracker.
+// NewGatewaySyncTracker creates an in-memory GatewaySyncTracker.
 func NewGatewaySyncTracker(staleThreshold time.Duration) *GatewaySyncTracker {
+	return NewGatewaySyncTrackerWithStore(staleThreshold, nil)
+}
+
+// NewGatewaySyncTrackerWithStore creates a GatewaySyncTracker backed by durable storage.
+// On startup, it loads the persisted convergence head and previously acknowledged gateway states,
+// preventing loss of convergence history upon control plane restart.
+func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConvergenceStore) *GatewaySyncTracker {
 	if staleThreshold <= 0 {
 		staleThreshold = 15 * time.Second
 	}
@@ -64,22 +67,60 @@ func NewGatewaySyncTracker(staleThreshold time.Duration) *GatewaySyncTracker {
 		gateways:        make(map[string]*GatewaySyncRecord),
 		staleThreshold:  staleThreshold,
 		targetUpdatedAt: time.Now().UTC(),
+		store:           s,
 	}
 	t.targetVersion.Store(1)
+
+	if s != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		ver, chk, updated, err := s.GetEdgeConvergenceHead(ctx)
+		if err == nil && ver > 0 {
+			t.targetVersion.Store(ver)
+			t.targetChecksum = chk
+			if !updated.IsZero() {
+				t.targetUpdatedAt = updated
+			}
+		}
+
+		if records, err := s.ListGatewaySyncRecords(ctx); err == nil {
+			for _, rec := range records {
+				if rec != nil && rec.GatewayID != "" {
+					cp := *rec
+					t.gateways[rec.GatewayID] = &cp
+				}
+			}
+		}
+	}
+
 	return t
 }
 
-// AdvanceTargetVersion increments the global configuration generation.
+// AdvanceTargetVersion increments the global configuration generation idempotently.
+// If checksum is non-empty and identical to current target checksum, this represents
+// duplicate event delivery for the same desired state; the version is NOT incremented.
 func (t *GatewaySyncTracker) AdvanceTargetVersion(delta int64, checksum string) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Idempotency: avoid incrementing version if desired configuration checksum has not changed
+	if checksum != "" && t.targetChecksum == checksum {
+		return t.targetVersion.Load()
+	}
+
 	if delta <= 0 {
 		delta = 1
 	}
 	newVer := t.targetVersion.Add(delta)
-
-	t.mu.Lock()
 	t.targetChecksum = checksum
 	t.targetUpdatedAt = time.Now().UTC()
-	t.mu.Unlock()
+
+	if t.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = t.store.SaveEdgeConvergenceHead(ctx, newVer, checksum)
+	}
 
 	return newVer
 }
@@ -97,6 +138,8 @@ func (t *GatewaySyncTracker) TargetChecksum() string {
 }
 
 // RecordAck records an applied version acknowledgement from an edge gateway.
+// Rejects applied checksum mismatch with ErrChecksumMismatch and sets status to CHECKSUM_MISMATCH.
+// A gateway CANNOT be marked IN_SYNC unless both version and checksum match authoritative desired state.
 func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*GatewaySyncRecord, error) {
 	if strings.TrimSpace(ack.GatewayID) == "" {
 		return nil, errors.New("gateway_id is required")
@@ -117,23 +160,49 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 		lag = 0
 	}
 
-	var status GatewaySyncStatus
-	if strings.ToUpper(ack.Status) == string(SyncStatusError) || ack.Error != "" {
-		status = SyncStatusError
-	} else if ack.AppliedVersion >= targetVer {
-		status = SyncStatusInSync
-	} else if strings.ToUpper(ack.Status) == string(SyncStatusApplying) {
-		status = SyncStatusApplying
-	} else {
-		status = SyncStatusLagging
-	}
-
 	var convLagMs int64
 	if !t.targetUpdatedAt.IsZero() {
 		convLagMs = now.Sub(t.targetUpdatedAt).Milliseconds()
 		if convLagMs < 0 {
 			convLagMs = 0
 		}
+	}
+
+	// Strict checksum validation: Gateway cannot be IN_SYNC on checksum mismatch for target version
+	if ack.AppliedVersion >= targetVer && targetChk != "" && ack.AppliedChecksum != "" && ack.AppliedChecksum != targetChk {
+		errMsg := fmt.Sprintf("applied checksum mismatch: expected %s, got %s", targetChk, ack.AppliedChecksum)
+		rec := &GatewaySyncRecord{
+			GatewayID:        ack.GatewayID,
+			PoPID:            ack.PoPID,
+			AppliedVersion:   ack.AppliedVersion,
+			AppliedChecksum:  ack.AppliedChecksum,
+			TargetVersion:    targetVer,
+			TargetChecksum:   targetChk,
+			VersionLag:       lag,
+			Status:           model.SyncStatusChecksumMismatch,
+			LastError:        errMsg,
+			LastAckAt:        now,
+			ConvergenceLagMs: convLagMs,
+		}
+		t.gateways[ack.GatewayID] = rec
+		if t.store != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = t.store.SaveGatewaySyncRecord(ctx, rec)
+		}
+		recCopy := *rec
+		return &recCopy, model.ErrChecksumMismatch
+	}
+
+	var status GatewaySyncStatus
+	if strings.ToUpper(ack.Status) == string(model.SyncStatusError) || ack.Error != "" {
+		status = model.SyncStatusError
+	} else if ack.AppliedVersion >= targetVer && (targetChk == "" || ack.AppliedChecksum == targetChk) {
+		status = model.SyncStatusInSync
+	} else if strings.ToUpper(ack.Status) == string(model.SyncStatusApplying) {
+		status = model.SyncStatusApplying
+	} else {
+		status = model.SyncStatusLagging
 	}
 
 	rec := &GatewaySyncRecord{
@@ -151,6 +220,11 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 	}
 
 	t.gateways[ack.GatewayID] = rec
+	if t.store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = t.store.SaveGatewaySyncRecord(ctx, rec)
+	}
 	recCopy := *rec
 	return &recCopy, nil
 }
@@ -178,7 +252,7 @@ func (t *GatewaySyncTracker) ListGateways() []*GatewaySyncRecord {
 
 	for _, rec := range t.gateways {
 		copy := *rec
-		if now.Sub(rec.LastAckAt) > t.staleThreshold && copy.Status != SyncStatusError {
+		if now.Sub(rec.LastAckAt) > t.staleThreshold && copy.Status != SyncStatusError && copy.Status != SyncStatusChecksumMismatch {
 			copy.Status = SyncStatusStale
 			rec.Status = SyncStatusStale
 		}
@@ -204,7 +278,7 @@ func (t *GatewaySyncTracker) GetConvergenceSummary() map[string]interface{} {
 	var maxLag int64
 
 	for _, rec := range t.gateways {
-		if now.Sub(rec.LastAckAt) > t.staleThreshold && rec.Status != SyncStatusError {
+		if now.Sub(rec.LastAckAt) > t.staleThreshold && rec.Status != SyncStatusError && rec.Status != SyncStatusChecksumMismatch {
 			rec.Status = SyncStatusStale
 		}
 		switch rec.Status {
@@ -214,7 +288,7 @@ func (t *GatewaySyncTracker) GetConvergenceSummary() map[string]interface{} {
 			lagging++
 		case SyncStatusStale:
 			stale++
-		case SyncStatusError:
+		case SyncStatusError, SyncStatusChecksumMismatch:
 			errCount++
 		}
 		if rec.VersionLag > maxLag {
