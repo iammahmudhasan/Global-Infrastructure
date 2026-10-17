@@ -388,29 +388,72 @@ pub fn parse_sse_block(block: &str) -> Option<SseEvent> {
     }
 }
 
-/// Manages asynchronous, reliable dispatch of Gateway synchronization ACKs with exponential backoff.
-/// Guarantees that ACKs are never silently dropped upon control plane transient 503s or network errors.
+use std::path::PathBuf;
+
+/// Manages asynchronous, reliable dispatch of Gateway synchronization ACKs with exponential backoff and jitter.
+/// Guarantees that ACKs are never silently dropped upon control plane transient 503s or network errors,
+/// and survives daemon crashes/restarts via an atomic on-disk spool.
 pub struct GatewayAckManager {
     endpoint: String,
     auth_token: String,
     client: HttpClient,
-    pending_ack: Arc<RwLock<Option<GatewaySyncAckPayload>>>,
+    spool_path: Option<PathBuf>,
+    pub pending_ack: Arc<RwLock<Option<GatewaySyncAckPayload>>>,
     notify: Arc<tokio::sync::Notify>,
 }
 
 impl GatewayAckManager {
-    pub fn new(endpoint: String, auth_token: String, client: HttpClient) -> Self {
+    pub fn new(
+        endpoint: String,
+        auth_token: String,
+        client: HttpClient,
+        spool_path: Option<PathBuf>,
+    ) -> Self {
+        let mut initial_ack = None;
+        if let Some(ref path) = spool_path {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(recovered) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                        tracing::info!(
+                            pop_id = %recovered.pop_id,
+                            gateway_id = %recovered.gateway_id,
+                            version = recovered.applied_version,
+                            spool_file = %path.display(),
+                            "Recovered pending edge gateway ACK from durable disk spool"
+                        );
+                        initial_ack = Some(recovered);
+                    }
+                }
+            }
+        }
+
         Self {
             endpoint,
             auth_token,
             client,
-            pending_ack: Arc::new(RwLock::new(None)),
+            spool_path,
+            pending_ack: Arc::new(RwLock::new(initial_ack)),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
+    /// Invariant: Atomically persists ACK payload to durable disk spool before updating memory.
     pub fn submit_ack(&self, ack: GatewaySyncAckPayload) {
+        if let Some(ref path) = self.spool_path {
+            if let Ok(serialized) = serde_json::to_string_pretty(&ack) {
+                let tmp_path = format!("{}.tmp.{}", path.display(), std::process::id());
+                if let Ok(mut file) = std::fs::File::create(&tmp_path) {
+                    use std::io::Write;
+                    if file.write_all(serialized.as_bytes()).is_ok() && file.sync_all().is_ok() {
+                        let _ = std::fs::rename(&tmp_path, path);
+                    } else {
+                        let _ = std::fs::remove_file(&tmp_path);
+                    }
+                }
+            }
+        }
+
         if let Ok(mut guard) = self.pending_ack.write() {
             *guard = Some(ack);
         }
@@ -422,7 +465,7 @@ impl GatewayAckManager {
         self.pending_ack.read().ok().and_then(|g| g.clone())
     }
 
-    /// Spawns a background task that reliably delivers pending ACKs with exponential backoff.
+    /// Spawns a background task that reliably delivers pending ACKs with exponential backoff and jitter.
     pub fn spawn_worker(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(500);
@@ -448,6 +491,9 @@ impl GatewayAckManager {
                                     checksum = %ack.applied_checksum,
                                     "Successfully acknowledged edge gateway synchronization state to Control Plane"
                                 );
+                                if let Some(ref path) = self.spool_path {
+                                    let _ = std::fs::remove_file(path);
+                                }
                                 if let Ok(mut guard) = self.pending_ack.write() {
                                     if let Some(ref latest) = *guard {
                                         if latest.applied_version == ack.applied_version
@@ -460,14 +506,20 @@ impl GatewayAckManager {
                                 backoff = Duration::from_millis(500);
                             }
                             Err(e) => {
+                                let jitter_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.subsec_millis() as u64)
+                                    .unwrap_or(0)
+                                    % 250;
+                                let sleep_duration = backoff + Duration::from_millis(jitter_ms);
                                 tracing::warn!(
                                     pop_id = %ack.pop_id,
                                     error = %e,
                                     version = ack.applied_version,
-                                    backoff_ms = backoff.as_millis(),
-                                    "Control Plane ACK submission failed; retrying with backoff"
+                                    backoff_ms = sleep_duration.as_millis(),
+                                    "Control Plane ACK submission failed; retrying with backoff and jitter"
                                 );
-                                tokio::time::sleep(backoff).await;
+                                tokio::time::sleep(sleep_duration).await;
                                 backoff = (backoff * 2).min(MAX_BACKOFF);
                             }
                         }
@@ -864,6 +916,7 @@ mod tests {
             "http://127.0.0.1:9091".to_string(),
             "test-token".to_string(),
             client,
+            None,
         );
 
         let ack1 = GatewaySyncAckPayload {
@@ -899,5 +952,64 @@ mod tests {
             assert_eq!(lock.as_ref().unwrap().applied_version, 2);
             assert_eq!(lock.as_ref().unwrap().applied_checksum, "hash-2");
         }
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_durable_disk_spool_restart_recovery() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+
+        // 1. Initial process lifetime: instantiate manager with durable spool and submit ACK
+        let mgr1 = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client.clone(),
+            Some(spool_path.clone()),
+        );
+
+        let payload = GatewaySyncAckPayload {
+            gateway_id: "gw-dhaka-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 42,
+            applied_checksum: "hash-v42-durable".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        mgr1.submit_ack(payload.clone());
+
+        // Verify spool file physically exists on disk and matches payload
+        assert!(spool_path.exists());
+        let raw = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        assert!(raw.contains("\"applied_version\": 42"));
+        assert!(raw.contains("\"applied_checksum\": \"hash-v42-durable\""));
+
+        // 2. Simulate daemon crash/restart: instantiate new manager instance pointing to existing spool
+        let mgr2 = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client.clone(),
+            Some(spool_path.clone()),
+        );
+
+        // Invariant: Un-ACKed payload MUST be automatically recovered from disk spool on startup
+        let recovered = mgr2.pending_ack();
+        assert!(recovered.is_some());
+        let rec = recovered.unwrap();
+        assert_eq!(rec.applied_version, 42);
+        assert_eq!(rec.applied_checksum, "hash-v42-durable");
+        assert_eq!(rec.pop_id, "dhaka");
+        assert_eq!(rec.gateway_id, "gw-dhaka-01");
+
+        // Clean up
+        let _ = std::fs::remove_file(&spool_path);
     }
 }

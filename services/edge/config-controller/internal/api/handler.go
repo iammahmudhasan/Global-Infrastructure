@@ -2816,6 +2816,12 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 			bodySum := sha256.Sum256(respBytes)
 			bodyHash = hex.EncodeToString(bodySum[:])
 			finalBytes = respBytes
+			if h.gatewaySyncTracker != nil {
+				if err := h.gatewaySyncTracker.SetPoPTargetChecksum(popID, targetVer, bodyHash); err != nil {
+					writeError(w, http.StatusInternalServerError, "failed to persist authoritative pop snapshot head: "+err.Error())
+					return
+				}
+			}
 
 			h.snapshotCacheMu.Lock()
 			h.snapshotCache[popID] = poPSnapshotCacheEntry{
@@ -2823,10 +2829,6 @@ func (h *APIHandler) handlePoPsRoute(w http.ResponseWriter, r *http.Request) {
 				bodyBytes:   respBytes,
 			}
 			h.snapshotCacheMu.Unlock()
-		}
-
-		if h.gatewaySyncTracker != nil {
-			h.gatewaySyncTracker.SetPoPTargetChecksum(popID, targetVer, bodyHash)
 		}
 
 		w.Header().Set("X-Snapshot-Checksum", bodyHash)
@@ -4271,7 +4273,7 @@ func (h *APIHandler) handleGatewaySync(w http.ResponseWriter, r *http.Request) {
 	targetVer := h.gatewaySyncTracker.TargetVersion()
 	targetChk := h.gatewaySyncTracker.TargetChecksum()
 	if popID != "" {
-		if popVer, popChk := h.gatewaySyncTracker.GetPoPTargetChecksum(popID); popChk != "" {
+		if popVer, popChk, err := h.gatewaySyncTracker.GetPoPTargetChecksum(popID); err == nil && popChk != "" {
 			targetChk = popChk
 			if popVer > 0 {
 				targetVer = popVer

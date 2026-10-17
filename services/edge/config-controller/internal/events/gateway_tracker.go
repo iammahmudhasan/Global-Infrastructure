@@ -198,61 +198,73 @@ func (t *GatewaySyncTracker) TargetUpdatedAt() time.Time {
 }
 
 // SetPoPTargetChecksum records the authoritative compiled snapshot checksum and version for a specific PoP.
-// Invariant: Durable across multi-replica control plane. If backing store exists, persists to durable storage.
-func (t *GatewaySyncTracker) SetPoPTargetChecksum(popID string, targetVersion int64, checksum string) {
+// Invariant: Fail-closed persistence. The snapshot head MUST be durably persisted to PostgreSQL BEFORE
+// updating local in-memory cache and BEFORE publishing the snapshot to the gateway.
+func (t *GatewaySyncTracker) SetPoPTargetChecksum(popID string, targetVersion int64, checksum string) error {
 	if strings.TrimSpace(popID) == "" || strings.TrimSpace(checksum) == "" {
-		return
+		return errors.New("pop_id and checksum are required")
 	}
+
+	store := t.store
+	if store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := store.SavePoPSnapshotHead(ctx, popID, targetVersion, checksum); err != nil {
+			return fmt.Errorf("persist authoritative pop snapshot head: %w", err)
+		}
+	}
+
 	t.mu.Lock()
 	if t.popTargetChecksums == nil {
 		t.popTargetChecksums = make(map[string]string)
 		t.popTargetVersions = make(map[string]int64)
 	}
-	t.popTargetChecksums[popID] = checksum
-	t.popTargetVersions[popID] = targetVersion
-	store := t.store
-	t.mu.Unlock()
-
-	if store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = store.SavePoPSnapshotHead(ctx, popID, targetVersion, checksum)
+	if existingVer := t.popTargetVersions[popID]; existingVer <= targetVersion {
+		t.popTargetChecksums[popID] = checksum
+		t.popTargetVersions[popID] = targetVersion
 	}
+	t.mu.Unlock()
+	return nil
 }
 
-// GetPoPTargetChecksum returns the authoritative compiled snapshot checksum and version for a PoP,
-// checking local cache first, falling back to durable store, and finally global target version/checksum.
-func (t *GatewaySyncTracker) GetPoPTargetChecksum(popID string) (int64, string) {
-	t.mu.RLock()
-	if t.popTargetChecksums != nil {
-		if chk, exists := t.popTargetChecksums[popID]; exists && chk != "" {
-			ver := t.popTargetVersions[popID]
-			t.mu.RUnlock()
-			return ver, chk
-		}
-	}
+// GetPoPTargetChecksum returns the authoritative compiled snapshot checksum and version for a PoP.
+// Invariant: In multi-replica deployment with backing store, the durable store is the authoritative source
+// of truth to prevent split-brain / stale-cache validation across replicas.
+// If the durable store returns an error (outage/network drop), it fails closed by returning the error
+// rather than declaring false synchronization with a stale local cache.
+func (t *GatewaySyncTracker) GetPoPTargetChecksum(popID string) (int64, string, error) {
 	store := t.store
-	globalVer := t.targetVersion.Load()
-	globalChk := t.targetChecksum
-	t.mu.RUnlock()
-
 	if store != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if ver, chk, _, err := store.GetPoPSnapshotHead(ctx, popID); err == nil && chk != "" {
+		ver, chk, _, err := store.GetPoPSnapshotHead(ctx, popID)
+		if err == nil && chk != "" {
 			t.mu.Lock()
 			if t.popTargetChecksums == nil {
 				t.popTargetChecksums = make(map[string]string)
 				t.popTargetVersions = make(map[string]int64)
 			}
-			t.popTargetChecksums[popID] = chk
-			t.popTargetVersions[popID] = ver
+			if existingVer := t.popTargetVersions[popID]; existingVer <= ver {
+				t.popTargetChecksums[popID] = chk
+				t.popTargetVersions[popID] = ver
+			}
 			t.mu.Unlock()
-			return ver, chk
+			return ver, chk, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) && !strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return 0, "", fmt.Errorf("authoritative pop snapshot store query failed: %w", err)
 		}
 	}
 
-	return globalVer, globalChk
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.popTargetChecksums != nil {
+		if chk, exists := t.popTargetChecksums[popID]; exists && chk != "" {
+			return t.popTargetVersions[popID], chk, nil
+		}
+	}
+
+	return t.targetVersion.Load(), t.targetChecksum, nil
 }
 
 // RecordAck records an applied version acknowledgement from an edge gateway.
@@ -271,7 +283,10 @@ func (t *GatewaySyncTracker) RecordAck(ack GatewaySyncAcknowledgement) (*Gateway
 
 	// Authoritative lookup for PoP-specific snapshot head (multi-replica consistent)
 	// Resolved before acquiring t.mu.Lock() to avoid recursive lock deadlock and store I/O under mutex.
-	popVer, popChk := t.GetPoPTargetChecksum(ack.PoPID)
+	popVer, popChk, err := t.GetPoPTargetChecksum(ack.PoPID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to verify authoritative pop snapshot head: %w", err)
+	}
 
 	t.mu.Lock()
 	defer t.mu.Unlock()

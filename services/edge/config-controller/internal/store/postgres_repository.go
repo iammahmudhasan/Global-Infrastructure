@@ -1301,7 +1301,21 @@ type CacheReconciliationStats struct {
 // and synchronizing version-advanced configurations.
 func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconciliationStats, error) {
 	start := time.Now()
-	rows, err := r.db.QueryContext(ctx,
+
+	// Use a single REPEATABLE READ read-only transaction to ensure an atomic, point-in-time
+	// MVCC snapshot across all configuration tables (domains, routes, pools, origins, certs, policies).
+	// Prevents cross-table inconsistencies caused by concurrent mutations during reconciliation.
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reconcile cache begin repeatable read tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. Stage Active Domains
+	rows, err := tx.QueryContext(ctx,
 		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at, version FROM domains",
 	)
 	if err != nil {
@@ -1330,7 +1344,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 
 	// 2. Stage Routes for active domains
 	stagedRoutesByDomain := make(map[string][]*model.Route)
-	routeRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
+	routeRows, err := tx.QueryContext(ctx, "SELECT id, domain_id, pool_id, path_prefix, priority, timeout_ms FROM routes ORDER BY priority DESC")
 	if err != nil {
 		return nil, fmt.Errorf("reconcile cache query routes: %w", err)
 	}
@@ -1348,7 +1362,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	}
 
 	// 3. Stage Origin Pools and Origins
-	poolRows, err := r.db.QueryContext(ctx, "SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools")
+	poolRows, err := tx.QueryContext(ctx, "SELECT id, project_id, name, lb_algorithm, allowed_pops FROM origin_pools")
 	if err != nil {
 		return nil, fmt.Errorf("reconcile cache query origin pools: %w", err)
 	}
@@ -1363,7 +1377,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		}
 		p.AllowedPoPs = []string(pops)
 
-		origRows, errOrig := r.db.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
+		origRows, errOrig := tx.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
 		if errOrig != nil {
 			return nil, fmt.Errorf("reconcile cache query origins for pool %s: %w", p.ID, errOrig)
 		}
@@ -1389,7 +1403,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	}
 
 	// 4. Stage Active Certificates
-	certRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE status = 'ACTIVE'")
+	certRows, err := tx.QueryContext(ctx, "SELECT id, domain_id, status, issuer, cert_sn, cert_pem, private_key_pem, fingerprint_sha256, key_type, domains, auto_renew, issued_at, expires_at FROM certificates WHERE status = 'ACTIVE'")
 	if err != nil {
 		return nil, fmt.Errorf("reconcile cache query certificates: %w", err)
 	}
@@ -1426,7 +1440,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	}
 
 	// 5. Stage Active Security Policies
-	spRows, err := r.db.QueryContext(ctx, "SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies")
+	spRows, err := tx.QueryContext(ctx, "SELECT id, domain_id, waf_enabled, waf_mode, rate_limit_enabled, rate_limit_rpm, waf_rules_json, rate_limit_rules_json FROM security_policies")
 	if err != nil {
 		return nil, fmt.Errorf("reconcile cache query security policies: %w", err)
 	}
@@ -1453,6 +1467,11 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	}
 	if err := spRows.Err(); err != nil {
 		return nil, fmt.Errorf("reconcile cache iterate security policies: %w", err)
+	}
+
+	// Commit the read-only transaction to close the MVCC snapshot
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("reconcile cache commit tx: %w", err)
 	}
 
 	// =========================================================================
@@ -3061,19 +3080,19 @@ func (r *PostgresRepository) SavePoPSnapshotHead(ctx context.Context, popID stri
 		SET target_version = EXCLUDED.target_version,
 		    target_checksum = EXCLUDED.target_checksum,
 		    updated_at = NOW()
+		WHERE pop_snapshot_heads.target_version <= EXCLUDED.target_version
 	`
-	_, err := r.db.ExecContext(ctx, query, popID, targetVersion, targetChecksum)
+	res, err := r.db.ExecContext(ctx, query, popID, targetVersion, targetChecksum)
 	if err != nil {
 		return fmt.Errorf("save pop snapshot head: %w", err)
 	}
-	_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
+	if rows, _ := res.RowsAffected(); rows > 0 {
+		_ = r.cache.SavePoPSnapshotHead(ctx, popID, targetVersion, targetChecksum)
+	}
 	return nil
 }
 
 func (r *PostgresRepository) GetPoPSnapshotHead(ctx context.Context, popID string) (int64, string, time.Time, error) {
-	if v, c, t, err := r.cache.GetPoPSnapshotHead(ctx, popID); err == nil && v > 0 {
-		return v, c, t, nil
-	}
 	query := `SELECT target_version, target_checksum, updated_at FROM pop_snapshot_heads WHERE pop_id = $1`
 	var targetVersion int64
 	var targetChecksum string

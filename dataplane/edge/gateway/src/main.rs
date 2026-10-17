@@ -244,10 +244,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
+        let ack_spool_path = std::env::var("NEXUSEDGE_ACK_SPOOL_PATH")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(format!("{}.ack.json", autonomous_snapshot_path))
+            });
+
         let ack_manager = Arc::new(GatewayAckManager::new(
             cp_cfg.endpoint.clone(),
             cp_cfg.auth_token.clone(),
             sync_client.clone(),
+            Some(ack_spool_path),
         ));
         Arc::clone(&ack_manager).spawn_worker();
 

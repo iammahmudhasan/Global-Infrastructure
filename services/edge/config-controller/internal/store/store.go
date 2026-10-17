@@ -1928,6 +1928,9 @@ func (s *Store) SavePoPSnapshotHead(ctx context.Context, popID string, targetVer
 		s.popSnapshotChecksums = make(map[string]string)
 		s.popSnapshotTimes = make(map[string]time.Time)
 	}
+	if existingVer, exists := s.popSnapshotVersions[popID]; exists && existingVer > targetVersion {
+		return nil
+	}
 	s.popSnapshotVersions[popID] = targetVersion
 	s.popSnapshotChecksums[popID] = targetChecksum
 	s.popSnapshotTimes[popID] = time.Now().UTC()
