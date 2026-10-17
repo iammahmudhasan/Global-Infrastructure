@@ -198,6 +198,16 @@ func (l *AuditLogger) LastHash() string {
 	return l.lastHash
 }
 
+// SyncLastHash synchronizes the chain head pointer if a newer authoritative head exists in durable storage.
+func (l *AuditLogger) SyncLastHash(hash string) {
+	if hash == "" {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lastHash = hash
+}
+
 // RollbackLastRecord removes the last appended record if its ID matches, restoring the previous head hash.
 // This prevents divergence between persistent database storage and in-memory cryptographic state on storage failure.
 // Returns true if the record was successfully popped from the tail of the in-memory chain; false otherwise.

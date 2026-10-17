@@ -1363,6 +1363,14 @@ func (s *Store) SaveAuditLog(log *model.AuditLog) error {
 		return errors.New("audit log is nil")
 	}
 	clone := *log
+	if existing, exists := s.auditLogMap[clone.ID]; exists {
+		if existing.Hash == clone.Hash {
+			// Idempotent duplicate replay: event already recorded with identical hash
+			return nil
+		}
+		return fmt.Errorf("audit log conflict: ID %s exists with different hash", clone.ID)
+	}
+
 	s.auditLogs = append(s.auditLogs, &clone)
 	s.auditLogMap[clone.ID] = &clone
 	return nil

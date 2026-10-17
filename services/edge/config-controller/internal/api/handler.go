@@ -618,6 +618,10 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 		}
 	}
 
+	if head := h.store.GetLastAuditHash(); head != "" {
+		h.auditLogger.SyncLastHash(head)
+	}
+
 	rec, err := h.auditLogger.Record(actor, orgID, projectID, action, resourceType, resourceID, clientIP, details)
 	if err != nil {
 		log.Printf("[AUDIT ERROR] failed to record audit event: %v", err)

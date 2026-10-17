@@ -143,15 +143,23 @@ func (r *PostgresRepository) Close() error {
 }
 
 func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
-	// Serialize schema migrations across concurrent replicas using PostgreSQL session advisory lock
-	const migrationAdvisoryLockID = 74291048201
-	_, _ = r.db.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID)
+	// Serialize schema migrations across concurrent replicas using a dedicated connection with session advisory lock
+	conn, err := r.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire dedicated migration connection: %w", err)
+	}
+	defer conn.Close()
+
+	const migrationAdvisoryLockID int64 = 74291048201
+	if _, err := conn.ExecContext(ctx, "SELECT pg_advisory_lock($1)", migrationAdvisoryLockID); err != nil {
+		return fmt.Errorf("acquire migration advisory lock: %w", err)
+	}
 	defer func() {
-		_, _ = r.db.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
+		_, _ = conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", migrationAdvisoryLockID)
 	}()
 
 	// 0. Ensure schema_migrations table exists for versioned tracking
-	_, err := r.db.ExecContext(ctx, `
+	_, err = conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version VARCHAR(64) PRIMARY KEY,
 			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -392,11 +400,28 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`ALTER TABLE domains ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;`,
 			},
 		},
+		{
+			version: "0006_outbox_lease_and_audit_head",
+			stmts: []string{
+				`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS locked_by VARCHAR(128) NOT NULL DEFAULT '';`,
+				`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ;`,
+				`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '';`,
+				`CREATE INDEX IF NOT EXISTS idx_outbox_lease ON outbox_events(status, locked_until);`,
+				`CREATE TABLE IF NOT EXISTS audit_chain_head (
+					id INT PRIMARY KEY DEFAULT 1,
+					last_hash VARCHAR(128) NOT NULL,
+					updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+				);`,
+				`CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_logs_unique_prev_hash
+				 ON audit_logs(prev_hash)
+				 WHERE prev_hash != '' AND prev_hash != '0000000000000000000000000000000000000000000000000000000000000000';`,
+			},
+		},
 	}
 
 	for _, m := range migrations {
 		var exists bool
-		err := r.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)", m.version).Scan(&exists)
+		err := conn.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)", m.version).Scan(&exists)
 		if err != nil {
 			return fmt.Errorf("check migration version %s: %w", m.version, err)
 		}
@@ -404,7 +429,7 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 			continue
 		}
 
-		tx, err := r.db.BeginTx(ctx, nil)
+		tx, err := conn.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin tx for migration %s: %w", m.version, err)
 		}
@@ -958,10 +983,59 @@ func (r *PostgresRepository) getDomainByHostFromDB(hostname string) (*model.Doma
 }
 
 func (r *PostgresRepository) ListDomainsByProject(projectID string) []*model.Domain {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains WHERE project_id = $1 ORDER BY created_at ASC",
+		projectID,
+	)
+	if err != nil {
+		return r.cache.ListDomainsByProject(projectID)
+	}
+	defer rows.Close()
+
+	var domains []*model.Domain
+	for rows.Next() {
+		var d model.Domain
+		var pops pq.StringArray
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt); err == nil {
+			d.AllowedPoPs = []string(pops)
+			domains = append(domains, &d)
+			_ = r.cache.SaveDomain(&d)
+		}
+	}
+	if len(domains) > 0 {
+		return domains
+	}
 	return r.cache.ListDomainsByProject(projectID)
 }
 
 func (r *PostgresRepository) ListDomains() []*model.Domain {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	rows, err := r.db.QueryContext(ctx,
+		"SELECT id, project_id, hostname, status, onboarding_type, cname_target, allowed_pops, created_at, updated_at FROM domains ORDER BY created_at ASC",
+	)
+	if err != nil {
+		return r.cache.ListDomains()
+	}
+	defer rows.Close()
+
+	var domains []*model.Domain
+	for rows.Next() {
+		var d model.Domain
+		var pops pq.StringArray
+		if err := rows.Scan(&d.ID, &d.ProjectID, &d.Hostname, &d.Status, &d.OnboardingType, &d.CNAMETarget, &pops, &d.CreatedAt, &d.UpdatedAt); err == nil {
+			d.AllowedPoPs = []string(pops)
+			domains = append(domains, &d)
+			_ = r.cache.SaveDomain(&d)
+		}
+	}
+	if len(domains) > 0 {
+		return domains
+	}
 	return r.cache.ListDomains()
 }
 
@@ -1707,27 +1781,72 @@ func (r *PostgresRepository) SaveAuditLog(log *model.AuditLog) error {
 		return errors.New("audit log cannot be nil")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	detailsJSON, err := json.Marshal(log.Details)
 	if err != nil {
-		detailsJSON = []byte("{}")
+		return fmt.Errorf("marshal audit log details: %w", err)
 	}
 
-	_, err = r.db.ExecContext(ctx, `
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin audit log tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Lock the audit chain serialization head to serialize concurrent append transactions
+	const auditChainLockID int64 = 98234109281
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", auditChainLockID); err != nil {
+		return fmt.Errorf("acquire audit chain lock: %w", err)
+	}
+
+	var insertedID string
+	err = tx.QueryRowContext(ctx, `
 		INSERT INTO audit_logs (
 			id, org_id, project_id, actor, action, resource_type,
 			resource_id, client_ip, details, prev_hash, hash, created_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (id) DO NOTHING
+		RETURNING id
 	`, log.ID, log.OrgID, log.ProjectID, log.Actor, log.Action, log.ResourceType,
-		log.ResourceID, log.ClientIP, detailsJSON, log.PrevHash, log.Hash, log.CreatedAt)
-	if err != nil {
+		log.ResourceID, log.ClientIP, detailsJSON, log.PrevHash, log.Hash, log.CreatedAt).Scan(&insertedID)
+
+	if err != nil && err != sql.ErrNoRows {
 		return fmt.Errorf("persist audit log: %w", err)
 	}
 
-	return r.cache.SaveAuditLog(log)
+	if err == sql.ErrNoRows {
+		// Event with this ID already exists: verify hash for idempotent replay
+		var existingHash string
+		qErr := tx.QueryRowContext(ctx, "SELECT hash FROM audit_logs WHERE id = $1", log.ID).Scan(&existingHash)
+		if qErr != nil {
+			return fmt.Errorf("query existing audit log %s: %w", log.ID, qErr)
+		}
+		if existingHash != log.Hash {
+			return fmt.Errorf("audit log %s conflict: existing record has different hash", log.ID)
+		}
+		_ = tx.Commit()
+		_ = r.cache.SaveAuditLog(log)
+		return nil
+	}
+
+	// Update audit chain head in database
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO audit_chain_head (id, last_hash, updated_at)
+		VALUES (1, $1, NOW())
+		ON CONFLICT (id) DO UPDATE SET last_hash = $1, updated_at = NOW()
+	`, log.Hash)
+	if err != nil {
+		return fmt.Errorf("update audit chain head: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit audit log tx: %w", err)
+	}
+
+	_ = r.cache.SaveAuditLog(log)
+	return nil
 }
 
 func (r *PostgresRepository) ListAuditLogs(projectID string, limit int, offset int) ([]*model.AuditLog, int, error) {
@@ -1739,6 +1858,21 @@ func (r *PostgresRepository) GetAuditLog(id string) (*model.AuditLog, error) {
 }
 
 func (r *PostgresRepository) GetLastAuditHash() string {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var headHash string
+	err := r.db.QueryRowContext(ctx, "SELECT last_hash FROM audit_chain_head WHERE id = 1").Scan(&headHash)
+	if err == nil && headHash != "" {
+		return headHash
+	}
+
+	var latestHash string
+	err = r.db.QueryRowContext(ctx, "SELECT hash FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 1").Scan(&latestHash)
+	if err == nil && latestHash != "" {
+		return latestHash
+	}
+
 	return r.cache.GetLastAuditHash()
 }
 
@@ -1792,11 +1926,78 @@ func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 	return events, nil
 }
 
+// ClaimOutboxEvents claims up to limit unapplied outbox events using PostgreSQL FOR UPDATE SKIP LOCKED
+// with a worker lease. This coordinates multiple concurrent workers with zero contention
+// and provides automatic recovery if a worker crashes before processing.
+func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID string, limit int, leaseDuration time.Duration) ([]*OutboxEvent, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	leaseSeconds := int(leaseDuration.Seconds())
+	if leaseSeconds <= 0 {
+		leaseSeconds = 30
+	}
+
+	query := `
+		UPDATE outbox_events
+		SET status = 'PROCESSING',
+		    locked_by = $1,
+		    locked_until = NOW() + ($2 || ' seconds')::INTERVAL,
+		    retry_count = retry_count + 1
+		WHERE event_id IN (
+			SELECT event_id
+			FROM outbox_events
+			WHERE (status = 'PENDING')
+			   OR (status = 'PROCESSING' AND locked_until < NOW())
+			ORDER BY created_at ASC
+			LIMIT $3
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, created_at, processed_at
+	`
+	rows, err := r.db.QueryContext(ctx, query, workerID, leaseSeconds, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim outbox events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*OutboxEvent
+	for rows.Next() {
+		var ev OutboxEvent
+		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
+			return nil, fmt.Errorf("scan claimed outbox event: %w", err)
+		}
+		events = append(events, &ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimed outbox events: %w", err)
+	}
+	return events, nil
+}
+
+// MarkOutboxEventFailed marks an outbox event as FAILED or DEAD_LETTER after repeated retry exhaustion.
+func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID string, reason string) error {
+	const maxRetries = 5
+	query := `
+		UPDATE outbox_events
+		SET status = CASE WHEN retry_count >= $1 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
+		    error_message = $2,
+		    locked_by = '',
+		    locked_until = NULL
+		WHERE event_id = $3
+	`
+	_, err := r.db.ExecContext(ctx, query, maxRetries, reason, eventID)
+	if err != nil {
+		return fmt.Errorf("mark outbox event failed: %w", err)
+	}
+	return nil
+}
+
 // MarkOutboxEventProcessed marks an outbox event as PROCESSED.
 func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, eventID string) error {
 	now := time.Now().UTC()
 	_, err := r.db.ExecContext(ctx,
-		"UPDATE outbox_events SET status = 'PROCESSED', processed_at = $1 WHERE event_id = $2",
+		"UPDATE outbox_events SET status = 'PROCESSED', processed_at = $1, locked_by = '', locked_until = NULL WHERE event_id = $2",
 		now, eventID,
 	)
 	if err != nil {

@@ -578,3 +578,82 @@ func TestStore_AIProviderCRUDAndValidation(t *testing.T) {
 		t.Fatal("expected ErrNotFound after deletion")
 	}
 }
+
+func TestStore_SaveAuditLog_IdempotentReplay(t *testing.T) {
+	st := store.NewStore()
+
+	log := &model.AuditLog{
+		ID:           "aud-001",
+		OrgID:        "org-test",
+		ProjectID:    "prj-test",
+		Actor:        "user-admin",
+		Action:       "domain.create",
+		ResourceType: "domain",
+		ResourceID:   "dom-123",
+		ClientIP:     "192.168.1.1",
+		PrevHash:     "0000000000000000000000000000000000000000000000000000000000000000",
+		Hash:         "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	// 1. Initial save
+	if err := st.SaveAuditLog(log); err != nil {
+		t.Fatalf("failed to save audit log: %v", err)
+	}
+
+	// 2. Replay with identical hash -> MUST succeed idempotently
+	if err := st.SaveAuditLog(log); err != nil {
+		t.Fatalf("idempotent replay failed: %v", err)
+	}
+
+	// 3. Verify that duplicate was NOT appended to slice
+	logs, total, err := st.ListAuditLogs("prj-test", 10, 0)
+	if err != nil {
+		t.Fatalf("failed to list audit logs: %v", err)
+	}
+	if total != 1 || len(logs) != 1 {
+		t.Fatalf("expected exactly 1 audit log after replay, got %d (total: %d)", len(logs), total)
+	}
+	if logs[0].Hash != log.Hash {
+		t.Fatalf("expected hash %s, got %s", log.Hash, logs[0].Hash)
+	}
+}
+
+func TestStore_SaveAuditLog_ConflictDetection(t *testing.T) {
+	st := store.NewStore()
+
+	log1 := &model.AuditLog{
+		ID:        "aud-conf-1",
+		ProjectID: "prj-test",
+		Actor:     "user-1",
+		Action:    "domain.create",
+		Hash:      "hash-111",
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := st.SaveAuditLog(log1); err != nil {
+		t.Fatalf("failed to save initial audit log: %v", err)
+	}
+
+	// Conflict: Same ID but different hash
+	log2 := &model.AuditLog{
+		ID:        "aud-conf-1",
+		ProjectID: "prj-test",
+		Actor:     "user-malicious",
+		Action:    "domain.tamper",
+		Hash:      "hash-tampered-222",
+		CreatedAt: time.Now().UTC(),
+	}
+	err := st.SaveAuditLog(log2)
+	if err == nil {
+		t.Fatal("expected conflict error for duplicate ID with different hash, got nil")
+	}
+
+	// Verify original entry was preserved
+	got, err := st.GetAuditLog("aud-conf-1")
+	if err != nil {
+		t.Fatalf("failed to retrieve original log: %v", err)
+	}
+	if got.Hash != "hash-111" {
+		t.Fatalf("original log was corrupted: expected hash-111, got %s", got.Hash)
+	}
+}
