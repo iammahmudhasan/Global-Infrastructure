@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -146,6 +148,11 @@ func NewPostgresRepositoryFromDB(db *sql.DB) (*PostgresRepository, error) {
 // Close closes the underlying database pool.
 func (r *PostgresRepository) Close() error {
 	return r.db.Close()
+}
+
+// DB returns the underlying *sql.DB instance (primarily for tests and health verification).
+func (r *PostgresRepository) DB() *sql.DB {
+	return r.db
 }
 
 func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
@@ -421,6 +428,17 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				`CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_logs_unique_prev_hash
 				 ON audit_logs(prev_hash)
 				 WHERE prev_hash != '' AND prev_hash != '0000000000000000000000000000000000000000000000000000000000000000';`,
+			},
+		},
+		{
+			version: "0007_outbox_lease_token_and_audit_sequence",
+			stmts: []string{
+				`ALTER TABLE outbox_events ADD COLUMN IF NOT EXISTS lease_token VARCHAR(64) NOT NULL DEFAULT '';`,
+				`CREATE INDEX IF NOT EXISTS idx_outbox_lease_token ON outbox_events(event_id, lease_token);`,
+				`INSERT INTO audit_chain_head (id, last_hash, updated_at)
+				 VALUES (1, '0000000000000000000000000000000000000000000000000000000000000000', NOW())
+				 ON CONFLICT (id) DO NOTHING;`,
+				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS sequence_num BIGSERIAL;`,
 			},
 		},
 	}
@@ -1827,43 +1845,47 @@ func (r *PostgresRepository) SaveAuditLog(log *model.AuditLog) error {
 		return fmt.Errorf("query existing audit log %s: %w", log.ID, err)
 	}
 
-	// 2. Read authoritative chain head from database
+	// 2. Read authoritative chain head from database under advisory lock
 	var currentHead string
 	headErr := tx.QueryRowContext(ctx, "SELECT last_hash FROM audit_chain_head WHERE id = 1 FOR UPDATE").Scan(&currentHead)
-	if headErr == sql.ErrNoRows || headErr != nil || currentHead == "" {
-		var latestHash string
-		qErr := tx.QueryRowContext(ctx, "SELECT hash FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE").Scan(&latestHash)
-		if qErr == nil && latestHash != "" {
-			currentHead = latestHash
-		} else {
+	if headErr != nil {
+		if headErr == sql.ErrNoRows {
+			// Seed row id=1 with GenesisHash if table was uninitialized
 			currentHead = security.GenesisHash
+			_, insErr := tx.ExecContext(ctx, "INSERT INTO audit_chain_head (id, last_hash, updated_at) VALUES (1, $1, NOW()) ON CONFLICT (id) DO NOTHING", currentHead)
+			if insErr != nil {
+				return fmt.Errorf("initialize audit chain head: %w", insErr)
+			}
+		} else {
+			return fmt.Errorf("read authoritative audit chain head under advisory lock: %w", headErr)
 		}
 	}
 
 	// 3. Atomically re-link prev_hash and re-compute canonical HMAC hash if another replica advanced head
 	if log.PrevHash != currentHead {
-		log.PrevHash = currentHead
-		if len(r.auditHMACKey) > 0 {
-			tsStr := log.CreatedAt.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
-			newHash, hashErr := security.ComputeCanonicalPayloadHash(
-				r.auditHMACKey,
-				log.ID,
-				tsStr,
-				log.Actor,
-				log.OrgID,
-				log.ProjectID,
-				log.Action,
-				log.ResourceType,
-				log.ResourceID,
-				log.ClientIP,
-				log.Details,
-				log.PrevHash,
-			)
-			if hashErr != nil {
-				return fmt.Errorf("recompute canonical hash for audit log %s: %w", log.ID, hashErr)
-			}
-			log.Hash = newHash
+		if len(r.auditHMACKey) == 0 {
+			return errors.New("audit log re-linking required due to concurrent head advancement but auditHMACKey is not configured: failing closed to prevent chain corruption")
 		}
+		log.PrevHash = currentHead
+		tsStr := log.CreatedAt.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
+		newHash, hashErr := security.ComputeCanonicalPayloadHash(
+			r.auditHMACKey,
+			log.ID,
+			tsStr,
+			log.Actor,
+			log.OrgID,
+			log.ProjectID,
+			log.Action,
+			log.ResourceType,
+			log.ResourceID,
+			log.ClientIP,
+			log.Details,
+			log.PrevHash,
+		)
+		if hashErr != nil {
+			return fmt.Errorf("recompute canonical hash for audit log %s: %w", log.ID, hashErr)
+		}
+		log.Hash = newHash
 	}
 
 	// 4. Insert row into audit_logs
@@ -1919,7 +1941,7 @@ func (r *PostgresRepository) ListAuditLogs(projectID string, limit int, offset i
 			       COALESCE(prev_hash, ''), COALESCE(hash, ''), created_at
 			FROM audit_logs
 			WHERE project_id = $1
-			ORDER BY created_at DESC, id DESC
+			ORDER BY sequence_num DESC, created_at DESC, id DESC
 			LIMIT $2 OFFSET $3
 		`
 		selectArgs = []interface{}{projectID, limit, offset}
@@ -1931,7 +1953,7 @@ func (r *PostgresRepository) ListAuditLogs(projectID string, limit int, offset i
 			       resource_type, resource_id, COALESCE(client_ip, ''), details,
 			       COALESCE(prev_hash, ''), COALESCE(hash, ''), created_at
 			FROM audit_logs
-			ORDER BY created_at DESC, id DESC
+			ORDER BY sequence_num DESC, created_at DESC, id DESC
 			LIMIT $1 OFFSET $2
 		`
 		selectArgs = []interface{}{limit, offset}
@@ -1939,12 +1961,12 @@ func (r *PostgresRepository) ListAuditLogs(projectID string, limit int, offset i
 
 	var total int
 	if err := r.db.QueryRowContext(ctx, countQuery, countArgs...).Scan(&total); err != nil {
-		return r.cache.ListAuditLogs(projectID, limit, offset)
+		return nil, 0, fmt.Errorf("count audit logs: %w", err)
 	}
 
 	rows, err := r.db.QueryContext(ctx, selectQuery, selectArgs...)
 	if err != nil {
-		return r.cache.ListAuditLogs(projectID, limit, offset)
+		return nil, 0, fmt.Errorf("query audit logs: %w", err)
 	}
 	defer rows.Close()
 
@@ -1996,7 +2018,7 @@ func (r *PostgresRepository) GetAuditLog(id string) (*model.AuditLog, error) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return r.cache.GetAuditLog(id)
+		return nil, fmt.Errorf("query audit log %s: %w", id, err)
 	}
 	if len(detailsJSON) > 0 {
 		if err := json.Unmarshal(detailsJSON, &l.Details); err != nil {
@@ -2018,7 +2040,7 @@ func (r *PostgresRepository) GetLastAuditHash() string {
 	}
 
 	var latestHash string
-	err = r.db.QueryRowContext(ctx, "SELECT hash FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT 1").Scan(&latestHash)
+	err = r.db.QueryRowContext(ctx, "SELECT hash FROM audit_logs ORDER BY sequence_num DESC, created_at DESC, id DESC LIMIT 1").Scan(&latestHash)
 	if err == nil && latestHash != "" {
 		return latestHash
 	}
@@ -2040,6 +2062,7 @@ type OutboxEvent struct {
 	Payload       []byte     `json:"payload"`
 	Status        string     `json:"status"`
 	RetryCount    int        `json:"retry_count"`
+	LeaseToken    string     `json:"lease_token,omitempty"`
 	CreatedAt     time.Time  `json:"created_at"`
 	ProcessedAt   *time.Time `json:"processed_at,omitempty"`
 }
@@ -2050,7 +2073,7 @@ func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 		limit = 100
 	}
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, created_at, processed_at
+		`SELECT event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, COALESCE(lease_token, ''), created_at, processed_at
 		 FROM outbox_events
 		 WHERE status = 'PENDING'
 		 ORDER BY created_at ASC
@@ -2065,7 +2088,7 @@ func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 	var events []*OutboxEvent
 	for rows.Next() {
 		var ev OutboxEvent
-		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
+		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.LeaseToken, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
 			return nil, fmt.Errorf("scan outbox event: %w", err)
 		}
 		events = append(events, &ev)
@@ -2077,9 +2100,12 @@ func (r *PostgresRepository) GetPendingOutboxEvents(ctx context.Context, limit i
 }
 
 // ClaimOutboxEvents claims up to limit unapplied outbox events using PostgreSQL FOR UPDATE SKIP LOCKED
-// with a worker lease. This coordinates multiple concurrent workers with zero contention
-// and provides automatic recovery if a worker crashes before processing.
+// with a worker lease and a cryptographic lease token. This coordinates multiple concurrent workers
+// with zero contention and provides lease-fenced safety against stale acknowledgements.
 func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID string, limit int, leaseDuration time.Duration) ([]*OutboxEvent, error) {
+	if strings.TrimSpace(workerID) == "" {
+		return nil, errors.New("workerID is required to claim outbox events")
+	}
 	if limit <= 0 {
 		limit = 100
 	}
@@ -2088,11 +2114,18 @@ func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID str
 		leaseSeconds = 30
 	}
 
+	tokenBytes := make([]byte, 16)
+	if _, err := cryptorand.Read(tokenBytes); err != nil {
+		return nil, fmt.Errorf("generate outbox lease token: %w", err)
+	}
+	leaseToken := fmt.Sprintf("lease-%d-%s", time.Now().UnixNano(), hex.EncodeToString(tokenBytes))
+
 	query := `
 		UPDATE outbox_events
 		SET status = 'PROCESSING',
 		    locked_by = $1,
-		    locked_until = NOW() + ($2 || ' seconds')::INTERVAL,
+		    lease_token = $2,
+		    locked_until = NOW() + ($3 || ' seconds')::INTERVAL,
 		    retry_count = retry_count + 1
 		WHERE event_id IN (
 			SELECT event_id
@@ -2100,12 +2133,12 @@ func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID str
 			WHERE (status = 'PENDING')
 			   OR (status = 'PROCESSING' AND locked_until < NOW())
 			ORDER BY created_at ASC
-			LIMIT $3
+			LIMIT $4
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, created_at, processed_at
+		RETURNING event_id, aggregate_type, aggregate_id, event_type, payload, status, retry_count, lease_token, created_at, processed_at
 	`
-	rows, err := r.db.QueryContext(ctx, query, workerID, leaseSeconds, limit)
+	rows, err := r.db.QueryContext(ctx, query, workerID, leaseToken, leaseSeconds, limit)
 	if err != nil {
 		return nil, fmt.Errorf("claim outbox events: %w", err)
 	}
@@ -2114,7 +2147,7 @@ func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID str
 	var events []*OutboxEvent
 	for rows.Next() {
 		var ev OutboxEvent
-		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
+		if err := rows.Scan(&ev.EventID, &ev.AggregateType, &ev.AggregateID, &ev.EventType, &ev.Payload, &ev.Status, &ev.RetryCount, &ev.LeaseToken, &ev.CreatedAt, &ev.ProcessedAt); err != nil {
 			return nil, fmt.Errorf("scan claimed outbox event: %w", err)
 		}
 		events = append(events, &ev)
@@ -2128,10 +2161,13 @@ func (r *PostgresRepository) ClaimOutboxEvents(ctx context.Context, workerID str
 var ErrOutboxLeaseLost = errors.New("outbox event lease lost or claimed by another worker")
 
 // MarkOutboxEventFailed marks an outbox event as FAILED or DEAD_LETTER after repeated retry exhaustion,
-// fenced by worker lease ownership to prevent stale workers from overwriting active events.
-func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID string, workerID string, reason string) error {
+// fenced by worker lease ownership AND lease token to prevent stale workers from overwriting active events.
+func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID string, workerID string, leaseToken string, reason string) error {
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("workerID is required for outbox lease fencing")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errors.New("leaseToken is required for outbox lease fencing")
 	}
 	const maxRetries = 5
 	query := `
@@ -2139,12 +2175,14 @@ func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID 
 		SET status = CASE WHEN retry_count >= $1 THEN 'DEAD_LETTER' ELSE 'PENDING' END,
 		    error_message = $2,
 		    locked_by = '',
+		    lease_token = '',
 		    locked_until = NULL
 		WHERE event_id = $3
 		  AND locked_by = $4
+		  AND lease_token = $5
 		  AND locked_until >= NOW()
 	`
-	res, err := r.db.ExecContext(ctx, query, maxRetries, reason, eventID, workerID)
+	res, err := r.db.ExecContext(ctx, query, maxRetries, reason, eventID, workerID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark outbox event failed: %w", err)
 	}
@@ -2159,10 +2197,13 @@ func (r *PostgresRepository) MarkOutboxEventFailed(ctx context.Context, eventID 
 }
 
 // MarkOutboxEventProcessed marks an outbox event as PROCESSED,
-// fenced by worker lease ownership to prevent stale workers from overwriting active events.
-func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, eventID string, workerID string) error {
+// fenced by worker lease ownership AND lease token to prevent stale workers from overwriting active events.
+func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, eventID string, workerID string, leaseToken string) error {
 	if strings.TrimSpace(workerID) == "" {
 		return errors.New("workerID is required for outbox lease fencing")
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return errors.New("leaseToken is required for outbox lease fencing")
 	}
 	now := time.Now().UTC()
 	query := `
@@ -2170,12 +2211,14 @@ func (r *PostgresRepository) MarkOutboxEventProcessed(ctx context.Context, event
 		SET status = 'PROCESSED',
 		    processed_at = $1,
 		    locked_by = '',
+		    lease_token = '',
 		    locked_until = NULL
 		WHERE event_id = $2
 		  AND locked_by = $3
+		  AND lease_token = $4
 		  AND locked_until >= NOW()
 	`
-	res, err := r.db.ExecContext(ctx, query, now, eventID, workerID)
+	res, err := r.db.ExecContext(ctx, query, now, eventID, workerID, leaseToken)
 	if err != nil {
 		return fmt.Errorf("mark outbox event processed: %w", err)
 	}

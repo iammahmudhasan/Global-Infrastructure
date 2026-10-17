@@ -74,6 +74,7 @@ type APIHandler struct {
 	universalScheduler *scheduler.UniversalScheduler
 	storageManager     *storage.Manager
 	cableManager       *cable.Manager
+	auditKey           []byte
 }
 
 func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compiler.Compiler) *APIHandler {
@@ -81,13 +82,21 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	mux := http.NewServeMux()
 
 	auditKeyStr := os.Getenv("AUDIT_HMAC_KEY")
+	var auditKey []byte
 	if len(auditKeyStr) == 0 {
 		if !onboarding.IsExplicitDevEnvironment() {
-			panic("FATAL: AUDIT_HMAC_KEY environment variable is required in production mode for cryptographic audit logging")
+			panic("FATAL: AUDIT_HMAC_KEY environment variable is strictly required in production mode for cryptographic audit logging")
 		}
-		auditKeyStr = "nexusedge-immutable-audit-key-2026"
+		// In dev/test mode without an explicit AUDIT_HMAC_KEY, generate an ephemeral random 256-bit key at startup.
+		// Hardcoded static fallback keys in source code are strictly forbidden (Rule 18 / P1 Finding).
+		randKey := make([]byte, 32)
+		if _, err := rand.Read(randKey); err != nil {
+			panic(fmt.Sprintf("failed to generate ephemeral dev audit key: %v", err))
+		}
+		auditKey = randKey
+	} else {
+		auditKey = []byte(auditKeyStr)
 	}
-	auditKey := []byte(auditKeyStr)
 	if pgRepo, ok := s.(*store.PostgresRepository); ok {
 		pgRepo.SetAuditHMACKey(auditKey)
 	}
@@ -182,6 +191,7 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		universalScheduler: scheduler.NewUniversalScheduler(nil),
 		storageManager:     storage.NewManager(),
 		cableManager:       cable.NewManager(),
+		auditKey:           auditKey,
 	}
 	h.registerRoutes()
 	return h
@@ -621,50 +631,60 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 		}
 	}
 
-	if head := h.store.GetLastAuditHash(); head != "" {
-		h.auditLogger.SyncLastHash(head)
+	idBytes := make([]byte, 16)
+	if _, err := rand.Read(idBytes); err != nil {
+		return fmt.Errorf("generate audit id: %w", err)
 	}
+	recordID := fmt.Sprintf("aud-%x", idBytes)
+	now := time.Now().UTC()
+	tsStr := now.Truncate(time.Microsecond).Format(time.RFC3339Nano)
 
-	rec, err := h.auditLogger.Record(actor, orgID, projectID, action, resourceType, resourceID, clientIP, details)
+	head := h.store.GetLastAuditHash()
+	initialHash, err := security.ComputeCanonicalPayloadHash(
+		h.auditKey, recordID, tsStr, actor, orgID, projectID,
+		action, resourceType, resourceID, clientIP, details, head,
+	)
 	if err != nil {
-		log.Printf("[AUDIT ERROR] failed to record audit event: %v", err)
-		return err
-	}
-
-	t, parseErr := time.Parse(time.RFC3339Nano, rec.Timestamp)
-	if parseErr != nil {
-		t = time.Now().UTC()
+		return fmt.Errorf("compute initial audit hash: %w", err)
 	}
 
 	auditLog := &model.AuditLog{
-		ID:           rec.ID,
-		OrgID:        rec.OrgID,
-		ProjectID:    rec.ProjectID,
-		Actor:        rec.ActorID,
-		Action:       rec.Action,
-		ResourceType: rec.ResourceType,
-		ResourceID:   rec.ResourceID,
-		ClientIP:     rec.ClientIP,
-		Details:      rec.Details,
-		PrevHash:     rec.PrevHash,
-		Hash:         rec.Hash,
-		CreatedAt:    t,
+		ID:           recordID,
+		OrgID:        orgID,
+		ProjectID:    projectID,
+		Actor:        actor,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		ClientIP:     clientIP,
+		Details:      details,
+		PrevHash:     head,
+		Hash:         initialHash,
+		CreatedAt:    now,
 	}
 
 	if err := h.store.SaveAuditLog(auditLog); err != nil {
-		if rolledBack := h.auditLogger.RollbackLastRecord(rec.ID); !rolledBack {
-			h.auditChainValid = false
-			h.auditChainErr = fmt.Errorf("audit log database save failed and in-memory rollback failed for record %s: %w", rec.ID, err)
-			log.Printf("[CRITICAL AUDIT ERROR] in-memory audit chain corrupted, chain invalidated: %v", h.auditChainErr)
-		} else {
-			log.Printf("[AUDIT ERROR] failed to persist audit log %s, rolled back in-memory chain: %v", auditLog.ID, err)
-		}
+		log.Printf("[AUDIT ERROR] failed to persist audit log %s: %v", auditLog.ID, err)
 		return err
 	}
 
-	// If persistent store re-linked the record to a newly committed durable head, synchronize in-memory logger
-	if auditLog.Hash != rec.Hash {
-		h.auditLogger.UpdateLastRecord(rec.ID, auditLog.PrevHash, auditLog.Hash)
+	// Persistent store is the single authoritative source of truth:
+	// Append only authoritatively committed records in exact serialized commit order
+	if h.auditLogger != nil {
+		h.auditLogger.AppendCommittedRecord(&security.AuditRecord{
+			ID:           auditLog.ID,
+			Timestamp:    tsStr,
+			ActorID:      auditLog.Actor,
+			OrgID:        auditLog.OrgID,
+			ProjectID:    auditLog.ProjectID,
+			Action:       auditLog.Action,
+			ResourceType: auditLog.ResourceType,
+			ResourceID:   auditLog.ResourceID,
+			ClientIP:     auditLog.ClientIP,
+			Details:      auditLog.Details,
+			PrevHash:     auditLog.PrevHash,
+			Hash:         auditLog.Hash,
+		})
 	}
 
 	return nil

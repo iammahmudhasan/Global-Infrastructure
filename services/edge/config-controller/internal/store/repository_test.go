@@ -544,9 +544,34 @@ func TestPostgresRepository_AuditPersistenceAndFencing(t *testing.T) {
 		t.Fatalf("expected log2 to be atomically re-linked to prevHash %s, got %s", log1.Hash, log2.PrevHash)
 	}
 
+	// 4. Missing HMAC key when re-linking is required: must fail closed immediately (P1 Finding A)
+	repoNoKey, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository without HMAC key: %v", err)
+	}
+	defer repoNoKey.Close()
+
+	staleLogNoKey := &model.AuditLog{
+		ID:           fmt.Sprintf("aud-fail-key-%d", time.Now().UnixNano()),
+		OrgID:        "org-1",
+		ProjectID:    "prj-audit-test",
+		Actor:        "admin",
+		Action:       "domain.delete",
+		ResourceType: "domain",
+		ResourceID:   "dom-1",
+		ClientIP:     "127.0.0.1",
+		Details:      map[string]interface{}{"note": "fail-key"},
+		PrevHash:     "stale-head-requiring-relink",
+		Hash:         "placeholder-hash",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := repoNoKey.SaveAuditLog(staleLogNoKey); err == nil {
+		t.Fatalf("expected SaveAuditLog to fail closed when re-linking without HMAC key, got nil")
+	}
+
 	_ = repo1.Close()
 
-	// 4. Restart recovery and durable reads
+	// 5. Restart recovery and durable reads
 	repo2, err := store.NewPostgresRepository(dbURL)
 	if err != nil {
 		t.Fatalf("failed to restart repository: %v", err)
@@ -570,14 +595,14 @@ func TestPostgresRepository_AuditPersistenceAndFencing(t *testing.T) {
 		t.Fatalf("expected at least 2 audit logs, got total=%d len=%d", total, len(logs))
 	}
 
-	// 5. Authoritative empty query results
+	// 6. Authoritative empty query results
 	emptyDomains := repo2.ListDomainsByProject("non-existent-project-404")
 	if len(emptyDomains) != 0 {
 		t.Fatalf("expected empty slice for non-existent project, got %d domains", len(emptyDomains))
 	}
 
-	// 6. Outbox lease fencing
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// 7. Outbox lease fencing with cryptographically unique lease token (P1 Finding)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	claimedEvents, err := repo2.ClaimOutboxEvents(ctx, "worker-primary", 5, 30*time.Second)
@@ -586,13 +611,52 @@ func TestPostgresRepository_AuditPersistenceAndFencing(t *testing.T) {
 	}
 	if len(claimedEvents) > 0 {
 		ev := claimedEvents[0]
-		// Stale worker attempt must fail with ErrOutboxLeaseLost
-		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-stale"); err != store.ErrOutboxLeaseLost {
+		if ev.LeaseToken == "" {
+			t.Fatalf("expected claimed event to have non-empty LeaseToken")
+		}
+
+		// A. Wrong worker attempt must fail with ErrOutboxLeaseLost
+		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-stale", ev.LeaseToken); err != store.ErrOutboxLeaseLost {
 			t.Fatalf("expected ErrOutboxLeaseLost for wrong worker, got %v", err)
 		}
-		// Authorized lease holder must succeed
-		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-primary"); err != nil {
-			t.Fatalf("authorized worker failed to mark processed: %v", err)
+
+		// B. Stale lease token attempt (even with same workerID) must fail with ErrOutboxLeaseLost
+		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-primary", "lease-stale-invalid-token"); err != store.ErrOutboxLeaseLost {
+			t.Fatalf("expected ErrOutboxLeaseLost for stale lease token, got %v", err)
 		}
+
+		// C. Re-claim scenario: if lease expires or is reclaimed with a new lease token, the old lease token is rejected
+		_, _ = repo2.DB().ExecContext(ctx, "UPDATE outbox_events SET status = 'PENDING', locked_until = NOW() - INTERVAL '1 second' WHERE event_id = $1", ev.EventID)
+		reclaimedEvents, err := repo2.ClaimOutboxEvents(ctx, "worker-primary", 1, 30*time.Second)
+		if err != nil {
+			t.Fatalf("failed to reclaim outbox event: %v", err)
+		}
+		if len(reclaimedEvents) > 0 {
+			newEv := reclaimedEvents[0]
+			if newEv.LeaseToken == ev.LeaseToken {
+				t.Fatalf("expected new claim to generate distinct lease token, got duplicate: %s", newEv.LeaseToken)
+			}
+			// Stale ack using previous token must fail even though workerID is identical ("worker-primary")
+			if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-primary", ev.LeaseToken); err != store.ErrOutboxLeaseLost {
+				t.Fatalf("expected stale lease token from previous claim to be rejected with ErrOutboxLeaseLost, got %v", err)
+			}
+			// Authorized worker with current lease token must succeed
+			if err := repo2.MarkOutboxEventProcessed(ctx, newEv.EventID, "worker-primary", newEv.LeaseToken); err != nil {
+				t.Fatalf("authorized worker with new lease token failed to mark processed: %v", err)
+			}
+		}
+	}
+
+	// 8. Audit DB outage semantics: queries must fail closed and return error (never silent cache fallback)
+	closedRepo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to open repo for outage test: %v", err)
+	}
+	_ = closedRepo.Close() // simulate DB outage
+	if _, _, err := closedRepo.ListAuditLogs("", 10, 0); err == nil {
+		t.Fatalf("expected ListAuditLogs to return error on database outage, got nil")
+	}
+	if _, err := closedRepo.GetAuditLog(testID); err == nil {
+		t.Fatalf("expected GetAuditLog to return error on database outage, got nil")
 	}
 }

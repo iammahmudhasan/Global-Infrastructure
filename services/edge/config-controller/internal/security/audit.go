@@ -247,3 +247,14 @@ func (l *AuditLogger) UpdateLastRecord(recordID, newPrevHash, newHash string) bo
 	l.lastHash = newHash
 	return true
 }
+
+// AppendCommittedRecord appends an authoritatively committed audit record to the in-memory projection.
+func (l *AuditLogger) AppendCommittedRecord(r *AuditRecord) {
+	if r == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.records = append(l.records, r)
+	l.lastHash = r.Hash
+}
