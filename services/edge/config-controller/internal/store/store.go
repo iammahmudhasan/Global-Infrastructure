@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,13 @@ import (
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 )
+
+// generateOutboxEventID generates a bounded, unique event ID (under 45 chars) to prevent
+// database column truncation errors across variable-length tenant and entity identifiers.
+func generateOutboxEventID(prefix, aggregateID string) string {
+	h := sha256.Sum256([]byte(fmt.Sprintf("%s:%d", aggregateID, time.Now().UnixNano())))
+	return fmt.Sprintf("evt-%s-%d-%s", prefix, time.Now().UnixNano(), hex.EncodeToString(h[:6]))
+}
 
 const (
 	MaxOriginsPerPool           = 256
@@ -211,7 +219,7 @@ func (s *Store) SaveDomain(d *model.Domain) error {
 		s.projectDomainCount[d.ProjectID]++
 	}
 
-	eventID := fmt.Sprintf("evt-cfg-%d-%s", time.Now().UnixNano(), d.ID)
+	eventID := generateOutboxEventID("cfg", d.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id":    d.ID,
 		"project_id":   d.ProjectID,
@@ -412,7 +420,7 @@ func (s *Store) UpdateDomainStatus(id string, status model.DomainStatus) error {
 	}
 	d.Status = status
 
-	eventID := fmt.Sprintf("evt-status-%d-%s", time.Now().UnixNano(), id)
+	eventID := generateOutboxEventID("status", id)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id": id,
 		"status":    string(status),
@@ -472,7 +480,7 @@ func (s *Store) deleteDomainLocked(domainID string) error {
 	delete(s.pendingCertificates, domainID)
 	delete(s.tlsSettings, domainID)
 
-	eventID := fmt.Sprintf("evt-del-%d-%s", time.Now().UnixNano(), domainID)
+	eventID := generateOutboxEventID("del", domainID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id":  domainID,
 		"deleted_at": time.Now().UTC().Format(time.RFC3339),
@@ -540,7 +548,7 @@ func (s *Store) SaveOriginPool(p *model.OriginPool) error {
 		s.origins[o.ID] = cloneOrigin(&o)
 	}
 
-	eventID := fmt.Sprintf("evt-pool-%d-%s", time.Now().UnixNano(), p.ID)
+	eventID := generateOutboxEventID("pool", p.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"pool_id":      p.ID,
 		"project_id":   p.ProjectID,
@@ -744,7 +752,7 @@ func (s *Store) SaveRoute(r *model.Route) error {
 		s.routes[r.DomainID] = append(existingList, cloneRoute(r))
 	}
 
-	eventID := fmt.Sprintf("evt-route-%d-%s", time.Now().UnixNano(), r.ID)
+	eventID := generateOutboxEventID("route", r.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"route_id":    r.ID,
 		"domain_id":   r.DomainID,
@@ -804,7 +812,7 @@ func (s *Store) SaveSecurityPolicy(sp *model.SecurityPolicy) error {
 		s.rateLimits[sp.DomainID] = append([]model.RateLimitRule(nil), sp.RateLimitRules...)
 	}
 
-	eventID := fmt.Sprintf("evt-sec-%d-%s", time.Now().UnixNano(), sp.DomainID)
+	eventID := generateOutboxEventID("sec", sp.DomainID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id":     sp.DomainID,
 		"waf_enabled":   sp.WAFEnabled,
@@ -1098,7 +1106,7 @@ func (s *Store) SaveCertificate(cert *model.Certificate) error {
 		s.certificates[cert.DomainID] = cloneCertificate(cert)
 		delete(s.pendingCertificates, cert.DomainID)
 
-		eventID := fmt.Sprintf("evt-cert-%d-%s", time.Now().UnixNano(), cert.ID)
+		eventID := generateOutboxEventID("cert", cert.ID)
 		payloadJSON, _ := json.Marshal(map[string]interface{}{
 			"cert_id":    cert.ID,
 			"domain_id":  cert.DomainID,
@@ -1481,7 +1489,7 @@ func (s *Store) SaveAIProvider(p *model.AIProvider) error {
 	clone := *p
 	s.aiProviders[p.ID] = &clone
 
-	eventID := fmt.Sprintf("evt-aiprov-%d-%s", time.Now().UnixNano(), p.ID)
+	eventID := generateOutboxEventID("aiprov", p.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"provider_id":   p.ID,
 		"project_id":    p.ProjectID,

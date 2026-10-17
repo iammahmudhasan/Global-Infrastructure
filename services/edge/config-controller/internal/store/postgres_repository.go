@@ -412,9 +412,9 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 			version: "0005_outbox_events_and_desired_state",
 			stmts: []string{
 				`CREATE TABLE IF NOT EXISTS outbox_events (
-					event_id VARCHAR(64) PRIMARY KEY,
+					event_id VARCHAR(128) PRIMARY KEY,
 					aggregate_type VARCHAR(64) NOT NULL,
-					aggregate_id VARCHAR(64) NOT NULL,
+					aggregate_id VARCHAR(128) NOT NULL,
 					event_type VARCHAR(64) NOT NULL,
 					payload JSONB NOT NULL,
 					status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
@@ -453,6 +453,13 @@ func (r *PostgresRepository) migrateSchema(ctx context.Context) error {
 				 VALUES (1, '0000000000000000000000000000000000000000000000000000000000000000', NOW())
 				 ON CONFLICT (id) DO NOTHING;`,
 				`ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS sequence_num BIGSERIAL;`,
+			},
+		},
+		{
+			version: "0008_expand_outbox_identifiers",
+			stmts: []string{
+				`ALTER TABLE outbox_events ALTER COLUMN event_id TYPE VARCHAR(128);`,
+				`ALTER TABLE outbox_events ALTER COLUMN aggregate_id TYPE VARCHAR(128);`,
 			},
 		},
 	}
@@ -933,7 +940,7 @@ func (r *PostgresRepository) SaveDomain(d *model.Domain) error {
 	}
 	d.Version = newVersion
 
-	eventID := fmt.Sprintf("evt-%d-%s", time.Now().UnixNano(), d.ID)
+	eventID := generateOutboxEventID("dom", d.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id":       d.ID,
 		"project_id":      d.ProjectID,
@@ -1128,7 +1135,7 @@ func (r *PostgresRepository) UpdateDomainStatus(id string, status model.DomainSt
 		return fmt.Errorf("update domain status: %w", err)
 	}
 
-	eventID := fmt.Sprintf("evt-status-%d-%s", time.Now().UnixNano(), id)
+	eventID := generateOutboxEventID("status", id)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id": id,
 		"status":    string(status),
@@ -1159,7 +1166,7 @@ func (r *PostgresRepository) DeleteDomain(domainID string) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	eventID := fmt.Sprintf("evt-del-%d-%s", time.Now().UnixNano(), domainID)
+	eventID := generateOutboxEventID("del", domainID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"domain_id":  domainID,
 		"deleted_at": time.Now().UTC().Format(time.RFC3339),
@@ -1468,7 +1475,7 @@ func (r *PostgresRepository) SaveOriginPool(p *model.OriginPool) error {
 		}
 	}
 
-	eventID := fmt.Sprintf("evt-pool-%d-%s", time.Now().UnixNano(), p.ID)
+	eventID := generateOutboxEventID("pool", p.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"pool_id":      p.ID,
 		"project_id":   p.ProjectID,
@@ -1671,7 +1678,7 @@ func (r *PostgresRepository) SaveRoute(rt *model.Route) error {
 		return fmt.Errorf("persist route: %w", err)
 	}
 
-	eventID := fmt.Sprintf("evt-route-%d-%s", time.Now().UnixNano(), rt.ID)
+	eventID := generateOutboxEventID("route", rt.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"route_id":    rt.ID,
 		"domain_id":   rt.DomainID,
@@ -1770,7 +1777,7 @@ func (r *PostgresRepository) SaveSecurityPolicy(sp *model.SecurityPolicy) error 
 		return fmt.Errorf("persist security policy: %w", err)
 	}
 
-	eventID := fmt.Sprintf("evt-sec-%d-%s", time.Now().UnixNano(), sp.DomainID)
+	eventID := generateOutboxEventID("sec", sp.DomainID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"security_policy_id": sp.ID,
 		"domain_id":          sp.DomainID,
@@ -2050,7 +2057,7 @@ func (r *PostgresRepository) SaveCertificate(cert *model.Certificate) error {
 		return fmt.Errorf("upsert certificate: %w", err)
 	}
 
-	eventID := fmt.Sprintf("evt-cert-%d-%s", time.Now().UnixNano(), cert.ID)
+	eventID := generateOutboxEventID("cert", cert.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"certificate_id": cert.ID,
 		"cert_id":        cert.ID,
@@ -2270,7 +2277,7 @@ func (r *PostgresRepository) SaveAIProvider(p *model.AIProvider) error {
 		return fmt.Errorf("persist ai_provider: %w", err)
 	}
 
-	eventID := fmt.Sprintf("evt-ai-%d-%s", time.Now().UnixNano(), p.ID)
+	eventID := generateOutboxEventID("ai", p.ID)
 	payloadJSON, _ := json.Marshal(map[string]interface{}{
 		"provider_id":   p.ID,
 		"project_id":    p.ProjectID,
