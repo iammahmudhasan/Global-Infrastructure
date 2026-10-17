@@ -1865,3 +1865,109 @@ func TestStore_ApplyReconciliationSnapshot_AtomicEviction(t *testing.T) {
 		t.Fatalf("expected store version to increment from %d, got %d", versionBefore, s.GetVersion())
 	}
 }
+
+func TestPostgresRepository_MultiReplicaPoPSnapshotHeadConcurrency(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("skipping Postgres MultiReplicaPoPSnapshotHeadConcurrency test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize replica 1: %v", err)
+	}
+	defer repo1.Close()
+
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize replica 2: %v", err)
+	}
+	defer repo2.Close()
+
+	popID := fmt.Sprintf("pop-concurrent-head-%d", time.Now().UnixNano())
+
+	// 1. Concurrent Idempotent Write: Both replicas write version 10 with checksum "hash-v10"
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, r := range []*store.PostgresRepository{repo1, repo2} {
+		wg.Add(1)
+		go func(repo *store.PostgresRepository) {
+			defer wg.Done()
+			errs <- repo.SavePoPSnapshotHead(ctx, popID, 10, "hash-v10")
+		}(r)
+	}
+	wg.Wait()
+	close(errs)
+
+	for e := range errs {
+		if e != nil {
+			t.Fatalf("concurrent idempotent SavePoPSnapshotHead failed: %v", e)
+		}
+	}
+
+	// Verify authoritative head in DB is v10 / "hash-v10"
+	ver1, chk1, _, err := repo1.GetPoPSnapshotHead(ctx, popID)
+	if err != nil {
+		t.Fatalf("repo1.GetPoPSnapshotHead failed: %v", err)
+	}
+	ver2, chk2, _, err := repo2.GetPoPSnapshotHead(ctx, popID)
+	if err != nil {
+		t.Fatalf("repo2.GetPoPSnapshotHead failed: %v", err)
+	}
+	if ver1 != 10 || chk1 != "hash-v10" || ver2 != 10 || chk2 != "hash-v10" {
+		t.Fatalf("expected head v10/hash-v10 on both replicas, got r1=(%d,%s) r2=(%d,%s)", ver1, chk1, ver2, chk2)
+	}
+
+	// 2. Monotonic Advancement: Replica 1 advances to version 15
+	if err := repo1.SavePoPSnapshotHead(ctx, popID, 15, "hash-v15"); err != nil {
+		t.Fatalf("replica 1 failed to advance to v15: %v", err)
+	}
+
+	// 3. Stale Version Rejection: Replica 2 attempts to write stale version 12
+	staleErr := repo2.SavePoPSnapshotHead(ctx, popID, 12, "hash-v12")
+	if staleErr == nil {
+		t.Fatalf("expected stale version 12 to be rejected by repo2, got nil error")
+	}
+	if !strings.Contains(staleErr.Error(), "stale snapshot version 12 rejected") {
+		t.Fatalf("expected stale rejection message, got: %v", staleErr)
+	}
+
+	// 4. Conflicting Checksum Rejection: Replica 2 attempts to write version 15 with differing checksum "hash-v15-conflict"
+	conflictErr := repo2.SavePoPSnapshotHead(ctx, popID, 15, "hash-v15-conflict")
+	if conflictErr == nil {
+		t.Fatalf("expected checksum conflict on version 15 to be rejected, got nil error")
+	}
+	if !strings.Contains(conflictErr.Error(), "checksum mismatch conflict") {
+		t.Fatalf("expected checksum mismatch error, got: %v", conflictErr)
+	}
+
+	// 5. Invariant: Authoritative state remains v15 / "hash-v15" on both replicas
+	verFinal, chkFinal, _, err := repo2.GetPoPSnapshotHead(ctx, popID)
+	if err != nil || verFinal != 15 || chkFinal != "hash-v15" {
+		t.Fatalf("expected authoritative head to remain v15/hash-v15, got ver=%d chk=%s err=%v", verFinal, chkFinal, err)
+	}
+}
+
+func TestPostgresRepository_SavePoPSnapshotHead_CanceledContext(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("skipping Postgres SavePoPSnapshotHead CanceledContext test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository: %v", err)
+	}
+	defer repo.Close()
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel() // canceled immediately to simulate connection/outage failure
+
+	err = repo.SavePoPSnapshotHead(canceledCtx, "pop-outage", 1, "chk-1")
+	if err == nil {
+		t.Fatalf("expected error when saving snapshot head with canceled context, got nil")
+	}
+}

@@ -331,7 +331,7 @@ pub async fn fetch_and_apply_control_plane_snapshot_full(
     })
 }
 
-/// Persists the raw snapshot string atomically to disk using a temporary file and rename.
+/// Persists the raw snapshot string atomically to disk using a unique temporary file, fsync, and rename.
 pub fn persist_snapshot_to_disk(path: &str, payload: &str) -> Result<(), std::io::Error> {
     let p = std::path::Path::new(path);
     if let Some(parent) = p.parent() {
@@ -339,9 +339,34 @@ pub fn persist_snapshot_to_disk(path: &str, payload: &str) -> Result<(), std::io
             std::fs::create_dir_all(parent)?;
         }
     }
-    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
-    std::fs::write(&tmp_path, payload.as_bytes())?;
-    std::fs::rename(&tmp_path, path)?;
+    static SNAP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let nonce = SNAP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = format!("{}.tmp.{}.{}.{}", path, std::process::id(), nanos, nonce);
+
+    let write_res = (|| -> Result<(), std::io::Error> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(payload.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp_path, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = p.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -400,6 +425,7 @@ pub struct GatewayAckManager {
     spool_path: Option<PathBuf>,
     pub pending_ack: Arc<RwLock<Option<GatewaySyncAckPayload>>>,
     notify: Arc<tokio::sync::Notify>,
+    spool_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl GatewayAckManager {
@@ -434,52 +460,105 @@ impl GatewayAckManager {
             spool_path,
             pending_ack: Arc::new(RwLock::new(initial_ack)),
             notify: Arc::new(tokio::sync::Notify::new()),
+            spool_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
     /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
     /// Invariant: Atomically persists ACK payload to durable disk spool before updating memory.
     /// Fail-Closed: If persisting to disk spool fails, the ACK is rejected and not staged in memory.
+    /// Thread-Safe: Serialized under spool_lock with globally unique temporary file naming.
     pub fn submit_ack(&self, ack: GatewaySyncAckPayload) -> Result<(), std::io::Error> {
+        let _spool_guard = self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
+
         if let Some(ref path) = self.spool_path {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent)?;
                 }
             }
+
+            // Monotonic generation check on disk:
+            // Prevent older ACKs from overwriting newer state on disk.
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    if let Ok(existing) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                        if existing.applied_version > ack.applied_version {
+                            tracing::warn!(
+                                existing_version = existing.applied_version,
+                                proposed_version = ack.applied_version,
+                                "Ignoring stale ACK submission; disk already holds newer version"
+                            );
+                            let mut guard =
+                                self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                            if guard
+                                .as_ref()
+                                .map(|g| g.applied_version < existing.applied_version)
+                                .unwrap_or(true)
+                            {
+                                *guard = Some(existing);
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             let serialized = serde_json::to_string_pretty(&ack)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-            let tmp_path = format!("{}.tmp.{}", path.display(), std::process::id());
-            {
+
+            static ACK_TMP_NONCE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let nonce = ACK_TMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let tmp_path = format!(
+                "{}.tmp.{}.{}.{}",
+                path.display(),
+                std::process::id(),
+                nanos,
+                nonce
+            );
+
+            let write_res = (|| -> Result<(), std::io::Error> {
                 use std::io::Write;
                 let mut file = std::fs::File::create(&tmp_path)?;
                 file.write_all(serialized.as_bytes())?;
                 file.sync_all()?;
-            }
-            std::fs::rename(&tmp_path, path)?;
+                std::fs::rename(&tmp_path, path)?;
 
-            #[cfg(unix)]
-            if let Some(parent) = path.parent() {
-                if let Ok(dir) = std::fs::File::open(parent) {
-                    let _ = dir.sync_all();
+                #[cfg(unix)]
+                if let Some(parent) = path.parent() {
+                    if let Ok(dir) = std::fs::File::open(parent) {
+                        let _ = dir.sync_all();
+                    }
                 }
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
             }
         }
 
-        if let Ok(mut guard) = self.pending_ack.write() {
-            *guard = Some(ack);
-        } else {
-            return Err(std::io::Error::other(
-                "Failed to acquire pending_ack write lock",
-            ));
-        }
+        // Memory update with poisoned lock recovery
+        let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(ack);
+        drop(guard);
+
         self.notify.notify_one();
         Ok(())
     }
 
     /// Returns a copy of the currently pending ACK, if any.
     pub fn pending_ack(&self) -> Option<GatewaySyncAckPayload> {
-        self.pending_ack.read().ok().and_then(|g| g.clone())
+        self.pending_ack
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// Spawns a background task that reliably delivers pending ACKs with exponential backoff and jitter.
@@ -489,7 +568,42 @@ impl GatewayAckManager {
             const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
             loop {
-                let current_opt = self.pending_ack.read().ok().and_then(|g| g.clone());
+                // Disk as source-of-truth:
+                // Check memory first; if memory is None, reload from disk spool under spool_lock.
+                let current_opt = {
+                    let mem = self
+                        .pending_ack
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if mem.is_some() {
+                        mem
+                    } else if let Some(ref path) = self.spool_path {
+                        let _spool_guard =
+                            self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
+                        if path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(path) {
+                                if let Ok(recovered) =
+                                    serde_json::from_str::<GatewaySyncAckPayload>(&content)
+                                {
+                                    let mut guard =
+                                        self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                                    *guard = Some(recovered.clone());
+                                    Some(recovered)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
                 match current_opt {
                     Some(ack) => {
                         match send_control_plane_ack(
@@ -508,10 +622,11 @@ impl GatewayAckManager {
                                     checksum = %ack.applied_checksum,
                                     "Successfully acknowledged edge gateway synchronization state to Control Plane"
                                 );
+                                // Invariant: Version-matched check-and-delete strictly under spool_lock
+                                // to eliminate any check-then-delete race with concurrent submit_ack().
                                 if let Some(ref path) = self.spool_path {
-                                    // Invariant: Version-matched deletion.
-                                    // Only delete the on-disk spool if its contents match the ACK that was just delivered.
-                                    // If a newer ACK was written to disk while this request was in flight, retain it.
+                                    let _spool_guard =
+                                        self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
                                     if let Ok(content) = std::fs::read_to_string(path) {
                                         if let Ok(spooled) =
                                             serde_json::from_str::<GatewaySyncAckPayload>(&content)
@@ -520,6 +635,12 @@ impl GatewayAckManager {
                                                 && spooled.applied_checksum == ack.applied_checksum
                                             {
                                                 let _ = std::fs::remove_file(path);
+                                                #[cfg(unix)]
+                                                if let Some(parent) = path.parent() {
+                                                    if let Ok(dir) = std::fs::File::open(parent) {
+                                                        let _ = dir.sync_all();
+                                                    }
+                                                }
                                             } else {
                                                 tracing::debug!(
                                                     spooled_version = spooled.applied_version,
@@ -530,13 +651,13 @@ impl GatewayAckManager {
                                         }
                                     }
                                 }
-                                if let Ok(mut guard) = self.pending_ack.write() {
-                                    if let Some(ref latest) = *guard {
-                                        if latest.applied_version == ack.applied_version
-                                            && latest.applied_checksum == ack.applied_checksum
-                                        {
-                                            *guard = None;
-                                        }
+                                let mut guard =
+                                    self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                                if let Some(ref latest) = *guard {
+                                    if latest.applied_version == ack.applied_version
+                                        && latest.applied_checksum == ack.applied_checksum
+                                    {
+                                        *guard = None;
                                     }
                                 }
                                 backoff = Duration::from_millis(500);
@@ -1187,5 +1308,108 @@ mod tests {
 
         // Invariant: In-memory pending_ack MUST NOT be updated (fails closed)
         assert!(mgr.pending_ack().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_concurrent_submissions_monotonic() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_concurrent_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = Arc::new(GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        ));
+
+        let mut handles = Vec::new();
+        for v in 1..=20 {
+            let m = mgr.clone();
+            handles.push(tokio::spawn(async move {
+                let payload = GatewaySyncAckPayload {
+                    gateway_id: "gw-concurrent-01".to_string(),
+                    pop_id: "dhaka".to_string(),
+                    applied_version: v,
+                    applied_checksum: format!("hash-v{}", v),
+                    status: "IN_SYNC".to_string(),
+                    error: None,
+                };
+                let _ = m.submit_ack(payload);
+            }));
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        // Invariant: After 20 concurrent submissions, spool file on disk MUST exist and be valid JSON
+        assert!(spool_path.exists());
+        let raw = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        let parsed: GatewaySyncAckPayload = serde_json::from_str(&raw)
+            .expect("spool JSON must not be corrupted by concurrent writes");
+
+        // Highest version 20 must have won on disk and memory
+        assert_eq!(parsed.applied_version, 20);
+        assert_eq!(mgr.pending_ack().unwrap().applied_version, 20);
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_stale_ack_rejected_on_disk() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_stale_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        let ack_v50 = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 50,
+            applied_checksum: "hash-v50".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v50).is_ok());
+
+        // Stale attempt with version 40
+        let ack_v40 = GatewaySyncAckPayload {
+            gateway_id: "gw-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 40,
+            applied_checksum: "hash-v40".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        assert!(mgr.submit_ack(ack_v40).is_ok());
+
+        // Invariant: On-disk spool MUST retain version 50; stale version 40 must NOT overwrite it
+        let raw = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        let parsed: GatewaySyncAckPayload = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.applied_version, 50);
+        assert_eq!(mgr.pending_ack().unwrap().applied_version, 50);
+
+        let _ = std::fs::remove_file(&spool_path);
     }
 }
