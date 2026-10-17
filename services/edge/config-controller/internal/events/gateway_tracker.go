@@ -2,8 +2,10 @@ package events
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,6 +36,7 @@ type GatewaySyncAcknowledgement = model.GatewaySyncAcknowledgement
 type GatewayConvergenceStore interface {
 	SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error
 	GetEdgeConvergenceHead(ctx context.Context) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
+	AllocateEdgeConvergenceHead(ctx context.Context, checksum string) (targetVersion int64, targetChecksum string, err error)
 	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
 	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
 	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)
@@ -49,17 +52,20 @@ type GatewaySyncTracker struct {
 	gateways        map[string]*GatewaySyncRecord
 	staleThreshold  time.Duration
 	store           GatewayConvergenceStore
+	startupErr      error
 }
 
 // NewGatewaySyncTracker creates an in-memory GatewaySyncTracker.
 func NewGatewaySyncTracker(staleThreshold time.Duration) *GatewaySyncTracker {
-	return NewGatewaySyncTrackerWithStore(staleThreshold, nil)
+	tracker, _ := NewGatewaySyncTrackerWithStore(staleThreshold, nil)
+	return tracker
 }
 
 // NewGatewaySyncTrackerWithStore creates a GatewaySyncTracker backed by durable storage.
 // On startup, it loads the persisted convergence head and previously acknowledged gateway states,
 // preventing loss of convergence history upon control plane restart.
-func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConvergenceStore) *GatewaySyncTracker {
+// In production mode, failure to load durable state results in an error (fail-closed startup).
+func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConvergenceStore) (*GatewaySyncTracker, error) {
 	if staleThreshold <= 0 {
 		staleThreshold = 15 * time.Second
 	}
@@ -76,7 +82,13 @@ func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConve
 		defer cancel()
 
 		ver, chk, updated, err := s.GetEdgeConvergenceHead(ctx)
-		if err == nil && ver > 0 {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			t.startupErr = fmt.Errorf("load edge convergence head: %w", err)
+			isProd := os.Getenv("NEXUSEDGE_DEV_MODE") == "false" || os.Getenv("NEXUSEDGE_ENV") == "production"
+			if isProd {
+				return nil, fmt.Errorf("fail-closed: %w", t.startupErr)
+			}
+		} else if ver > 0 {
 			t.targetVersion.Store(ver)
 			t.targetChecksum = chk
 			if !updated.IsZero() {
@@ -84,7 +96,16 @@ func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConve
 			}
 		}
 
-		if records, err := s.ListGatewaySyncRecords(ctx); err == nil {
+		records, err := s.ListGatewaySyncRecords(ctx)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			if t.startupErr == nil {
+				t.startupErr = fmt.Errorf("load gateway sync records: %w", err)
+			}
+			isProd := os.Getenv("NEXUSEDGE_DEV_MODE") == "false" || os.Getenv("NEXUSEDGE_ENV") == "production"
+			if isProd {
+				return nil, fmt.Errorf("fail-closed: %w", t.startupErr)
+			}
+		} else {
 			for _, rec := range records {
 				if rec != nil && rec.GatewayID != "" {
 					cp := *rec
@@ -94,35 +115,61 @@ func NewGatewaySyncTrackerWithStore(staleThreshold time.Duration, s GatewayConve
 		}
 	}
 
-	return t
+	return t, nil
 }
 
-// AdvanceTargetVersion increments the global configuration generation idempotently.
-// If checksum is non-empty and identical to current target checksum, this represents
-// duplicate event delivery for the same desired state; the version is NOT incremented.
-func (t *GatewaySyncTracker) AdvanceTargetVersion(delta int64, checksum string) int64 {
+// StartupError returns any initialization error encountered while recovering durable state.
+func (t *GatewaySyncTracker) StartupError() error {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.startupErr
+}
+
+// IsReady reports whether the tracker successfully loaded its durable state.
+func (t *GatewaySyncTracker) IsReady() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.startupErr == nil
+}
+
+// AdvanceTargetVersion increments the global configuration generation idempotently and fail-closed.
+// If store is configured, it executes an authoritative transaction-safe allocation in PostgreSQL.
+// If persistence fails, an error is returned and the in-memory state is NOT advanced.
+func (t *GatewaySyncTracker) AdvanceTargetVersion(ctx context.Context, checksum string) (int64, string, error) {
+	if t.store != nil {
+		if ctx == nil {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+		}
+		newVer, newChk, err := t.store.AllocateEdgeConvergenceHead(ctx, checksum)
+		if err != nil {
+			return 0, "", fmt.Errorf("durable generation allocation failed: %w", err)
+		}
+
+		t.mu.Lock()
+		t.targetVersion.Store(newVer)
+		t.targetChecksum = newChk
+		t.targetUpdatedAt = time.Now().UTC()
+		t.mu.Unlock()
+
+		return newVer, newChk, nil
+	}
+
+	// In-memory fallback (standalone unit tests without persistent store)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	// Idempotency: avoid incrementing version if desired configuration checksum has not changed
 	if checksum != "" && t.targetChecksum == checksum {
-		return t.targetVersion.Load()
+		return t.targetVersion.Load(), t.targetChecksum, nil
 	}
 
-	if delta <= 0 {
-		delta = 1
-	}
-	newVer := t.targetVersion.Add(delta)
+	newVer := t.targetVersion.Add(1)
 	t.targetChecksum = checksum
 	t.targetUpdatedAt = time.Now().UTC()
 
-	if t.store != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		_ = t.store.SaveEdgeConvergenceHead(ctx, newVer, checksum)
-	}
-
-	return newVer
+	return newVer, checksum, nil
 }
 
 // TargetVersion returns the active target configuration version.

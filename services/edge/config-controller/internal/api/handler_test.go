@@ -4591,7 +4591,7 @@ func TestGatewayConvergenceRoutes(t *testing.T) {
 	}
 
 	// 4. Target version advances -> gateway sync query detects lag
-	h.GatewaySyncTracker().AdvanceTargetVersion(1, "chk-target-2")
+	_, _, _ = h.GatewaySyncTracker().AdvanceTargetVersion(context.Background(), "chk-target-2")
 	reqSync2 := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=1", nil)
 	wSync2 := httptest.NewRecorder()
 	h.ServeHTTP(wSync2, reqSync2)
@@ -4609,7 +4609,7 @@ func TestGatewayConvergenceRoutes(t *testing.T) {
 
 func TestGatewayConvergence_ChecksumMismatchHTTP409(t *testing.T) {
 	h := setupTestServer()
-	h.GatewaySyncTracker().AdvanceTargetVersion(1, "chk-authoritative-v2")
+	_, _, _ = h.GatewaySyncTracker().AdvanceTargetVersion(context.Background(), "chk-authoritative-v2")
 
 	// Gateway reports applied version 2 with incorrect checksum -> HTTP 409 Conflict
 	ackBody, _ := json.Marshal(map[string]interface{}{
@@ -4645,6 +4645,9 @@ func TestGatewayConvergence_IdentityAuthorization(t *testing.T) {
 
 	// Register edge node credential restricted to node gw-dhk-01 and PoP dhaka
 	authInst.RegisterNodeWithPoP("key-gw-dhk", "tenant-edge", "proj-core", "gw-dhk-01", "dhaka")
+
+	// Register edge node credential with EMPTY NodeID (simulating edge case)
+	authInst.RegisterNodeWithPoP("key-gw-empty-node", "tenant-edge", "proj-core", "", "dhaka")
 
 	// 1. Unauthorized tenant user attempting to call /v1/edge/gateways/ack -> 403 Forbidden
 	authInst.RegisterTenantWithRole("key-tenant-readonly", "tenant-user", "proj-user", auth.RoleTenant, "proj-user")
@@ -4692,7 +4695,37 @@ func TestGatewayConvergence_IdentityAuthorization(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden when edge node acknowledges for unauthorized PoP, got %d", wPopSpoof.Code)
 	}
 
-	// 4. Legitimate node ACK for own gateway and authorized PoP -> 200 OK
+	// 4. EdgeNode with EMPTY NodeID in credentials must be strictly rejected (Finding P1)
+	emptyNodeBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "dhaka",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+	})
+	reqEmptyNode := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(emptyNodeBody))
+	reqEmptyNode.Header.Set("Authorization", "Bearer key-gw-empty-node")
+	wEmptyNode := httptest.NewRecorder()
+	h.ServeHTTP(wEmptyNode, reqEmptyNode)
+	if wEmptyNode.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden when edge node credential has empty NodeID, got %d", wEmptyNode.Code)
+	}
+
+	// 5. ACK payload missing required pop_id -> 400 Bad Request
+	missingPoPBody, _ := json.Marshal(map[string]interface{}{
+		"gateway_id":       "gw-dhk-01",
+		"pop_id":           "",
+		"applied_version":  1,
+		"applied_checksum": "chk-genesis",
+	})
+	reqMissingPoP := httptest.NewRequest(http.MethodPost, "/v1/edge/gateways/ack", bytes.NewReader(missingPoPBody))
+	reqMissingPoP.Header.Set("Authorization", "Bearer key-gw-dhk")
+	wMissingPoP := httptest.NewRecorder()
+	h.ServeHTTP(wMissingPoP, reqMissingPoP)
+	if wMissingPoP.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request when pop_id is empty, got %d", wMissingPoP.Code)
+	}
+
+	// 6. Legitimate node ACK for own gateway and authorized PoP -> 200 OK
 	legitBody, _ := json.Marshal(map[string]interface{}{
 		"gateway_id":       "gw-dhk-01",
 		"pop_id":           "dhaka",
@@ -4713,7 +4746,10 @@ func TestGatewayConvergence_EndToEndSnapshotPull(t *testing.T) {
 	h := setupTestServer()
 
 	// Advance target version with authoritative checksum
-	targetVer := h.GatewaySyncTracker().AdvanceTargetVersion(2, "sha256-auth-v3")
+	targetVer, _, err := h.GatewaySyncTracker().AdvanceTargetVersion(context.Background(), "sha256-auth-v3")
+	if err != nil {
+		t.Fatalf("AdvanceTargetVersion failed: %v", err)
+	}
 
 	// Step 1: Edge gateway checks convergence status
 	reqSync := httptest.NewRequest(http.MethodGet, "/v1/edge/gateways/sync?gateway_id=gw-dhk-01&current_version=1&pop_id=dhaka", nil)
@@ -4763,5 +4799,45 @@ func TestGatewayConvergence_EndToEndSnapshotPull(t *testing.T) {
 	_ = json.NewDecoder(wSyncAfter.Body).Decode(&syncResAfter)
 	if syncResAfter["needs_pull"] != false {
 		t.Fatalf("expected needs_pull=false after convergence, got %v", syncResAfter["needs_pull"])
+	}
+}
+
+type mockHandlerFailingStore struct {
+	store.Repository
+	failHead bool
+}
+
+func (m *mockHandlerFailingStore) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time.Time, error) {
+	if m.failHead {
+		return 0, "", time.Time{}, errors.New("simulated database read failure at startup")
+	}
+	return m.Repository.GetEdgeConvergenceHead(ctx)
+}
+
+func TestGatewayConvergence_HealthzUnreadyOnStartupFailure(t *testing.T) {
+	memStore := store.NewStore()
+	failingStore := &mockHandlerFailingStore{
+		Repository: memStore,
+		failHead:   true,
+	}
+
+	svc := onboarding.NewDomainService(memStore)
+	comp := compiler.NewCompiler(9901, 80, 443)
+	h := api.NewAPIHandler(failingStore, svc, comp)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 Service Unavailable when edge convergence tracker fails startup durable recovery, got %d", w.Code)
+	}
+
+	var res map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&res); err != nil {
+		t.Fatalf("decode healthz response failed: %v", err)
+	}
+	if res["status"] != "unready" {
+		t.Fatalf("expected status 'unready', got %v", res["status"])
 	}
 }

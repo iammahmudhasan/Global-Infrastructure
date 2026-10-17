@@ -90,6 +90,7 @@ type Repository interface {
 	// Edge Configuration Convergence
 	SaveEdgeConvergenceHead(ctx context.Context, targetVersion int64, targetChecksum string) error
 	GetEdgeConvergenceHead(ctx context.Context) (targetVersion int64, targetChecksum string, updatedAt time.Time, err error)
+	AllocateEdgeConvergenceHead(ctx context.Context, checksum string) (targetVersion int64, targetChecksum string, err error)
 	SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error
 	GetGatewaySyncRecord(ctx context.Context, gatewayID string) (*model.GatewaySyncRecord, error)
 	ListGatewaySyncRecords(ctx context.Context) ([]*model.GatewaySyncRecord, error)

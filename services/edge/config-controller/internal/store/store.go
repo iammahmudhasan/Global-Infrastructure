@@ -1851,6 +1851,26 @@ func (s *Store) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time
 	return s.edgeConvergenceVer, s.edgeConvergenceChk, s.edgeConvergenceTime, nil
 }
 
+func (s *Store) AllocateEdgeConvergenceHead(ctx context.Context, checksum string) (int64, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Idempotency: duplicate event with identical checksum does not advance version
+	if checksum != "" && s.edgeConvergenceChk == checksum {
+		return s.edgeConvergenceVer, s.edgeConvergenceChk, nil
+	}
+
+	if s.edgeConvergenceVer <= 0 {
+		s.edgeConvergenceVer = 1
+	} else {
+		s.edgeConvergenceVer++
+	}
+	s.edgeConvergenceChk = checksum
+	s.edgeConvergenceTime = time.Now().UTC()
+
+	return s.edgeConvergenceVer, s.edgeConvergenceChk, nil
+}
+
 func (s *Store) SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error {
 	if rec == nil || rec.GatewayID == "" {
 		return errors.New("gateway_id required")

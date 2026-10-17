@@ -174,11 +174,17 @@ func (b *BroadcasterBridge) HandleOutboxEvent(ctx context.Context, ev *store.Out
 	}
 
 	sum := sha256.Sum256(ev.Payload)
-	checksum := hex.EncodeToString(sum[:8])
+	checksum := hex.EncodeToString(sum[:])
 
 	var targetVer int64
 	if b.tracker != nil {
-		targetVer = b.tracker.AdvanceTargetVersion(1, checksum)
+		var advErr error
+		targetVer, checksum, advErr = b.tracker.AdvanceTargetVersion(ctx, checksum)
+		if advErr != nil {
+			return fmt.Errorf("advance target version: %w", advErr)
+		}
+	} else if os.Getenv("NEXUSEDGE_DEV_MODE") == "false" || os.Getenv("NEXUSEDGE_ENV") == "production" {
+		return errors.New("fail-closed: tracker is nil in production outbox dispatcher")
 	}
 
 	var allowedPoPs []string

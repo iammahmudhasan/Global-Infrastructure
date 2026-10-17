@@ -166,6 +166,8 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	popMgr := pop.NewManager()
 	popProber := health.NewPoPHealthProber(popMgr, alerter)
 
+	gwTracker, gwTrackerErr := events.NewGatewaySyncTrackerWithStore(15*time.Second, s)
+
 	h := &APIHandler{
 		store:              s,
 		service:            svc,
@@ -194,7 +196,10 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		storageManager:     storage.NewManager(),
 		cableManager:       cable.NewManager(),
 		auditKey:           auditKey,
-		gatewaySyncTracker: events.NewGatewaySyncTrackerWithStore(15*time.Second, s),
+		gatewaySyncTracker: gwTracker,
+	}
+	if gwTrackerErr != nil {
+		log.Printf("[ERROR] GatewaySyncTracker startup failed durable recovery: %v", gwTrackerErr)
 	}
 	h.registerRoutes()
 	return h
@@ -456,6 +461,15 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"status":  "unready",
 			"error":   "audit chain integrity degraded or failed startup verification",
 			"details": fmt.Sprintf("%v", chainErr),
+			"service": "nexusedge-config-controller",
+		})
+		return
+	}
+	if h.gatewaySyncTracker != nil && !h.gatewaySyncTracker.IsReady() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"status":  "unready",
+			"error":   "edge convergence tracker failed startup durable state recovery",
+			"details": fmt.Sprintf("%v", h.gatewaySyncTracker.StartupError()),
 			"service": "nexusedge-config-controller",
 		})
 		return
@@ -4080,15 +4094,38 @@ func (h *APIHandler) handleGatewayAck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request payload")
 		return
 	}
-	if tc, ok := auth.FromContext(r.Context()); ok && tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
-		if tc.NodeID != "" && tc.NodeID != ack.GatewayID {
+	if strings.TrimSpace(ack.GatewayID) == "" {
+		writeError(w, http.StatusBadRequest, "gateway_id is required")
+		return
+	}
+	if strings.TrimSpace(ack.PoPID) == "" {
+		writeError(w, http.StatusBadRequest, "pop_id is required")
+		return
+	}
+
+	tc, ok := auth.FromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "authentication context missing")
+		return
+	}
+
+	if tc.Role == auth.RoleEdgeNode && !tc.IsDevBypass {
+		// Strict fail-closed EdgeNode identity validation (Finding P1)
+		if strings.TrimSpace(tc.NodeID) == "" {
+			writeError(w, http.StatusForbidden, "edge node credential requires non-empty NodeID")
+			return
+		}
+		if tc.NodeID != ack.GatewayID {
 			writeError(w, http.StatusForbidden, "edge node credential cannot acknowledge for another gateway")
 			return
 		}
-		if ack.PoPID != "" && !h.authenticator.AuthorizePoP(r.Context(), ack.PoPID) {
+		if !h.authenticator.AuthorizePoP(r.Context(), ack.PoPID) {
 			writeError(w, http.StatusForbidden, "edge node is not authorized for specified pop_id")
 			return
 		}
+	} else if tc.Role != auth.RolePlatformOperator && !tc.IsDevBypass {
+		writeError(w, http.StatusForbidden, "forbidden: insufficient permissions for gateway ack")
+		return
 	}
 	if h.gatewaySyncTracker == nil {
 		writeError(w, http.StatusServiceUnavailable, "gateway sync tracker not initialized")

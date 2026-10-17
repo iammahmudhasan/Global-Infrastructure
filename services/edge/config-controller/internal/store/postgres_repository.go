@@ -2877,6 +2877,29 @@ func (r *PostgresRepository) GetEdgeConvergenceHead(ctx context.Context) (int64,
 	return dbVer, dbChk, dbTime, nil
 }
 
+func (r *PostgresRepository) AllocateEdgeConvergenceHead(ctx context.Context, checksum string) (int64, string, error) {
+	query := `
+		INSERT INTO edge_convergence_head (id, target_version, target_checksum, updated_at)
+		VALUES (1, 1, $1, NOW())
+		ON CONFLICT (id) DO UPDATE
+		SET target_version = CASE
+				WHEN edge_convergence_head.target_checksum = EXCLUDED.target_checksum THEN edge_convergence_head.target_version
+				ELSE edge_convergence_head.target_version + 1
+			END,
+			target_checksum = EXCLUDED.target_checksum,
+			updated_at = NOW()
+		RETURNING target_version, target_checksum;
+	`
+	var targetVersion int64
+	var targetChecksum string
+	err := r.db.QueryRowContext(ctx, query, checksum).Scan(&targetVersion, &targetChecksum)
+	if err != nil {
+		return 0, "", fmt.Errorf("allocate edge convergence head: %w", err)
+	}
+	_ = r.cache.SaveEdgeConvergenceHead(ctx, targetVersion, targetChecksum)
+	return targetVersion, targetChecksum, nil
+}
+
 func (r *PostgresRepository) SaveGatewaySyncRecord(ctx context.Context, rec *model.GatewaySyncRecord) error {
 	if rec == nil || rec.GatewayID == "" {
 		return errors.New("gateway_id required")

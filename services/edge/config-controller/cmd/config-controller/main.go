@@ -170,6 +170,11 @@ func main() {
 
 	// 4. Initialize HTTP API Server
 	handler := api.NewAPIHandler(dataStore, domainSvc, envoyCompiler)
+	if handler.GatewaySyncTracker() != nil && handler.GatewaySyncTracker().StartupError() != nil {
+		if os.Getenv("NEXUSEDGE_DEV_MODE") == "false" || os.Getenv("NEXUSEDGE_ENV") == "production" {
+			log.Fatalf("[FATAL] Edge convergence engine failed durable state recovery at startup: %v", handler.GatewaySyncTracker().StartupError())
+		}
+	}
 
 	certsDir := os.Getenv("NEXUSEDGE_CERTS_DIR")
 	if certsDir != "" {

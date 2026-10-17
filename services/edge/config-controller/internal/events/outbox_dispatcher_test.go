@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -509,7 +511,10 @@ func TestGatewaySyncTracker_ConvergenceLifecycle(t *testing.T) {
 	tracker := NewGatewaySyncTracker(100 * time.Millisecond)
 
 	// Advance target version
-	v1 := tracker.AdvanceTargetVersion(1, "chk-1")
+	v1, _, err := tracker.AdvanceTargetVersion(context.Background(), "chk-1")
+	if err != nil {
+		t.Fatalf("AdvanceTargetVersion failed: %v", err)
+	}
 	if v1 != 2 {
 		t.Fatalf("expected target version 2, got %d", v1)
 	}
@@ -568,11 +573,15 @@ func TestGatewaySyncTracker_ConvergenceLifecycle(t *testing.T) {
 
 func TestGatewaySyncTracker_WrongChecksumRejection(t *testing.T) {
 	st := store.NewStore()
-	tracker := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	_ = st.SaveEdgeConvergenceHead(context.Background(), 4, "chk-4")
+	tracker, err := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	if err != nil {
+		t.Fatalf("NewGatewaySyncTrackerWithStore failed: %v", err)
+	}
 
-	tracker.AdvanceTargetVersion(4, "chk-authoritative-5")
-	if tracker.TargetVersion() != 5 {
-		t.Fatalf("expected target version 5, got %d", tracker.TargetVersion())
+	v5, _, err := tracker.AdvanceTargetVersion(context.Background(), "chk-authoritative-5")
+	if err != nil || v5 != 5 {
+		t.Fatalf("expected target version 5, got %d (err=%v)", v5, err)
 	}
 
 	// Gateway reports applied version 5, but wrong checksum "bad-chk"
@@ -605,32 +614,42 @@ func TestGatewaySyncTracker_WrongChecksumRejection(t *testing.T) {
 
 func TestGatewaySyncTracker_DuplicateEventIdempotency(t *testing.T) {
 	st := store.NewStore()
-	tracker := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	tracker, err := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	if err != nil {
+		t.Fatalf("NewGatewaySyncTrackerWithStore failed: %v", err)
+	}
 
 	// First event advances target to version 2
-	v1 := tracker.AdvanceTargetVersion(1, "chk-config-v2")
-	if v1 != 2 {
-		t.Fatalf("expected version 2, got %d", v1)
+	v1, _, err := tracker.AdvanceTargetVersion(context.Background(), "chk-config-v2")
+	if err != nil || v1 != 2 {
+		t.Fatalf("expected version 2, got %d (err=%v)", v1, err)
 	}
 
 	// Duplicate event arrives with identical checksum -> version must NOT advance
-	v2 := tracker.AdvanceTargetVersion(1, "chk-config-v2")
-	if v2 != 2 {
-		t.Fatalf("expected version to remain 2 on duplicate checksum, got %d", v2)
+	v2, _, err := tracker.AdvanceTargetVersion(context.Background(), "chk-config-v2")
+	if err != nil || v2 != 2 {
+		t.Fatalf("expected version to remain 2 on duplicate checksum, got %d (err=%v)", v2, err)
 	}
 
 	// Third event with distinct checksum advances target to version 3
-	v3 := tracker.AdvanceTargetVersion(1, "chk-config-v3")
-	if v3 != 3 {
-		t.Fatalf("expected version to advance to 3 on new checksum, got %d", v3)
+	v3, _, err := tracker.AdvanceTargetVersion(context.Background(), "chk-config-v3")
+	if err != nil || v3 != 3 {
+		t.Fatalf("expected version to advance to 3 on new checksum, got %d (err=%v)", v3, err)
 	}
 }
 
 func TestGatewaySyncTracker_RestartRecovery(t *testing.T) {
 	st := store.NewStore()
-	tracker1 := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	_ = st.SaveEdgeConvergenceHead(context.Background(), 9, "chk-9")
+	tracker1, err := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	if err != nil {
+		t.Fatalf("NewGatewaySyncTrackerWithStore failed: %v", err)
+	}
 
-	tracker1.AdvanceTargetVersion(9, "chk-state-10")
+	v10, _, err := tracker1.AdvanceTargetVersion(context.Background(), "chk-state-10")
+	if err != nil || v10 != 10 {
+		t.Fatalf("expected version 10, got %d (err=%v)", v10, err)
+	}
 	rec, err := tracker1.RecordAck(GatewaySyncAcknowledgement{
 		GatewayID:       "gw-dhk-01",
 		PoPID:           "dhaka",
@@ -646,7 +665,10 @@ func TestGatewaySyncTracker_RestartRecovery(t *testing.T) {
 	}
 
 	// Simulate control plane restart by creating a new tracker against the same store
-	tracker2 := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	tracker2, err := NewGatewaySyncTrackerWithStore(1*time.Minute, st)
+	if err != nil {
+		t.Fatalf("tracker2 initialization failed: %v", err)
+	}
 	if tracker2.TargetVersion() != 10 {
 		t.Fatalf("expected recovered target version 10, got %d", tracker2.TargetVersion())
 	}
@@ -660,6 +682,157 @@ func TestGatewaySyncTracker_RestartRecovery(t *testing.T) {
 	}
 	if gw.Status != SyncStatusInSync || gw.AppliedVersion != 10 {
 		t.Fatalf("expected recovered gateway status IN_SYNC and version 10, got status=%s ver=%d", gw.Status, gw.AppliedVersion)
+	}
+}
+
+type mockFailingStore struct {
+	*store.Store
+	failAllocate bool
+	failHead     bool
+}
+
+func (m *mockFailingStore) AllocateEdgeConvergenceHead(ctx context.Context, checksum string) (int64, string, error) {
+	if m.failAllocate {
+		return 0, "", errors.New("simulated database write failure")
+	}
+	return m.Store.AllocateEdgeConvergenceHead(ctx, checksum)
+}
+
+func (m *mockFailingStore) GetEdgeConvergenceHead(ctx context.Context) (int64, string, time.Time, error) {
+	if m.failHead {
+		return 0, "", time.Time{}, errors.New("simulated database read failure")
+	}
+	return m.Store.GetEdgeConvergenceHead(ctx)
+}
+
+func TestGatewaySyncTracker_DatabaseFailureFailClosed(t *testing.T) {
+	memStore := store.NewStore()
+	failingStore := &mockFailingStore{
+		Store:        memStore,
+		failAllocate: true,
+	}
+
+	tracker, err := NewGatewaySyncTrackerWithStore(1*time.Minute, failingStore)
+	if err != nil {
+		t.Fatalf("unexpected init error: %v", err)
+	}
+
+	// Attempting to advance version must fail closed
+	initialVer := tracker.TargetVersion()
+	_, _, err = tracker.AdvanceTargetVersion(context.Background(), "chk-fail")
+	if err == nil {
+		t.Fatalf("expected error from failed database write, got nil")
+	}
+	if tracker.TargetVersion() != initialVer {
+		t.Fatalf("tracker target version should not advance when DB write fails; expected %d, got %d", initialVer, tracker.TargetVersion())
+	}
+
+	// Verify BroadcasterBridge translates this error to fail-closed outbox processing
+	b := NewBroadcaster()
+	defer b.Close()
+	bridge := NewBroadcasterBridgeWithTracker(b, tracker)
+
+	payloadBytes, _ := json.Marshal(map[string]interface{}{
+		"domain_id": "dom-test",
+		"status":    "ACTIVE",
+	})
+	ev := &store.OutboxEvent{
+		EventID:   "evt-fail-test",
+		EventType: "domain.status.changed",
+		Payload:   payloadBytes,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	handleErr := bridge.HandleOutboxEvent(context.Background(), ev)
+	if handleErr == nil {
+		t.Fatalf("expected BroadcasterBridge to return error on database write failure, got nil")
+	}
+}
+
+func TestGatewaySyncTracker_ConcurrentMultiReplicaAllocation(t *testing.T) {
+	memStore := store.NewStore()
+	tracker1, _ := NewGatewaySyncTrackerWithStore(1*time.Minute, memStore)
+	tracker2, _ := NewGatewaySyncTrackerWithStore(1*time.Minute, memStore)
+
+	concurrency := 20
+	var wg sync.WaitGroup
+	errCh := make(chan error, concurrency*2)
+
+	// Replica 1 and Replica 2 allocate concurrent versions
+	for i := 0; i < concurrency; i++ {
+		wg.Add(2)
+		chk1 := fmt.Sprintf("chk-r1-%d", i)
+		chk2 := fmt.Sprintf("chk-r2-%d", i)
+
+		go func() {
+			defer wg.Done()
+			_, _, err := tracker1.AdvanceTargetVersion(context.Background(), chk1)
+			if err != nil {
+				errCh <- err
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+			_, _, err := tracker2.AdvanceTargetVersion(context.Background(), chk2)
+			if err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Fatalf("concurrent allocation failed: %v", err)
+	}
+
+	authVer, _, _, err := memStore.GetEdgeConvergenceHead(context.Background())
+	if err != nil {
+		t.Fatalf("failed to get authoritative convergence head: %v", err)
+	}
+	expectedVer := int64(concurrency*2 + 1)
+	if authVer != expectedVer {
+		t.Fatalf("expected authoritative target version %d after concurrent allocations, got %d", expectedVer, authVer)
+	}
+}
+
+func TestGatewaySyncTracker_ProductionStartupFailClosed(t *testing.T) {
+	failingStore := &mockFailingStore{
+		Store:    store.NewStore(),
+		failHead: true,
+	}
+
+	// 1. In production mode, startup fails immediately (fail-closed)
+	os.Setenv("NEXUSEDGE_DEV_MODE", "false")
+	os.Setenv("NEXUSEDGE_ENV", "production")
+	defer func() {
+		os.Setenv("NEXUSEDGE_DEV_MODE", "true")
+		os.Setenv("NEXUSEDGE_ENV", "development")
+	}()
+
+	tracker, err := NewGatewaySyncTrackerWithStore(1*time.Minute, failingStore)
+	if err == nil {
+		t.Fatalf("expected error in production mode on durable state recovery failure, got nil")
+	}
+	if tracker != nil {
+		t.Fatalf("expected nil tracker on production startup failure")
+	}
+
+	// 2. In dev mode, tracker records StartupError and marks IsReady false
+	os.Setenv("NEXUSEDGE_DEV_MODE", "true")
+	os.Setenv("NEXUSEDGE_ENV", "development")
+
+	devTracker, err := NewGatewaySyncTrackerWithStore(1*time.Minute, failingStore)
+	if err != nil {
+		t.Fatalf("expected dev mode to allow degraded startup, got err: %v", err)
+	}
+	if devTracker.IsReady() {
+		t.Fatalf("expected devTracker.IsReady() to be false")
+	}
+	if devTracker.StartupError() == nil {
+		t.Fatalf("expected devTracker.StartupError() to be non-nil")
 	}
 }
 

@@ -1568,6 +1568,35 @@ func TestStore_EdgeConvergencePersistence(t *testing.T) {
 	}
 }
 
+func TestStore_AllocateEdgeConvergenceHead(t *testing.T) {
+	ctx := context.Background()
+	s := store.NewStore()
+
+	// Initial store starts at genesis version 1 with empty checksum
+	v0, c0, _, _ := s.GetEdgeConvergenceHead(ctx)
+	if v0 != 1 || c0 != "" {
+		t.Fatalf("expected genesis version 1 with empty checksum, got ver=%d chk=%s", v0, c0)
+	}
+
+	// First configuration allocation advances from genesis 1 to 2
+	v1, c1, err := s.AllocateEdgeConvergenceHead(ctx, "sha256-chk-1")
+	if err != nil || v1 != 2 || c1 != "sha256-chk-1" {
+		t.Fatalf("unexpected allocation 1: ver=%d chk=%s err=%v", v1, c1, err)
+	}
+
+	// Idempotent allocation with identical checksum does NOT advance version
+	v2, c2, err := s.AllocateEdgeConvergenceHead(ctx, "sha256-chk-1")
+	if err != nil || v2 != 2 || c2 != "sha256-chk-1" {
+		t.Fatalf("unexpected idempotent allocation: ver=%d chk=%s err=%v", v2, c2, err)
+	}
+
+	// Distinct checksum advances version to 3
+	v3, c3, err := s.AllocateEdgeConvergenceHead(ctx, "sha256-chk-2")
+	if err != nil || v3 != 3 || c3 != "sha256-chk-2" {
+		t.Fatalf("unexpected allocation 2: ver=%d chk=%s err=%v", v3, c3, err)
+	}
+}
+
 func TestPostgresRepository_EdgeConvergencePersistence(t *testing.T) {
 	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -1619,6 +1648,26 @@ func TestPostgresRepository_EdgeConvergencePersistence(t *testing.T) {
 	recVer, recChk, _, err := repo2.GetEdgeConvergenceHead(ctx)
 	if err != nil || recVer != targetVer || recChk != targetChk {
 		t.Fatalf("repo2 recovered unexpected convergence head: ver=%d (expected %d) chk=%s (expected %s) err=%v", recVer, targetVer, recChk, targetChk, err)
+	}
+
+	// 4. Cross-replica atomic generation allocation with row-lock in PostgreSQL
+	chkAlloc1 := fmt.Sprintf("sha256-alloc-1-%d", targetVer)
+	allocVer1, allocChk1, err := repo1.AllocateEdgeConvergenceHead(ctx, chkAlloc1)
+	if err != nil || allocVer1 <= targetVer || allocChk1 != chkAlloc1 {
+		t.Fatalf("repo1.AllocateEdgeConvergenceHead failed: ver=%d chk=%s err=%v", allocVer1, allocChk1, err)
+	}
+
+	// Replica 2 duplicate checksum allocation must be idempotent
+	allocVer2, allocChk2, err := repo2.AllocateEdgeConvergenceHead(ctx, chkAlloc1)
+	if err != nil || allocVer2 != allocVer1 || allocChk2 != chkAlloc1 {
+		t.Fatalf("repo2 duplicate AllocateEdgeConvergenceHead failed: ver=%d (expected %d) chk=%s err=%v", allocVer2, allocVer1, allocChk2, err)
+	}
+
+	// Replica 2 new checksum allocation must advance version atomically
+	chkAlloc2 := fmt.Sprintf("sha256-alloc-2-%d", targetVer)
+	allocVer3, allocChk3, err := repo2.AllocateEdgeConvergenceHead(ctx, chkAlloc2)
+	if err != nil || allocVer3 != allocVer1+1 || allocChk3 != chkAlloc2 {
+		t.Fatalf("repo2 distinct AllocateEdgeConvergenceHead failed: ver=%d (expected %d) chk=%s err=%v", allocVer3, allocVer1+1, allocChk3, err)
 	}
 
 	fetchedGw, err := repo2.GetGatewaySyncRecord(ctx, gwID)
