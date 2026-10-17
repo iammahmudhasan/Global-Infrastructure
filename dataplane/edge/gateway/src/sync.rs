@@ -495,6 +495,118 @@ impl GatewayAckManager {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Re-evaluates the durable on-disk spool following operator manual inspection/repair.
+    /// If the file is valid JSON, clears the corrupt flag, restores the payload to memory, and wakes the worker.
+    /// If the file was removed by the operator, clears the corrupt flag and resets memory to None.
+    /// If the file is still corrupted or unreadable, returns an error and keeps the corrupt flag set.
+    pub fn recheck_and_recover_spool(
+        &self,
+    ) -> Result<Option<GatewaySyncAckPayload>, std::io::Error> {
+        let _spool_guard = self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some(ref path) = self.spool_path {
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                let recovered = serde_json::from_str::<GatewaySyncAckPayload>(&content)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+                self.corrupt_spool_detected
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+                *guard = Some(recovered.clone());
+                drop(guard);
+
+                self.notify.notify_one();
+                tracing::info!(
+                    spool_file = %path.display(),
+                    version = recovered.applied_version,
+                    "Operator manual recovery successful: corrupt spool flag cleared, recovered ACK loaded and worker notified"
+                );
+                return Ok(Some(recovered));
+            }
+        }
+
+        self.corrupt_spool_detected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+        *guard = None;
+        drop(guard);
+
+        tracing::info!("Operator cleared spool: file absent, corrupt flag reset");
+        Ok(None)
+    }
+
+    /// Allows an operator to manually overwrite/repair a corrupted spool with a validated payload.
+    /// Atomically persists the payload, clears the corrupt flag, updates memory, and wakes the worker.
+    pub fn force_recover_spool(
+        &self,
+        payload: GatewaySyncAckPayload,
+    ) -> Result<(), std::io::Error> {
+        let _spool_guard = self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        if let Some(ref path) = self.spool_path {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+
+            let serialized = serde_json::to_string_pretty(&payload)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+            static FORCE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let nonce = FORCE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let tmp_path = format!(
+                "{}.tmp.{}.{}.{}",
+                path.display(),
+                std::process::id(),
+                nanos,
+                nonce
+            );
+
+            let write_res = (|| -> Result<(), std::io::Error> {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp_path)?;
+                file.write_all(serialized.as_bytes())?;
+                file.sync_all()?;
+                std::fs::rename(&tmp_path, path)?;
+
+                #[cfg(unix)]
+                if let Some(parent) = path.parent() {
+                    let dir_path = if parent.as_os_str().is_empty() {
+                        std::path::Path::new(".")
+                    } else {
+                        parent
+                    };
+                    let dir = std::fs::File::open(dir_path)?;
+                    dir.sync_all()?;
+                }
+                Ok(())
+            })();
+
+            if let Err(e) = write_res {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
+
+        self.corrupt_spool_detected
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
+        *guard = Some(payload);
+        drop(guard);
+
+        self.notify.notify_one();
+        tracing::info!(
+            "Operator force recovery successful: spool replaced, corrupt flag cleared, worker notified"
+        );
+        Ok(())
+    }
+
     /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
     /// Invariant: Atomically persists ACK payload to durable disk spool before updating memory.
     /// Fail-Closed: If persisting to disk spool fails, the ACK is rejected and not staged in memory.
@@ -1740,9 +1852,51 @@ mod tests {
         let _ = std::fs::remove_file(&spool_path);
     }
 
+    async fn read_mock_http_request<T: tokio::io::AsyncReadExt + Unpin>(
+        socket: &mut T,
+    ) -> Result<(String, Vec<u8>), std::io::Error> {
+        let mut buffer = Vec::new();
+        let mut temp = [0u8; 1024];
+        let header_end;
+        loop {
+            let n = socket.read(&mut temp).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF before HTTP headers completed",
+                ));
+            }
+            buffer.extend_from_slice(&temp[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+
+        let header_str = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let mut content_length = 0;
+        for line in header_str.lines() {
+            let lower = line.to_ascii_lowercase();
+            if let Some(val) = lower.strip_prefix("content-length:") {
+                content_length = val.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = socket.read(&mut temp).await?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&temp[..n]);
+        }
+
+        Ok((header_str, body))
+    }
+
     #[tokio::test]
     async fn test_gateway_ack_manager_stale_ack_wakes_worker() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1760,6 +1914,7 @@ mod tests {
                 .as_nanos()
         ));
 
+        // 1. Initialize manager with NO file on disk and empty memory
         let client = HttpClient::new();
         let mgr = Arc::new(GatewayAckManager::new(
             endpoint,
@@ -1767,8 +1922,28 @@ mod tests {
             client,
             Some(spool_path.clone()),
         ));
+        assert!(mgr.pending_ack().is_none());
 
-        // 1. Initial authoritative submission of version 100
+        // Spawn mock server with protocol-aware HTTP request parsing
+        let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                if let Ok((_headers, body)) = read_mock_http_request(&mut socket).await {
+                    if let Ok(payload) = serde_json::from_slice::<GatewaySyncAckPayload>(&body) {
+                        let _ = tx_payload.send(payload);
+                    }
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        // 2. Spawn background worker while memory and disk are both empty
+        // The worker runs loop iteration 1, sees None, and enters self.notify.notified().await (parks/idles)
+        let worker_handle = mgr.clone().spawn_worker();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 3. Directly place version 100 on disk without notifying the worker
         let ack_v100 = GatewaySyncAckPayload {
             gateway_id: "gw-01".to_string(),
             pop_id: "dhaka".to_string(),
@@ -1777,37 +1952,17 @@ mod tests {
             status: "IN_SYNC".to_string(),
             error: None,
         };
-        assert!(mgr.submit_ack(ack_v100).is_ok());
+        let serialized_v100 = serde_json::to_string_pretty(&ack_v100).unwrap();
+        std::fs::write(&spool_path, serialized_v100).expect("write spool failed");
 
-        // Clear in-memory state to simulate a worker pickup or memory reset while disk retains v100
-        if let Ok(mut guard) = mgr.pending_ack.write() {
-            *guard = None;
-        }
-        assert!(mgr.pending_ack().is_none());
+        // Give the worker time to ensure it does NOT send on its own (remains parked on notify.notified())
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            mgr.pending_ack().is_none(),
+            "worker or memory must not have picked up disk spool yet"
+        );
 
-        // Spawn mock server to receive delivered ACK
-        let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buffer = [0u8; 4096];
-                if let Ok(n) = socket.read(&mut buffer).await {
-                    let req_str = String::from_utf8_lossy(&buffer[..n]);
-                    if let Some(body_start) = req_str.find("\r\n\r\n") {
-                        let body = &req_str[body_start + 4..];
-                        if let Ok(payload) = serde_json::from_str::<GatewaySyncAckPayload>(body) {
-                            let _ = tx_payload.send(payload);
-                        }
-                    }
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                }
-            }
-        });
-
-        // Spawn background worker
-        let worker_handle = mgr.clone().spawn_worker();
-
-        // 2. Submit a stale version 90 (simulates delayed/out-of-order ACK arrival)
+        // 4. Submit a stale version 90 (simulates delayed/out-of-order ACK arrival)
         let ack_stale = GatewaySyncAckPayload {
             gateway_id: "gw-01".to_string(),
             pop_id: "dhaka".to_string(),
@@ -1818,12 +1973,12 @@ mod tests {
         };
         assert!(mgr.submit_ack(ack_stale).is_ok());
 
-        // 3. Invariant: in-memory queue MUST be restored with disk's version 100
+        // 5. Invariant: in-memory queue MUST be restored with disk's version 100
         let restored = mgr.pending_ack().expect("expected restored ACK in memory");
         assert_eq!(restored.applied_version, 100);
         assert_eq!(restored.applied_checksum, "hash-v100");
 
-        // 4. Invariant: worker MUST be awakened by notify_one() and deliver version 100 to mock server
+        // 6. Invariant: worker MUST be awakened by notify_one() and deliver version 100 to mock server
         let delivered = tokio::time::timeout(Duration::from_secs(5), rx_payload)
             .await
             .expect("worker failed to deliver ACK within timeout")
@@ -1831,7 +1986,7 @@ mod tests {
         assert_eq!(delivered.applied_version, 100);
         assert_eq!(delivered.applied_checksum, "hash-v100");
 
-        // 5. Invariant: spool file on disk MUST be deleted upon 200 OK
+        // 7. Invariant: spool file on disk MUST be deleted upon 200 OK
         let mut cleaned_up = false;
         for _ in 0..50 {
             if !spool_path.exists() {
@@ -1894,8 +2049,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gateway_ack_manager_operator_recheck_and_recover_spool() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock TCP listener failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let endpoint = format!("http://{}", addr);
+
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_operator_recover_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Start with corrupt spool
+        let corrupted_content = "{\"gateway_id\": \"gw-repaired\", \"applied_version\": broken...";
+        std::fs::write(&spool_path, corrupted_content).expect("write corrupt spool failed");
+
+        let client = HttpClient::new();
+        let mgr = Arc::new(GatewayAckManager::new(
+            endpoint,
+            "token-op".to_string(),
+            client,
+            Some(spool_path.clone()),
+        ));
+
+        assert!(mgr.has_corrupt_spool());
+        assert!(mgr.pending_ack().is_none());
+
+        // Spawn mock server with protocol-aware reader
+        let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                if let Ok((_headers, body)) = read_mock_http_request(&mut socket).await {
+                    if let Ok(payload) = serde_json::from_slice::<GatewaySyncAckPayload>(&body) {
+                        let _ = tx_payload.send(payload);
+                    }
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let worker_handle = mgr.clone().spawn_worker();
+
+        // Operator fixes the file on disk with valid JSON
+        let repaired_ack = GatewaySyncAckPayload {
+            gateway_id: "gw-repaired".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 120,
+            applied_checksum: "hash-v120".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        let valid_json = serde_json::to_string_pretty(&repaired_ack).unwrap();
+        std::fs::write(&spool_path, valid_json).expect("write repaired spool failed");
+
+        // Operator triggers manual recovery
+        let recover_res = mgr.recheck_and_recover_spool();
+        assert!(recover_res.is_ok(), "recheck_and_recover_spool failed");
+        let opt = recover_res.unwrap();
+        assert!(opt.is_some());
+        assert_eq!(opt.unwrap().applied_version, 120);
+
+        // Invariant: corrupt flag must now be false
+        assert!(
+            !mgr.has_corrupt_spool(),
+            "expected corrupt spool flag to be cleared"
+        );
+
+        // Invariant: worker delivers the recovered version 120
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx_payload)
+            .await
+            .expect("worker failed to deliver recovered ACK within timeout")
+            .expect("failed to receive payload from mock server");
+        assert_eq!(delivered.applied_version, 120);
+        assert_eq!(delivered.applied_checksum, "hash-v120");
+
+        // Invariant: spool file removed after successful delivery
+        let mut cleaned_up = false;
+        for _ in 0..50 {
+            if !spool_path.exists() {
+                cleaned_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(cleaned_up, "spool file was not cleaned up after delivery");
+
+        worker_handle.abort();
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
     async fn test_gateway_ack_manager_crash_recovery_idempotent_redelivery() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1928,18 +2182,13 @@ mod tests {
         let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buffer = [0u8; 4096];
-                if let Ok(n) = socket.read(&mut buffer).await {
-                    let req_str = String::from_utf8_lossy(&buffer[..n]);
-                    if let Some(body_start) = req_str.find("\r\n\r\n") {
-                        let body = &req_str[body_start + 4..];
-                        if let Ok(payload) = serde_json::from_str::<GatewaySyncAckPayload>(body) {
-                            let _ = tx_payload.send(payload);
-                        }
+                if let Ok((_headers, body)) = read_mock_http_request(&mut socket).await {
+                    if let Ok(payload) = serde_json::from_slice::<GatewaySyncAckPayload>(&body) {
+                        let _ = tx_payload.send(payload);
                     }
-                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-                    let _ = socket.write_all(resp.as_bytes()).await;
                 }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
             }
         });
 

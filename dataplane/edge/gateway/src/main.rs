@@ -202,6 +202,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
+    let (ack_manager, sync_client_opt) =
+        if config.control_plane.enabled || config.control_plane.snapshot_file.is_some() {
+            let cp_cfg = config.control_plane.clone();
+            let sync_client = HttpClient::builder()
+                .timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+
+            let ack_spool_path = std::env::var("NEXUSEDGE_ACK_SPOOL_PATH")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(format!("{}.ack.json", autonomous_snapshot_path))
+                });
+
+            let mgr = Arc::new(GatewayAckManager::new(
+                cp_cfg.endpoint.clone(),
+                cp_cfg.auth_token.clone(),
+                sync_client.clone(),
+                Some(ack_spool_path),
+            ));
+            Arc::clone(&mgr).spawn_worker();
+            (Some(mgr), Some(sync_client))
+        } else {
+            (None, None)
+        };
+
     let client_cache = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let state = Arc::new(ProxyState {
         config: config.clone(),
@@ -218,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         is_ready: Arc::clone(&is_ready),
         ai_director,
         metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
+        ack_manager: ack_manager.clone(),
     });
 
     // 4. Background Maintenance Task (Clean expired rate-limit buckets)
@@ -231,33 +259,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
 
     // 5. Control Plane Dynamic Snapshot Synchronizer (P1 Consistency Bridge & Readiness Gate)
-    if config.control_plane.enabled || config.control_plane.snapshot_file.is_some() {
+    if let (Some(ref ack_manager), Some(sync_client)) = (ack_manager, sync_client_opt) {
         let sync_router = router.clone();
         let sync_dns = Arc::clone(&dns_resolver);
         let sync_is_ready = Arc::clone(&is_ready);
         let sync_ai = state.ai_director.clone();
         let cp_cfg = config.control_plane.clone();
-
-        // Control Plane HTTP client uses standard host DNS resolution (completely decoupled from origin DNS pinning)
-        let sync_client = HttpClient::builder()
-            .timeout(Duration::from_millis(config.upstream.timeout_ms.max(5000)))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-
-        let ack_spool_path = std::env::var("NEXUSEDGE_ACK_SPOOL_PATH")
-            .ok()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(format!("{}.ack.json", autonomous_snapshot_path))
-            });
-
-        let ack_manager = Arc::new(GatewayAckManager::new(
-            cp_cfg.endpoint.clone(),
-            cp_cfg.auth_token.clone(),
-            sync_client.clone(),
-            Some(ack_spool_path),
-        ));
-        Arc::clone(&ack_manager).spawn_worker();
 
         if cp_cfg.enabled {
             let sse_endpoint = cp_cfg.endpoint.clone();
@@ -273,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let sse_ai = sync_ai.clone();
             let sse_is_ready = Arc::clone(&sync_is_ready);
             let sse_snapshot_path = autonomous_snapshot_path.clone();
-            let sse_ack_manager = Arc::clone(&ack_manager);
+            let sse_ack_manager = Arc::clone(ack_manager);
 
             tokio::spawn(async move {
                 let mut backoff_secs = 1u64;
@@ -314,7 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let watchdog_checksum = Arc::clone(&last_checksum);
         let watchdog_snapshot_path = autonomous_snapshot_path.clone();
         let watchdog_node_id = config.server.node_id.clone();
-        let watchdog_ack_manager = Arc::clone(&ack_manager);
+        let watchdog_ack_manager = Arc::clone(ack_manager);
 
         tokio::spawn(async move {
             let interval_secs = cp_cfg.poll_interval_secs.max(15);

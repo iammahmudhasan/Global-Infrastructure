@@ -24,14 +24,15 @@ const (
 
 // Standard Event Types
 const (
-	EventTypeOriginDown      = "ORIGIN_DOWN"
-	EventTypeOriginRecovered = "ORIGIN_RECOVERED"
-	EventTypeHighLatency     = "HIGH_LATENCY"
-	EventTypeTest            = "TEST"
-	EventTypePoPDegraded     = "POP_DEGRADED"
-	EventTypePoPDown         = "POP_DOWN"
-	EventTypePoPRecovered    = "POP_RECOVERED"
-	EventTypePoPFailover     = "POP_FAILOVER"
+	EventTypeOriginDown                  = "ORIGIN_DOWN"
+	EventTypeOriginRecovered             = "ORIGIN_RECOVERED"
+	EventTypeHighLatency                 = "HIGH_LATENCY"
+	EventTypeTest                        = "TEST"
+	EventTypePoPDegraded                 = "POP_DEGRADED"
+	EventTypePoPDown                     = "POP_DOWN"
+	EventTypePoPRecovered                = "POP_RECOVERED"
+	EventTypePoPFailover                 = "POP_FAILOVER"
+	EventTypeReconcilerThresholdExceeded = "RECONCILER_THRESHOLD_EXCEEDED"
 )
 
 // Event represents a structured infrastructure health or performance alert.

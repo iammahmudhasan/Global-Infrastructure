@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/events"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
@@ -2054,6 +2055,30 @@ func TestPostgresRepository_SavePoPSnapshotHead_CanceledContext(t *testing.T) {
 	}
 }
 
+type mockReconcileAlerter struct {
+	mu     sync.Mutex
+	events []alert.Event
+}
+
+func (m *mockReconcileAlerter) SendAlert(ctx context.Context, event alert.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, event)
+	return nil
+}
+
+func (m *mockReconcileAlerter) IsConfigured() bool {
+	return true
+}
+
+func (m *mockReconcileAlerter) getEvents() []alert.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copied := make([]alert.Event, len(m.events))
+	copy(copied, m.events)
+	return copied
+}
+
 func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *testing.T) {
 	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -2065,6 +2090,9 @@ func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *
 		t.Fatalf("failed to initialize repository: %v", err)
 	}
 	defer repo.Close()
+
+	mockAlert := &mockReconcileAlerter{}
+	repo.SetAlerter(mockAlert)
 
 	// Initial consecutive failures count must be 0
 	if fails := repo.ConsecutiveReconcileFailures(); fails != 0 {
@@ -2089,8 +2117,32 @@ func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *
 	if lastErr := repo.LastReconcileError(); lastErr == nil {
 		t.Fatalf("expected recorded last reconcile error, got nil")
 	}
+	if dur := repo.LastReconcileDuration(); dur <= 0 {
+		t.Fatalf("expected recorded reconcile duration > 0, got %v", dur)
+	}
+
+	// Invariant: Alerter MUST have received RECONCILER_THRESHOLD_EXCEEDED event
+	time.Sleep(100 * time.Millisecond) // allow goroutine dispatch
+	events := mockAlert.getEvents()
+	var thresholdAlertFound bool
+	for _, ev := range events {
+		if ev.Type == alert.EventTypeReconcilerThresholdExceeded {
+			thresholdAlertFound = true
+			if ev.Severity != alert.SeverityCritical {
+				t.Fatalf("expected CRITICAL severity, got %v", ev.Severity)
+			}
+			if ev.Details["consecutive_failures"] != "3" {
+				t.Fatalf("expected consecutive_failures=3, got %v", ev.Details["consecutive_failures"])
+			}
+			break
+		}
+	}
+	if !thresholdAlertFound {
+		t.Fatalf("expected RECONCILER_THRESHOLD_EXCEEDED alert event, got %v", events)
+	}
 
 	// 2. Successful reconciliation resets failure counter to 0
+	testStart := time.Now().UTC()
 	ctx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelTimeout()
 
@@ -2107,5 +2159,8 @@ func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *
 	}
 	if lastErr := repo.LastReconcileError(); lastErr != nil {
 		t.Fatalf("expected last error to reset to nil after success, got %v", lastErr)
+	}
+	if lastSuccess := repo.LastReconcileSuccess(); lastSuccess.Before(testStart) {
+		t.Fatalf("expected last reconcile success timestamp (%v) to be after testStart (%v)", lastSuccess, testStart)
 	}
 }

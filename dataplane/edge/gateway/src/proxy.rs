@@ -161,6 +161,7 @@ pub struct ProxyState {
     pub is_ready: Arc<std::sync::atomic::AtomicBool>,
     pub ai_director: Option<Arc<crate::ai::AiTrafficDirector>>,
     pub metrics: Arc<GatewayMetrics>,
+    pub ack_manager: Option<Arc<crate::sync::GatewayAckManager>>,
 }
 
 impl ProxyState {
@@ -278,6 +279,20 @@ impl ProxyState {
                 output.push_str(&format!("nexusedge_ai_tokens_total {}\n", total_tokens));
             }
         }
+
+        let spool_corrupted = self
+            .ack_manager
+            .as_ref()
+            .map(|m| if m.has_corrupt_spool() { 1 } else { 0 })
+            .unwrap_or(0);
+        output.push_str(
+            "\n# HELP nexusedge_gateway_ack_spool_corrupted Indicates if disk ACK spool is corrupted on startup\n",
+        );
+        output.push_str("# TYPE nexusedge_gateway_ack_spool_corrupted gauge\n");
+        output.push_str(&format!(
+            "nexusedge_gateway_ack_spool_corrupted {}\n",
+            spool_corrupted
+        ));
 
         output
     }
@@ -479,7 +494,14 @@ pub async fn handle_request(
         } else {
             true
         };
-        let is_ready = state.is_ready.load(std::sync::atomic::Ordering::Acquire) && ai_ready;
+        let spool_corrupted = state
+            .ack_manager
+            .as_ref()
+            .map(|m| m.has_corrupt_spool())
+            .unwrap_or(false);
+        let is_ready = state.is_ready.load(std::sync::atomic::Ordering::Acquire)
+            && ai_ready
+            && !spool_corrupted;
         let status = if is_ready {
             StatusCode::OK
         } else {
@@ -489,6 +511,7 @@ pub async fn handle_request(
             "status": if is_ready { "ready" } else { "unready" },
             "control_plane_synced": state.is_ready.load(std::sync::atomic::Ordering::Acquire),
             "auth_registry_healthy": ai_ready,
+            "spool_corrupted": spool_corrupted,
         });
         return Ok(json_response(status, body));
     }
@@ -526,6 +549,110 @@ pub async fn handle_request(
             "text/plain; version=0.0.4; charset=utf-8",
             metrics_text,
         ));
+    }
+
+    if path == "/v1/system/spool/recover" {
+        if method != hyper::Method::POST {
+            let body = serde_json::json!({
+                "error": "Method Not Allowed",
+                "message": "Spool recovery must be invoked via POST",
+            });
+            return Ok(json_response(StatusCode::METHOD_NOT_ALLOWED, body));
+        }
+
+        let is_internal = client_ip.is_loopback()
+            || state
+                .trusted_proxies
+                .iter()
+                .any(|cidr| cidr.contains(client_ip));
+        let auth_header = req
+            .headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .trim();
+        let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
+        let expected_token = std::env::var("NEXUSEDGE_SYSTEM_AUTH_TOKEN")
+            .unwrap_or_else(|_| std::env::var("NEXUSEDGE_CP_AUTH_TOKEN").unwrap_or_default());
+
+        let is_authenticated = !expected_token.is_empty() && token == expected_token;
+
+        if !is_internal && !is_authenticated {
+            let body = serde_json::json!({
+                "error": "Forbidden",
+                "message": "Spool recovery restricted to internal network or authorized operator",
+            });
+            return Ok(json_response(StatusCode::FORBIDDEN, body));
+        }
+
+        let Some(ref ack_mgr) = state.ack_manager else {
+            let body = serde_json::json!({
+                "error": "Bad Request",
+                "message": "GatewayAckManager is not enabled on this instance",
+            });
+            return Ok(json_response(StatusCode::BAD_REQUEST, body));
+        };
+
+        // Read optional payload
+        let mut limited_body = Limited::new(req.into_body(), MAX_REQUEST_BODY_BYTES);
+        let mut body_buf = Vec::new();
+        while let Some(frame_res) = limited_body.frame().await {
+            if let Ok(frame) = frame_res {
+                if let Ok(data) = frame.into_data() {
+                    body_buf.extend_from_slice(&data);
+                }
+            }
+        }
+
+        if !body_buf.is_empty() {
+            match serde_json::from_slice::<crate::sync::GatewaySyncAckPayload>(&body_buf) {
+                Ok(force_payload) => match ack_mgr.force_recover_spool(force_payload.clone()) {
+                    Ok(()) => {
+                        let body = serde_json::json!({
+                            "status": "recovered",
+                            "action": "force_overwrite",
+                            "applied_version": force_payload.applied_version,
+                            "spool_corrupted": ack_mgr.has_corrupt_spool(),
+                        });
+                        return Ok(json_response(StatusCode::OK, body));
+                    }
+                    Err(e) => {
+                        let body = serde_json::json!({
+                            "error": "Internal Server Error",
+                            "message": format!("Failed to force recover spool: {}", e),
+                        });
+                        return Ok(json_response(StatusCode::INTERNAL_SERVER_ERROR, body));
+                    }
+                },
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "error": "Bad Request",
+                        "message": format!("Invalid GatewaySyncAckPayload JSON: {}", e),
+                    });
+                    return Ok(json_response(StatusCode::BAD_REQUEST, body));
+                }
+            }
+        } else {
+            match ack_mgr.recheck_and_recover_spool() {
+                Ok(recovered_opt) => {
+                    let body = serde_json::json!({
+                        "status": "recovered",
+                        "action": "recheck_disk",
+                        "recovered_version": recovered_opt.map(|p| p.applied_version),
+                        "spool_corrupted": ack_mgr.has_corrupt_spool(),
+                    });
+                    return Ok(json_response(StatusCode::OK, body));
+                }
+                Err(e) => {
+                    let body = serde_json::json!({
+                        "error": "Conflict",
+                        "message": format!("Spool file is still unreadable or corrupted: {}", e),
+                        "spool_corrupted": true,
+                    });
+                    return Ok(json_response(StatusCode::CONFLICT, body));
+                }
+            }
+        }
     }
 
     state

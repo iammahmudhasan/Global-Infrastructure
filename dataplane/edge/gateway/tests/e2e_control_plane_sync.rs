@@ -11,8 +11,8 @@ use nexusedge_gateway::proxy::{handle_request, ProxyState};
 use nexusedge_gateway::rate_limit::RateLimiter;
 use nexusedge_gateway::router::{parse_pop_config_routes, Router, RouterError, RoutingError};
 use nexusedge_gateway::sync::{
-    fetch_and_apply_control_plane_snapshot, validate_control_plane_endpoint, SyncError,
-    MAX_CONTROL_PLANE_SNAPSHOT_BYTES,
+    fetch_and_apply_control_plane_snapshot, validate_control_plane_endpoint, GatewayAckManager,
+    GatewaySyncAckPayload, SyncError, MAX_CONTROL_PLANE_SNAPSHOT_BYTES,
 };
 use nexusedge_gateway::waf::WafEngine;
 use reqwest::dns::Resolve;
@@ -944,6 +944,7 @@ async fn test_e2e_readiness_and_liveness_probes() {
         config,
         ai_director: None,
         metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
+        ack_manager: None,
     });
 
     let (addr, shutdown_tx) = spawn_mock_gateway(state).await;
@@ -999,8 +1000,143 @@ async fn test_e2e_readiness_and_liveness_probes() {
     assert!(metrics_body.contains("nexusedge_requests_total"));
     assert!(metrics_body.contains("nexusedge_responses_total"));
     assert!(metrics_body.contains("nexusedge_waf_blocked_total"));
+    assert!(metrics_body.contains("nexusedge_gateway_ack_spool_corrupted 0"));
 
     let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn test_e2e_corrupt_spool_readiness_gate_and_operator_recovery() {
+    let temp_dir = std::env::temp_dir();
+    let spool_path = temp_dir.join(format!(
+        "nexusedge_e2e_corrupt_spool_{}_{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    // 1. Write corrupted JSON payload to disk
+    std::fs::write(&spool_path, "{ broken json...").expect("write corrupt spool failed");
+
+    let ack_mgr = Arc::new(GatewayAckManager::new(
+        "http://127.0.0.1:9999".to_string(),
+        "dummy-token".to_string(),
+        HttpClient::new(),
+        Some(spool_path.clone()),
+    ));
+    assert!(ack_mgr.has_corrupt_spool());
+
+    let config = GatewayConfig::default();
+    let is_ready = Arc::new(AtomicBool::new(true)); // control plane synced
+    let state = Arc::new(ProxyState {
+        rate_limiter: RateLimiter::new(
+            config.rate_limit.enabled,
+            config.rate_limit.requests_per_second,
+            config.rate_limit.burst_capacity,
+        ),
+        waf: WafEngine::new(&config.waf),
+        cache: EdgeCache::new(
+            config.cache.enabled,
+            config.cache.default_ttl_seconds,
+            config.cache.max_entries,
+            config.cache.max_bytes,
+        ),
+        router: Router::new(vec![], 5000),
+        http_client: HttpClient::new(),
+        client_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        inflight_buffer_semaphore: Arc::new(tokio::sync::Semaphore::new(100)),
+        aggregate_buffered_bytes: Arc::new(AtomicUsize::new(0)),
+        aggregate_buffered_request_bytes: Arc::new(AtomicUsize::new(0)),
+        is_ready: Arc::clone(&is_ready),
+        trusted_proxies: config.parsed_trusted_proxies(),
+        config,
+        ai_director: None,
+        metrics: Arc::new(nexusedge_gateway::proxy::GatewayMetrics::default()),
+        ack_manager: Some(Arc::clone(&ack_mgr)),
+    });
+
+    let (addr, shutdown_tx) = spawn_mock_gateway(state).await;
+    let client = HttpClient::new();
+
+    // 2. Invariant: /ready MUST return 503 Service Unavailable when spool is corrupt
+    let ready_resp = client
+        .get(format!("http://127.0.0.1:{}/ready", addr.port()))
+        .send()
+        .await
+        .expect("Ready probe request must succeed");
+    assert_eq!(
+        ready_resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let ready_body: serde_json::Value = ready_resp.json().await.unwrap();
+    assert_eq!(ready_body["status"], "unready");
+    assert_eq!(ready_body["spool_corrupted"], true);
+
+    // 3. Invariant: /metrics MUST expose nexusedge_gateway_ack_spool_corrupted 1
+    let metrics_resp = client
+        .get(format!("http://127.0.0.1:{}/metrics", addr.port()))
+        .send()
+        .await
+        .expect("Metrics request must succeed");
+    assert_eq!(metrics_resp.status(), reqwest::StatusCode::OK);
+    let metrics_text = metrics_resp.text().await.unwrap();
+    assert!(metrics_text.contains("nexusedge_gateway_ack_spool_corrupted 1"));
+
+    // 4. Operator repairs spool file with valid JSON
+    let valid_payload = GatewaySyncAckPayload {
+        gateway_id: "gw-e2e-repair".to_string(),
+        pop_id: "dhaka".to_string(),
+        applied_version: 55,
+        applied_checksum: "hash-v55".to_string(),
+        status: "IN_SYNC".to_string(),
+        error: None,
+    };
+    std::fs::write(
+        &spool_path,
+        serde_json::to_string_pretty(&valid_payload).unwrap(),
+    )
+    .expect("write repaired spool failed");
+
+    // 5. Operator triggers POST /v1/system/spool/recover
+    let recover_resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/v1/system/spool/recover",
+            addr.port()
+        ))
+        .send()
+        .await
+        .expect("Spool recover request must succeed");
+    assert_eq!(recover_resp.status(), reqwest::StatusCode::OK);
+    let recover_body: serde_json::Value = recover_resp.json().await.unwrap();
+    assert_eq!(recover_body["status"], "recovered");
+    assert_eq!(recover_body["spool_corrupted"], false);
+    assert_eq!(recover_body["recovered_version"], 55);
+
+    // 6. Invariant: /ready MUST now return 200 OK
+    let ready_again = client
+        .get(format!("http://127.0.0.1:{}/ready", addr.port()))
+        .send()
+        .await
+        .expect("Ready probe request must succeed");
+    assert_eq!(ready_again.status(), reqwest::StatusCode::OK);
+    let ready_again_body: serde_json::Value = ready_again.json().await.unwrap();
+    assert_eq!(ready_again_body["status"], "ready");
+    assert_eq!(ready_again_body["spool_corrupted"], false);
+
+    // 7. Invariant: /metrics MUST now expose nexusedge_gateway_ack_spool_corrupted 0
+    let metrics_again = client
+        .get(format!("http://127.0.0.1:{}/metrics", addr.port()))
+        .send()
+        .await
+        .expect("Metrics request must succeed");
+    assert_eq!(metrics_again.status(), reqwest::StatusCode::OK);
+    let metrics_again_text = metrics_again.text().await.unwrap();
+    assert!(metrics_again_text.contains("nexusedge_gateway_ack_spool_corrupted 0"));
+
+    let _ = shutdown_tx.send(());
+    let _ = std::fs::remove_file(&spool_path);
 }
 
 #[tokio::test]

@@ -168,6 +168,10 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 	popMgr := pop.NewManager()
 	popProber := health.NewPoPHealthProber(popMgr, alerter)
 
+	if pgRepo, ok := s.(*store.PostgresRepository); ok && alerter != nil {
+		pgRepo.SetAlerter(alerter)
+	}
+
 	gwTracker, gwTrackerErr := events.NewGatewaySyncTrackerWithStore(15*time.Second, s)
 
 	h := &APIHandler{
@@ -212,6 +216,9 @@ func (h *APIHandler) SetAlerter(a alert.Alerter) {
 	h.alerter = a
 	if h.monitor != nil {
 		h.monitor.SetAlerter(a)
+	}
+	if pgRepo, ok := h.store.(*store.PostgresRepository); ok {
+		pgRepo.SetAlerter(a)
 	}
 }
 
@@ -475,6 +482,22 @@ func (h *APIHandler) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			"service": "nexusedge-config-controller",
 		})
 		return
+	}
+	if pgRepo, ok := h.store.(*store.PostgresRepository); ok {
+		if fails := pgRepo.ConsecutiveReconcileFailures(); fails >= 3 {
+			lastErrStr := ""
+			if lastErr := pgRepo.LastReconcileError(); lastErr != nil {
+				lastErrStr = lastErr.Error()
+			}
+			writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+				"status":               "unready",
+				"error":                "cache reconciler consecutive failure threshold exceeded",
+				"consecutive_failures": fails,
+				"last_error":           lastErrStr,
+				"service":              "nexusedge-config-controller",
+			})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "healthy",

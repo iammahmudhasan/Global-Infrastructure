@@ -11,12 +11,14 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/lib/pq"
 
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/alert"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 )
@@ -89,6 +91,9 @@ type PostgresRepository struct {
 	reconcileMu               sync.RWMutex
 	consecutiveReconcileFails int64
 	lastReconcileError        error
+	lastReconcileSuccess      time.Time
+	lastReconcileDuration     time.Duration
+	alerter                   alert.Alerter
 }
 
 var _ Repository = (*PostgresRepository)(nil)
@@ -98,17 +103,44 @@ func (r *PostgresRepository) SetAuditHMACKey(key []byte) {
 	r.auditHMACKey = key
 }
 
-func (r *PostgresRepository) recordReconcileFailure(err error) {
+// SetAlerter wires an operational alert dispatcher for reconciler threshold notifications.
+func (r *PostgresRepository) SetAlerter(a alert.Alerter) {
+	r.reconcileMu.Lock()
+	defer r.reconcileMu.Unlock()
+	r.alerter = a
+}
+
+func (r *PostgresRepository) recordReconcileFailure(err error, dur time.Duration) {
 	r.reconcileMu.Lock()
 	r.consecutiveReconcileFails++
 	count := r.consecutiveReconcileFails
 	r.lastReconcileError = err
+	r.lastReconcileDuration = dur
+	alerter := r.alerter
 	r.reconcileMu.Unlock()
 
 	const alertThreshold = 3
 	if count >= alertThreshold {
 		log.Printf("[CRITICAL RECONCILER THRESHOLD EXCEEDED] event=reconcile_failure_threshold_exceeded consecutive_failures=%d threshold=%d error=%q",
 			count, alertThreshold, err.Error())
+		if alerter != nil && alerter.IsConfigured() {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				_ = alerter.SendAlert(ctx, alert.Event{
+					Type:      alert.EventTypeReconcilerThresholdExceeded,
+					Severity:  alert.SeverityCritical,
+					Title:     fmt.Sprintf("Cache Reconciler Threshold Exceeded (%d failures)", count),
+					Message:   fmt.Sprintf("Edge config-controller cache reconciliation has failed %d consecutive times. Last error: %s", count, err.Error()),
+					Timestamp: time.Now().UTC(),
+					Details: map[string]string{
+						"consecutive_failures": strconv.FormatInt(count, 10),
+						"threshold":            strconv.Itoa(alertThreshold),
+						"last_error":           err.Error(),
+					},
+				})
+			}()
+		}
 	}
 }
 
@@ -124,6 +156,20 @@ func (r *PostgresRepository) LastReconcileError() error {
 	r.reconcileMu.RLock()
 	defer r.reconcileMu.RUnlock()
 	return r.lastReconcileError
+}
+
+// LastReconcileSuccess returns the timestamp of the last successful cache reconciliation.
+func (r *PostgresRepository) LastReconcileSuccess() time.Time {
+	r.reconcileMu.RLock()
+	defer r.reconcileMu.RUnlock()
+	return r.lastReconcileSuccess
+}
+
+// LastReconcileDuration returns the duration of the last cache reconciliation attempt.
+func (r *PostgresRepository) LastReconcileDuration() time.Duration {
+	r.reconcileMu.RLock()
+	defer r.reconcileMu.RUnlock()
+	return r.lastReconcileDuration
 }
 
 // NewPostgresRepository establishes a connection to PostgreSQL, executes initial schema migrations,
@@ -1333,18 +1379,20 @@ type CacheReconciliationStats struct {
 // PostgreSQL system-of-record state, evicting any stale domains deleted by other replicas
 // and synchronizing version-advanced configurations.
 func (r *PostgresRepository) ReconcileCache(ctx context.Context) (stats *CacheReconciliationStats, err error) {
+	start := time.Now()
 	defer func() {
+		dur := time.Since(start)
 		if err != nil {
-			r.recordReconcileFailure(err)
+			r.recordReconcileFailure(err, dur)
 		} else {
 			r.reconcileMu.Lock()
 			r.consecutiveReconcileFails = 0
 			r.lastReconcileError = nil
+			r.lastReconcileSuccess = time.Now().UTC()
+			r.lastReconcileDuration = dur
 			r.reconcileMu.Unlock()
 		}
 	}()
-
-	start := time.Now()
 
 	// Use a single REPEATABLE READ read-only transaction to ensure an atomic, point-in-time
 	// MVCC snapshot across all configuration tables (domains, routes, pools, origins, certs, policies).
