@@ -430,6 +430,7 @@ pub struct GatewayAckManager {
     pub pending_ack: Arc<RwLock<Option<GatewaySyncAckPayload>>>,
     notify: Arc<tokio::sync::Notify>,
     spool_lock: Arc<std::sync::Mutex<()>>,
+    pub corrupt_spool_detected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GatewayAckManager {
@@ -439,19 +440,38 @@ impl GatewayAckManager {
         client: HttpClient,
         spool_path: Option<PathBuf>,
     ) -> Self {
+        let corrupt_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut initial_ack = None;
         if let Some(ref path) = spool_path {
             if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(recovered) = serde_json::from_str::<GatewaySyncAckPayload>(&content) {
-                        tracing::info!(
-                            pop_id = %recovered.pop_id,
-                            gateway_id = %recovered.gateway_id,
-                            version = recovered.applied_version,
+                match std::fs::read_to_string(path) {
+                    Ok(content) => match serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                        Ok(recovered) => {
+                            tracing::info!(
+                                pop_id = %recovered.pop_id,
+                                gateway_id = %recovered.gateway_id,
+                                version = recovered.applied_version,
+                                spool_file = %path.display(),
+                                "Recovered pending edge gateway ACK from durable disk spool"
+                            );
+                            initial_ack = Some(recovered);
+                        }
+                        Err(e) => {
+                            corrupt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            tracing::error!(
+                                spool_file = %path.display(),
+                                error = %e,
+                                "CRITICAL: Durable ACK spool on disk is corrupted (invalid JSON) upon startup. Preserving corrupt file for diagnostics; operator recovery required"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        corrupt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        tracing::error!(
                             spool_file = %path.display(),
-                            "Recovered pending edge gateway ACK from durable disk spool"
+                            error = %e,
+                            "CRITICAL: Durable ACK spool exists on disk but cannot be read upon startup. Preserving corrupt file for diagnostics; operator recovery required"
                         );
-                        initial_ack = Some(recovered);
                     }
                 }
             }
@@ -465,7 +485,14 @@ impl GatewayAckManager {
             pending_ack: Arc::new(RwLock::new(initial_ack)),
             notify: Arc::new(tokio::sync::Notify::new()),
             spool_lock: Arc::new(std::sync::Mutex::new(())),
+            corrupt_spool_detected: corrupt_flag,
         }
+    }
+
+    /// Returns true if an unreadable or corrupted ACK spool was encountered on disk during startup or worker reload.
+    pub fn has_corrupt_spool(&self) -> bool {
+        self.corrupt_spool_detected
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Enqueues the latest applied state acknowledgement and wakes the retry worker.
@@ -642,19 +669,39 @@ impl GatewayAckManager {
                         let _spool_guard =
                             self.spool_lock.lock().unwrap_or_else(|p| p.into_inner());
                         if path.exists() {
-                            if let Ok(content) = std::fs::read_to_string(path) {
-                                if let Ok(recovered) =
-                                    serde_json::from_str::<GatewaySyncAckPayload>(&content)
-                                {
-                                    let mut guard =
-                                        self.pending_ack.write().unwrap_or_else(|p| p.into_inner());
-                                    *guard = Some(recovered.clone());
-                                    Some(recovered)
-                                } else {
+                            match std::fs::read_to_string(path) {
+                                Ok(content) => {
+                                    match serde_json::from_str::<GatewaySyncAckPayload>(&content) {
+                                        Ok(recovered) => {
+                                            let mut guard = self
+                                                .pending_ack
+                                                .write()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            *guard = Some(recovered.clone());
+                                            Some(recovered)
+                                        }
+                                        Err(e) => {
+                                            self.corrupt_spool_detected
+                                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                                            tracing::error!(
+                                                spool_file = %path.display(),
+                                                error = %e,
+                                                "CRITICAL: Background retry worker found corrupted ACK spool on disk. Preserving file for manual recovery"
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    self.corrupt_spool_detected
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                    tracing::error!(
+                                        spool_file = %path.display(),
+                                        error = %e,
+                                        "CRITICAL: Background retry worker cannot read existing ACK spool file. Preserving file for manual recovery"
+                                    );
                                     None
                                 }
-                            } else {
-                                None
                             }
                         } else {
                             None
@@ -1695,6 +1742,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_gateway_ack_manager_stale_ack_wakes_worker() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock TCP listener failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let endpoint = format!("http://{}", addr);
+
         let temp_dir = std::env::temp_dir();
         let spool_path = temp_dir.join(format!(
             "nexusedge_test_spool_stale_wake_{}_{}.json",
@@ -1706,12 +1761,12 @@ mod tests {
         ));
 
         let client = HttpClient::new();
-        let mgr = GatewayAckManager::new(
-            "http://127.0.0.1:9091".to_string(),
+        let mgr = Arc::new(GatewayAckManager::new(
+            endpoint,
             "token-01".to_string(),
             client,
             Some(spool_path.clone()),
-        );
+        ));
 
         // 1. Initial authoritative submission of version 100
         let ack_v100 = GatewaySyncAckPayload {
@@ -1724,13 +1779,35 @@ mod tests {
         };
         assert!(mgr.submit_ack(ack_v100).is_ok());
 
-        // Clear in-memory state to simulate a worker pickup or memory reset
+        // Clear in-memory state to simulate a worker pickup or memory reset while disk retains v100
         if let Ok(mut guard) = mgr.pending_ack.write() {
             *guard = None;
         }
         assert!(mgr.pending_ack().is_none());
 
-        // 2. Submit a stale version 90
+        // Spawn mock server to receive delivered ACK
+        let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                if let Ok(n) = socket.read(&mut buffer).await {
+                    let req_str = String::from_utf8_lossy(&buffer[..n]);
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = &req_str[body_start + 4..];
+                        if let Ok(payload) = serde_json::from_str::<GatewaySyncAckPayload>(body) {
+                            let _ = tx_payload.send(payload);
+                        }
+                    }
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        // Spawn background worker
+        let worker_handle = mgr.clone().spawn_worker();
+
+        // 2. Submit a stale version 90 (simulates delayed/out-of-order ACK arrival)
         let ack_stale = GatewaySyncAckPayload {
             gateway_id: "gw-01".to_string(),
             pop_id: "dhaka".to_string(),
@@ -1746,6 +1823,167 @@ mod tests {
         assert_eq!(restored.applied_version, 100);
         assert_eq!(restored.applied_checksum, "hash-v100");
 
+        // 4. Invariant: worker MUST be awakened by notify_one() and deliver version 100 to mock server
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx_payload)
+            .await
+            .expect("worker failed to deliver ACK within timeout")
+            .expect("failed to receive payload from mock server");
+        assert_eq!(delivered.applied_version, 100);
+        assert_eq!(delivered.applied_checksum, "hash-v100");
+
+        // 5. Invariant: spool file on disk MUST be deleted upon 200 OK
+        let mut cleaned_up = false;
+        for _ in 0..50 {
+            if !spool_path.exists() {
+                cleaned_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cleaned_up,
+            "spool file was not cleaned up after successful delivery"
+        );
+
+        worker_handle.abort();
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_startup_detects_corrupt_spool() {
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_startup_corrupt_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let corrupted_content = "{\"gateway_id\": \"gw-corrupt\", \"applied_version\": ";
+        std::fs::write(&spool_path, corrupted_content).expect("write corrupt spool failed");
+
+        let client = HttpClient::new();
+        let mgr = GatewayAckManager::new(
+            "http://127.0.0.1:9091".to_string(),
+            "token-01".to_string(),
+            client,
+            Some(spool_path.clone()),
+        );
+
+        // Invariant: corrupt spool flag must be raised
+        assert!(
+            mgr.has_corrupt_spool(),
+            "expected corrupt spool flag to be true"
+        );
+        // Invariant: corrupt state must not be loaded into memory
+        assert!(
+            mgr.pending_ack().is_none(),
+            "expected pending_ack to be None"
+        );
+        // Invariant: corrupt spool file must NOT be deleted automatically (preserved for operator diagnostics)
+        assert!(
+            spool_path.exists(),
+            "corrupt spool file was deleted automatically"
+        );
+        let on_disk = std::fs::read_to_string(&spool_path).expect("read spool failed");
+        assert_eq!(on_disk, corrupted_content);
+
+        let _ = std::fs::remove_file(&spool_path);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_ack_manager_crash_recovery_idempotent_redelivery() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock TCP listener failed");
+        let addr = listener.local_addr().expect("local_addr failed");
+        let endpoint = format!("http://{}", addr);
+
+        let temp_dir = std::env::temp_dir();
+        let spool_path = temp_dir.join(format!(
+            "nexusedge_test_spool_crash_recovery_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        // Simulate pre-existing durable spool file left by previous process crash before directory sync
+        let existing_ack = GatewaySyncAckPayload {
+            gateway_id: "gw-crash-01".to_string(),
+            pop_id: "dhaka".to_string(),
+            applied_version: 75,
+            applied_checksum: "hash-crash-75".to_string(),
+            status: "IN_SYNC".to_string(),
+            error: None,
+        };
+        let serialized = serde_json::to_string_pretty(&existing_ack).unwrap();
+        std::fs::write(&spool_path, serialized).expect("write existing spool failed");
+
+        let (tx_payload, rx_payload) = tokio::sync::oneshot::channel::<GatewaySyncAckPayload>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                if let Ok(n) = socket.read(&mut buffer).await {
+                    let req_str = String::from_utf8_lossy(&buffer[..n]);
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = &req_str[body_start + 4..];
+                        if let Ok(payload) = serde_json::from_str::<GatewaySyncAckPayload>(body) {
+                            let _ = tx_payload.send(payload);
+                        }
+                    }
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let client = HttpClient::new();
+        let mgr = Arc::new(GatewayAckManager::new(
+            endpoint,
+            "token-crash".to_string(),
+            client,
+            Some(spool_path.clone()),
+        ));
+
+        // Invariant: startup recovers v75 into memory
+        assert!(!mgr.has_corrupt_spool());
+        let recovered = mgr
+            .pending_ack()
+            .expect("expected recovered ACK on startup");
+        assert_eq!(recovered.applied_version, 75);
+        assert_eq!(recovered.applied_checksum, "hash-crash-75");
+
+        let worker_handle = mgr.clone().spawn_worker();
+
+        let delivered = tokio::time::timeout(Duration::from_secs(5), rx_payload)
+            .await
+            .expect("worker failed to deliver recovered ACK within timeout")
+            .expect("failed to receive payload from mock server");
+
+        assert_eq!(delivered.applied_version, 75);
+        assert_eq!(delivered.applied_checksum, "hash-crash-75");
+
+        // Invariant: spool file deleted after delivery
+        let mut cleaned_up = false;
+        for _ in 0..50 {
+            if !spool_path.exists() {
+                cleaned_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            cleaned_up,
+            "spool file was not cleaned up after crash recovery delivery"
+        );
+
+        worker_handle.abort();
         let _ = std::fs::remove_file(&spool_path);
     }
 }

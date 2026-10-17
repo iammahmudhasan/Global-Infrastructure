@@ -85,6 +85,10 @@ type PostgresRepository struct {
 	auditHMACKey     []byte
 	reconcilerCancel context.CancelFunc
 	reconcilerWg     sync.WaitGroup
+
+	reconcileMu               sync.RWMutex
+	consecutiveReconcileFails int64
+	lastReconcileError        error
 }
 
 var _ Repository = (*PostgresRepository)(nil)
@@ -92,6 +96,34 @@ var _ Repository = (*PostgresRepository)(nil)
 // SetAuditHMACKey configures the HMAC signing key used for atomic chain serialization in SaveAuditLog.
 func (r *PostgresRepository) SetAuditHMACKey(key []byte) {
 	r.auditHMACKey = key
+}
+
+func (r *PostgresRepository) recordReconcileFailure(err error) {
+	r.reconcileMu.Lock()
+	r.consecutiveReconcileFails++
+	count := r.consecutiveReconcileFails
+	r.lastReconcileError = err
+	r.reconcileMu.Unlock()
+
+	const alertThreshold = 3
+	if count >= alertThreshold {
+		log.Printf("[CRITICAL RECONCILER THRESHOLD EXCEEDED] event=reconcile_failure_threshold_exceeded consecutive_failures=%d threshold=%d error=%q",
+			count, alertThreshold, err.Error())
+	}
+}
+
+// ConsecutiveReconcileFailures returns the current count of consecutive failed cache reconciliations.
+func (r *PostgresRepository) ConsecutiveReconcileFailures() int64 {
+	r.reconcileMu.RLock()
+	defer r.reconcileMu.RUnlock()
+	return r.consecutiveReconcileFails
+}
+
+// LastReconcileError returns the last error encountered during cache reconciliation, if any.
+func (r *PostgresRepository) LastReconcileError() error {
+	r.reconcileMu.RLock()
+	defer r.reconcileMu.RUnlock()
+	return r.lastReconcileError
 }
 
 // NewPostgresRepository establishes a connection to PostgreSQL, executes initial schema migrations,
@@ -1300,7 +1332,18 @@ type CacheReconciliationStats struct {
 // ReconcileCache reconciles the local in-memory cache projection against authoritative
 // PostgreSQL system-of-record state, evicting any stale domains deleted by other replicas
 // and synchronizing version-advanced configurations.
-func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconciliationStats, error) {
+func (r *PostgresRepository) ReconcileCache(ctx context.Context) (stats *CacheReconciliationStats, err error) {
+	defer func() {
+		if err != nil {
+			r.recordReconcileFailure(err)
+		} else {
+			r.reconcileMu.Lock()
+			r.consecutiveReconcileFails = 0
+			r.lastReconcileError = nil
+			r.reconcileMu.Unlock()
+		}
+	}()
+
 	start := time.Now()
 
 	// Use a single REPEATABLE READ read-only transaction to ensure an atomic, point-in-time
@@ -1440,7 +1483,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		if encKey != "" {
 			dec, decErr := security.DecryptSecret(encKey)
 			if decErr != nil {
-				log.Printf("[SECURITY ALERT] ReconcileCache rejected un-decryptable private key for certificate %s (domain %s): %v", cert.ID, cert.DomainID, decErr)
+				log.Printf("[SECURITY ALERT] event=secret_decryption_failure category=certificate_private_key domain_id=%s cert_id=%s error=%q", cert.DomainID, cert.ID, decErr.Error())
 				return nil, fmt.Errorf("reconcile cache decrypt private key for certificate %s (domain %s): %w", cert.ID, cert.DomainID, decErr)
 			}
 			cert.PrivateKeyPEM = dec
@@ -1535,7 +1578,7 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 		return nil, fmt.Errorf("apply reconciliation snapshot to cache: %w", err)
 	}
 
-	stats := &CacheReconciliationStats{
+	stats = &CacheReconciliationStats{
 		ActiveDomains:  len(activeDBMap),
 		EvictedDomains: evictedDomains,
 		UpdatedDomains: updatedDomains,
@@ -1571,7 +1614,8 @@ func (r *PostgresRepository) StartReconciler(ctx context.Context, interval time.
 			case <-ticker.C:
 				reconcileTimeoutCtx, tCancel := context.WithTimeout(reconcileCtx, 5*time.Second)
 				if _, recErr := r.ReconcileCache(reconcileTimeoutCtx); recErr != nil {
-					log.Printf("[RECONCILER ERROR] Periodic cache reconciliation failed: %v", recErr)
+					log.Printf("[RECONCILER ERROR] event=periodic_reconciliation_failed consecutive_failures=%d error=%q",
+						r.ConsecutiveReconcileFailures(), recErr.Error())
 				}
 				tCancel()
 			}
@@ -2283,7 +2327,7 @@ func (r *PostgresRepository) GetCertificate(domainID string) *model.Certificate 
 	if encKey != "" {
 		dec, decErr := security.DecryptSecret(encKey)
 		if decErr != nil {
-			log.Printf("[SECURITY ALERT] Failed to decrypt active certificate private key for domain=%s cert_id=%s: %v", domainID, cert.ID, decErr)
+			log.Printf("[SECURITY ALERT] event=secret_decryption_failure category=certificate_private_key domain_id=%s cert_id=%s error=%q", domainID, cert.ID, decErr.Error())
 			return nil
 		}
 		cert.PrivateKeyPEM = dec
@@ -2495,7 +2539,7 @@ func (r *PostgresRepository) GetAIProvider(id string) (*model.AIProvider, error)
 	if encryptedKey != "" {
 		dec, decErr := security.DecryptSecret(encryptedKey)
 		if decErr != nil {
-			log.Printf("[SECURITY ALERT] Failed to decrypt AI provider secret for id=%s: %v", id, decErr)
+			log.Printf("[SECURITY ALERT] event=secret_decryption_failure category=ai_provider_api_key provider_id=%s error=%q", id, decErr.Error())
 			return nil, fmt.Errorf("decrypt ai_provider %s secret: %w", id, decErr)
 		}
 		p.APIKey = dec

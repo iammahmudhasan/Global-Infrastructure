@@ -2053,3 +2053,59 @@ func TestPostgresRepository_SavePoPSnapshotHead_CanceledContext(t *testing.T) {
 		t.Fatalf("expected error when saving snapshot head with canceled context, got nil")
 	}
 }
+
+func TestPostgresRepository_ReconcileCache_RepeatedFailuresThresholdTracking(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("skipping Postgres ReconcileCache repeated failures test: NEXUSEDGE_TEST_DATABASE_URL not set")
+	}
+
+	repo, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository: %v", err)
+	}
+	defer repo.Close()
+
+	// Initial consecutive failures count must be 0
+	if fails := repo.ConsecutiveReconcileFailures(); fails != 0 {
+		t.Fatalf("expected 0 initial failures, got %d", fails)
+	}
+
+	// 1. Simulate repeated reconciliation failures with canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for i := 1; i <= 3; i++ {
+		_, recErr := repo.ReconcileCache(canceledCtx)
+		if recErr == nil {
+			t.Fatalf("iteration %d: expected error on canceled context, got nil", i)
+		}
+		if fails := repo.ConsecutiveReconcileFailures(); fails != int64(i) {
+			t.Fatalf("iteration %d: expected consecutive failures = %d, got %d", i, i, fails)
+		}
+	}
+
+	// Check that threshold (>= 3) was reached and last error was recorded
+	if lastErr := repo.LastReconcileError(); lastErr == nil {
+		t.Fatalf("expected recorded last reconcile error, got nil")
+	}
+
+	// 2. Successful reconciliation resets failure counter to 0
+	ctx, cancelTimeout := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelTimeout()
+
+	stats, recErr := repo.ReconcileCache(ctx)
+	if recErr != nil {
+		t.Fatalf("expected healthy ReconcileCache to succeed, got %v", recErr)
+	}
+	if stats == nil {
+		t.Fatalf("expected non-nil stats from successful ReconcileCache")
+	}
+
+	if fails := repo.ConsecutiveReconcileFailures(); fails != 0 {
+		t.Fatalf("expected consecutive failures to reset to 0 after success, got %d", fails)
+	}
+	if lastErr := repo.LastReconcileError(); lastErr != nil {
+		t.Fatalf("expected last error to reset to nil after success, got %v", lastErr)
+	}
+}
