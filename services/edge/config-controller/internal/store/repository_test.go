@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/model"
+	"github.com/iammahmudhasan/nexusedge-config-controller/internal/security"
 	"github.com/iammahmudhasan/nexusedge-config-controller/internal/store"
 )
 
@@ -454,5 +456,143 @@ func TestValidateProductionDatabaseURL(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestPostgresRepository_AuditPersistenceAndFencing(t *testing.T) {
+	dbURL := os.Getenv("NEXUSEDGE_TEST_DATABASE_URL")
+	if dbURL == "" {
+		dbURL = os.Getenv("POSTGRES_TEST_URL")
+	}
+	if dbURL == "" {
+		t.Skip("skipping PostgresRepository audit persistence and outbox fencing test: NEXUSEDGE_TEST_DATABASE_URL is not set")
+	}
+
+	repo1, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to initialize repository: %v", err)
+	}
+
+	testKey := []byte("nexusedge-test-audit-key-2026")
+	repo1.SetAuditHMACKey(testKey)
+
+	testID := fmt.Sprintf("aud-test-%d", time.Now().UnixNano())
+	now := time.Now().UTC()
+	tsStr := now.Truncate(time.Microsecond).Format(time.RFC3339Nano)
+
+	head := repo1.GetLastAuditHash()
+	hash1, err := security.ComputeCanonicalPayloadHash(
+		testKey, testID, tsStr, "admin", "org-1", "prj-audit-test",
+		"domain.create", "domain", "dom-1", "127.0.0.1",
+		map[string]interface{}{"note": "test"}, head,
+	)
+	if err != nil {
+		t.Fatalf("failed to compute canonical hash: %v", err)
+	}
+
+	log1 := &model.AuditLog{
+		ID:           testID,
+		OrgID:        "org-1",
+		ProjectID:    "prj-audit-test",
+		Actor:        "admin",
+		Action:       "domain.create",
+		ResourceType: "domain",
+		ResourceID:   "dom-1",
+		ClientIP:     "127.0.0.1",
+		Details:      map[string]interface{}{"note": "test"},
+		PrevHash:     head,
+		Hash:         hash1,
+		CreatedAt:    now,
+	}
+
+	if err := repo1.SaveAuditLog(log1); err != nil {
+		t.Fatalf("failed to save audit log: %v", err)
+	}
+
+	// 1. Idempotent replay: exact duplicate (same ID, same hash) must succeed
+	if err := repo1.SaveAuditLog(log1); err != nil {
+		t.Fatalf("idempotent replay of audit log failed: %v", err)
+	}
+
+	// 2. Conflict detection: duplicate ID with altered hash must fail
+	conflictLog := *log1
+	conflictLog.Hash = "tampered-hash-value"
+	if err := repo1.SaveAuditLog(&conflictLog); err == nil {
+		t.Fatalf("expected conflict error for altered hash with existing ID, got nil")
+	}
+
+	// 3. Atomic head re-linking: saving an audit log with stale prev_hash must atomically re-link to head
+	testID2 := fmt.Sprintf("aud-relink-%d", time.Now().UnixNano())
+	log2 := &model.AuditLog{
+		ID:           testID2,
+		OrgID:        "org-1",
+		ProjectID:    "prj-audit-test",
+		Actor:        "admin",
+		Action:       "domain.update",
+		ResourceType: "domain",
+		ResourceID:   "dom-1",
+		ClientIP:     "127.0.0.1",
+		Details:      map[string]interface{}{"note": "relink-test"},
+		PrevHash:     "stale-nonexistent-head", // intentional stale head
+		Hash:         "initial-placeholder-hash",
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := repo1.SaveAuditLog(log2); err != nil {
+		t.Fatalf("failed to save and re-link audit log: %v", err)
+	}
+	if log2.PrevHash != log1.Hash {
+		t.Fatalf("expected log2 to be atomically re-linked to prevHash %s, got %s", log1.Hash, log2.PrevHash)
+	}
+
+	_ = repo1.Close()
+
+	// 4. Restart recovery and durable reads
+	repo2, err := store.NewPostgresRepository(dbURL)
+	if err != nil {
+		t.Fatalf("failed to restart repository: %v", err)
+	}
+	repo2.SetAuditHMACKey(testKey)
+	defer repo2.Close()
+
+	recoveredLog, err := repo2.GetAuditLog(testID)
+	if err != nil || recoveredLog == nil {
+		t.Fatalf("failed to get audit log from database after restart: %v", err)
+	}
+	if recoveredLog.Hash != hash1 {
+		t.Fatalf("expected hash %s, got %s", hash1, recoveredLog.Hash)
+	}
+
+	logs, total, err := repo2.ListAuditLogs("prj-audit-test", 10, 0)
+	if err != nil {
+		t.Fatalf("failed to list audit logs from database: %v", err)
+	}
+	if total < 2 || len(logs) < 2 {
+		t.Fatalf("expected at least 2 audit logs, got total=%d len=%d", total, len(logs))
+	}
+
+	// 5. Authoritative empty query results
+	emptyDomains := repo2.ListDomainsByProject("non-existent-project-404")
+	if len(emptyDomains) != 0 {
+		t.Fatalf("expected empty slice for non-existent project, got %d domains", len(emptyDomains))
+	}
+
+	// 6. Outbox lease fencing
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	claimedEvents, err := repo2.ClaimOutboxEvents(ctx, "worker-primary", 5, 30*time.Second)
+	if err != nil {
+		t.Fatalf("failed to claim outbox events: %v", err)
+	}
+	if len(claimedEvents) > 0 {
+		ev := claimedEvents[0]
+		// Stale worker attempt must fail with ErrOutboxLeaseLost
+		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-stale"); err != store.ErrOutboxLeaseLost {
+			t.Fatalf("expected ErrOutboxLeaseLost for wrong worker, got %v", err)
+		}
+		// Authorized lease holder must succeed
+		if err := repo2.MarkOutboxEventProcessed(ctx, ev.EventID, "worker-primary"); err != nil {
+			t.Fatalf("authorized worker failed to mark processed: %v", err)
+		}
 	}
 }

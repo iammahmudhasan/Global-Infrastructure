@@ -88,6 +88,9 @@ func NewAPIHandler(s store.Repository, svc *onboarding.DomainService, c *compile
 		auditKeyStr = "nexusedge-immutable-audit-key-2026"
 	}
 	auditKey := []byte(auditKeyStr)
+	if pgRepo, ok := s.(*store.PostgresRepository); ok {
+		pgRepo.SetAuditHMACKey(auditKey)
+	}
 	auditLogger := security.NewAuditLogger(auditKey)
 	var allLogs []*model.AuditLog
 	offset := 0
@@ -657,6 +660,11 @@ func (h *APIHandler) recordAudit(r *http.Request, orgID, projectID, action, reso
 			log.Printf("[AUDIT ERROR] failed to persist audit log %s, rolled back in-memory chain: %v", auditLog.ID, err)
 		}
 		return err
+	}
+
+	// If persistent store re-linked the record to a newly committed durable head, synchronize in-memory logger
+	if auditLog.Hash != rec.Hash {
+		h.auditLogger.UpdateLastRecord(rec.ID, auditLog.PrevHash, auditLog.Hash)
 	}
 
 	return nil

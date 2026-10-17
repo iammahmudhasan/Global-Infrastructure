@@ -100,9 +100,8 @@ func (l *AuditLogger) Record(actorID, orgID, projectID, action, resourceType, re
 	return record, nil
 }
 
-// computeRecordHash generates an HMAC-SHA256 signature across the canonical fields of the record.
-func (l *AuditLogger) computeRecordHash(r *AuditRecord) (string, error) {
-	// Canonical representation omitting the Hash field itself
+// ComputeCanonicalPayloadHash generates an HMAC-SHA256 signature across the canonical fields of an audit record.
+func ComputeCanonicalPayloadHash(hmacKey []byte, id, timestamp, actorID, orgID, projectID, action, resourceType, resourceID, clientIP string, details map[string]interface{}, prevHash string) (string, error) {
 	canonicalPayload := struct {
 		ID           string                 `json:"id"`
 		Timestamp    string                 `json:"timestamp"`
@@ -116,17 +115,17 @@ func (l *AuditLogger) computeRecordHash(r *AuditRecord) (string, error) {
 		Details      map[string]interface{} `json:"details,omitempty"`
 		PrevHash     string                 `json:"prev_hash"`
 	}{
-		ID:           r.ID,
-		Timestamp:    r.Timestamp,
-		ActorID:      r.ActorID,
-		OrgID:        r.OrgID,
-		ProjectID:    r.ProjectID,
-		Action:       r.Action,
-		ResourceType: r.ResourceType,
-		ResourceID:   r.ResourceID,
-		ClientIP:     r.ClientIP,
-		Details:      r.Details,
-		PrevHash:     r.PrevHash,
+		ID:           id,
+		Timestamp:    timestamp,
+		ActorID:      actorID,
+		OrgID:        orgID,
+		ProjectID:    projectID,
+		Action:       action,
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		ClientIP:     clientIP,
+		Details:      details,
+		PrevHash:     prevHash,
 	}
 
 	raw, err := json.Marshal(canonicalPayload)
@@ -134,9 +133,14 @@ func (l *AuditLogger) computeRecordHash(r *AuditRecord) (string, error) {
 		return "", err
 	}
 
-	mac := hmac.New(sha256.New, l.hmacKey)
+	mac := hmac.New(sha256.New, hmacKey)
 	mac.Write(raw)
 	return hex.EncodeToString(mac.Sum(nil)), nil
+}
+
+// computeRecordHash generates an HMAC-SHA256 signature across the canonical fields of the record.
+func (l *AuditLogger) computeRecordHash(r *AuditRecord) (string, error) {
+	return ComputeCanonicalPayloadHash(l.hmacKey, r.ID, r.Timestamp, r.ActorID, r.OrgID, r.ProjectID, r.Action, r.ResourceType, r.ResourceID, r.ClientIP, r.Details, r.PrevHash)
 }
 
 // VerifyChain iterates through all recorded audit logs and cryptographically verifies the hash chain.
@@ -226,4 +230,20 @@ func (l *AuditLogger) RollbackLastRecord(recordID string) bool {
 		return true
 	}
 	return false
+}
+
+// UpdateLastRecord updates the tail record's prevHash and re-computed hash when re-linked to the durable chain head.
+func (l *AuditLogger) UpdateLastRecord(recordID, newPrevHash, newHash string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	n := len(l.records)
+	if n == 0 || l.records[n-1].ID != recordID {
+		return false
+	}
+
+	l.records[n-1].PrevHash = newPrevHash
+	l.records[n-1].Hash = newHash
+	l.lastHash = newHash
+	return true
 }
