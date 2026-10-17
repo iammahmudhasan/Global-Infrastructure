@@ -1366,40 +1366,51 @@ func (r *PostgresRepository) ReconcileCache(ctx context.Context) (*CacheReconcil
 	if err != nil {
 		return nil, fmt.Errorf("reconcile cache query origin pools: %w", err)
 	}
-	defer poolRows.Close()
 
 	var stagedPools []*model.OriginPool
 	for poolRows.Next() {
 		var p model.OriginPool
 		var pops pq.StringArray
 		if err := poolRows.Scan(&p.ID, &p.ProjectID, &p.Name, &p.LBAlgorithm, &pops); err != nil {
+			poolRows.Close()
 			return nil, fmt.Errorf("reconcile cache scan origin pool: %w", err)
 		}
 		p.AllowedPoPs = []string(pops)
-
-		origRows, errOrig := tx.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins WHERE pool_id = $1", p.ID)
-		if errOrig != nil {
-			return nil, fmt.Errorf("reconcile cache query origins for pool %s: %w", p.ID, errOrig)
-		}
-		for origRows.Next() {
-			var o model.Origin
-			var opops pq.StringArray
-			if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err != nil {
-				origRows.Close()
-				return nil, fmt.Errorf("reconcile cache scan origin for pool %s: %w", p.ID, err)
-			}
-			o.AllowedPoPs = []string(opops)
-			p.Origins = append(p.Origins, o)
-		}
-		if err := origRows.Err(); err != nil {
-			origRows.Close()
-			return nil, fmt.Errorf("reconcile cache iterate origins for pool %s: %w", p.ID, err)
-		}
-		origRows.Close()
 		stagedPools = append(stagedPools, &p)
 	}
 	if err := poolRows.Err(); err != nil {
+		poolRows.Close()
 		return nil, fmt.Errorf("reconcile cache iterate origin pools: %w", err)
+	}
+	poolRows.Close()
+
+	// Query all origins in a single bulk query on the same transaction connection
+	origRows, errOrig := tx.QueryContext(ctx, "SELECT id, pool_id, address, port, protocol, weight, healthy, allowed_pops, sni, ca_bundle_path FROM origins")
+	if errOrig != nil {
+		return nil, fmt.Errorf("reconcile cache query origins: %w", errOrig)
+	}
+
+	originsByPool := make(map[string][]model.Origin)
+	for origRows.Next() {
+		var o model.Origin
+		var opops pq.StringArray
+		if err := origRows.Scan(&o.ID, &o.PoolID, &o.Address, &o.Port, &o.Protocol, &o.Weight, &o.Healthy, &opops, &o.SNI, &o.CABundlePath); err != nil {
+			origRows.Close()
+			return nil, fmt.Errorf("reconcile cache scan origin: %w", err)
+		}
+		o.AllowedPoPs = []string(opops)
+		originsByPool[o.PoolID] = append(originsByPool[o.PoolID], o)
+	}
+	if err := origRows.Err(); err != nil {
+		origRows.Close()
+		return nil, fmt.Errorf("reconcile cache iterate origins: %w", err)
+	}
+	origRows.Close()
+
+	for _, p := range stagedPools {
+		if origins, ok := originsByPool[p.ID]; ok {
+			p.Origins = origins
+		}
 	}
 
 	// 4. Stage Active Certificates
